@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lumenqraph Explorer</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font: 15px/1.5 system-ui, sans-serif; margin: 0; padding: 1.5rem; max-width: 1100px; margin-inline: auto; }
+    h1 { margin: 0 0 .25rem; }
+    .sub { opacity: .7; margin-bottom: 1.25rem; }
+    .row { display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: 1rem; }
+    input, button, select { font: inherit; padding: .45rem .6rem; border-radius: 6px; border: 1px solid #8886; background: transparent; color: inherit; }
+    button { cursor: pointer; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: .4rem .5rem; border-bottom: 1px solid #8883; vertical-align: top; }
+    code { font-family: ui-monospace, monospace; word-break: break-all; }
+    .pill { display: inline-block; padding: .05rem .4rem; border-radius: 999px; background: #6791ff33; font-size: 12px; }
+    .health { font-size: 13px; opacity: .85; }
+    .wrap { overflow-x: auto; }
+  </style>
+</head>
+<body>
+  <h1>Lumenqraph Explorer</h1>
+  <div class="sub">A minimal read UI over the Lumenqraph REST API. No build step.</div>
+
+  <div class="row">
+    <input id="base" size="34" value="http://localhost:8080" title="API base URL" />
+    <input id="key" size="22" placeholder="x-api-key (optional)" />
+    <button onclick="loadHealth()">Health</button>
+    <button onclick="loadContracts()">Contracts</button>
+  </div>
+  <div id="health" class="health"></div>
+
+  <div class="row">
+    <input id="cid" size="56" placeholder="contract id" />
+    <select id="kind">
+      <option value="events">events</option>
+      <option value="transfers">transfers</option>
+    </select>
+    <button onclick="loadRows()">Load</button>
+  </div>
+
+  <div class="wrap"><table id="tbl"></table></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const base = () => $('base').value.replace(/\/$/, '');
+const headers = () => $('key').value ? { 'x-api-key': $('key').value } : {};
+
+async function get(path) {
+  const r = await fetch(base() + path, { headers: headers() });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+
+async function loadHealth() {
+  try {
+    const h = await get('/health');
+    $('health').textContent =
+      `status: ${h.status} · lag: ${h.lag_ledgers ?? '—'} ledgers · ` +
+      `processed: ${h.last_processed_ledger ?? '—'} · events: ${h.events_ingested_total ?? '—'}`;
+  } catch (e) { $('health').textContent = e.message; }
+}
+
+function render(rows, cols) {
+  const t = $('tbl');
+  t.innerHTML = '<tr>' + cols.map(c => `<th>${c}</th>`).join('') + '</tr>';
+  for (const row of rows) {
+    t.innerHTML += '<tr>' + cols.map(c => {
+      let v = row[c];
+      if (v && typeof v === 'object') v = JSON.stringify(v);
+      return `<td><code>${v ?? ''}</code></td>`;
+    }).join('') + '</tr>';
+  }
+}
+
+async function loadContracts() {
+  const rows = await get('/contracts');
+  render(rows, ['contract_id', 'event_count', 'first_seen_ledger', 'last_seen_ledger']);
+  if (rows[0]) $('cid').value = rows[0].contract_id;
+}
+
+async function loadRows() {
+  const cid = $('cid').value.trim();
+  if (!cid) return;
+  if ($('kind').value === 'transfers') {
+    render(await get(`/contracts/${cid}/transfers?limit=50`),
+      ['ledger', 'from_addr', 'to_addr', 'amount', 'event_id']);
+  } else {
+    render(await get(`/contracts/${cid}/events?limit=50`),
+      ['ledger', 'event_name', 'decoded_topics', 'decoded_value', 'tx_hash']);
+  }
+}
+
+loadHealth();
+</script>
+</body>
+</html>

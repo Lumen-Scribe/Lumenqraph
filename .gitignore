@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+.env
+.env.local
+*.log
+
+# Postgres data volume for local docker dev
+/.pgdata

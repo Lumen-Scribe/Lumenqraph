@@ -1,0 +1,65 @@
+# Full local stack: Postgres + all three services, built from the Dockerfile.
+# For dev with only Postgres, use docker-compose.yml instead.
+#
+#   docker compose -f docker-compose.full.yml up --build
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: lumenqraph
+      POSTGRES_PASSWORD: lumenqraph
+      POSTGRES_DB: lumenqraph
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lumenqraph"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  indexer:
+    build: .
+    command: ["lumenqraph-indexer"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://lumenqraph:lumenqraph@postgres:5432/lumenqraph
+      RPC_URL: ${RPC_URL:-https://soroban-testnet.stellar.org}
+      CONTRACT_IDS: ${CONTRACT_IDS:-}
+      POLL_INTERVAL_SECS: ${POLL_INTERVAL_SECS:-5}
+      RUST_LOG: ${RUST_LOG:-info}
+
+  api:
+    build: .
+    command: ["lumenqraph-api"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://lumenqraph:lumenqraph@postgres:5432/lumenqraph
+      API_BIND_ADDR: 0.0.0.0:8080
+      REQUIRE_API_KEY: ${REQUIRE_API_KEY:-false}
+      ANON_RATE_LIMIT_PER_MIN: ${ANON_RATE_LIMIT_PER_MIN:-60}
+      RUST_LOG: ${RUST_LOG:-info}
+
+  webhooks:
+    build: .
+    command: ["lumenqraph-webhooks"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://lumenqraph:lumenqraph@postgres:5432/lumenqraph
+      RUST_LOG: ${RUST_LOG:-info}
+
+volumes:
+  pgdata:

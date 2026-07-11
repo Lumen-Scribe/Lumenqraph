@@ -1,0 +1,22 @@
+[package]
+name = "lumenqraph-indexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lumenqraph-indexer"
+path = "src/main.rs"
+
+[dependencies]
+lumenqraph-core.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dotenvy.workspace = true
+sqlx.workspace = true
+reqwest.workspace = true

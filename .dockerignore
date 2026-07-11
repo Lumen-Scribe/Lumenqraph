@@ -1,0 +1,7 @@
+/target
+/.pgdata
+.env
+.env.local
+*.log
+.git
+explorer/node_modules

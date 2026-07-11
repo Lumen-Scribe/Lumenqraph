@@ -1,0 +1,19 @@
+# Local Postgres for development. In production, point DATABASE_URL at a
+# managed instance (Neon/Supabase) instead of running this.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: lumenqraph-postgres
+    environment:
+      POSTGRES_USER: lumenqraph
+      POSTGRES_PASSWORD: lumenqraph
+      POSTGRES_DB: lumenqraph
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./.pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lumenqraph"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
