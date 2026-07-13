@@ -111,9 +111,9 @@
       <span class="tag">Explorer &amp; self-host dashboard</span>
     </div>
     <div class="conn">
-      <input id="base" size="26" value="http://localhost:8080" title="API base URL" />
+      <input id="base" size="26" value="" placeholder="API base (blank = same origin)" title="API base URL — leave blank when the page is served by/behind the API" />
       <input id="key" size="16" placeholder="x-api-key (optional)" />
-      <button class="primary" onclick="connect()">Connect</button>
+      <button class="primary" onclick="connect()">Load</button>
     </div>
   </header>
 
@@ -327,7 +327,8 @@ async function decodeAny() {
   catch (e) { $('detail').innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
 }
 
-// Auto-connect on load against the default base.
+// Auto-connect on load. With a blank base, calls are same-origin — so the page
+// works when served by (or behind a proxy in front of) the API, with no CORS.
 connect();
 </script>
 </body>
