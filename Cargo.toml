@@ -12,7 +12,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/Lost-Z/Lumenqraph"
+repository = "https://github.com/Lumen-Scribe/Lumenqraph"
 
 # Shared dependency versions — pinned once, referenced by each crate with
 # `<dep>.workspace = true` so the indexer (writer) and api (reader) never drift.
