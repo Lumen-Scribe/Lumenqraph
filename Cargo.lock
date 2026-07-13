@@ -1019,6 +1019,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumenqraph-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dotenvy",
+ "hex",
+ "lumenqraph-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "lumenqraph-webhooks"
 version = "0.1.0"
 dependencies = [

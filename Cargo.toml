@@ -5,6 +5,7 @@ members = [
     "crates/lumenqraph-indexer",
     "crates/lumenqraph-api",
     "crates/lumenqraph-webhooks",
+    "crates/lumenqraph-mcp",
 ]
 
 [workspace.package]

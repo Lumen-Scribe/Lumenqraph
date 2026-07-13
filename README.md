@@ -52,6 +52,7 @@ Lumenqraph's angle is **simplicity, self-hostability, and typed decoding that ne
 | 🧩 **Full XDR → JSON decoding** | ScVal decoded to friendly JSON: `i128`/`u128` as decimal strings, addresses as `G…`/`C…` strkeys, bytes as hex, vecs/maps as arrays/objects. Raw base64 always retained. |
 | 🏷️ **Typed, spec-driven decoding** | Reads each contract's on-chain `contractspecv0` interface to emit **named, typed** events (`{from, to, amount: i128}`) — zero ABI upload. Serves the full decoded interface at `/contracts/:id/interface`. |
 | 📖 **Read layer (`eth_call` for Soroban)** | Invoke any contract view function read-only over REST and get a **typed** result. Arguments are type-checked against the on-chain spec before simulation. |
+| 🤖 **MCP server (AI-agent access)** | A [Model Context Protocol](https://modelcontextprotocol.io) server that lets Claude (or any MCP agent) discover, query, and call any indexed Soroban contract — typed and self-describing, zero hand-written schema. |
 | 💸 **Materialized token transfers** | SEP-41 `transfer` events projected into a queryable `from`/`to`/`amount` table. |
 | 🔌 **REST API** | Contracts, events (filterable by name), transfers, health, and Prometheus metrics. |
 | 📣 **Signed webhooks** | Register a URL + filter, receive HMAC-SHA256-signed event pushes with retries and exponential backoff. |
@@ -82,6 +83,7 @@ Lumenqraph is a Rust workspace of three service binaries sharing one core librar
 | [`lumenqraph-indexer`](crates/lumenqraph-indexer) | Always-on process: polls `getEvents`, decodes, enriches against each contract's interface, writes to Postgres. |
 | [`lumenqraph-api`](crates/lumenqraph-api) | Axum read + management API (auth, rate limiting, metrics) and the read layer (typed view-function calls via RPC). |
 | [`lumenqraph-webhooks`](crates/lumenqraph-webhooks) | Matches events to subscriptions and delivers signed pushes. |
+| [`lumenqraph-mcp`](crates/lumenqraph-mcp) | Model Context Protocol server: typed, self-describing contract access for AI agents. |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for details.
 
@@ -249,6 +251,37 @@ curl -X POST localhost:8080/contracts/<CID>/call \
 
 Errors are precise and client-facing: unknown function, missing/extra argument, or a wrong-typed argument all return `400` with a message (`argument "account": invalid address strkey`) rather than a failed simulation. Reads need the contract's interface, which the indexer captures on first sighting — Stellar Asset Contracts (no WASM spec) aren't callable this way. Supported argument types today: bool, all sized integers, `i128`/`u128`, `Symbol`, `String`, `Address`, `Bytes`/`BytesN`, `Option`, `Vec`, `Tuple`, and symbol-keyed `Map`; big-int (256-bit) and user-defined-type arguments are on the roadmap. Implementation: [`lumenqraph-core::read`](crates/lumenqraph-core/src/read.rs).
 
+## AI-agent access — the MCP server
+
+Everything above — typed events, decoded interfaces, typed read calls — is exactly the structured, self-describing metadata an AI agent needs to work with a chain. [`lumenqraph-mcp`](crates/lumenqraph-mcp) exposes it as a [Model Context Protocol](https://modelcontextprotocol.io) server, so **Claude (Desktop or Code) or any MCP client can discover, query, and call any Soroban contract** — with no hand-written tool schemas, because the schemas come from each contract's on-chain interface.
+
+It's a standard stdio JSON-RPC server that reuses the same Postgres and read-layer encoder as the API, and offers four tools:
+
+| Tool | What the agent can do |
+| --- | --- |
+| `list_contracts` | See which contracts are indexed, with event counts. |
+| `get_contract_interface` | Discover a contract's functions (typed inputs/outputs), events, and user-defined types. |
+| `query_events` | Read a contract's recent events, decoded and enriched. |
+| `call_contract` | Invoke a view function read-only and get a typed result (args type-checked against the spec). |
+
+Point Claude Desktop at it by adding to your MCP client config:
+
+```jsonc
+{
+  "mcpServers": {
+    "lumenqraph": {
+      "command": "lumenqraph-mcp",
+      "env": {
+        "DATABASE_URL": "postgres://…",   // the same DB the indexer writes
+        "RPC_URL": "https://soroban-testnet.stellar.org"
+      }
+    }
+  }
+}
+```
+
+Then just ask: *"What functions does contract C… expose? What's the balance of G…? Show me its last few transfers."* The agent discovers the interface and makes the typed calls itself.
+
 Generate an API key:
 
 ```bash
@@ -302,12 +335,13 @@ Lumenqraph/
 │   ├── lumenqraph-core/       # shared models, errors, XDR↔JSON, spec parser, read encoder
 │   ├── lumenqraph-indexer/    # polling, decoding, spec enrichment, backfill, persistence
 │   ├── lumenqraph-api/        # Axum REST API, auth, rate limiting, metrics, read layer
-│   └── lumenqraph-webhooks/   # subscription matching + signed delivery
+│   ├── lumenqraph-webhooks/   # subscription matching + signed delivery
+│   └── lumenqraph-mcp/        # Model Context Protocol server for AI agents
 ├── migrations/                # ordered sqlx SQL migrations (0001–0004)
 ├── docs/                      # ARCHITECTURE, API, DEPLOYMENT
 ├── explorer/                  # minimal zero-build read UI
 ├── scripts/                   # gen_api_key, backfill, setup_db
-├── Dockerfile                 # multi-stage build (all three binaries)
+├── Dockerfile                 # multi-stage build (all four binaries)
 ├── docker-compose.yml         # local Postgres for dev
 ├── docker-compose.full.yml    # full stack
 └── Makefile                   # common tasks (make help)
@@ -329,6 +363,7 @@ CI runs formatting, Clippy (warnings denied), tests, and a release build against
 
 - [x] Typed, self-describing decoding from each contract's on-chain interface (`contractspecv0`)
 - [x] Read layer: typed, read-only view-function calls via `simulateTransaction` (`eth_call` for Soroban)
+- [x] MCP server: typed, self-describing Soroban access for AI agents (Model Context Protocol)
 - [ ] Read layer: user-defined-type and 256-bit-integer arguments; in-memory spec cache in the API
 - [ ] Contract *state* indexing: versioned snapshots of storage entries (historical state + analytics)
 - [ ] Enrichment for user-defined struct/enum/union values (naming nested UDT fields, not just event params)
