@@ -25,6 +25,9 @@ Tail contract events from Soroban RPC, decode their XDR to clean JSON, store the
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [API](#api)
+- [Typed, self-describing decoding](#typed-self-describing-decoding)
+- [Read layer — `eth_call` for Soroban](#read-layer--eth_call-for-soroban)
+- [AI-agent access — the MCP server](#ai-agent-access--the-mcp-server)
 - [Webhooks](#webhooks)
 - [Running in production](#running-in-production)
 - [Project structure](#project-structure)
@@ -190,6 +193,12 @@ Base URL defaults to `http://localhost:8080`. Full reference: [docs/API.md](docs
 ```
 </details>
 
+Generate an API key:
+
+```bash
+DATABASE_URL=... ./scripts/gen_api_key.sh myapp pro 600   # name, tier, requests/min
+```
+
 ## Typed, self-describing decoding
 
 Every generic decoder can tell you a value is an `i128` or an address. Lumenqraph goes further: it reads each contract's **on-chain interface** — the `contractspecv0` schema that Soroban embeds directly in the deployed WASM — and uses it to attach real **field names and types** to every event, automatically.
@@ -264,13 +273,37 @@ It's a standard stdio JSON-RPC server that reuses the same Postgres and read-lay
 | `query_events` | Read a contract's recent events, decoded and enriched. |
 | `call_contract` | Invoke a view function read-only and get a typed result (args type-checked against the spec). |
 
-Point Claude Desktop at it by adding to your MCP client config:
+### Quick start
+
+**1. Build the server binary.**
+
+```bash
+cargo build --release -p lumenqraph-mcp
+# → target/release/lumenqraph-mcp   (install it on your PATH, or use the full path below)
+```
+
+**2. Make sure the indexer has populated the database.** The MCP server is a *read* surface over the same Postgres the indexer writes — it needs data (and, for `call_contract`, the contract's interface, which the indexer captures on first sighting). If you followed the [Quick start](#quick-start) above, you already have this.
+
+**3. Smoke-test it without an MCP client** by piping newline-delimited JSON-RPC to its stdin (protocol replies come back on stdout, one per line):
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_contracts","arguments":{}}}' \
+| DATABASE_URL='postgres://lumenqraph:lumenqraph@localhost:5432/lumenqraph' \
+  RPC_URL='https://soroban-testnet.stellar.org' \
+  ./target/release/lumenqraph-mcp
+# → an initialize result, the four tool definitions, then your indexed contracts.
+```
+
+**4. Register it with your MCP client** (e.g. Claude Desktop's `claude_desktop_config.json`, or Claude Code via `claude mcp add`):
 
 ```jsonc
 {
   "mcpServers": {
     "lumenqraph": {
-      "command": "lumenqraph-mcp",
+      "command": "lumenqraph-mcp",   // or the absolute path to the built binary
       "env": {
         "DATABASE_URL": "postgres://…",   // the same DB the indexer writes
         "RPC_URL": "https://soroban-testnet.stellar.org"
@@ -280,13 +313,11 @@ Point Claude Desktop at it by adding to your MCP client config:
 }
 ```
 
-Then just ask: *"What functions does contract C… expose? What's the balance of G…? Show me its last few transfers."* The agent discovers the interface and makes the typed calls itself.
+**5. Restart the client and just ask** — in plain language:
 
-Generate an API key:
+> *"Using lumenqraph, what functions does contract `C…` expose? What's the balance of `G…`? Show me its last few `transfer` events."*
 
-```bash
-DATABASE_URL=... ./scripts/gen_api_key.sh myapp pro 600   # name, tier, requests/min
-```
+The agent calls `get_contract_interface` to discover the typed signatures, then `call_contract` and `query_events` to answer — all typed, all validated against the on-chain spec, with no schema you had to write.
 
 ## Webhooks
 
