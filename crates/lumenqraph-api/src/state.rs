@@ -6,6 +6,7 @@ use std::sync::Arc;
 use sqlx::PgPool;
 
 use crate::rate_limit::RateLimiter;
+use crate::rpc::RpcClient;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -16,4 +17,6 @@ pub struct AppState {
     pub anon_rate_limit: i32,
     pub limiter: Arc<RateLimiter>,
     pub http_requests: Arc<AtomicU64>,
+    /// Soroban RPC client, for the read layer (`POST /contracts/:id/call`).
+    pub rpc: RpcClient,
 }

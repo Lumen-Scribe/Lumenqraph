@@ -49,6 +49,14 @@ reqwest = { version = "0.12", default-features = false, features = [
 axum = "0.7"
 tower = "0.5"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
+# Canonical Stellar XDR types. Used ONLY on the cold, once-per-contract spec /
+# ledger-entry path (parsing a contract's on-chain interface). The hot event
+# decode path stays dependency-free in `lumenqraph-core::xdr`.
+stellar-xdr = { version = "23", default-features = false, features = [
+    "std",
+    "curr",
+    "base64",
+] }
 
 [profile.release]
 opt-level = 3

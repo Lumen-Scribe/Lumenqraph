@@ -7,6 +7,7 @@ mod error;
 mod metrics;
 mod rate_limit;
 mod routes;
+mod rpc;
 mod state;
 
 use std::sync::atomic::AtomicU64;
@@ -46,6 +47,8 @@ async fn main() -> anyhow::Result<()> {
 
     let database_url = std::env::var("DATABASE_URL").context("missing DATABASE_URL")?;
     let bind_addr = std::env::var("API_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let rpc_url = std::env::var("RPC_URL")
+        .unwrap_or_else(|_| "https://soroban-testnet.stellar.org".to_string());
 
     let pool = PgPoolOptions::new()
         .max_connections(10)
@@ -59,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
         anon_rate_limit: env_parse("ANON_RATE_LIMIT_PER_MIN", 60),
         limiter: Arc::new(RateLimiter::new()),
         http_requests: Arc::new(AtomicU64::new(0)),
+        rpc: rpc::RpcClient::new(rpc_url),
     };
 
     let app = routes::router(state)

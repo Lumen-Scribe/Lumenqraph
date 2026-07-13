@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 use crate::convert::to_new_event;
 use crate::rpc_client::RpcClient;
+use crate::specs::SpecCache;
 use crate::{cursor, store};
 
 /// getEvents only serves recent history. If our cursor falls further than this
@@ -26,9 +27,12 @@ pub fn max_lookback() -> i64 {
 pub async fn run(pool: PgPool, rpc: RpcClient, config: Config) -> anyhow::Result<()> {
     let base_interval = Duration::from_secs(config.poll_interval_secs.max(1));
     let mut backoff = base_interval;
+    // One spec cache for the process lifetime: each contract's interface is
+    // fetched and parsed once, then reused to enrich every event.
+    let specs = SpecCache::new();
 
     loop {
-        let sleep_for = match poll_once(&pool, &rpc, &config).await {
+        let sleep_for = match poll_once(&pool, &rpc, &config, &specs).await {
             Ok(processed_to) => {
                 backoff = base_interval;
                 if let Some(ledger) = processed_to {
@@ -56,7 +60,12 @@ pub async fn run(pool: PgPool, rpc: RpcClient, config: Config) -> anyhow::Result
 }
 
 /// One catch-up to the current tip. Returns the ledger we advanced to.
-async fn poll_once(pool: &PgPool, rpc: &RpcClient, config: &Config) -> anyhow::Result<Option<i64>> {
+async fn poll_once(
+    pool: &PgPool,
+    rpc: &RpcClient,
+    config: &Config,
+    specs: &SpecCache,
+) -> anyhow::Result<Option<i64>> {
     let latest = rpc.get_latest_ledger().await?;
 
     let mut start = match cursor::read_last_processed(pool).await? {
@@ -80,7 +89,7 @@ async fn poll_once(pool: &PgPool, rpc: &RpcClient, config: &Config) -> anyhow::R
         start = clamped;
     }
 
-    let inserted = fetch_and_store(pool, rpc, config, start, latest).await?;
+    let inserted = fetch_and_store(pool, rpc, config, specs, start, latest).await?;
     cursor::write_progress(pool, latest, latest, inserted).await?;
     if inserted > 0 {
         info!(inserted, up_to_ledger = latest, "indexed events");
@@ -94,6 +103,7 @@ pub async fn fetch_and_store(
     pool: &PgPool,
     rpc: &RpcClient,
     config: &Config,
+    specs: &SpecCache,
     start: i64,
     _tip: i64,
 ) -> anyhow::Result<u64> {
@@ -108,7 +118,12 @@ pub async fn fetch_and_store(
                 config.page_size,
             )
             .await?;
-        let batch: Vec<NewEvent> = page.events.iter().map(to_new_event).collect();
+        let mut batch: Vec<NewEvent> = Vec::with_capacity(page.events.len());
+        for ev in &page.events {
+            // Interface lookups are cached, so this is one fetch per contract.
+            let spec = specs.get(pool, rpc, &ev.contract_id).await;
+            batch.push(to_new_event(ev, spec.as_deref()));
+        }
         let n = batch.len();
         total_inserted += store::insert_events(pool, &batch).await?;
 

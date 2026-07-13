@@ -1,8 +1,15 @@
 //! Thin JSON-RPC client for the Soroban RPC `getEvents` / `getLatestLedger`
 //! methods. Only the fields we use are modeled.
 
+use std::str::FromStr;
+use std::time::Duration;
+
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
+use stellar_xdr::curr::{
+    ContractDataDurability, ContractExecutable, LedgerEntryData, LedgerKey, LedgerKeyContractCode,
+    LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal, WriteXdr,
+};
 
 pub struct RpcClient {
     http: reqwest::Client,
@@ -102,8 +109,15 @@ pub struct EventInfo {
 
 impl RpcClient {
     pub fn new(url: impl Into<String>) -> Self {
+        // A request timeout is essential for a 24/7 poller: without it, a hung
+        // RPC connection blocks the poll loop indefinitely and the backoff path
+        // (which only fires on an error) is never reached.
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("failed to build HTTP client");
         Self {
-            http: reqwest::Client::new(),
+            http,
             url: url.into(),
         }
     }
@@ -165,4 +179,74 @@ impl RpcClient {
         };
         self.call("getEvents", params).await
     }
+
+    /// Fetch a contract's deployed WASM (hex hash + bytes), so its on-chain
+    /// interface spec can be parsed. Returns `Ok(None)` for contracts with no
+    /// WASM (e.g. a Stellar Asset Contract) or when the entries aren't found.
+    ///
+    /// Two hops, both via `getLedgerEntries`: the contract's *instance* entry
+    /// names the WASM hash of its executable; the *code* entry holds the bytes.
+    pub async fn get_contract_wasm(
+        &self,
+        contract_id: &str,
+    ) -> anyhow::Result<Option<(String, Vec<u8>)>> {
+        let addr = ScAddress::from_str(contract_id)
+            .with_context(|| format!("invalid contract id {contract_id}"))?;
+
+        let instance_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: addr,
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+        });
+        let Some(entry) = self.get_ledger_entry(&instance_key).await? else {
+            return Ok(None);
+        };
+        let wasm_hash = match entry {
+            LedgerEntryData::ContractData(cd) => match cd.val {
+                ScVal::ContractInstance(inst) => match inst.executable {
+                    ContractExecutable::Wasm(hash) => hash,
+                    ContractExecutable::StellarAsset => return Ok(None),
+                },
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+
+        let hash_hex = hex::encode(wasm_hash.0);
+        let code_key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: wasm_hash });
+        let Some(entry) = self.get_ledger_entry(&code_key).await? else {
+            return Ok(None);
+        };
+        match entry {
+            LedgerEntryData::ContractCode(cc) => Ok(Some((hash_hex, cc.code.into()))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Fetch and XDR-decode a single ledger entry by key. `None` if absent.
+    async fn get_ledger_entry(&self, key: &LedgerKey) -> anyhow::Result<Option<LedgerEntryData>> {
+        let key_b64 = key
+            .to_xdr_base64(Limits::none())
+            .context("encode ledger key")?;
+        let result: LedgerEntriesResult = self
+            .call("getLedgerEntries", serde_json::json!({ "keys": [key_b64] }))
+            .await?;
+        let Some(first) = result.entries.unwrap_or_default().into_iter().next() else {
+            return Ok(None);
+        };
+        let data = LedgerEntryData::from_xdr_base64(&first.xdr, Limits::none())
+            .context("decode ledger entry")?;
+        Ok(Some(data))
+    }
+}
+
+#[derive(Deserialize)]
+struct LedgerEntriesResult {
+    #[serde(default)]
+    entries: Option<Vec<LedgerEntryItem>>,
+}
+
+#[derive(Deserialize)]
+struct LedgerEntryItem {
+    xdr: String,
 }

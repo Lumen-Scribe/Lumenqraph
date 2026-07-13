@@ -28,17 +28,21 @@ pub async fn enqueue(pool: &PgPool, batch: i64) -> anyhow::Result<u64> {
     .fetch_one(pool)
     .await?;
 
-    let upper: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(max(seq), 0) FROM events WHERE seq > $1 AND seq <= $1 + $2",
-    )
-    .bind(last_seq)
-    .bind(batch)
-    .fetch_one(pool)
-    .await?;
+    // Advance the watermark by at most `batch` toward the global max seq.
+    // Using the *global* max (not the max within the window) is essential:
+    // `seq` is a BIGSERIAL that also increments on `ON CONFLICT DO NOTHING`, so
+    // re-fetching the tip each cycle burns seq values and leaves gaps. If a gap
+    // ever exceeds `batch`, a window-local max would be NULL and this watermark
+    // would stall forever. Stepping toward the global max always makes progress
+    // (empty gaps simply enqueue nothing), so the pipeline can never wedge.
+    let global_max: i64 = sqlx::query_scalar("SELECT COALESCE(max(seq), 0) FROM events")
+        .fetch_one(pool)
+        .await?;
 
-    if upper <= last_seq {
+    if global_max <= last_seq {
         return Ok(0);
     }
+    let upper = (last_seq + batch).min(global_max);
 
     let created = sqlx::query(
         "INSERT INTO webhook_deliveries (subscription_id, event_id)

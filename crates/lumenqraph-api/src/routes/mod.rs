@@ -4,6 +4,7 @@
 pub mod contracts;
 pub mod events;
 pub mod health;
+pub mod read;
 pub mod transfers;
 pub mod webhooks;
 
@@ -23,6 +24,15 @@ pub fn router(state: AppState) -> Router {
     // Data + management endpoints, behind auth + rate limiting.
     let protected = Router::new()
         .route("/contracts", get(contracts::list_contracts))
+        .route(
+            "/contracts/:contract_id/interface",
+            get(contracts::contract_interface),
+        )
+        .route(
+            "/contracts/:contract_id/functions",
+            get(read::list_functions),
+        )
+        .route("/contracts/:contract_id/call", post(read::call_function))
         .route("/contracts/:contract_id/events", get(events::list_events))
         .route(
             "/contracts/:contract_id/transfers",

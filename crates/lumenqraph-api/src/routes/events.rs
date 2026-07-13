@@ -35,7 +35,7 @@ pub async fn list_events(
     let events: Vec<EventRow> = sqlx::query_as(
         "SELECT event_id, contract_id, ledger, ledger_closed_at, event_type,
                 topics, decoded_topics, event_name, value, decoded_value,
-                tx_hash, in_successful_call, paging_token, created_at
+                enriched, tx_hash, in_successful_call, paging_token, created_at
          FROM events
          WHERE contract_id = $1
            AND ($2::text IS NULL OR event_name = $2)

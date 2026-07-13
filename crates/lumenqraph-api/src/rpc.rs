@@ -1,0 +1,100 @@
+//! Minimal Soroban RPC client for the read layer: just `simulateTransaction`,
+//! used to execute contract view functions read-only.
+
+use std::time::Duration;
+
+use serde::Deserialize;
+
+#[derive(Clone)]
+pub struct RpcClient {
+    http: reqwest::Client,
+    url: String,
+}
+
+/// The outcome of a simulation: either a base64 `ScVal` result, or a contract-
+/// or host-level error message.
+pub enum SimOutcome {
+    Ok {
+        result_xdr: String,
+        latest_ledger: i64,
+    },
+    Error(String),
+}
+
+#[derive(Deserialize)]
+struct RpcEnvelope {
+    result: Option<SimulateResult>,
+    error: Option<RpcError>,
+}
+
+#[derive(Deserialize)]
+struct RpcError {
+    message: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SimulateResult {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    results: Option<Vec<SimResultItem>>,
+    #[serde(default)]
+    latest_ledger: i64,
+}
+
+#[derive(Deserialize)]
+struct SimResultItem {
+    xdr: String,
+}
+
+impl RpcClient {
+    pub fn new(url: impl Into<String>) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("failed to build HTTP client");
+        Self {
+            http,
+            url: url.into(),
+        }
+    }
+
+    /// Simulate a base64 transaction envelope. `Ok(SimOutcome::Error)` carries a
+    /// client-facing message (e.g. the function trapped); `Err` is transport.
+    pub async fn simulate(&self, tx_xdr: &str) -> anyhow::Result<SimOutcome> {
+        let req = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "simulateTransaction",
+            "params": { "transaction": tx_xdr }
+        });
+        let env: RpcEnvelope = self
+            .http
+            .post(&self.url)
+            .json(&req)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        if let Some(e) = env.error {
+            return Err(anyhow::anyhow!("rpc error: {}", e.message));
+        }
+        let result = env
+            .result
+            .ok_or_else(|| anyhow::anyhow!("rpc returned no result"))?;
+
+        if let Some(err) = result.error {
+            return Ok(SimOutcome::Error(err));
+        }
+        match result.results.and_then(|mut v| v.drain(..).next()) {
+            Some(item) => Ok(SimOutcome::Ok {
+                result_xdr: item.xdr,
+                latest_ledger: result.latest_ledger,
+            }),
+            None => Ok(SimOutcome::Error(
+                "simulation returned no result value".to_string(),
+            )),
+        }
+    }
+}

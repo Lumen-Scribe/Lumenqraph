@@ -21,8 +21,8 @@ pub async fn insert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result
             "INSERT INTO events (
                 event_id, contract_id, ledger, ledger_closed_at, event_type,
                 topics, decoded_topics, event_name, value, decoded_value,
-                tx_hash, in_successful_call, paging_token
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                enriched, tx_hash, in_successful_call, paging_token
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
              ON CONFLICT (event_id) DO NOTHING",
         )
         .bind(&e.event_id)
@@ -35,6 +35,7 @@ pub async fn insert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result
         .bind(&e.event_name)
         .bind(&e.value)
         .bind(&e.decoded_value)
+        .bind(&e.enriched)
         .bind(&e.tx_hash)
         .bind(e.in_successful_call)
         .bind(&e.paging_token)
@@ -103,4 +104,71 @@ fn extract_transfer(e: &NewEvent) -> Option<Transfer> {
         ledger: e.ledger,
         ledger_closed_at: e.ledger_closed_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn event(name: Option<&str>, topics: Vec<Value>, value: Value) -> NewEvent {
+        NewEvent {
+            event_id: "e1".into(),
+            contract_id: "C1".into(),
+            ledger: 42,
+            ledger_closed_at: chrono::Utc::now(),
+            event_type: "contract".into(),
+            topics: vec![],
+            decoded_topics: topics,
+            event_name: name.map(|s| s.to_string()),
+            value: String::new(),
+            decoded_value: value,
+            enriched: None,
+            tx_hash: "tx".into(),
+            in_successful_call: true,
+            paging_token: "e1".into(),
+        }
+    }
+
+    #[test]
+    fn extracts_transfer_from_to_amount() {
+        let e = event(
+            Some("transfer"),
+            vec![json!("transfer"), json!("GFROM"), json!("GTO")],
+            json!("300"),
+        );
+        let t = extract_transfer(&e).expect("transfer should be recognised");
+        assert_eq!(t.from_addr.as_deref(), Some("GFROM"));
+        assert_eq!(t.to_addr.as_deref(), Some("GTO"));
+        assert_eq!(t.amount, "300");
+        assert_eq!(t.event_id, "e1");
+    }
+
+    #[test]
+    fn ignores_non_transfer_events() {
+        let e = event(Some("mint"), vec![json!("mint")], json!("1"));
+        assert!(extract_transfer(&e).is_none());
+    }
+
+    #[test]
+    fn non_string_amount_is_stringified() {
+        // Small amounts decode to a JSON number rather than a string.
+        let e = event(
+            Some("transfer"),
+            vec![json!("transfer"), json!("GFROM"), json!("GTO")],
+            json!(300),
+        );
+        let t = extract_transfer(&e).unwrap();
+        assert_eq!(t.amount, "300");
+    }
+
+    #[test]
+    fn missing_address_topics_are_none() {
+        // A malformed transfer with no address topics still projects, with NULLs.
+        let e = event(Some("transfer"), vec![json!("transfer")], json!("5"));
+        let t = extract_transfer(&e).unwrap();
+        assert!(t.from_addr.is_none());
+        assert!(t.to_addr.is_none());
+        assert_eq!(t.amount, "5");
+    }
 }

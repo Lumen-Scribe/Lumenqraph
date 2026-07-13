@@ -31,6 +31,9 @@ pub struct NewEvent {
     pub value: String,
     /// Decoded event body as JSON.
     pub decoded_value: Value,
+    /// Named, typed record built from the contract's on-chain spec, when one is
+    /// available for this event. `None` falls back to the decoded_* fields.
+    pub enriched: Option<Value>,
     pub tx_hash: String,
     pub in_successful_call: bool,
     pub paging_token: String,
@@ -49,6 +52,8 @@ pub struct EventRow {
     pub event_name: Option<String>,
     pub value: String,
     pub decoded_value: Json<Value>,
+    /// Named, typed record from the contract spec; null when no spec matched.
+    pub enriched: Option<Json<Value>>,
     pub tx_hash: String,
     pub in_successful_call: bool,
     pub paging_token: String,

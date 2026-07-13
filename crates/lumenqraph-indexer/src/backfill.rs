@@ -11,6 +11,7 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::poller::fetch_and_store;
 use crate::rpc_client::RpcClient;
+use crate::specs::SpecCache;
 use crate::{cursor, poller};
 
 pub async fn run(
@@ -31,7 +32,8 @@ pub async fn run(
     }
     info!(from = start, to = tip, "starting backfill");
 
-    let inserted = fetch_and_store(&pool, &rpc, &config, start, tip).await?;
+    let specs = SpecCache::new();
+    let inserted = fetch_and_store(&pool, &rpc, &config, &specs, start, tip).await?;
     cursor::write_progress(&pool, tip, tip, inserted).await?;
     info!(inserted, up_to_ledger = tip, "backfill complete");
     Ok(())

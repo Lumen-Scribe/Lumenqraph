@@ -3,9 +3,12 @@
 
 pub mod error;
 pub mod models;
+pub mod read;
+pub mod spec;
 pub mod xdr;
 
 pub use error::{Error, Result};
 pub use models::{
     ApiKey, Contract, EventRow, IndexerStatus, NewEvent, TokenTransfer, WebhookSubscription,
 };
+pub use spec::ContractSpec;
