@@ -3,8 +3,8 @@
 //! typed, self-describing access to Soroban contracts.
 //!
 //! It reuses the same Postgres the API reads and the same read-layer encoder the
-//! API calls, exposing four tools: `list_contracts`, `get_contract_interface`,
-//! `query_events`, and `call_contract`. Because the interface and argument types
+//! API calls, exposing five tools: `list_contracts`, `get_contract_interface`,
+//! `get_contract_state`, `query_events`, and `call_contract`. Because the types
 //! come from each contract's on-chain spec, an agent can *discover* what a
 //! contract does and call it correctly — with zero hand-written schema.
 //!
@@ -193,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn all_four_tools_are_defined_with_schemas() {
+    fn all_tools_are_defined_with_schemas() {
         let defs = tools::definitions();
         let names: Vec<&str> = defs
             .as_array()
@@ -206,6 +206,7 @@ mod tests {
             vec![
                 "list_contracts",
                 "get_contract_interface",
+                "get_contract_state",
                 "query_events",
                 "call_contract"
             ]

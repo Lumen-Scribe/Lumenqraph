@@ -12,6 +12,10 @@ pub struct Config {
     pub page_size: u32,
     /// Ledger to start from on a fresh index. 0 => start near the current tip.
     pub start_ledger: i64,
+    /// When true, snapshot each active contract's instance storage into
+    /// `contract_state` (versioned). Off by default — it costs one extra RPC
+    /// call per active contract per cycle. Best paired with `CONTRACT_IDS`.
+    pub state_indexing: bool,
 }
 
 impl Config {
@@ -28,8 +32,16 @@ impl Config {
             poll_interval_secs: env_parse("POLL_INTERVAL_SECS", 5)?,
             page_size: env_parse("PAGE_SIZE", 1000)?,
             start_ledger: env_parse("START_LEDGER", 0)?,
+            state_indexing: env_bool("STATE_INDEXING", false),
         })
     }
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(default)
 }
 
 fn env(key: &str) -> anyhow::Result<String> {

@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::convert::to_new_event;
 use crate::rpc_client::RpcClient;
 use crate::specs::SpecCache;
-use crate::{cursor, store};
+use crate::{cursor, state, store};
 
 /// getEvents only serves recent history. If our cursor falls further than this
 /// behind the tip, we clamp forward and log the (unrecoverable) gap.
@@ -109,6 +109,7 @@ pub async fn fetch_and_store(
 ) -> anyhow::Result<u64> {
     let mut cursor_token: Option<String> = None;
     let mut total_inserted = 0u64;
+    let mut active_contracts: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
         let page = rpc
             .get_events(
@@ -122,6 +123,10 @@ pub async fn fetch_and_store(
         for ev in &page.events {
             // Interface lookups are cached, so this is one fetch per contract.
             let spec = specs.get(pool, rpc, &ev.contract_id).await;
+            // Only needed for index-all state snapshotting (see below).
+            if config.state_indexing && config.contract_ids.is_empty() {
+                active_contracts.insert(ev.contract_id.clone());
+            }
             batch.push(to_new_event(ev, spec.as_deref()));
         }
         let n = batch.len();
@@ -130,6 +135,21 @@ pub async fn fetch_and_store(
         cursor_token = page.cursor;
         if n < config.page_size as usize || cursor_token.is_none() {
             break;
+        }
+    }
+
+    // Snapshot contract state (change-detected, so unchanged instances are
+    // no-op writes). With an explicit CONTRACT_IDS list we track those contracts
+    // every cycle; in index-all mode we restrict to contracts active this cycle
+    // to bound the extra RPC calls.
+    if config.state_indexing {
+        let targets: Vec<&String> = if config.contract_ids.is_empty() {
+            active_contracts.iter().collect()
+        } else {
+            config.contract_ids.iter().collect()
+        };
+        for contract_id in targets {
+            state::snapshot(pool, rpc, specs, contract_id).await;
         }
     }
     Ok(total_inserted)

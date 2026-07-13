@@ -29,6 +29,10 @@ pub fn router(state: AppState) -> Router {
             get(contracts::contract_interface),
         )
         .route(
+            "/contracts/:contract_id/state",
+            get(contracts::contract_state),
+        )
+        .route(
             "/contracts/:contract_id/functions",
             get(read::list_functions),
         )

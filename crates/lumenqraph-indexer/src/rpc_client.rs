@@ -198,7 +198,7 @@ impl RpcClient {
             key: ScVal::LedgerKeyContractInstance,
             durability: ContractDataDurability::Persistent,
         });
-        let Some(entry) = self.get_ledger_entry(&instance_key).await? else {
+        let Some((entry, _)) = self.get_ledger_entry(&instance_key).await? else {
             return Ok(None);
         };
         let wasm_hash = match entry {
@@ -214,7 +214,7 @@ impl RpcClient {
 
         let hash_hex = hex::encode(wasm_hash.0);
         let code_key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: wasm_hash });
-        let Some(entry) = self.get_ledger_entry(&code_key).await? else {
+        let Some((entry, _)) = self.get_ledger_entry(&code_key).await? else {
             return Ok(None);
         };
         match entry {
@@ -223,8 +223,49 @@ impl RpcClient {
         }
     }
 
-    /// Fetch and XDR-decode a single ledger entry by key. `None` if absent.
-    async fn get_ledger_entry(&self, key: &LedgerKey) -> anyhow::Result<Option<LedgerEntryData>> {
+    /// Fetch a contract's *instance* ledger entry: its current executable hash
+    /// (`None` for a Stellar Asset Contract), its instance storage as a single
+    /// `ScVal::Map`, and the ledger at which the instance last changed. Used for
+    /// state snapshots and upgrade detection. `Ok(None)` if the contract's
+    /// instance entry isn't found.
+    pub async fn get_contract_instance(
+        &self,
+        contract_id: &str,
+    ) -> anyhow::Result<Option<InstanceEntry>> {
+        let addr = ScAddress::from_str(contract_id)
+            .with_context(|| format!("invalid contract id {contract_id}"))?;
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: addr,
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+        });
+        let Some((data, last_modified_ledger)) = self.get_ledger_entry(&key).await? else {
+            return Ok(None);
+        };
+        let LedgerEntryData::ContractData(cd) = data else {
+            return Ok(None);
+        };
+        let ScVal::ContractInstance(inst) = cd.val else {
+            return Ok(None);
+        };
+        let wasm_hash = match inst.executable {
+            ContractExecutable::Wasm(h) => Some(hex::encode(h.0)),
+            ContractExecutable::StellarAsset => None,
+        };
+        Ok(Some(InstanceEntry {
+            wasm_hash,
+            // The instance storage map (may be empty/None) as one decodable ScVal.
+            storage: ScVal::Map(inst.storage),
+            last_modified_ledger,
+        }))
+    }
+
+    /// Fetch and XDR-decode a single ledger entry by key, with the ledger it was
+    /// last modified at. `None` if absent.
+    async fn get_ledger_entry(
+        &self,
+        key: &LedgerKey,
+    ) -> anyhow::Result<Option<(LedgerEntryData, i64)>> {
         let key_b64 = key
             .to_xdr_base64(Limits::none())
             .context("encode ledger key")?;
@@ -236,8 +277,16 @@ impl RpcClient {
         };
         let data = LedgerEntryData::from_xdr_base64(&first.xdr, Limits::none())
             .context("decode ledger entry")?;
-        Ok(Some(data))
+        Ok(Some((data, first.last_modified_ledger_seq)))
     }
+}
+
+/// A contract's instance entry: executable hash, instance storage, and the
+/// ledger it last changed at.
+pub struct InstanceEntry {
+    pub wasm_hash: Option<String>,
+    pub storage: ScVal,
+    pub last_modified_ledger: i64,
 }
 
 #[derive(Deserialize)]
@@ -247,6 +296,9 @@ struct LedgerEntriesResult {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct LedgerEntryItem {
     xdr: String,
+    #[serde(default)]
+    last_modified_ledger_seq: i64,
 }

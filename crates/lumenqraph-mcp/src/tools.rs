@@ -27,6 +27,18 @@ pub fn definitions() -> Value {
             }
         },
         {
+            "name": "get_contract_state",
+            "description": "Get a contract's current on-chain state (its decoded instance storage: admin, config, counters, …), and optionally recent historical versions. Requires the indexer's state indexing to be enabled.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "contract_id": { "type": "string", "description": "Contract id (C...)" },
+                    "limit": { "type": "integer", "description": "How many versions, newest first (1-200, default 1 = current state)" }
+                },
+                "required": ["contract_id"], "additionalProperties": false
+            }
+        },
+        {
             "name": "query_events",
             "description": "Query recent indexed events for a contract, newest first. Each event includes decoded topics/value and, when available, a named+typed 'enriched' record.",
             "inputSchema": {
@@ -61,6 +73,14 @@ pub async fn call(state: &State, name: &str, args: &Value) -> anyhow::Result<Val
     match name {
         "list_contracts" => list_contracts(state).await,
         "get_contract_interface" => get_interface(state, str_arg(args, "contract_id")?).await,
+        "get_contract_state" => {
+            get_state(
+                state,
+                str_arg(args, "contract_id")?,
+                args.get("limit").and_then(Value::as_i64),
+            )
+            .await
+        }
         "query_events" => {
             query_events(
                 state,
@@ -115,6 +135,31 @@ async fn get_interface(state: &State, contract_id: &str) -> anyhow::Result<Value
              sighting; Stellar Asset Contracts have no callable spec)"
         ),
     }
+}
+
+async fn get_state(state: &State, contract_id: &str, limit: Option<i64>) -> anyhow::Result<Value> {
+    let limit = limit.unwrap_or(1).clamp(1, 200);
+    let rows: Vec<(i64, sqlx::types::Json<Value>, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT ledger, storage, captured_at
+         FROM contract_state WHERE contract_id = $1
+         ORDER BY ledger DESC LIMIT $2",
+    )
+    .bind(contract_id)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await?;
+    if rows.is_empty() {
+        anyhow::bail!(
+            "no state snapshots for {contract_id} (state indexing may be disabled on the indexer)"
+        );
+    }
+    let versions: Vec<Value> = rows
+        .into_iter()
+        .map(|(ledger, storage, captured_at)| {
+            json!({ "ledger": ledger, "storage": storage.0, "captured_at": captured_at })
+        })
+        .collect();
+    Ok(json!({ "contract_id": contract_id, "count": versions.len(), "versions": versions }))
 }
 
 async fn query_events(

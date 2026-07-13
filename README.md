@@ -27,6 +27,7 @@ Tail contract events from Soroban RPC, decode their XDR to clean JSON, store the
 - [API](#api)
 - [Typed, self-describing decoding](#typed-self-describing-decoding)
 - [Read layer — `eth_call` for Soroban](#read-layer--eth_call-for-soroban)
+- [Contract state indexing](#contract-state-indexing)
 - [AI-agent access — the MCP server](#ai-agent-access--the-mcp-server)
 - [Webhooks](#webhooks)
 - [Running in production](#running-in-production)
@@ -56,6 +57,7 @@ Lumenqraph's angle is **simplicity, self-hostability, and typed decoding that ne
 | 🏷️ **Typed, spec-driven decoding** | Reads each contract's on-chain `contractspecv0` interface to emit **named, typed** events (`{from, to, amount: i128}`) — zero ABI upload. Serves the full decoded interface at `/contracts/:id/interface`. |
 | 📖 **Read layer (`eth_call` for Soroban)** | Invoke any contract view function read-only over REST and get a **typed** result. Arguments are type-checked against the on-chain spec before simulation. |
 | 🤖 **MCP server (AI-agent access)** | A [Model Context Protocol](https://modelcontextprotocol.io) server that lets Claude (or any MCP agent) discover, query, and call any indexed Soroban contract — typed and self-describing, zero hand-written schema. |
+| 🗂️ **Contract state indexing** | Optional versioned snapshots of each contract's instance storage (admin, config, TVL, counters…), decoded to JSON — historical *state*, not just events. |
 | 💸 **Materialized token transfers** | SEP-41 `transfer` events projected into a queryable `from`/`to`/`amount` table. |
 | 🔌 **REST API** | Contracts, events (filterable by name), transfers, health, and Prometheus metrics. |
 | 📣 **Signed webhooks** | Register a URL + filter, receive HMAC-SHA256-signed event pushes with retries and exponential backoff. |
@@ -135,6 +137,7 @@ All configuration is via environment variables (see [`.env.example`](.env.exampl
 | `POLL_INTERVAL_SECS` | `5` | How often the indexer polls for new events. |
 | `PAGE_SIZE` | `1000` | Events requested per `getEvents` page (1–10000). |
 | `START_LEDGER` | `0` | Ledger to start a fresh index from. `0` = near the tip. Clamped to RPC retention. |
+| `STATE_INDEXING` | `false` | Snapshot contract instance storage into `contract_state` (versioned). One extra RPC call per tracked contract per cycle; best paired with `CONTRACT_IDS`. |
 | `API_BIND_ADDR` | `0.0.0.0:8080` | API listen address. |
 | `REQUIRE_API_KEY` | `false` | Require a valid API key on data routes. |
 | `ANON_RATE_LIMIT_PER_MIN` | `60` | Requests/min for unauthenticated callers. |
@@ -155,6 +158,7 @@ Base URL defaults to `http://localhost:8080`. Full reference: [docs/API.md](docs
 | `GET` | `/metrics` | Prometheus metrics. *(public)* |
 | `GET` | `/contracts` | Contracts seen, with per-contract counts. |
 | `GET` | `/contracts/:id/interface` | The contract's decoded on-chain interface: functions, events, and user-defined types. |
+| `GET` | `/contracts/:id/state` | Versioned snapshots of the contract's instance storage, newest first. Query: `limit` (1 = current state). |
 | `GET` | `/contracts/:id/functions` | The contract's callable functions with typed inputs/outputs. |
 | `POST` | `/contracts/:id/call` | Invoke a view function read-only and return a typed result. Body: `{ function, args, source_account? }`. |
 | `GET` | `/contracts/:id/events` | Events for a contract. Query: `limit`, `offset`, `event_name`. |
@@ -260,6 +264,36 @@ curl -X POST localhost:8080/contracts/<CID>/call \
 
 Errors are precise and client-facing: unknown function, missing/extra argument, or a wrong-typed argument all return `400` with a message (`argument "account": invalid address strkey`) rather than a failed simulation. Reads need the contract's interface, which the indexer captures on first sighting — Stellar Asset Contracts (no WASM spec) aren't callable this way. Supported argument types today: bool, all sized integers, `i128`/`u128`, `Symbol`, `String`, `Address`, `Bytes`/`BytesN`, `Option`, `Vec`, `Tuple`, and symbol-keyed `Map`; big-int (256-bit) and user-defined-type arguments are on the roadmap. Implementation: [`lumenqraph-core::read`](crates/lumenqraph-core/src/read.rs).
 
+## Contract state indexing
+
+Events are *history* (what happened); the read layer is current state *on demand* (one call, right now). Contract state indexing is the third leg: **versioned snapshots of a contract's on-chain state**, stored so you can query current state cheaply and see how it changed over time — something even `eth_call` can't do without an archive node.
+
+Enable it with `STATE_INDEXING=true` (ideally alongside `CONTRACT_IDS`). Each cycle the indexer reads a tracked contract's **instance storage** — the enumerable key→value map Soroban keeps in the contract's instance entry (admin, config, global counters, TVL, …) — decodes it to JSON (the same shape as events), and writes a new `contract_state` row **only when the instance actually changed** (detected via the entry's `lastModifiedLedgerSeq`). The newest row is current state; older rows are history.
+
+```jsonc
+// GET /contracts/<CID>/state          → current state (limit=1, the default)
+// GET /contracts/<CID>/state?limit=50 → the last 50 versions, newest first
+{
+  "contract_id": "CDTLXP6K…HIZA",
+  "count": 1,
+  "versions": [
+    {
+      "ledger": 3584379,
+      "captured_at": "2026-07-13T13:11:59Z",
+      "storage": [
+        { "key": "METADATA", "val": { "name": "Stellars LP", "symbol": "sLP", "decimals": 13 } },
+        { "key": ["TotalSupply"],  "val": "1624887782285314838" },
+        { "key": ["ReservedUsdc"], "val": "768829008937" },
+        { "key": ["IsPaused"],     "val": false }
+        // …
+      ]
+    }
+  ]
+}
+```
+
+Reading the instance also reveals the contract's current WASM hash, so an **upgraded contract is detected automatically** — its cached interface is evicted and re-parsed on the next event, keeping enrichment and the read/MCP layers correct across upgrades. Instance storage is what's universally enumerable via RPC; per-key persistent storage (e.g. individual balances) is on the roadmap. Implementation: [`lumenqraph-indexer::state`](crates/lumenqraph-indexer/src/state.rs).
+
 ## AI-agent access — the MCP server
 
 Everything above — typed events, decoded interfaces, typed read calls — is exactly the structured, self-describing metadata an AI agent needs to work with a chain. [`lumenqraph-mcp`](crates/lumenqraph-mcp) exposes it as a [Model Context Protocol](https://modelcontextprotocol.io) server, so **Claude (Desktop or Code) or any MCP client can discover, query, and call any Soroban contract** — with no hand-written tool schemas, because the schemas come from each contract's on-chain interface.
@@ -270,6 +304,7 @@ It's a standard stdio JSON-RPC server that reuses the same Postgres and read-lay
 | --- | --- |
 | `list_contracts` | See which contracts are indexed, with event counts. |
 | `get_contract_interface` | Discover a contract's functions (typed inputs/outputs), events, and user-defined types. |
+| `get_contract_state` | Read a contract's current (and historical) instance storage. |
 | `query_events` | Read a contract's recent events, decoded and enriched. |
 | `call_contract` | Invoke a view function read-only and get a typed result (args type-checked against the spec). |
 
@@ -364,11 +399,11 @@ Scrape `GET /metrics` and alert on `lumenqraph_indexer_lag_ledgers` climbing. Fo
 Lumenqraph/
 ├── crates/
 │   ├── lumenqraph-core/       # shared models, errors, XDR↔JSON, spec parser, read encoder
-│   ├── lumenqraph-indexer/    # polling, decoding, spec enrichment, backfill, persistence
+│   ├── lumenqraph-indexer/    # polling, decoding, spec enrichment, state snapshots, backfill
 │   ├── lumenqraph-api/        # Axum REST API, auth, rate limiting, metrics, read layer
 │   ├── lumenqraph-webhooks/   # subscription matching + signed delivery
 │   └── lumenqraph-mcp/        # Model Context Protocol server for AI agents
-├── migrations/                # ordered sqlx SQL migrations (0001–0004)
+├── migrations/                # ordered sqlx SQL migrations (0001–0005)
 ├── docs/                      # ARCHITECTURE, API, DEPLOYMENT
 ├── explorer/                  # minimal zero-build read UI
 ├── scripts/                   # gen_api_key, backfill, setup_db
@@ -395,8 +430,9 @@ CI runs formatting, Clippy (warnings denied), tests, and a release build against
 - [x] Typed, self-describing decoding from each contract's on-chain interface (`contractspecv0`)
 - [x] Read layer: typed, read-only view-function calls via `simulateTransaction` (`eth_call` for Soroban)
 - [x] MCP server: typed, self-describing Soroban access for AI agents (Model Context Protocol)
+- [x] Contract state indexing: versioned instance-storage snapshots + automatic spec refresh on upgrade
+- [ ] State indexing: per-key persistent storage (e.g. individual balances), not just instance storage
 - [ ] Read layer: user-defined-type and 256-bit-integer arguments; in-memory spec cache in the API
-- [ ] Contract *state* indexing: versioned snapshots of storage entries (historical state + analytics)
 - [ ] Enrichment for user-defined struct/enum/union values (naming nested UDT fields, not just event params)
 - [ ] Deep historical backfill via a captive-core / data-lake source (beyond RPC's ~7-day window)
 - [ ] Additional materialized verticals (AMM swaps, liquidity, NFT mints/transfers)

@@ -13,6 +13,7 @@ mod cursor;
 mod poller;
 mod rpc_client;
 mod specs;
+mod state;
 mod store;
 
 use anyhow::Context;
