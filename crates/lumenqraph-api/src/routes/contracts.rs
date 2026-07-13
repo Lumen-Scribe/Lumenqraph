@@ -104,3 +104,147 @@ pub async fn contract_state(
         "versions": versions,
     })))
 }
+
+#[derive(Deserialize)]
+pub struct DataQuery {
+    /// Filter to a discovery label, e.g. `balance`.
+    label: Option<String>,
+    /// Max keys to return (latest value of each), default 100.
+    #[serde(default = "default_data_limit")]
+    limit: i64,
+}
+
+fn default_data_limit() -> i64 {
+    100
+}
+
+/// One `contract_data` row as selected below: (key_hash, key, durability,
+/// ledger, value, label, captured_at).
+type DataRow = (
+    String,
+    SqlxJson<Value>,
+    String,
+    i64,
+    SqlxJson<Value>,
+    Option<String>,
+    DateTime<Utc>,
+);
+
+/// `GET /contracts/:id/data` — the current value of every *per-key* entry
+/// snapshotted for this contract (e.g. every tracked holder balance), one row
+/// per key (its latest snapshot). Requires the indexer's key indexing.
+pub async fn contract_data(
+    State(state): State<AppState>,
+    Path(contract_id): Path<String>,
+    Query(q): Query<DataQuery>,
+) -> ApiResult<Json<Value>> {
+    let limit = q.limit.clamp(1, 1000);
+    // DISTINCT ON gives the newest row per key_hash; the outer query orders and
+    // bounds the set of keys returned.
+    let rows: Vec<DataRow> = sqlx::query_as(
+        "SELECT key_hash, key, durability, ledger, value, label, captured_at FROM (
+                 SELECT DISTINCT ON (key_hash)
+                        key_hash, key, durability, ledger, value, label, captured_at
+                 FROM contract_data
+                 WHERE contract_id = $1 AND ($2::text IS NULL OR label = $2)
+                 ORDER BY key_hash, ledger DESC
+             ) latest
+             ORDER BY ledger DESC
+             LIMIT $3",
+    )
+    .bind(&contract_id)
+    .bind(&q.label)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Err(ApiError::not_found(
+            "no per-key data snapshots for this contract (key indexing may be disabled, \
+             or no tracked keys have been active since it was enabled)",
+        ));
+    }
+
+    let keys: Vec<Value> = rows
+        .into_iter()
+        .map(
+            |(key_hash, key, durability, ledger, value, label, captured_at)| {
+                json!({
+                    "key_hash": key_hash,
+                    "key": key.0,
+                    "durability": durability,
+                    "ledger": ledger,
+                    "value": value.0,
+                    "label": label,
+                    "captured_at": captured_at,
+                })
+            },
+        )
+        .collect();
+    Ok(Json(json!({
+        "contract_id": contract_id,
+        "count": keys.len(),
+        "keys": keys,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct DataHistoryQuery {
+    /// How many versions to return, newest first.
+    #[serde(default = "default_state_limit")]
+    limit: i64,
+}
+
+/// `GET /contracts/:id/data/:key_hash` — the version history of a single
+/// per-key entry (e.g. one holder's balance over time), newest first.
+pub async fn contract_data_key(
+    State(state): State<AppState>,
+    Path((contract_id, key_hash)): Path<(String, String)>,
+    Query(q): Query<DataHistoryQuery>,
+) -> ApiResult<Json<Value>> {
+    let limit = q.limit.clamp(1, 500);
+    // (key, durability, ledger, value, label, captured_at)
+    type HistRow = (
+        SqlxJson<Value>,
+        String,
+        i64,
+        SqlxJson<Value>,
+        Option<String>,
+        DateTime<Utc>,
+    );
+    let rows: Vec<HistRow> = sqlx::query_as(
+        "SELECT key, durability, ledger, value, label, captured_at
+             FROM contract_data
+             WHERE contract_id = $1 AND key_hash = $2
+             ORDER BY ledger DESC LIMIT $3",
+    )
+    .bind(&contract_id)
+    .bind(&key_hash)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Err(ApiError::not_found("no data snapshots for this key"));
+    }
+
+    // Key and durability are constant across a key's history; take them once.
+    let key = rows[0].0 .0.clone();
+    let durability = rows[0].1.clone();
+    let label = rows[0].4.clone();
+    let versions: Vec<Value> = rows
+        .into_iter()
+        .map(|(_, _, ledger, value, _, captured_at)| {
+            json!({ "ledger": ledger, "value": value.0, "captured_at": captured_at })
+        })
+        .collect();
+    Ok(Json(json!({
+        "contract_id": contract_id,
+        "key_hash": key_hash,
+        "key": key,
+        "durability": durability,
+        "label": label,
+        "count": versions.len(),
+        "versions": versions,
+    })))
+}

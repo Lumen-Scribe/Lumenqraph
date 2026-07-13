@@ -260,6 +260,37 @@ impl RpcClient {
         }))
     }
 
+    /// Fetch a single contract-data entry by its exact storage `key` and
+    /// `durability`. Unlike instance storage, these per-key entries aren't
+    /// enumerable, so the caller must know the key (e.g. a `Balance(Address)`).
+    /// Returns the decoded value `ScVal` and the ledger it last changed at, or
+    /// `Ok(None)` if no such entry exists (e.g. a holder with a zero balance
+    /// whose entry was never written or has expired).
+    pub async fn get_contract_data(
+        &self,
+        contract_id: &str,
+        key: &ScVal,
+        durability: ContractDataDurability,
+    ) -> anyhow::Result<Option<DataEntry>> {
+        let addr = ScAddress::from_str(contract_id)
+            .with_context(|| format!("invalid contract id {contract_id}"))?;
+        let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: addr,
+            key: key.clone(),
+            durability,
+        });
+        let Some((data, last_modified_ledger)) = self.get_ledger_entry(&ledger_key).await? else {
+            return Ok(None);
+        };
+        let LedgerEntryData::ContractData(cd) = data else {
+            return Ok(None);
+        };
+        Ok(Some(DataEntry {
+            val: cd.val,
+            last_modified_ledger,
+        }))
+    }
+
     /// Fetch and XDR-decode a single ledger entry by key, with the ledger it was
     /// last modified at. `None` if absent.
     async fn get_ledger_entry(
@@ -286,6 +317,13 @@ impl RpcClient {
 pub struct InstanceEntry {
     pub wasm_hash: Option<String>,
     pub storage: ScVal,
+    pub last_modified_ledger: i64,
+}
+
+/// A single contract-data entry: its decoded value and the ledger it last
+/// changed at.
+pub struct DataEntry {
+    pub val: ScVal,
     pub last_modified_ledger: i64,
 }
 

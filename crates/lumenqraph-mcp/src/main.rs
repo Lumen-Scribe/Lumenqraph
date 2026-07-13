@@ -3,10 +3,11 @@
 //! typed, self-describing access to Soroban contracts.
 //!
 //! It reuses the same Postgres the API reads and the same read-layer encoder the
-//! API calls, exposing five tools: `list_contracts`, `get_contract_interface`,
-//! `get_contract_state`, `query_events`, and `call_contract`. Because the types
-//! come from each contract's on-chain spec, an agent can *discover* what a
-//! contract does and call it correctly — with zero hand-written schema.
+//! API calls, exposing seven tools: `list_contracts`, `get_contract_interface`,
+//! `get_contract_state`, `get_contract_data`, `query_events`, `call_contract`,
+//! and `simulate_call`. Because the interface and argument types come from each
+//! contract's on-chain spec, an agent can *discover* what a contract does and
+//! call it correctly — with zero hand-written schema.
 //!
 //! Transport is newline-delimited JSON-RPC 2.0 over stdio (the standard MCP
 //! stdio transport). Logs go to stderr so stdout stays a clean protocol channel.
@@ -207,8 +208,10 @@ mod tests {
                 "list_contracts",
                 "get_contract_interface",
                 "get_contract_state",
+                "get_contract_data",
                 "query_events",
-                "call_contract"
+                "call_contract",
+                "simulate_call"
             ]
         );
         for t in defs.as_array().unwrap() {

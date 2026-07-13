@@ -1,0 +1,43 @@
+{
+  "name": "@lumenqraph/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript client for the Lumenqraph Soroban event-indexer API (REST + GraphQL).",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Lumen-Scribe/Lumenqraph",
+    "directory": "sdk/typescript"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "stellar",
+    "soroban",
+    "indexer",
+    "graphql",
+    "lumenqraph"
+  ],
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

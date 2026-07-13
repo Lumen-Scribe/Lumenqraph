@@ -14,6 +14,8 @@ pub struct RpcClient {
 pub enum SimOutcome {
     Ok {
         result_xdr: String,
+        events: Vec<String>,
+        min_resource_fee: Option<String>,
         latest_ledger: i64,
     },
     Error(String),
@@ -37,6 +39,10 @@ struct SimulateResult {
     error: Option<String>,
     #[serde(default)]
     results: Option<Vec<SimResultItem>>,
+    #[serde(default)]
+    events: Vec<String>,
+    #[serde(default)]
+    min_resource_fee: Option<String>,
     #[serde(default)]
     latest_ledger: i64,
 }
@@ -82,9 +88,13 @@ impl RpcClient {
         if let Some(err) = result.error {
             return Ok(SimOutcome::Error(err));
         }
+        let events = result.events.clone();
+        let min_resource_fee = result.min_resource_fee.clone();
         match result.results.and_then(|mut v| v.drain(..).next()) {
             Some(item) => Ok(SimOutcome::Ok {
                 result_xdr: item.xdr,
+                events,
+                min_resource_fee,
                 latest_ledger: result.latest_ledger,
             }),
             None => Ok(SimOutcome::Error("simulation returned no value".into())),

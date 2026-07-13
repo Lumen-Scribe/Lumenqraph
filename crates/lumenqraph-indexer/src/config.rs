@@ -16,6 +16,17 @@ pub struct Config {
     /// `contract_state` (versioned). Off by default — it costs one extra RPC
     /// call per active contract per cycle. Best paired with `CONTRACT_IDS`.
     pub state_indexing: bool,
+    /// When true, snapshot *per-holder* balances into `contract_data`: for each
+    /// holder named in a token's events this cycle, fetch its `Balance(Address)`
+    /// entry. Off by default — it costs one RPC call per newly-active holder per
+    /// cycle, so it should be paired with `CONTRACT_IDS`.
+    pub key_indexing: bool,
+    /// The symbol naming the balance storage-key variant (`DataKey::Balance` in
+    /// the soroban token reference). Configurable for tokens that differ.
+    pub balance_key_symbol: String,
+    /// Durability of the balance storage entry: "persistent" (default) or
+    /// "temporary".
+    pub balance_key_durability: String,
 }
 
 impl Config {
@@ -33,6 +44,15 @@ impl Config {
             page_size: env_parse("PAGE_SIZE", 1000)?,
             start_ledger: env_parse("START_LEDGER", 0)?,
             state_indexing: env_bool("STATE_INDEXING", false),
+            key_indexing: env_bool("KEY_INDEXING", false),
+            balance_key_symbol: std::env::var("BALANCE_KEY_SYMBOL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "Balance".to_string()),
+            balance_key_durability: std::env::var("BALANCE_KEY_DURABILITY")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "persistent".to_string()),
         })
     }
 }

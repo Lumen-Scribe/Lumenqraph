@@ -28,6 +28,9 @@ Tail contract events from Soroban RPC, decode their XDR to clean JSON, store the
 - [Typed, self-describing decoding](#typed-self-describing-decoding)
 - [Read layer — `eth_call` for Soroban](#read-layer--eth_call-for-soroban)
 - [Contract state indexing](#contract-state-indexing)
+- [Per-key state indexing](#per-key-state-indexing)
+- [GraphQL](#graphql)
+- [TypeScript SDK](#typescript-sdk)
 - [AI-agent access — the MCP server](#ai-agent-access--the-mcp-server)
 - [Webhooks](#webhooks)
 - [Running in production](#running-in-production)
@@ -56,10 +59,13 @@ Lumenqraph's angle is **simplicity, self-hostability, and typed decoding that ne
 | 🧩 **Full XDR → JSON decoding** | ScVal decoded to friendly JSON: `i128`/`u128` as decimal strings, addresses as `G…`/`C…` strkeys, bytes as hex, vecs/maps as arrays/objects. Raw base64 always retained. |
 | 🏷️ **Typed, spec-driven decoding** | Reads each contract's on-chain `contractspecv0` interface to emit **named, typed** events (`{from, to, amount: i128}`) — zero ABI upload. Serves the full decoded interface at `/contracts/:id/interface`. |
 | 📖 **Read layer (`eth_call` for Soroban)** | Invoke any contract view function read-only over REST and get a **typed** result. Arguments are type-checked against the on-chain spec before simulation. |
+| 🔮 **Transaction preview** | Dry-run *any* call (even state-changing ones) without signing or submitting, and see the typed result, the **events it would emit**, and its resource cost. Tenderly-style preview for Soroban. |
 | 🤖 **MCP server (AI-agent access)** | A [Model Context Protocol](https://modelcontextprotocol.io) server that lets Claude (or any MCP agent) discover, query, and call any indexed Soroban contract — typed and self-describing, zero hand-written schema. |
 | 🗂️ **Contract state indexing** | Optional versioned snapshots of each contract's instance storage (admin, config, TVL, counters…), decoded to JSON — historical *state*, not just events. |
+| 👛 **Per-key state indexing** | Optional versioned snapshots of *individual* storage entries — e.g. each token holder's `Balance(Address)` — discovered from the contract's own events. Per-key history, not just the instance map. |
 | 💸 **Materialized token transfers** | SEP-41 `transfer` events projected into a queryable `from`/`to`/`amount` table. |
-| 🔌 **REST API** | Contracts, events (filterable by name), transfers, health, and Prometheus metrics. |
+| 🔌 **REST + GraphQL API** | Contracts, events (filterable), transfers, state, per-key data, health, and Prometheus metrics over REST — plus a GraphQL endpoint with Relay-style cursor pagination. |
+| 📦 **TypeScript SDK** | A typed, zero-dependency client (`@lumenqraph/sdk`) over the REST + GraphQL API, with a cursor-paginating async iterator. |
 | 📣 **Signed webhooks** | Register a URL + filter, receive HMAC-SHA256-signed event pushes with retries and exponential backoff. |
 | 🔑 **Auth & rate limiting** | SHA-256-hashed API keys with per-key request limits. |
 | 📊 **Observability** | Prometheus `/metrics` and a `/health` endpoint reporting chain-tip lag. |
@@ -159,10 +165,14 @@ Base URL defaults to `http://localhost:8080`. Full reference: [docs/API.md](docs
 | `GET` | `/contracts` | Contracts seen, with per-contract counts. |
 | `GET` | `/contracts/:id/interface` | The contract's decoded on-chain interface: functions, events, and user-defined types. |
 | `GET` | `/contracts/:id/state` | Versioned snapshots of the contract's instance storage, newest first. Query: `limit` (1 = current state). |
+| `GET` | `/contracts/:id/data` | Latest value of every per-key entry (e.g. holder balances). Query: `label`, `limit`. |
+| `GET` | `/contracts/:id/data/:key_hash` | Version history of a single per-key entry. Query: `limit`. |
 | `GET` | `/contracts/:id/functions` | The contract's callable functions with typed inputs/outputs. |
 | `POST` | `/contracts/:id/call` | Invoke a view function read-only and return a typed result. Body: `{ function, args, source_account? }`. |
+| `POST` | `/contracts/:id/simulate` | Dry-run any call; returns the typed result, the events it would emit, and its resource cost. Same body as `/call`. |
 | `GET` | `/contracts/:id/events` | Events for a contract. Query: `limit`, `offset`, `event_name`. |
 | `GET` | `/contracts/:id/transfers` | Materialized token transfers. Query: `limit`, `offset`, `from`, `to`. |
+| `POST`/`GET` | `/graphql` | GraphQL endpoint (POST queries; GET serves the GraphiQL IDE). See [GraphQL](#graphql). |
 | `POST` | `/webhooks` | Create a subscription. |
 | `GET` | `/webhooks` | List subscriptions (secrets omitted). |
 | `DELETE` | `/webhooks/:id` | Delete a subscription. |
@@ -264,6 +274,33 @@ curl -X POST localhost:8080/contracts/<CID>/call \
 
 Errors are precise and client-facing: unknown function, missing/extra argument, or a wrong-typed argument all return `400` with a message (`argument "account": invalid address strkey`) rather than a failed simulation. Reads need the contract's interface, which the indexer captures on first sighting — Stellar Asset Contracts (no WASM spec) aren't callable this way. Supported argument types today: bool, all sized integers, `i128`/`u128`, `Symbol`, `String`, `Address`, `Bytes`/`BytesN`, `Option`, `Vec`, `Tuple`, and symbol-keyed `Map`; big-int (256-bit) and user-defined-type arguments are on the roadmap. Implementation: [`lumenqraph-core::read`](crates/lumenqraph-core/src/read.rs).
 
+### Transaction preview
+
+`POST /contracts/:id/simulate` goes a step further: it dry-runs **any** call — including state-changing ones like `transfer` or `deposit` — and returns not just the typed result but **the events the call would emit** (decoded, and enriched with the contract's spec) and its estimated resource fee. Nothing is signed or broadcast; it runs through RPC simulation. This is Soroban's answer to Tenderly's transaction preview — *see exactly what a call would do before your users ever sign it*.
+
+```jsonc
+// POST /contracts/<CID>/simulate  { "function": "transfer", "args": { "from": "G…", "to": "G…", "amount": "1000" } }
+{
+  "contract_id": "C…",
+  "function": "transfer",
+  "result": { "type": "void", "value": null },
+  "events": [
+    {
+      "type": "contract",
+      "contract_id": "C…",
+      "event": "transfer",
+      "enriched": { "event": "transfer", "params": {
+        "from":   { "type": "Address", "value": "G…" },
+        "to":     { "type": "Address", "value": "G…" },
+        "amount": { "type": "i128",    "value": "1000" }
+      } }
+    }
+  ],
+  "min_resource_fee": "34567",
+  "simulated_at_ledger": 3585700
+}
+```
+
 ## Contract state indexing
 
 Events are *history* (what happened); the read layer is current state *on demand* (one call, right now). Contract state indexing is the third leg: **versioned snapshots of a contract's on-chain state**, stored so you can query current state cheaply and see how it changed over time — something even `eth_call` can't do without an archive node.
@@ -292,7 +329,61 @@ Enable it with `STATE_INDEXING=true` (ideally alongside `CONTRACT_IDS`). Each cy
 }
 ```
 
-Reading the instance also reveals the contract's current WASM hash, so an **upgraded contract is detected automatically** — its cached interface is evicted and re-parsed on the next event, keeping enrichment and the read/MCP layers correct across upgrades. Instance storage is what's universally enumerable via RPC; per-key persistent storage (e.g. individual balances) is on the roadmap. Implementation: [`lumenqraph-indexer::state`](crates/lumenqraph-indexer/src/state.rs).
+Reading the instance also reveals the contract's current WASM hash, so an **upgraded contract is detected automatically** — its cached interface is evicted and re-parsed on the next event, keeping enrichment and the read/MCP layers correct across upgrades. Implementation: [`lumenqraph-indexer::state`](crates/lumenqraph-indexer/src/state.rs).
+
+## Per-key state indexing
+
+Instance storage is the one enumerable map RPC exposes. But the most interesting state usually lives in *separate*, **non-enumerable** ledger entries — a token's `Balance(Address)` per holder, say. You can only read one of those if you already know its exact key.
+
+Lumenqraph derives the keys worth tracking from the events it already indexes: a token's own `transfer`/`mint`/`burn` events name its holders, so enabling `KEY_INDEXING=true` makes the indexer snapshot each holder's `Balance(Address)` entry (change-detected and versioned, exactly like instance state) into the `contract_data` table.
+
+```jsonc
+// GET /contracts/<CID>/data?label=balance      → latest value of every tracked key
+// GET /contracts/<CID>/data/<KEY_HASH>?limit=50 → one holder's balance over time
+{
+  "contract_id": "CDLZFC3S…YSC",
+  "count": 2,
+  "keys": [
+    { "key_hash": "9f2c…", "key": ["Balance", "GAIH3ULL…ZNSR"], "value": "100000000000", "ledger": 3584401, "durability": "persistent", "label": "balance" },
+    { "key_hash": "1a7b…", "key": ["Balance", "GDN4OHYR…YQZ3"], "value": "250000000000", "ledger": 3584390, "durability": "persistent", "label": "balance" }
+  ]
+}
+```
+
+The balance key variant symbol (`Balance` in the soroban token reference) and its durability are configurable via `BALANCE_KEY_SYMBOL` / `BALANCE_KEY_DURABILITY` for tokens that differ. Because per-holder snapshots cost one RPC call per newly-active holder per cycle, pair `KEY_INDEXING` with `CONTRACT_IDS`. Implementation: [`lumenqraph-indexer::keys`](crates/lumenqraph-indexer/src/keys.rs) (discovery) and [`state::snapshot_data`](crates/lumenqraph-indexer/src/state.rs).
+
+## GraphQL
+
+REST stays the primary, zero-dependency interface; a **GraphQL endpoint is offered alongside it** at `/graphql` (POST for queries, GET for the in-browser GraphiQL IDE) for clients that want to select fields and page large histories with cursors. High-volume lists (`events`, `transfers`) are **Relay-style cursor connections**; naturally bounded lists (`contracts`, `contractState`, `contractData`) are plain lists.
+
+```graphql
+query Recent($id: String!, $after: String) {
+  events(contractId: $id, eventName: "transfer", first: 50, after: $after) {
+    edges { cursor node { ledger eventName enriched decodedValue } }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+```
+
+Pass a page's `pageInfo.endCursor` back as `after` to fetch the next page. It sits behind the same auth + rate-limiting as the REST data routes.
+
+## TypeScript SDK
+
+[`sdk/typescript`](sdk/typescript) (`@lumenqraph/sdk`) is a typed, zero-runtime-dependency client over the REST + GraphQL API — it uses the platform `fetch` (Node 18+ or the browser).
+
+```ts
+import { LumenqraphClient } from "@lumenqraph/sdk";
+
+const lq = new LumenqraphClient({ baseUrl: "http://localhost:8080" });
+const balances = await lq.getData(contractId, { label: "balance" });
+
+// Cursor pagination, as a transparent async iterator:
+for await (const ev of lq.paginateEvents(contractId, { pageSize: 100 })) {
+  console.log(ev.ledger, ev.event_name, ev.enriched ?? ev.decoded_value);
+}
+```
+
+See the [SDK README](sdk/typescript/README.md) for the full method list.
 
 ## AI-agent access — the MCP server
 
@@ -305,8 +396,10 @@ It's a standard stdio JSON-RPC server that reuses the same Postgres and read-lay
 | `list_contracts` | See which contracts are indexed, with event counts. |
 | `get_contract_interface` | Discover a contract's functions (typed inputs/outputs), events, and user-defined types. |
 | `get_contract_state` | Read a contract's current (and historical) instance storage. |
+| `get_contract_data` | Read a contract's per-key state — individual entries like token holder balances. |
 | `query_events` | Read a contract's recent events, decoded and enriched. |
 | `call_contract` | Invoke a view function read-only and get a typed result (args type-checked against the spec). |
+| `simulate_call` | Dry-run any call and preview the result, the events it would emit, and its cost. |
 
 ### Quick start
 
@@ -399,13 +492,14 @@ Scrape `GET /metrics` and alert on `lumenqraph_indexer_lag_ledgers` climbing. Fo
 Lumenqraph/
 ├── crates/
 │   ├── lumenqraph-core/       # shared models, errors, XDR↔JSON, spec parser, read encoder
-│   ├── lumenqraph-indexer/    # polling, decoding, spec enrichment, state snapshots, backfill
-│   ├── lumenqraph-api/        # Axum REST API, auth, rate limiting, metrics, read layer
+│   ├── lumenqraph-indexer/    # polling, decoding, enrichment, state + per-key snapshots, backfill
+│   ├── lumenqraph-api/        # Axum REST + GraphQL API, auth, rate limiting, metrics, read layer
 │   ├── lumenqraph-webhooks/   # subscription matching + signed delivery
 │   └── lumenqraph-mcp/        # Model Context Protocol server for AI agents
-├── migrations/                # ordered sqlx SQL migrations (0001–0005)
+├── sdk/typescript/            # @lumenqraph/sdk — typed REST + GraphQL client
+├── migrations/                # ordered sqlx SQL migrations (0001–0006)
 ├── docs/                      # ARCHITECTURE, API, DEPLOYMENT
-├── explorer/                  # minimal zero-build read UI
+├── explorer/                  # zero-build explorer + self-host dashboard
 ├── scripts/                   # gen_api_key, backfill, setup_db
 ├── Dockerfile                 # multi-stage build (all four binaries)
 ├── docker-compose.yml         # local Postgres for dev
@@ -429,16 +523,18 @@ CI runs formatting, Clippy (warnings denied), tests, and a release build against
 
 - [x] Typed, self-describing decoding from each contract's on-chain interface (`contractspecv0`)
 - [x] Read layer: typed, read-only view-function calls via `simulateTransaction` (`eth_call` for Soroban)
+- [x] Transaction preview: dry-run any call for its typed result, emitted events, and cost (Tenderly-style)
 - [x] MCP server: typed, self-describing Soroban access for AI agents (Model Context Protocol)
 - [x] Contract state indexing: versioned instance-storage snapshots + automatic spec refresh on upgrade
-- [ ] State indexing: per-key persistent storage (e.g. individual balances), not just instance storage
+- [x] State indexing: per-key persistent storage (e.g. individual balances), discovered from a token's own events
+- [x] GraphQL endpoint alongside REST; cursor-based pagination
+- [x] Client SDK: TypeScript (`sdk/typescript`)
 - [ ] Read layer: user-defined-type and 256-bit-integer arguments; in-memory spec cache in the API
 - [ ] Enrichment for user-defined struct/enum/union values (naming nested UDT fields, not just event params)
 - [ ] Deep historical backfill via a captive-core / data-lake source (beyond RPC's ~7-day window)
 - [ ] Additional materialized verticals (AMM swaps, liquidity, NFT mints/transfers)
-- [ ] GraphQL endpoint alongside REST; cursor-based pagination
 - [ ] Redis-backed rate limiting and read caching for multi-instance deployments
-- [ ] Client SDKs (TypeScript, Python)
+- [ ] Client SDK: Python
 - [ ] Grafana dashboards and alert rules
 
 Contributions toward any of these are very welcome — see [Contributing](#contributing).

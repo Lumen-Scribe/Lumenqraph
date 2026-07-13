@@ -16,14 +16,16 @@ use std::str::FromStr;
 
 use serde_json::Value;
 use stellar_xdr::curr::{
-    HostFunction, Int128Parts, InvokeContractArgs, InvokeHostFunctionOp, Limited, Limits, Memo,
-    MuxedAccount, Operation, OperationBody, Preconditions, PublicKey, ReadXdr, ScAddress, ScBytes,
-    ScMap, ScMapEntry, ScSpecEntry, ScSpecFunctionV0, ScSpecTypeDef, ScString, ScSymbol, ScVal,
-    ScVec, SequenceNumber, Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope,
-    UInt128Parts, Uint256, VecM, WriteXdr,
+    ContractEventBody, ContractEventType, DiagnosticEvent, HostFunction, Int128Parts,
+    InvokeContractArgs, InvokeHostFunctionOp, Limited, Limits, Memo, MuxedAccount, Operation,
+    OperationBody, Preconditions, PublicKey, ReadXdr, ScAddress, ScBytes, ScMap, ScMapEntry,
+    ScSpecEntry, ScSpecFunctionV0, ScSpecTypeDef, ScString, ScSymbol, ScVal, ScVec, SequenceNumber,
+    Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope, UInt128Parts, Uint256,
+    VecM, WriteXdr,
 };
 
 use crate::spec::type_name;
+use crate::ContractSpec;
 
 /// The canonical all-zero account, used as the (never-signed, never-charged)
 /// source of a simulation transaction when the caller supplies none.
@@ -285,6 +287,65 @@ pub fn decode_result(result_xdr: &str, output_type: &str) -> Value {
     })
 }
 
+/// Decode the events a simulation reported. The low-level diagnostic trace
+/// (`fn_call`/`fn_return`) is filtered out; the remaining contract and system
+/// events are decoded like indexed events, and those emitted by
+/// `target_contract` are enriched with its spec when one is supplied. This is
+/// what makes `POST /contracts/:id/simulate` show "the events this call emits".
+pub fn decode_events(
+    events_xdr: &[String],
+    target_contract: &str,
+    spec: Option<&ContractSpec>,
+) -> Vec<Value> {
+    let mut out = Vec::new();
+    for b64 in events_xdr {
+        let Ok(diag) = DiagnosticEvent::from_xdr_base64(b64, Limits::none()) else {
+            continue;
+        };
+        let event = diag.event;
+        // Skip the fn_call/fn_return diagnostic trace — keep meaningful events.
+        let kind = match event.type_ {
+            ContractEventType::Contract => "contract",
+            ContractEventType::System => "system",
+            ContractEventType::Diagnostic => continue,
+        };
+        let ContractEventBody::V0(body) = event.body;
+        let contract_id = event
+            .contract_id
+            .map(|c| ScAddress::Contract(c).to_string());
+        let topics: Vec<Value> = body.topics.iter().map(scval_to_json).collect();
+        let data = scval_to_json(&body.data);
+        let event_name = topics.first().and_then(|t| t.as_str().map(String::from));
+
+        // Enrich events emitted by the contract we're simulating.
+        let enriched = match (spec, &event_name, &contract_id) {
+            (Some(spec), Some(name), Some(cid)) if cid == target_contract => {
+                spec.enrich_event(name, &topics, &data)
+            }
+            _ => None,
+        };
+
+        out.push(serde_json::json!({
+            "contract_id": contract_id,
+            "type": kind,
+            "event": event_name,
+            "topics": topics,
+            "data": data,
+            "enriched": enriched,
+        }));
+    }
+    out
+}
+
+/// Decode an already-parsed `ScVal` to JSON by re-encoding it through the same
+/// decoder events use (keeps one JSON shape across the whole system).
+fn scval_to_json(sv: &ScVal) -> Value {
+    match sv.to_xdr_base64(Limits::none()) {
+        Ok(b64) => crate::xdr::decode_scval_base64(&b64),
+        Err(_) => Value::Null,
+    }
+}
+
 // ---- small helpers ----
 
 fn str_of<'a>(v: &'a Value, name: &str) -> Result<&'a str, EncodeError> {
@@ -447,5 +508,43 @@ mod tests {
         assert_eq!(fns[0]["name"], "balance");
         assert_eq!(fns[0]["inputs"][0]["type"], "Address");
         assert_eq!(fns[0]["outputs"][0], "i128");
+    }
+
+    #[test]
+    fn decodes_simulation_events_and_skips_diagnostics() {
+        use stellar_xdr::curr::{
+            ContractEvent, ContractEventBody, ContractEventType, ContractEventV0, ContractId,
+            DiagnosticEvent, ExtensionPoint, Hash,
+        };
+        let sym = |s: &str| ScVal::Symbol(ScSymbol(s.try_into().unwrap()));
+        let mk = |ty: ContractEventType, topic0: &str| {
+            let ev = ContractEvent {
+                ext: ExtensionPoint::V0,
+                contract_id: Some(ContractId(Hash([7u8; 32]))),
+                type_: ty,
+                body: ContractEventBody::V0(ContractEventV0 {
+                    topics: vec![sym(topic0)].try_into().unwrap(),
+                    data: ScVal::I128(i128_parts(42)),
+                }),
+            };
+            DiagnosticEvent {
+                in_successful_contract_call: true,
+                event: ev,
+            }
+            .to_xdr_base64(Limits::none())
+            .unwrap()
+        };
+
+        let events = vec![
+            mk(ContractEventType::Contract, "transfer"),
+            mk(ContractEventType::Diagnostic, "fn_call"),
+        ];
+        let decoded = decode_events(&events, "CUNKNOWN", None);
+        // The diagnostic trace event is filtered out.
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0]["type"], "contract");
+        assert_eq!(decoded[0]["event"], "transfer");
+        assert_eq!(decoded[0]["data"], "42");
+        assert!(decoded[0]["contract_id"].as_str().unwrap().starts_with('C'));
     }
 }

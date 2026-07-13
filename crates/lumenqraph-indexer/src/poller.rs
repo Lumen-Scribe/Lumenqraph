@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::convert::to_new_event;
 use crate::rpc_client::RpcClient;
 use crate::specs::SpecCache;
-use crate::{cursor, state, store};
+use crate::{cursor, keys, state, store};
 
 /// getEvents only serves recent history. If our cursor falls further than this
 /// behind the tip, we clamp forward and log the (unrecoverable) gap.
@@ -110,6 +110,11 @@ pub async fn fetch_and_store(
     let mut cursor_token: Option<String> = None;
     let mut total_inserted = 0u64;
     let mut active_contracts: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // contract -> holder addresses seen this cycle (for per-key balance snapshots).
+    let mut holders_by_contract: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
     loop {
         let page = rpc
             .get_events(
@@ -127,7 +132,17 @@ pub async fn fetch_and_store(
             if config.state_indexing && config.contract_ids.is_empty() {
                 active_contracts.insert(ev.contract_id.clone());
             }
-            batch.push(to_new_event(ev, spec.as_deref()));
+            let new_event = to_new_event(ev, spec.as_deref());
+            // Discover holder addresses to snapshot per-key balances for.
+            if config.key_indexing {
+                for holder in keys::holders_in_event(&new_event) {
+                    holders_by_contract
+                        .entry(new_event.contract_id.clone())
+                        .or_default()
+                        .insert(holder);
+                }
+            }
+            batch.push(new_event);
         }
         let n = batch.len();
         total_inserted += store::insert_events(pool, &batch).await?;
@@ -150,6 +165,33 @@ pub async fn fetch_and_store(
         };
         for contract_id in targets {
             state::snapshot(pool, rpc, specs, contract_id).await;
+        }
+    }
+
+    // Snapshot per-holder balances discovered from this cycle's token events.
+    // When CONTRACT_IDS is set we only track balances for those contracts.
+    if config.key_indexing {
+        let durability = keys::parse_durability(&config.balance_key_durability);
+        for (contract_id, holders) in &holders_by_contract {
+            if !config.contract_ids.is_empty() && !config.contract_ids.contains(contract_id) {
+                continue;
+            }
+            for holder in holders {
+                match keys::balance_key(&config.balance_key_symbol, holder) {
+                    Ok(key) => {
+                        state::snapshot_data(
+                            pool,
+                            rpc,
+                            contract_id,
+                            &key,
+                            durability,
+                            Some("balance"),
+                        )
+                        .await
+                    }
+                    Err(e) => debug!(holder, error = %e, "skipping unbuildable balance key"),
+                }
+            }
         }
     }
     Ok(total_inserted)

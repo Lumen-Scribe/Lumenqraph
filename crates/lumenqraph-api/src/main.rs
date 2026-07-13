@@ -4,6 +4,7 @@
 
 mod auth;
 mod error;
+mod graphql;
 mod metrics;
 mod rate_limit;
 mod routes;

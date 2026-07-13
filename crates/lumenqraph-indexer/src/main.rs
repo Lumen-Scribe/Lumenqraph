@@ -10,6 +10,7 @@ mod backfill;
 mod config;
 mod convert;
 mod cursor;
+mod keys;
 mod poller;
 mod rpc_client;
 mod specs;

@@ -22,3 +22,4 @@ sqlx.workspace = true
 reqwest.workspace = true
 stellar-xdr.workspace = true
 hex.workspace = true
+sha2.workspace = true

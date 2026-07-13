@@ -2,8 +2,7 @@
 //! Postgres the API reads and the same read-layer encoder the API calls, so an
 //! agent gets typed, self-describing access to every indexed Soroban contract.
 
-use lumenqraph_core::read;
-use lumenqraph_core::{Contract, EventRow};
+use lumenqraph_core::{read, Contract, ContractSpec, EventRow};
 use serde_json::{json, Value};
 
 use crate::rpc::SimOutcome;
@@ -39,6 +38,19 @@ pub fn definitions() -> Value {
             }
         },
         {
+            "name": "get_contract_data",
+            "description": "Get a contract's per-key state: the current value of individual storage entries such as token holder balances (Balance(Address)), discovered from the contract's events. Requires the indexer's key indexing to be enabled.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "contract_id": { "type": "string", "description": "Contract id (C...)" },
+                    "label": { "type": "string", "description": "Optional label filter, e.g. 'balance'" },
+                    "limit": { "type": "integer", "description": "Max keys, latest value of each (1-1000, default 100)" }
+                },
+                "required": ["contract_id"], "additionalProperties": false
+            }
+        },
+        {
             "name": "query_events",
             "description": "Query recent indexed events for a contract, newest first. Each event includes decoded topics/value and, when available, a named+typed 'enriched' record.",
             "inputSchema": {
@@ -63,6 +75,20 @@ pub fn definitions() -> Value {
                 },
                 "required": ["contract_id", "function"], "additionalProperties": false
             }
+        },
+        {
+            "name": "simulate_call",
+            "description": "Dry-run ANY contract call (including state-changing ones like transfer/deposit) WITHOUT submitting it, and preview the typed result, the events it would emit, and its resource cost. Nothing is signed or broadcast. Use this to answer 'what would happen if I called X?'.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "contract_id": { "type": "string", "description": "Contract id (C...)" },
+                    "function": { "type": "string", "description": "Function name to simulate" },
+                    "args": { "description": "Arguments as an object keyed by parameter name, or a positional array" },
+                    "source_account": { "type": "string", "description": "Optional G... source account for the simulation" }
+                },
+                "required": ["contract_id", "function"], "additionalProperties": false
+            }
         }
     ])
 }
@@ -77,6 +103,15 @@ pub async fn call(state: &State, name: &str, args: &Value) -> anyhow::Result<Val
             get_state(
                 state,
                 str_arg(args, "contract_id")?,
+                args.get("limit").and_then(Value::as_i64),
+            )
+            .await
+        }
+        "get_contract_data" => {
+            get_data(
+                state,
+                str_arg(args, "contract_id")?,
+                args.get("label").and_then(Value::as_str),
                 args.get("limit").and_then(Value::as_i64),
             )
             .await
@@ -96,6 +131,19 @@ pub async fn call(state: &State, name: &str, args: &Value) -> anyhow::Result<Val
                 str_arg(args, "contract_id")?,
                 str_arg(args, "function")?,
                 args.get("args").cloned().unwrap_or(Value::Null),
+                None,
+                false,
+            )
+            .await
+        }
+        "simulate_call" => {
+            call_contract(
+                state,
+                str_arg(args, "contract_id")?,
+                str_arg(args, "function")?,
+                args.get("args").cloned().unwrap_or(Value::Null),
+                args.get("source_account").and_then(Value::as_str),
+                true,
             )
             .await
         }
@@ -162,6 +210,54 @@ async fn get_state(state: &State, contract_id: &str, limit: Option<i64>) -> anyh
     Ok(json!({ "contract_id": contract_id, "count": versions.len(), "versions": versions }))
 }
 
+async fn get_data(
+    state: &State,
+    contract_id: &str,
+    label: Option<&str>,
+    limit: Option<i64>,
+) -> anyhow::Result<Value> {
+    let limit = limit.unwrap_or(100).clamp(1, 1000);
+    // (key_hash, key, durability, ledger, value, label)
+    type DataRow = (
+        String,
+        sqlx::types::Json<Value>,
+        String,
+        i64,
+        sqlx::types::Json<Value>,
+        Option<String>,
+    );
+    let rows: Vec<DataRow> = sqlx::query_as(
+        "SELECT key_hash, key, durability, ledger, value, label FROM (
+             SELECT DISTINCT ON (key_hash)
+                    key_hash, key, durability, ledger, value, label
+             FROM contract_data
+             WHERE contract_id = $1 AND ($2::text IS NULL OR label = $2)
+             ORDER BY key_hash, ledger DESC
+         ) latest
+         ORDER BY ledger DESC LIMIT $3",
+    )
+    .bind(contract_id)
+    .bind(label)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await?;
+    if rows.is_empty() {
+        anyhow::bail!(
+            "no per-key data snapshots for {contract_id} (key indexing may be disabled on the indexer)"
+        );
+    }
+    let keys: Vec<Value> = rows
+        .into_iter()
+        .map(|(key_hash, key, durability, ledger, value, label)| {
+            json!({
+                "key_hash": key_hash, "key": key.0, "durability": durability,
+                "ledger": ledger, "value": value.0, "label": label,
+            })
+        })
+        .collect();
+    Ok(json!({ "contract_id": contract_id, "count": keys.len(), "keys": keys }))
+}
+
 async fn query_events(
     state: &State,
     contract_id: &str,
@@ -185,11 +281,15 @@ async fn query_events(
     Ok(json!({ "contract_id": contract_id, "count": events.len(), "events": events }))
 }
 
+/// Backs both `call_contract` (view read) and `simulate_call` (full preview).
+/// When `preview` is set, the emitted events and resource cost are included.
 async fn call_contract(
     state: &State,
     contract_id: &str,
     function: &str,
     args: Value,
+    source_account: Option<&str>,
+    preview: bool,
 ) -> anyhow::Result<Value> {
     let row: Option<(String,)> =
         sqlx::query_as("SELECT spec_section FROM contract_specs WHERE contract_id = $1")
@@ -201,19 +301,29 @@ async fn call_contract(
     })?;
     let section = hex::decode(&hex_section)?;
 
-    let call = read::encode_call(&section, contract_id, function, &args, None)
+    let call = read::encode_call(&section, contract_id, function, &args, source_account)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     match state.rpc.simulate(&call.tx_xdr).await? {
         SimOutcome::Ok {
             result_xdr,
+            events,
+            min_resource_fee,
             latest_ledger,
-        } => Ok(json!({
-            "contract_id": contract_id,
-            "function": function,
-            "result": read::decode_result(&result_xdr, &call.output_type),
-            "simulated_at_ledger": latest_ledger,
-        })),
+        } => {
+            let mut out = json!({
+                "contract_id": contract_id,
+                "function": function,
+                "result": read::decode_result(&result_xdr, &call.output_type),
+                "simulated_at_ledger": latest_ledger,
+            });
+            if preview {
+                let spec = ContractSpec::from_spec_xdr(&section);
+                out["events"] = json!(read::decode_events(&events, contract_id, spec.as_ref()));
+                out["min_resource_fee"] = json!(min_resource_fee);
+            }
+            Ok(out)
+        }
         SimOutcome::Error(msg) => anyhow::bail!("simulation failed: {msg}"),
     }
 }
