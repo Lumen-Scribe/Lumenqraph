@@ -29,9 +29,11 @@ primary_region = "iad"
   RUST_LOG = "info"
   STATE_INDEXING = "true"
   KEY_INDEXING = "true"
-  # Public RPCs reject getEvents more than a few thousand ledgers behind tip;
-  # raise this only with a retaining/paid RPC (see docs/DEPLOY.md).
-  MAX_CATCHUP_LEDGERS = "4000"
+  # Kept small so the indexer converges fast on the rate-limited public RPC —
+  # a hyperactive SAC like CAS3 emits ~500 events/ledger, so a large catch-up
+  # would saturate Postgres for hours before committing. Larger gaps are
+  # skipped + logged. Raise it only with a retaining/paid RPC (see DEPLOYMENT.md).
+  MAX_CATCHUP_LEDGERS = "120"
   EXPLORER_DIR = "/app/explorer"
 
 # HTTP is served only by the `api` process group. The indexer must run 24/7

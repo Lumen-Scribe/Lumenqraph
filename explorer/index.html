@@ -86,6 +86,10 @@
     .tabs button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
     .detail-head { padding: .7rem .85rem; border-bottom: 1px solid var(--border); font-size: .8rem; color: var(--ink-2); }
     .detail-head code { font-family: ui-monospace, monospace; word-break: break-all; }
+    .decodebar { display: flex; gap: .4rem; align-items: center; flex-wrap: wrap; }
+    .decodebar input { flex: 1 1 16rem; min-width: 0; }
+    .detail-title { margin-top: .5rem; }
+    .detail-title:empty { display: none; }
     .body { padding: .5rem; overflow-x: auto; }
 
     table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
@@ -151,9 +155,13 @@
         <button data-tab="interface" onclick="setTab('interface')">Interface</button>
       </div>
       <div class="detail-head" id="detailHead">
-        Select a contract, or decode any one:
-        <input id="anyCid" size="40" placeholder="contract id (C…)" style="margin-left:.4rem" />
-        <button onclick="decodeAny()">Decode</button>
+        <div class="decodebar">
+          <span class="muted">Decode any contract:</span>
+          <input id="anyCid" size="40" placeholder="contract id (C…)"
+                 onkeydown="if(event.key==='Enter')decodeAny()" />
+          <button onclick="decodeAny()">Decode</button>
+        </div>
+        <div id="detailTitle" class="detail-title"></div>
       </div>
       <div class="body" id="detail"><div class="empty">No contract selected.</div></div>
     </main>
@@ -256,7 +264,7 @@ function selectContract(cid) {
   [...document.querySelectorAll('.clist li')].forEach(li => {
     if (li.querySelector('.cid') && cid.startsWith(li.querySelector('.cid').textContent.split('…')[0])) li.classList.add('active');
   });
-  $('detailHead').innerHTML = `Contract <a class="ext" href="${seUrl('contract', cid)}" target="_blank" rel="noopener"><code>${esc(cid)}</code> ↗</a>`;
+  $('detailTitle').innerHTML = `Contract <a class="ext" href="${seUrl('contract', cid)}" target="_blank" rel="noopener"><code>${esc(cid)}</code> ↗</a>`;
   loadTab();
 }
 
@@ -338,7 +346,7 @@ async function decodeAny() {
   if (!cid) return;
   selected = cid; tab = 'interface';
   document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === 'interface'));
-  $('detailHead').innerHTML = `Contract <a class="ext" href="${seUrl('contract', cid)}" target="_blank" rel="noopener"><code>${esc(cid)}</code> ↗</a>`;
+  $('detailTitle').innerHTML = `Contract <a class="ext" href="${seUrl('contract', cid)}" target="_blank" rel="noopener"><code>${esc(cid)}</code> ↗</a>`;
   $('detail').innerHTML = '<div class="empty">Decoding…</div>';
   try { await renderInterface(cid); }
   catch (e) { $('detail').innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
