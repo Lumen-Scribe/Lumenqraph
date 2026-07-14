@@ -1,0 +1,63 @@
+# Fly.io deployment for Lumenqraph. One image (the repo Dockerfile), three
+# process groups sharing a managed Postgres. See docs/DEPLOY.md for the full
+# walkthrough (Neon/Supabase Postgres, secrets, scaling).
+#
+#   fly launch --no-deploy --copy-config   # reuse this file
+#   fly secrets set DATABASE_URL=... RPC_URL=...
+#   fly deploy
+#
+# Rename `app` to your own app before deploying.
+app = "lumenqraph"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# Three long-running services from the one image. The indexer and webhooks are
+# workers (no inbound service); the api serves HTTP + the explorer UI.
+[processes]
+  api = "lumenqraph-api"
+  indexer = "lumenqraph-indexer"
+  webhooks = "lumenqraph-webhooks"
+
+# Non-secret config. Secrets (DATABASE_URL, and CONTRACT_IDS if you prefer) go
+# via `fly secrets set`. CONTRACT_IDS left unset here = index ALL contract
+# events; set it to a comma-separated allowlist for a focused, cheaper index.
+[env]
+  API_BIND_ADDR = "0.0.0.0:8080"
+  RPC_URL = "https://mainnet.sorobanrpc.com"
+  RUST_LOG = "info"
+  STATE_INDEXING = "true"
+  KEY_INDEXING = "true"
+  # Public RPCs reject getEvents more than a few thousand ledgers behind tip;
+  # raise this only with a retaining/paid RPC (see docs/DEPLOY.md).
+  MAX_CATCHUP_LEDGERS = "4000"
+  EXPLORER_DIR = "/app/explorer"
+
+# HTTP is served only by the `api` process group. The indexer must run 24/7
+# (a sleeping poller falls behind the chain), so machines are never auto-stopped.
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["api"]
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "30s"
+    method = "GET"
+    path = "/health"
+
+# The indexer does more work (decode + snapshots) than the readers.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1024mb"
+  processes = ["indexer"]
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+  processes = ["api", "webhooks"]

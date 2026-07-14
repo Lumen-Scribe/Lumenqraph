@@ -504,6 +504,7 @@ Lumenqraph/
 ├── Dockerfile                 # multi-stage build (all four binaries)
 ├── docker-compose.yml         # local Postgres for dev
 ├── docker-compose.full.yml    # full stack
+├── fly.toml                   # Fly.io deploy (3 process groups)
 └── Makefile                   # common tasks (make help)
 ```
 
