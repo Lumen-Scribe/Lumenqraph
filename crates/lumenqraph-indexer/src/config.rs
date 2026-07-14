@@ -12,6 +12,14 @@ pub struct Config {
     pub page_size: u32,
     /// Ledger to start from on a fresh index. 0 => start near the current tip.
     pub start_ledger: i64,
+    /// Max ledgers behind the tip we'll request in a single catch-up. Public
+    /// Soroban RPCs reject a `getEvents` whose `startLedger` is more than a few
+    /// thousand ledgers behind the current tip (`-32001` "processing limit"), so
+    /// if the cursor falls further behind (e.g. after downtime) we skip ahead to
+    /// this window and log the unrecoverable gap rather than stalling forever.
+    /// Raise it with a retaining/paid RPC. Default 4000 (~5–6h) is conservative
+    /// for the SDF public endpoints.
+    pub max_catchup_ledgers: i64,
     /// When true, snapshot each active contract's instance storage into
     /// `contract_state` (versioned). Off by default — it costs one extra RPC
     /// call per active contract per cycle. Best paired with `CONTRACT_IDS`.
@@ -43,6 +51,7 @@ impl Config {
             poll_interval_secs: env_parse("POLL_INTERVAL_SECS", 5)?,
             page_size: env_parse("PAGE_SIZE", 1000)?,
             start_ledger: env_parse("START_LEDGER", 0)?,
+            max_catchup_ledgers: env_parse("MAX_CATCHUP_LEDGERS", 4000)?,
             state_indexing: env_bool("STATE_INDEXING", false),
             key_indexing: env_bool("KEY_INDEXING", false),
             balance_key_symbol: std::env::var("BALANCE_KEY_SYMBOL")

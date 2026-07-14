@@ -13,6 +13,7 @@ use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{delete, get, post};
 use axum::{middleware, Extension, Router};
+use tower_http::services::ServeDir;
 
 use crate::auth::auth_and_rate_limit;
 use crate::graphql::{self, AppSchema};
@@ -84,5 +85,16 @@ pub fn router(state: AppState) -> Router {
             auth_and_rate_limit,
         ));
 
-    public.merge(protected).with_state(state)
+    let app = public.merge(protected).with_state(state);
+
+    // Serve the static explorer UI at the same origin as the API (so it needs
+    // no CORS and no configured API base). Falls back to it for any unmatched
+    // path; `/` resolves to explorer/index.html. Dir is configurable so the
+    // container image can point at wherever the assets are COPYed.
+    let explorer_dir = std::env::var("EXPLORER_DIR").unwrap_or_else(|_| "explorer".to_string());
+    if std::path::Path::new(&explorer_dir).is_dir() {
+        app.fallback_service(ServeDir::new(explorer_dir))
+    } else {
+        app
+    }
 }

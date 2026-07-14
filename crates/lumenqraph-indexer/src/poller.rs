@@ -79,12 +79,15 @@ async fn poll_once(
         cursor::write_progress(pool, start - 1, latest, 0).await?;
         return Ok(None);
     }
-    if latest - start > MAX_LOOKBACK_LEDGERS {
-        let clamped = latest - MAX_LOOKBACK_LEDGERS;
+    if latest - start > config.max_catchup_ledgers {
+        let clamped = latest - config.max_catchup_ledgers;
         warn!(
             from = start,
             to = clamped,
-            "cursor beyond RPC retention; skipping ahead (gap unrecoverable via RPC)"
+            gap_ledgers = clamped - start,
+            "cursor too far behind tip; skipping ahead to the catch-up window \
+             (gap unrecoverable via public RPC — use a retaining/paid RPC or a \
+             datalake backfill for gapless history, or raise MAX_CATCHUP_LEDGERS)"
         );
         start = clamped;
     }
