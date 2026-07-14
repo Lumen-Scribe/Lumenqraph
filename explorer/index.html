@@ -94,6 +94,9 @@
     td code, .mono { font-family: ui-monospace, monospace; font-size: 11.5px; word-break: break-all; }
     tr:hover td { background: var(--surface-2); }
     .pill { display: inline-block; padding: .05rem .45rem; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 11px; font-weight: 600; }
+    a.ext { text-decoration: none; white-space: nowrap; }
+    a.ext:hover { text-decoration: underline; }
+    a.ext code { color: var(--accent); }
     pre { margin: 0; padding: .6rem .7rem; background: var(--surface-2); border-radius: 8px; font-size: 11.5px; overflow-x: auto; }
     .empty { padding: 1.5rem; color: var(--muted); text-align: center; }
     .rowbar { display: flex; gap: .45rem; flex-wrap: wrap; align-items: center; padding: .5rem .6rem; }
@@ -113,6 +116,10 @@
     <div class="conn">
       <input id="base" size="26" value="" placeholder="API base (blank = same origin)" title="API base URL — leave blank when the page is served by/behind the API" />
       <input id="key" size="16" placeholder="x-api-key (optional)" />
+      <select id="senet" title="Stellar.Expert network for ↗ links">
+        <option value="public">mainnet</option>
+        <option value="testnet">testnet</option>
+      </select>
       <button class="primary" onclick="connect()">Load</button>
     </div>
   </header>
@@ -158,6 +165,15 @@
 const $ = id => document.getElementById(id);
 const base = () => $('base').value.replace(/\/+$/, '');
 const headers = () => $('key').value ? { 'x-api-key': $('key').value } : {};
+
+// ---- Stellar.Expert deep links ----
+const seNet = () => $('senet').value;
+const seUrl = (type, val) => `https://stellar.expert/explorer/${seNet()}/${type}/${encodeURIComponent(val)}`;
+// A short, monospace external link to a Stellar.Expert page (contract/tx/account).
+function seLink(type, val, n = 8) {
+  if (!val) return '<span class="muted">—</span>';
+  return `<a class="ext" href="${seUrl(type, val)}" target="_blank" rel="noopener" title="${esc(val)}"><code>${esc(short(val, n))}</code> ↗</a>`;
+}
 let selected = null;
 let tab = 'events';
 let healthTimer = null;
@@ -224,7 +240,8 @@ async function loadContracts() {
     for (const c of rows) {
       const li = document.createElement('li');
       li.className = c.contract_id === selected ? 'active' : '';
-      li.innerHTML = `<div class="cid">${esc(short(c.contract_id, 10))}</div>
+      li.innerHTML = `<div class="cid">${esc(short(c.contract_id, 10))}
+          <a class="ext" href="${seUrl('contract', c.contract_id)}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="View on Stellar.Expert">↗</a></div>
         <div class="meta">${fmt(c.event_count)} events · ledgers ${fmt(c.first_seen_ledger)}–${fmt(c.last_seen_ledger)}</div>`;
       li.onclick = () => selectContract(c.contract_id);
       ul.appendChild(li);
@@ -239,7 +256,7 @@ function selectContract(cid) {
   [...document.querySelectorAll('.clist li')].forEach(li => {
     if (li.querySelector('.cid') && cid.startsWith(li.querySelector('.cid').textContent.split('…')[0])) li.classList.add('active');
   });
-  $('detailHead').innerHTML = `Contract <code>${esc(cid)}</code>`;
+  $('detailHead').innerHTML = `Contract <a class="ext" href="${seUrl('contract', cid)}" target="_blank" rel="noopener"><code>${esc(cid)}</code> ↗</a>`;
   loadTab();
 }
 
@@ -269,14 +286,14 @@ async function loadTab() {
         { label: 'Ledger', key: 'ledger' },
         { label: 'Event', render: r => `<span class="pill">${esc(r.event_name ?? r.event_type)}</span>` },
         { label: 'Typed / decoded', render: r => `<code>${esc(JSON.stringify(r.enriched ?? r.decoded_value))}</code>` },
-        { label: 'Tx', render: r => `<code>${esc(short(r.tx_hash, 8))}</code>` },
+        { label: 'Tx', render: r => seLink('tx', r.tx_hash) },
       ]);
     } else if (tab === 'transfers') {
       const rows = await get(`/contracts/${cid}/transfers?limit=50`);
       $('detail').innerHTML = table(rows, [
         { label: 'Ledger', key: 'ledger' },
-        { label: 'From', render: r => `<code>${esc(short(r.from_addr ?? '—', 8))}</code>` },
-        { label: 'To', render: r => `<code>${esc(short(r.to_addr ?? '—', 8))}</code>` },
+        { label: 'From', render: r => seLink('account', r.from_addr) },
+        { label: 'To', render: r => seLink('account', r.to_addr) },
         { label: 'Amount', key: 'amount' },
       ]);
     } else if (tab === 'state') {
@@ -321,7 +338,7 @@ async function decodeAny() {
   if (!cid) return;
   selected = cid; tab = 'interface';
   document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === 'interface'));
-  $('detailHead').innerHTML = `Contract <code>${esc(cid)}</code>`;
+  $('detailHead').innerHTML = `Contract <a class="ext" href="${seUrl('contract', cid)}" target="_blank" rel="noopener"><code>${esc(cid)}</code> ↗</a>`;
   $('detail').innerHTML = '<div class="empty">Decoding…</div>';
   try { await renderInterface(cid); }
   catch (e) { $('detail').innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
