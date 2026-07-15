@@ -464,26 +464,73 @@ function viewVersion(cid, n) {
   loadTab();
 }
 
+// ---- Interface rendering ----------------------------------------------------
+// Signatures are rendered in the same shape core::diff uses for the upgrade
+// timeline, so the same function reads identically in both tabs.
+
+/// A type name. The API renders these to strings server-side; the object guard
+/// is just so an unexpected shape degrades to visible JSON instead of
+/// "[object Object]".
+const tn = t => (t && typeof t === 'object') ? JSON.stringify(t) : String(t ?? '?');
+
+/// `balance(id: Address) -> i128`
+function fnSig(f) {
+  const ins = (f.inputs || []).map(a => `${a.name}: ${tn(a.type)}`).join(', ');
+  const outs = f.outputs || [];
+  const out = outs.length === 0 ? 'void' : outs.length === 1 ? tn(outs[0]) : `(${outs.map(tn).join(', ')})`;
+  return `${f.name}(${ins}) -> ${out}`;
+}
+
+/// `transfer(from: Address @topic, amount: i128 @data) [single]` — the location
+/// of each param and the body's data format decide how a consumer decodes the
+/// event, so they belong in the signature, not hidden in a JSON blob.
+function evSig(e) {
+  const ps = (e.params || []).map(p => `${p.name}: ${tn(p.type)} @${p.location}`).join(', ');
+  return `${e.name}(${ps}) [${e.data_format}]`;
+}
+
+/// Structs, unions, and enums, each rendered like its Rust declaration.
+function typeRows(i) {
+  const rows = [];
+  for (const s of i.structs || [])
+    rows.push([s.name, `struct ${s.name} { ${(s.fields || []).map(f => `${f.name}: ${tn(f.type)}`).join(', ')} }`]);
+  for (const u of i.unions || [])
+    rows.push([u.name, `union ${u.name} { ${(u.cases || []).map(c =>
+      (c.types && c.types.length) ? `${c.name}(${c.types.map(tn).join(', ')})` : c.name).join(', ')} }`]);
+  for (const e of i.enums || [])
+    // Enum cases arrive as [name, discriminant] pairs.
+    rows.push([e.name, `enum ${e.name} { ${(e.cases || []).map(c => `${c[0]} = ${c[1]}`).join(', ')} }`]);
+  return rows;
+}
+
+/// A signature cell, with the spec's own doc comment beneath it when present.
+function sigCell(sig, doc) {
+  return `<code>${esc(sig)}</code>${doc ? `<div class="tl-note" style="margin-top:.15rem">${esc(doc)}</div>` : ''}`;
+}
+
 async function renderInterface(cid, version) {
   const iface = await get(`/contracts/${cid}/interface${version ? `?version=${version}` : ''}`);
   const i = iface.interface || iface;
-  const fns = (i.functions || []).map(f => {
-    const ins = (f.inputs || []).map(a => `${a.name}: ${typeof a.type === 'object' ? JSON.stringify(a.type) : a.type}`).join(', ');
-    const out = f.outputs && f.outputs.length ? ` → ${JSON.stringify(f.outputs)}` : '';
-    return `<tr><td><code>${esc(f.name)}</code></td><td><code>${esc(ins)}${esc(out)}</code></td></tr>`;
-  }).join('');
-  const evs = (i.events || []).map(e => `<tr><td><code>${esc(e.name)}</code></td><td><code>${esc(JSON.stringify(e))}</code></td></tr>`).join('');
+  const fns = (i.functions || [])
+    .map(f => `<tr><td><code>${esc(f.name)}</code></td><td>${sigCell(fnSig(f), f.doc)}</td></tr>`).join('');
+  const evs = (i.events || [])
+    .map(e => `<tr><td><code>${esc(e.name)}</code></td><td>${sigCell(evSig(e), e.doc)}</td></tr>`).join('');
+  const tys = typeRows(i)
+    .map(([name, sig]) => `<tr><td><code>${esc(name)}</code></td><td><code>${esc(sig)}</code></td></tr>`).join('');
   // When pinned to a historical version, say so loudly — otherwise this reads
   // as the contract's current interface, which it isn't.
   const head = version
     ? `<div class="summary"><span>Interface at <strong>v${version}</strong></span>
          <span class="muted">·</span><span class="muted">observed ${fmtDate(iface.observed_at)}</span>
          <span class="muted">·</span><a href="#" onclick="setTab('interface');return false;">show current</a></div>`
-    : `<div class="muted" style="padding:.4rem .6rem">${(i.functions||[]).length} functions · ${(i.events||[]).length} events${iface.fetched_at ? ' · fetched ' + esc(iface.fetched_at) : ''}</div>`;
+    : `<div class="muted" style="padding:.4rem .6rem">${(i.functions||[]).length} functions · ${(i.events||[]).length} events · ${typeRows(i).length} types${iface.fetched_at ? ' · fetched ' + fmtDate(iface.fetched_at) : ''}</div>`;
+  const section = (label, col, rows) =>
+    rows ? `<div style="height:.6rem"></div><table><thead><tr><th>${label}</th><th>${col}</th></tr></thead><tbody>${rows}</tbody></table>` : '';
   $('detail').innerHTML =
     (head +
      (fns ? `<table><thead><tr><th>Function</th><th>Signature</th></tr></thead><tbody>${fns}</tbody></table>` : '') +
-     (evs ? `<div style="height:.6rem"></div><table><thead><tr><th>Event</th><th>Schema</th></tr></thead><tbody>${evs}</tbody></table>` : '')) ||
+     section('Event', 'Schema', evs) +
+     section('Type', 'Definition', tys)) ||
     '<div class="empty">No interface indexed (Stellar Asset Contracts have none).</div>';
 }
 
