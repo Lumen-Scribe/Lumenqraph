@@ -12,6 +12,7 @@ mod convert;
 mod cursor;
 mod keys;
 mod poller;
+mod retention;
 mod rpc_client;
 mod specs;
 mod state;

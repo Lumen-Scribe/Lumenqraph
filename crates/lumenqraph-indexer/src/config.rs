@@ -35,6 +35,11 @@ pub struct Config {
     /// Durability of the balance storage entry: "persistent" (default) or
     /// "temporary".
     pub balance_key_durability: String,
+    /// Keep only the last N ledgers of history, pruning older rows as the tip
+    /// advances. 0 (default) => keep everything. Set this when the database has
+    /// a hard size cap (e.g. a 500MB free tier) that an unbounded index would
+    /// hit; see `retention`.
+    pub retention_ledgers: i64,
 }
 
 impl Config {
@@ -62,6 +67,7 @@ impl Config {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "persistent".to_string()),
+            retention_ledgers: env_parse("RETENTION_LEDGERS", 0)?,
         })
     }
 }

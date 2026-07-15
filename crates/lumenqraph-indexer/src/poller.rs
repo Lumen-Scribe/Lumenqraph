@@ -3,7 +3,7 @@
 //! retried with exponential backoff so a flaky RPC never kills the process.
 //! Responds to Ctrl-C / SIGTERM for a clean shutdown.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lumenqraph_core::NewEvent;
 use sqlx::PgPool;
@@ -13,7 +13,12 @@ use crate::config::Config;
 use crate::convert::to_new_event;
 use crate::rpc_client::RpcClient;
 use crate::specs::SpecCache;
-use crate::{cursor, keys, state, store};
+use crate::{cursor, keys, retention, state, store};
+
+/// How often to prune outside the retention window. Decoupled from the poll
+/// interval: retention is a slow-moving disk concern, and re-checking it every
+/// few seconds would spend more on probes than the deletes are worth.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// getEvents only serves recent history. If our cursor falls further than this
 /// behind the tip, we clamp forward and log the (unrecoverable) gap.
@@ -30,6 +35,9 @@ pub async fn run(pool: PgPool, rpc: RpcClient, config: Config) -> anyhow::Result
     // One spec cache for the process lifetime: each contract's interface is
     // fetched and parsed once, then reused to enrich every event.
     let specs = SpecCache::new();
+    // None => prune on the first cycle that reaches the tip, so a deployment
+    // that switches retention on starts reclaiming immediately.
+    let mut last_prune: Option<Instant> = None;
 
     loop {
         let sleep_for = match poll_once(&pool, &rpc, &config, &specs).await {
@@ -37,6 +45,18 @@ pub async fn run(pool: PgPool, rpc: RpcClient, config: Config) -> anyhow::Result
                 backoff = base_interval;
                 if let Some(ledger) = processed_to {
                     debug!(ledger, "cycle complete");
+                    if config.retention_ledgers > 0
+                        && last_prune.is_none_or(|t| t.elapsed() >= PRUNE_INTERVAL)
+                    {
+                        // Never fatal: falling behind on disk reclamation is bad,
+                        // but stopping the tail over it is worse.
+                        if let Err(e) =
+                            retention::prune(&pool, ledger, config.retention_ledgers).await
+                        {
+                            warn!(error = %e, "retention prune failed");
+                        }
+                        last_prune = Some(Instant::now());
+                    }
                 }
                 base_interval
             }

@@ -144,6 +144,7 @@ All configuration is via environment variables (see [`.env.example`](.env.exampl
 | `PAGE_SIZE` | `1000` | Events requested per `getEvents` page (1–10000). |
 | `START_LEDGER` | `0` | Ledger to start a fresh index from. `0` = near the tip. Clamped to RPC retention. |
 | `STATE_INDEXING` | `false` | Snapshot contract instance storage into `contract_state` (versioned). One extra RPC call per tracked contract per cycle; best paired with `CONTRACT_IDS`. |
+| `RETENTION_LEDGERS` | `0` | Keep only the last N ledgers of history, pruning older events (+ cascaded transfers) and superseded state versions as the tip advances. `0` = keep everything. Set it when the database has a hard size cap. ~17280 ≈ 1 day. |
 | `API_BIND_ADDR` | `0.0.0.0:8080` | API listen address. |
 | `REQUIRE_API_KEY` | `false` | Require a valid API key on data routes. |
 | `ANON_RATE_LIMIT_PER_MIN` | `60` | Requests/min for unauthenticated callers. |

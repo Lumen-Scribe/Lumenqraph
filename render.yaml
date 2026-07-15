@@ -1,0 +1,67 @@
+# Render Blueprint — card-free deployment of Lumenqraph.
+#
+# Pairs with a free Supabase Postgres (Render's own free Postgres is DELETED 30
+# days after creation, so it can't host a standing demo). Full walkthrough,
+# including the keep-alive ping this tier requires: docs/DEPLOYMENT.md.
+#
+# Why one service instead of the three in fly.toml: Render's free plan covers
+# web services only — there is no free background-worker type — and the free
+# allowance is 750 instance-hours/month, which covers exactly one always-on
+# service (a month is ~730h). So the indexer rides along inside the web service
+# via scripts/run-all-in-one.sh. Fly/compose still run them separately.
+#
+# Deploy: push to GitHub, then Render Dashboard -> New -> Blueprint -> pick this
+# repo. You'll be prompted for the `sync: false` values below.
+
+services:
+  - name: lumenqraph
+    type: web
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # Overrides the image's default CMD (api only) to run indexer + api together.
+    dockerCommand: run-all-in-one.sh
+    healthCheckPath: /health
+
+    envVars:
+      # Supabase session-pooler URI, from Supabase -> Project Settings ->
+      # Database -> Connection string. Must include ?sslmode=require.
+      - key: DATABASE_URL
+        sync: false
+
+      # Comma-separated contract allowlist. MUST stay set on this tier, and MUST
+      # NOT include the CAS3J7GY… SAC: it emits ~550 events/ledger (~9.5M/day),
+      # which fills Supabase's 500MB free cap within hours. See DEPLOYMENT.md.
+      - key: CONTRACT_IDS
+        sync: false
+
+      - key: RPC_URL
+        value: https://mainnet.sorobanrpc.com
+
+      - key: RUST_LOG
+        value: info
+
+      - key: EXPLORER_DIR
+        value: /app/explorer
+
+      # Keep only a rolling window of history, so the index converges to a steady
+      # disk footprint instead of growing until writes fail at the 500MB cap.
+      # ~2 days at ~5s/ledger. Raise toward 120960 (~7 days, the limit of what
+      # public RPC serves anyway) only after watching actual Supabase disk use —
+      # running out of disk breaks the demo, a shorter window merely shortens it.
+      - key: RETENTION_LEDGERS
+        value: "34560"
+
+      # Public RPC rejects getEvents more than a few thousand ledgers behind the
+      # tip (-32001), so a cursor that falls behind can't catch up. Keep this
+      # small: gaps are skipped and logged rather than stalling the tail.
+      - key: MAX_CATCHUP_LEDGERS
+        value: "120"
+
+      - key: STATE_INDEXING
+        value: "true"
+
+      - key: KEY_INDEXING
+        value: "true"
