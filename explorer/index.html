@@ -19,6 +19,9 @@
       --good: #1f9d57;
       --warn: #b5820a;
       --crit: #d23b3b;
+      --good-soft: #1f9d571f;
+      --warn-soft: #b5820a1f;
+      --crit-soft: #d23b3b1f;
       --radius: 10px;
     }
     @media (prefers-color-scheme: dark) {
@@ -35,6 +38,9 @@
         --good: #46c983;
         --warn: #e0b64b;
         --crit: #f0736f;
+        --good-soft: #46c98326;
+        --warn-soft: #e0b64b26;
+        --crit-soft: #f0736f26;
       }
     }
     * { box-sizing: border-box; }
@@ -108,6 +114,36 @@
     .toast { position: fixed; bottom: 1rem; left: 50%; transform: translateX(-50%); background: var(--crit); color: #fff; padding: .5rem .9rem; border-radius: 8px; font-size: .85rem; opacity: 0; transition: opacity .2s; pointer-events: none; }
     .toast.show { opacity: 1; }
     .muted { color: var(--muted); }
+
+    /* Upgrade timeline: a contract's on-chain interface over time, newest first.
+       The rail is drawn as a left border so it connects the dots automatically,
+       however tall each entry grows. */
+    .summary { padding: .5rem .7rem; font-size: 12.5px; color: var(--ink-2); border-bottom: 1px solid var(--border); display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; }
+    .timeline { list-style: none; margin: 0; padding: .8rem .7rem .3rem 1.1rem; }
+    .tl-item { position: relative; padding: 0 0 1.15rem 1.15rem; border-left: 2px solid var(--border); }
+    .tl-item:last-child { border-left-color: transparent; padding-bottom: .3rem; }
+    .tl-dot { position: absolute; left: -.47rem; top: .2rem; width: .72rem; height: .72rem; border-radius: 50%;
+              background: var(--muted); border: 2px solid var(--bg); }
+    .tl-dot.crit { background: var(--crit); } .tl-dot.good { background: var(--good); }
+    .tl-head { display: flex; align-items: center; gap: .45rem; flex-wrap: wrap; }
+    .tl-head .ver { font-weight: 600; font-variant-numeric: tabular-nums; }
+    .tl-when { font-size: 12px; color: var(--muted); }
+    .tl-hash { font-family: ui-monospace, monospace; font-size: 11px; color: var(--muted); margin-top: .15rem; }
+    .tl-note { font-size: 12.5px; color: var(--muted); margin-top: .3rem; }
+    .badge { font-size: 10px; font-weight: 700; padding: .08rem .42rem; border-radius: 999px;
+             text-transform: uppercase; letter-spacing: .04em; }
+    .badge.crit { background: var(--crit-soft); color: var(--crit); }
+    .badge.good { background: var(--good-soft); color: var(--good); }
+    .badge.mute { background: var(--surface-2); color: var(--muted); }
+    /* Change lines read like a diff: the sign carries the meaning, so they stay
+       legible if colour is unavailable. */
+    .changes { list-style: none; margin: .45rem 0 0; padding: 0; }
+    .changes li { font-family: ui-monospace, monospace; font-size: 11.5px; line-height: 1.5;
+                  padding: .08rem .4rem; border-radius: 4px; white-space: pre-wrap; word-break: break-word; }
+    .changes li.add { color: var(--good); background: var(--good-soft); }
+    .changes li.rm  { color: var(--crit); background: var(--crit-soft); }
+    .changes li.ch  { color: var(--warn); background: var(--warn-soft); }
+    .changes li.sub { background: none; padding-left: 1.6rem; opacity: .95; }
   </style>
 </head>
 <body>
@@ -153,6 +189,7 @@
         <button data-tab="state" onclick="setTab('state')">State</button>
         <button data-tab="holders" onclick="setTab('holders')">Holders</button>
         <button data-tab="interface" onclick="setTab('interface')">Interface</button>
+        <button data-tab="upgrades" onclick="setTab('upgrades')">Upgrades</button>
       </div>
       <div class="detail-head" id="detailHead">
         <div class="decodebar">
@@ -185,12 +222,20 @@ function seLink(type, val, n = 8) {
 let selected = null;
 let tab = 'events';
 let healthTimer = null;
+// When set, the Interface tab shows this historical version instead of the
+// current one (set by clicking a version in the upgrade timeline).
+let ifaceVersion = null;
 
 function toast(msg) {
   const t = $('toast'); t.textContent = msg; t.classList.add('show');
   setTimeout(() => t.classList.remove('show'), 3200);
 }
 function fmt(n) { return (n === null || n === undefined) ? '—' : Number(n).toLocaleString(); }
+function fmtDate(s) {
+  if (!s) return '—';
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? esc(s) : d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+}
 function esc(s) { return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 function short(s, n = 12) { s = String(s); return s.length > n * 2 ? s.slice(0, n) + '…' + s.slice(-n) : s; }
 function cell(v) {
@@ -260,6 +305,9 @@ async function loadContracts() {
 
 function selectContract(cid) {
   selected = cid;
+  // Version pins are per-contract; carrying one across would show v2 of a
+  // contract the user never asked about.
+  ifaceVersion = null;
   document.querySelectorAll('.clist li').forEach(li => li.classList.remove('active'));
   [...document.querySelectorAll('.clist li')].forEach(li => {
     if (li.querySelector('.cid') && cid.startsWith(li.querySelector('.cid').textContent.split('…')[0])) li.classList.add('active');
@@ -269,6 +317,9 @@ function selectContract(cid) {
 }
 
 function setTab(t) {
+  // Clicking a tab always means "show me the live view", so drop any pinned
+  // historical version; viewVersion() sets it again on its way in.
+  ifaceVersion = null;
   tab = t;
   document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === t));
   loadTab();
@@ -318,15 +369,103 @@ async function loadTab() {
         { label: 'Ledger', key: 'ledger' },
       ]);
     } else if (tab === 'interface') {
-      await renderInterface(cid);
+      await renderInterface(cid, ifaceVersion);
+    } else if (tab === 'upgrades') {
+      await renderUpgrades(cid);
     }
   } catch (e) {
     $('detail').innerHTML = `<div class="empty">${esc(e.message)}</div>`;
   }
 }
 
-async function renderInterface(cid) {
-  const iface = await get(`/contracts/${cid}/interface`);
+// ---- Upgrade timeline -------------------------------------------------------
+// A Soroban contract can be upgraded in place, so its interface is a time
+// series. This renders that history newest-first, with each version's diff
+// against the one before it.
+
+/// One version's diff as +/- lines, grouped by section. Renders from the
+/// structured diff rather than its `summary` strings so a *changed* item can
+/// show its before and after on separate lines.
+function diffLines(diff) {
+  const out = [];
+  for (const [kind, sec] of [['function', diff.functions], ['event', diff.events], ['type', diff.types]]) {
+    if (!sec) continue;
+    for (const sig of sec.removed || []) out.push(`<li class="rm">− removed ${kind} ${esc(sig)}</li>`);
+    for (const it of sec.changed || []) {
+      out.push(`<li class="ch">~ changed ${kind} ${esc(it.name)}</li>`);
+      out.push(`<li class="rm sub">− ${esc(it.from)}</li>`);
+      out.push(`<li class="add sub">+ ${esc(it.to)}</li>`);
+    }
+    for (const sig of sec.added || []) out.push(`<li class="add">+ added ${kind} ${esc(sig)}</li>`);
+  }
+  // An upgrade with no interface changes is a code-only change (e.g. a bug
+  // fix) — worth showing as an upgrade, but there's nothing to react to.
+  return out.length
+    ? `<ul class="changes">${out.join('')}</ul>`
+    : '<div class="tl-note">Interface unchanged — code-only upgrade.</div>';
+}
+
+function versionItem(cid, v) {
+  const isBaseline = v.version === 1;
+  const dot = v.breaking ? 'crit' : isBaseline ? '' : 'good';
+  const badge = v.breaking
+    ? '<span class="badge crit">breaking</span>'
+    : isBaseline
+      ? '<span class="badge mute">baseline</span>'
+      : '<span class="badge good">compatible</span>';
+
+  let body;
+  if (isBaseline) {
+    body = '<div class="tl-note">First interface observed — the baseline this history is measured from, not an upgrade.</div>';
+  } else if (!v.diff) {
+    // version > 1 with no diff: the previous spec section couldn't be re-parsed.
+    body = '<div class="tl-note">Upgraded, but the previous interface could not be re-parsed — no diff available.</div>';
+  } else {
+    body = diffLines(v.diff);
+  }
+
+  const prev = v.previous_wasm_hash ? ` ← ${esc(short(v.previous_wasm_hash, 6))}` : '';
+  return `<li class="tl-item">
+    <span class="tl-dot ${dot}"></span>
+    <div class="tl-head">
+      <span class="ver">v${v.version}</span>
+      ${badge}
+      <span class="tl-when">${fmtDate(v.observed_at)}</span>
+      <a href="#" onclick="viewVersion('${esc(cid)}',${v.version});return false;" title="Show the full interface at this version">interface</a>
+    </div>
+    <div class="tl-hash" title="${esc(v.wasm_hash || '')}">wasm ${esc(short(v.wasm_hash || '—', 6))}${prev}</div>
+    ${body}
+  </li>`;
+}
+
+async function renderUpgrades(cid) {
+  const h = await get(`/contracts/${cid}/interface/history?limit=100`);
+  const vs = h.versions || [];
+  if (!vs.length) { $('detail').innerHTML = '<div class="empty">No interface history for this contract.</div>'; return; }
+
+  const upgrades = vs.filter(v => v.version > 1).length;
+  const breaking = vs.filter(v => v.breaking).length;
+  const summary = upgrades === 0
+    ? '<span>No upgrades observed — this contract\'s interface hasn\'t changed since indexing began.</span>'
+    : `<span><strong>${fmt(upgrades)}</strong> upgrade${upgrades === 1 ? '' : 's'} observed</span>
+       <span class="muted">·</span>
+       <span>${breaking ? `<span class="badge crit">${fmt(breaking)} breaking</span>` : '<span class="badge good">none breaking</span>'}</span>`;
+
+  $('detail').innerHTML =
+    `<div class="summary">${summary}</div>
+     <ol class="timeline">${vs.map(v => versionItem(cid, v)).join('')}</ol>`;
+}
+
+/// Jump to the Interface tab pinned to a historical version.
+function viewVersion(cid, n) {
+  ifaceVersion = n;
+  tab = 'interface';
+  document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === 'interface'));
+  loadTab();
+}
+
+async function renderInterface(cid, version) {
+  const iface = await get(`/contracts/${cid}/interface${version ? `?version=${version}` : ''}`);
   const i = iface.interface || iface;
   const fns = (i.functions || []).map(f => {
     const ins = (f.inputs || []).map(a => `${a.name}: ${typeof a.type === 'object' ? JSON.stringify(a.type) : a.type}`).join(', ');
@@ -334,17 +473,24 @@ async function renderInterface(cid) {
     return `<tr><td><code>${esc(f.name)}</code></td><td><code>${esc(ins)}${esc(out)}</code></td></tr>`;
   }).join('');
   const evs = (i.events || []).map(e => `<tr><td><code>${esc(e.name)}</code></td><td><code>${esc(JSON.stringify(e))}</code></td></tr>`).join('');
+  // When pinned to a historical version, say so loudly — otherwise this reads
+  // as the contract's current interface, which it isn't.
+  const head = version
+    ? `<div class="summary"><span>Interface at <strong>v${version}</strong></span>
+         <span class="muted">·</span><span class="muted">observed ${fmtDate(iface.observed_at)}</span>
+         <span class="muted">·</span><a href="#" onclick="setTab('interface');return false;">show current</a></div>`
+    : `<div class="muted" style="padding:.4rem .6rem">${(i.functions||[]).length} functions · ${(i.events||[]).length} events${iface.fetched_at ? ' · fetched ' + esc(iface.fetched_at) : ''}</div>`;
   $('detail').innerHTML =
-    `<div class="muted" style="padding:.4rem .6rem">${(i.functions||[]).length} functions · ${(i.events||[]).length} events${iface.fetched_at ? ' · fetched ' + esc(iface.fetched_at) : ''}</div>` +
-    (fns ? `<table><thead><tr><th>Function</th><th>Signature</th></tr></thead><tbody>${fns}</tbody></table>` : '') +
-    (evs ? `<div style="height:.6rem"></div><table><thead><tr><th>Event</th><th>Schema</th></tr></thead><tbody>${evs}</tbody></table>` : '') ||
+    (head +
+     (fns ? `<table><thead><tr><th>Function</th><th>Signature</th></tr></thead><tbody>${fns}</tbody></table>` : '') +
+     (evs ? `<div style="height:.6rem"></div><table><thead><tr><th>Event</th><th>Schema</th></tr></thead><tbody>${evs}</tbody></table>` : '')) ||
     '<div class="empty">No interface indexed (Stellar Asset Contracts have none).</div>';
 }
 
 async function decodeAny() {
   const cid = $('anyCid').value.trim();
   if (!cid) return;
-  selected = cid; tab = 'interface';
+  selected = cid; tab = 'interface'; ifaceVersion = null;
   document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === 'interface'));
   $('detailTitle').innerHTML = `Contract <a class="ext" href="${seUrl('contract', cid)}" target="_blank" rel="noopener"><code>${esc(cid)}</code> ↗</a>`;
   $('detail').innerHTML = '<div class="empty">Decoding…</div>';
