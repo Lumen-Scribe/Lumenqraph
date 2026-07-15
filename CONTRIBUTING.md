@@ -17,7 +17,27 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-CI runs the same against a Postgres service.
+### Postgres-backed tests
+
+`cargo test --workspace` skips anything marked `#[ignore]`, which is every test
+that needs a real database (retention pruning, contract-spec versioning, webhook
+enqueue). To run those, point `TEST_DATABASE_URL` at a database you don't mind
+losing — each test resets the schema to isolate itself:
+
+```bash
+docker run -d --rm --name lq-test-pg \
+  -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=lumenqraph -p 55433:5432 postgres:16-alpine
+
+export TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/lumenqraph
+cargo test -p lumenqraph-indexer  -- --ignored --test-threads=1
+cargo test -p lumenqraph-webhooks -- --ignored --test-threads=1
+```
+
+`--test-threads=1` is required, not a preference: each test runs
+`DROP SCHEMA public CASCADE` to start clean, so two running at once will drop
+the tables out from under each other.
+
+CI runs all of the above against a Postgres service.
 
 ## Conventions
 

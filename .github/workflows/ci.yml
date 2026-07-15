@@ -25,6 +25,9 @@ jobs:
           --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       DATABASE_URL: postgres://lumenqraph:lumenqraph@localhost:5432/lumenqraph
+      # Read by the #[ignore]-marked tests to reach the service container; they
+      # are run explicitly in the `--ignored` step below.
+      TEST_DATABASE_URL: postgres://lumenqraph:lumenqraph@localhost:5432/lumenqraph
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -37,5 +40,17 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      # The tests above skip anything marked #[ignore], which is every test that
+      # needs a real database — retention pruning, contract-spec versioning, and
+      # webhook enqueue all live there. Run them explicitly against the service
+      # container above.
+      #
+      # --test-threads=1 is required, not a preference: each test resets the
+      # schema (DROP SCHEMA public CASCADE) to isolate itself, so running two at
+      # once drops the tables out from under the other.
+      - name: Test (Postgres-backed)
+        run: |
+          cargo test -p lumenqraph-indexer -- --ignored --test-threads=1
+          cargo test -p lumenqraph-webhooks -- --ignored --test-threads=1
       - name: Build (release)
         run: cargo build --workspace --release
