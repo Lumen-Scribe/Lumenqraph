@@ -38,6 +38,99 @@ Materialized SEP-41 transfers. Query: `limit`, `offset`, `from`, `to`.
    "ledger": 3550885, "event_id": "..." }]
 ```
 
+### `GET /contracts/:id/state`
+Versioned snapshots of the contract's **instance storage** (admin, config,
+counters…), newest first. Query: `limit` (1–200, default 1 = current state).
+Requires the indexer's `STATE_INDEXING`; `404` if there are no snapshots.
+```json
+{ "contract_id": "CB...", "count": 1, "versions": [
+  { "ledger": 3550880, "storage": { "TotalSupply": "1000", "IsPaused": false },
+    "captured_at": "2026-07-15T..." }] }
+```
+
+### `GET /contracts/:id/data`
+The current value of every **per-key** entry snapshotted for this contract —
+e.g. each tracked holder's `Balance(Address)`. One row per key (its latest
+snapshot). Query: `label` (e.g. `balance`), `limit` (1–1000, default 100).
+Requires the indexer's `KEY_INDEXING`.
+```json
+{ "contract_id": "CB...", "count": 2, "keys": [
+  { "key_hash": "9f2c…", "key": ["Balance", "G..."], "durability": "persistent",
+    "ledger": 3550881, "value": "500", "label": "balance",
+    "captured_at": "2026-07-15T..." }] }
+```
+
+### `GET /contracts/:id/data/:key_hash`
+The version history of a single per-key entry (one holder's balance over time),
+newest first. Query: `limit` (1–500).
+
+## Read layer (authenticated)
+
+Invoke contracts through RPC simulation. Arguments are type-checked against the
+contract's on-chain spec *before* the network call, so mistakes come back as a
+`400` with a precise message rather than an opaque simulation failure. Nothing
+is ever signed or submitted.
+
+### `GET /contracts/:id/functions`
+The contract's callable functions with typed inputs/outputs.
+```json
+{ "contract_id": "CB...", "functions": [
+  { "name": "balance", "inputs": [{ "name": "id", "type": "Address" }],
+    "outputs": ["i128"] }] }
+```
+
+### `POST /contracts/:id/call`
+Invoke a **view** function read-only and return a typed result.
+Body: `{ "function": "balance", "args": { "id": "G..." }, "source_account": null }`
+— `args` takes an object keyed by parameter name, or a positional array.
+```json
+{ "contract_id": "CB...", "function": "balance",
+  "result": "500", "simulated_at_ledger": 3550886 }
+```
+
+### `POST /contracts/:id/simulate`
+Dry-run **any** call, including state-changing ones, and get the typed result,
+the events it would emit (decoded + enriched), and its estimated resource fee.
+Same body as `/call`.
+```json
+{ "contract_id": "CB...", "function": "transfer", "result": null,
+  "events": [
+    { "contract_id": "CB...", "type": "contract", "event": "transfer",
+      "topics": ["transfer", "G...", "G..."], "data": "500",
+      "enriched": { "event": "transfer", "params": { "amount": { "type": "i128", "value": "500" } } } }],
+  "min_resource_fee": "34561", "simulated_at_ledger": 3550886 }
+```
+`fn_call`/`fn_return` diagnostic noise is dropped; `enriched` is non-null only
+for events emitted by the contract being simulated, since that's the only spec
+in hand.
+
+Errors are client-facing: a wrong-typed argument gives
+`400 {"error": "argument \"id\": invalid address strkey"}`, an unknown function
+`400 {"error": "contract has no function named \"nope\""}`, and a contract whose
+interface isn't indexed (or a Stellar Asset Contract, which has no spec) gives
+`404`. A contract trap is the caller's mistake, not a server fault, so it comes
+back as `400 {"error": "simulation failed: ..."}`.
+
+## GraphQL
+
+### `POST /graphql`
+Executes queries; `GET /graphql` serves the GraphiQL IDE in a browser. Behind
+the same auth and rate limiting as the REST data routes.
+
+REST stays the primary, zero-dependency interface; GraphQL is for clients that
+want to select fields and page with cursors. High-volume lists (`events`,
+`transfers`) are Relay-style cursor connections; naturally bounded ones
+(`contracts`, `contractState`, `contractData`) are plain lists.
+
+```graphql
+query {
+  events(contractId: "CB...", first: 20) {
+    edges { cursor node { ledger eventName enriched } }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+```
+
 ## Contract interface & upgrades
 
 A Soroban contract can be upgraded in place, so its interface is a time series.
