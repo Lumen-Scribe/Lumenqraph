@@ -16,12 +16,12 @@ use std::str::FromStr;
 
 use serde_json::Value;
 use stellar_xdr::curr::{
-    ContractEventBody, ContractEventType, DiagnosticEvent, HostFunction, Int128Parts,
+    ContractEventBody, ContractEventType, DiagnosticEvent, HostFunction, Int128Parts, Int256Parts,
     InvokeContractArgs, InvokeHostFunctionOp, Limited, Limits, Memo, MuxedAccount, Operation,
     OperationBody, Preconditions, PublicKey, ReadXdr, ScAddress, ScBytes, ScMap, ScMapEntry,
     ScSpecEntry, ScSpecFunctionV0, ScSpecTypeDef, ScString, ScSymbol, ScVal, ScVec, SequenceNumber,
-    Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope, UInt128Parts, Uint256,
-    VecM, WriteXdr,
+    Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope, UInt128Parts,
+    UInt256Parts, Uint256, VecM, WriteXdr,
 };
 
 use crate::spec::type_name;
@@ -68,7 +68,10 @@ pub fn encode_call(
     args: &Value,
     source_account: Option<&str>,
 ) -> Result<EncodedCall, EncodeError> {
-    let func = find_function(spec_section, function)
+    // Parsed once and threaded through encoding: a `Udt` type is just a *name*,
+    // so resolving it to its struct/union/enum definition needs the whole spec.
+    let entries = parse_entries(spec_section);
+    let func = find_function(&entries, function)
         .ok_or_else(|| EncodeError::FunctionNotFound(function.to_string()))?;
 
     let mut scvals: Vec<ScVal> = Vec::with_capacity(func.inputs.len());
@@ -80,7 +83,7 @@ pub fn encode_call(
             _ => None,
         }
         .ok_or_else(|| EncodeError::MissingArgument(name.clone()))?;
-        scvals.push(json_to_scval(jv, &input.type_, &name)?);
+        scvals.push(json_to_scval(jv, &input.type_, &name, &entries)?);
     }
 
     let output_type = func
@@ -123,17 +126,23 @@ fn parse_entries(spec_section: &[u8]) -> Vec<ScSpecEntry> {
         .collect()
 }
 
-fn find_function(spec_section: &[u8], function: &str) -> Option<ScSpecFunctionV0> {
-    parse_entries(spec_section)
-        .into_iter()
-        .find_map(|e| match e {
-            ScSpecEntry::FunctionV0(f) if f.name.to_utf8_string_lossy() == function => Some(f),
-            _ => None,
-        })
+fn find_function(entries: &[ScSpecEntry], function: &str) -> Option<ScSpecFunctionV0> {
+    entries.iter().find_map(|e| match e {
+        ScSpecEntry::FunctionV0(f) if f.name.to_utf8_string_lossy() == function => Some(f.clone()),
+        _ => None,
+    })
 }
 
 /// Convert one JSON argument into an `ScVal` according to its declared type.
-fn json_to_scval(v: &Value, ty: &ScSpecTypeDef, name: &str) -> Result<ScVal, EncodeError> {
+///
+/// `entries` is the contract's full spec, needed to resolve `Udt` types (which
+/// carry only a name) to their struct/union/enum definitions.
+fn json_to_scval(
+    v: &Value,
+    ty: &ScSpecTypeDef,
+    name: &str,
+    entries: &[ScSpecEntry],
+) -> Result<ScVal, EncodeError> {
     use ScSpecTypeDef as T;
     let bad = |msg: &str| EncodeError::BadArgument {
         name: name.to_string(),
@@ -185,14 +194,14 @@ fn json_to_scval(v: &Value, ty: &ScSpecTypeDef, name: &str) -> Result<ScVal, Enc
             if v.is_null() {
                 ScVal::Void
             } else {
-                json_to_scval(v, &inner.value_type, name)?
+                json_to_scval(v, &inner.value_type, name, entries)?
             }
         }
         T::Vec(inner) => {
             let arr = v.as_array().ok_or_else(|| bad("expected an array"))?;
             let items: Result<Vec<ScVal>, _> = arr
                 .iter()
-                .map(|el| json_to_scval(el, &inner.element_type, name))
+                .map(|el| json_to_scval(el, &inner.element_type, name, entries))
                 .collect();
             ScVal::Vec(Some(ScVec(vecm(items?, name)?)))
         }
@@ -207,34 +216,301 @@ fn json_to_scval(v: &Value, ty: &ScSpecTypeDef, name: &str) -> Result<ScVal, Enc
             let items: Result<Vec<ScVal>, _> = arr
                 .iter()
                 .zip(t.value_types.iter())
-                .map(|(el, et)| json_to_scval(el, et, name))
+                .map(|(el, et)| json_to_scval(el, et, name, entries))
                 .collect();
             ScVal::Vec(Some(ScVec(vecm(items?, name)?)))
         }
         T::Map(m) => {
             // Only symbol/string-keyed maps map cleanly from a JSON object.
+            // serde_json orders object keys, which is also what ScMap requires.
             let obj = v.as_object().ok_or_else(|| bad("expected an object"))?;
-            let mut entries = Vec::with_capacity(obj.len());
+            let mut items = Vec::with_capacity(obj.len());
             for (k, val) in obj {
-                let key = json_to_scval(&Value::String(k.clone()), &m.key_type, name)?;
-                let val = json_to_scval(val, &m.value_type, name)?;
-                entries.push(ScMapEntry { key, val });
+                let key = json_to_scval(&Value::String(k.clone()), &m.key_type, name, entries)?;
+                let val = json_to_scval(val, &m.value_type, name, entries)?;
+                items.push(ScMapEntry { key, val });
             }
-            ScVal::Map(Some(ScMap(vecm(entries, name)?)))
+            ScVal::Map(Some(ScMap(vecm(items, name)?)))
         }
-        // Big integers and user-defined types need more context than the first
-        // cut of the read layer carries; surfaced as a clear client error.
-        T::U256
-        | T::I256
-        | T::Udt(_)
-        | T::Val
-        | T::Result(_)
-        | T::Error
-        | T::Void
-        | T::MuxedAddress => {
+        T::U256 => ScVal::U256(u256_parts(parse_u256(v, name)?)),
+        T::I256 => ScVal::I256(i256_parts(parse_i256(v, name)?)),
+        T::Void => {
+            if !v.is_null() {
+                return Err(bad("expected null"));
+            }
+            ScVal::Void
+        }
+        T::Udt(u) => udt_to_scval(v, &u.name.to_utf8_string_lossy(), name, entries)?,
+        // `Val` is untyped by definition, and Result/Error/MuxedAddress aren't
+        // things a view function takes as input in practice. Left as a clear
+        // client error rather than a guess.
+        T::Val | T::Result(_) | T::Error | T::MuxedAddress => {
             return Err(unsupported());
         }
     })
+}
+
+/// Encode a JSON value as a user-defined type, resolved by name from the spec.
+///
+/// The three UDT shapes have distinct on-chain encodings, mirroring how
+/// `soroban-sdk` derives them:
+///   - struct with named fields -> `ScMap` keyed by field-name symbols
+///   - struct with numeric field names (a tuple struct) -> `ScVec` of values
+///   - unit enum -> `ScVal::U32` of the case's declared value
+///   - union -> `ScVec` of `[Symbol(case), ..values]`
+fn udt_to_scval(
+    v: &Value,
+    udt_name: &str,
+    arg: &str,
+    entries: &[ScSpecEntry],
+) -> Result<ScVal, EncodeError> {
+    let bad = |msg: String| EncodeError::BadArgument {
+        name: arg.to_string(),
+        msg,
+    };
+
+    for entry in entries {
+        match entry {
+            ScSpecEntry::UdtStructV0(s) if s.name.to_utf8_string_lossy() == udt_name => {
+                return struct_to_scval(v, s, arg, entries);
+            }
+            ScSpecEntry::UdtEnumV0(e) if e.name.to_utf8_string_lossy() == udt_name => {
+                return enum_to_scval(v, e, arg);
+            }
+            ScSpecEntry::UdtUnionV0(u) if u.name.to_utf8_string_lossy() == udt_name => {
+                return union_to_scval(v, u, arg, entries);
+            }
+            _ => {}
+        }
+    }
+    // The spec referenced a type it doesn't define — a malformed/truncated spec
+    // section rather than a caller mistake, but there's nothing to encode against.
+    Err(bad(format!(
+        "contract spec references unknown type {udt_name:?}"
+    )))
+}
+
+fn struct_to_scval(
+    v: &Value,
+    s: &stellar_xdr::curr::ScSpecUdtStructV0,
+    arg: &str,
+    entries: &[ScSpecEntry],
+) -> Result<ScVal, EncodeError> {
+    let bad = |msg: String| EncodeError::BadArgument {
+        name: arg.to_string(),
+        msg,
+    };
+    let field_names: Vec<String> = s
+        .fields
+        .iter()
+        .map(|f| f.name.to_utf8_string_lossy())
+        .collect();
+
+    // soroban-sdk names tuple-struct fields "0", "1", … and encodes them
+    // positionally; a struct with real field names becomes a map.
+    let is_tuple = !field_names.is_empty()
+        && field_names
+            .iter()
+            .all(|n| n.chars().all(|c| c.is_ascii_digit()));
+
+    if is_tuple {
+        let arr = v
+            .as_array()
+            .ok_or_else(|| bad(format!("expected an array for tuple struct {:?}", s.name)))?;
+        if arr.len() != s.fields.len() {
+            return Err(bad(format!(
+                "expected {} elements for tuple struct {:?}, got {}",
+                s.fields.len(),
+                s.name,
+                arr.len()
+            )));
+        }
+        let items: Result<Vec<ScVal>, _> = arr
+            .iter()
+            .zip(s.fields.iter())
+            .map(|(el, f)| json_to_scval(el, &f.type_, arg, entries))
+            .collect();
+        return Ok(ScVal::Vec(Some(ScVec(vecm(items?, arg)?))));
+    }
+
+    let obj = v
+        .as_object()
+        .ok_or_else(|| bad(format!("expected an object for struct {:?}", s.name)))?;
+    let mut items = Vec::with_capacity(s.fields.len());
+    for f in s.fields.iter() {
+        let fname = f.name.to_utf8_string_lossy();
+        let fv = obj
+            .get(&fname)
+            .ok_or_else(|| bad(format!("missing field {fname:?} of struct {:?}", s.name)))?;
+        items.push(ScMapEntry {
+            key: ScVal::Symbol(ScSymbol(
+                fname
+                    .clone()
+                    .try_into()
+                    .map_err(|_| bad(format!("field name {fname:?} is not a valid symbol")))?,
+            )),
+            val: json_to_scval(fv, &f.type_, arg, entries)?,
+        });
+    }
+    // ScMap must be key-sorted; spec field order is declaration order.
+    items.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(ScVal::Map(Some(ScMap(vecm(items, arg)?))))
+}
+
+fn enum_to_scval(
+    v: &Value,
+    e: &stellar_xdr::curr::ScSpecUdtEnumV0,
+    arg: &str,
+) -> Result<ScVal, EncodeError> {
+    let bad = |msg: String| EncodeError::BadArgument {
+        name: arg.to_string(),
+        msg,
+    };
+    let names = || {
+        e.cases
+            .iter()
+            .map(|c| c.name.to_utf8_string_lossy())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    // Accept the case name (friendly) or its raw discriminant (what you'd see
+    // in decoded output), but validate either against the spec.
+    if let Some(s) = v.as_str() {
+        let case = e
+            .cases
+            .iter()
+            .find(|c| c.name.to_utf8_string_lossy() == s)
+            .ok_or_else(|| {
+                bad(format!(
+                    "unknown case {s:?} for enum {:?}; expected one of: {}",
+                    e.name,
+                    names()
+                ))
+            })?;
+        return Ok(ScVal::U32(case.value));
+    }
+    if let Some(n) = v.as_u64() {
+        let value = u32::try_from(n)
+            .map_err(|_| bad(format!("{n} is out of range for enum {:?}", e.name)))?;
+        if !e.cases.iter().any(|c| c.value == value) {
+            return Err(bad(format!(
+                "{value} is not a declared value of enum {:?}; expected one of: {}",
+                e.name,
+                names()
+            )));
+        }
+        return Ok(ScVal::U32(value));
+    }
+    Err(bad(format!(
+        "expected a case name or value for enum {:?}; expected one of: {}",
+        e.name,
+        names()
+    )))
+}
+
+fn union_to_scval(
+    v: &Value,
+    u: &stellar_xdr::curr::ScSpecUdtUnionV0,
+    arg: &str,
+    entries: &[ScSpecEntry],
+) -> Result<ScVal, EncodeError> {
+    use stellar_xdr::curr::ScSpecUdtUnionCaseV0 as Case;
+    let bad = |msg: String| EncodeError::BadArgument {
+        name: arg.to_string(),
+        msg,
+    };
+    let case_name = |c: &Case| match c {
+        Case::VoidV0(x) => x.name.to_utf8_string_lossy(),
+        Case::TupleV0(x) => x.name.to_utf8_string_lossy(),
+    };
+    let names = || u.cases.iter().map(case_name).collect::<Vec<_>>().join(", ");
+    let find = |want: &str| u.cases.iter().find(|c| case_name(c) == want).cloned();
+    let symbol = |s: &str| -> Result<ScVal, EncodeError> {
+        Ok(ScVal::Symbol(ScSymbol(s.to_string().try_into().map_err(
+            |_| bad(format!("case name {s:?} is not a valid symbol")),
+        )?)))
+    };
+
+    // A bare string selects a void case: "Active".
+    if let Some(s) = v.as_str() {
+        return match find(s) {
+            Some(Case::VoidV0(_)) => Ok(ScVal::Vec(Some(ScVec(vecm(vec![symbol(s)?], arg)?)))),
+            Some(Case::TupleV0(t)) => Err(bad(format!(
+                "case {s:?} of union {:?} carries {} value(s); pass {{\"{s}\": [..]}}",
+                u.name,
+                t.type_.len()
+            ))),
+            None => Err(bad(format!(
+                "unknown case {s:?} for union {:?}; expected one of: {}",
+                u.name,
+                names()
+            ))),
+        };
+    }
+
+    // Otherwise a single-key object selects a tuple case: {"Bid": [addr, 100]}.
+    let obj = v.as_object().ok_or_else(|| {
+        bad(format!(
+            "expected a case name or {{case: value}} for union {:?}; expected one of: {}",
+            u.name,
+            names()
+        ))
+    })?;
+    if obj.len() != 1 {
+        return Err(bad(format!(
+            "expected exactly one case for union {:?}, got {} keys",
+            u.name,
+            obj.len()
+        )));
+    }
+    let (key, val) = obj.iter().next().expect("len checked above");
+    match find(key) {
+        Some(Case::VoidV0(_)) => {
+            if !val.is_null() {
+                return Err(bad(format!(
+                    "case {key:?} of union {:?} carries no value",
+                    u.name
+                )));
+            }
+            Ok(ScVal::Vec(Some(ScVec(vecm(vec![symbol(key)?], arg)?))))
+        }
+        Some(Case::TupleV0(t)) => {
+            // One-value cases may be written unwrapped: {"Bid": 100}.
+            let owned;
+            let vals: &[Value] = match val.as_array() {
+                Some(a) => a,
+                None if t.type_.len() == 1 => {
+                    owned = [val.clone()];
+                    &owned
+                }
+                None => {
+                    return Err(bad(format!(
+                        "expected an array of {} values for case {key:?}",
+                        t.type_.len()
+                    )))
+                }
+            };
+            if vals.len() != t.type_.len() {
+                return Err(bad(format!(
+                    "case {key:?} of union {:?} expects {} value(s), got {}",
+                    u.name,
+                    t.type_.len(),
+                    vals.len()
+                )));
+            }
+            let mut items = vec![symbol(key)?];
+            for (el, et) in vals.iter().zip(t.type_.iter()) {
+                items.push(json_to_scval(el, et, arg, entries)?);
+            }
+            Ok(ScVal::Vec(Some(ScVec(vecm(items, arg)?))))
+        }
+        None => Err(bad(format!(
+            "unknown case {key:?} for union {:?}; expected one of: {}",
+            u.name,
+            names()
+        ))),
+    }
 }
 
 fn build_read_tx(
@@ -406,6 +682,122 @@ fn u128_parts(n: u128) -> UInt128Parts {
     }
 }
 
+// ---- 256-bit integers -------------------------------------------------------
+//
+// Rust has no u256/i256 and the crate carries no bignum dependency, so these
+// work on four big-endian 64-bit limbs (index 0 = most significant), which is
+// also exactly the shape `UInt256Parts`/`Int256Parts` want.
+
+type Limbs = [u64; 4];
+
+/// `limbs * 10 + digit`, or `None` on overflow past 256 bits.
+fn mul10_add(limbs: Limbs, digit: u8) -> Option<Limbs> {
+    let mut out = limbs;
+    let mut carry = digit as u128;
+    for i in (0..4).rev() {
+        let acc = out[i] as u128 * 10 + carry;
+        out[i] = acc as u64;
+        carry = acc >> 64;
+    }
+    (carry == 0).then_some(out)
+}
+
+/// Two's-complement negation, for reading a negative i256 as a bit pattern.
+fn negate(limbs: Limbs) -> Limbs {
+    let mut out = limbs.map(|x| !x);
+    let mut carry = 1u128;
+    for i in (0..4).rev() {
+        let acc = out[i] as u128 + carry;
+        out[i] = acc as u64;
+        carry = acc >> 64;
+        if carry == 0 {
+            break;
+        }
+    }
+    out
+}
+
+/// Parse a decimal magnitude (no sign) into limbs.
+fn parse_digits(s: &str, name: &str) -> Result<Limbs, EncodeError> {
+    let bad = |msg: &str| EncodeError::BadArgument {
+        name: name.to_string(),
+        msg: msg.to_string(),
+    };
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad("expected a decimal integer"));
+    }
+    let mut limbs: Limbs = [0; 4];
+    for b in s.bytes() {
+        limbs =
+            mul10_add(limbs, b - b'0').ok_or_else(|| bad("integer out of range for 256 bits"))?;
+    }
+    Ok(limbs)
+}
+
+/// A 256-bit value is beyond f64, so accept it as a decimal string; JSON numbers
+/// are still allowed for the small values that survive the round-trip intact.
+fn text_of_int(v: &Value, name: &str) -> Result<String, EncodeError> {
+    match v {
+        Value::String(s) => Ok(s.trim().to_string()),
+        Value::Number(n) if n.is_i64() || n.is_u64() => Ok(n.to_string()),
+        _ => Err(EncodeError::BadArgument {
+            name: name.to_string(),
+            msg: "expected a 256-bit integer as a decimal string".to_string(),
+        }),
+    }
+}
+
+fn parse_u256(v: &Value, name: &str) -> Result<Limbs, EncodeError> {
+    let s = text_of_int(v, name)?;
+    if s.starts_with('-') {
+        return Err(EncodeError::BadArgument {
+            name: name.to_string(),
+            msg: "expected an unsigned integer".to_string(),
+        });
+    }
+    parse_digits(s.strip_prefix('+').unwrap_or(&s), name)
+}
+
+fn parse_i256(v: &Value, name: &str) -> Result<Limbs, EncodeError> {
+    let s = text_of_int(v, name)?;
+    let bad = |msg: &str| EncodeError::BadArgument {
+        name: name.to_string(),
+        msg: msg.to_string(),
+    };
+    let negative = s.starts_with('-');
+    let digits = s.strip_prefix(['-', '+']).unwrap_or(&s);
+    let limbs = parse_digits(digits, name)?;
+
+    // Signed range is [-2^255, 2^255-1]: the magnitude may reach 2^255 only when
+    // negative, and that one value is its own negation.
+    let top = limbs[0] & (1 << 63) != 0;
+    let is_min = top && limbs[1..] == [0, 0, 0] && limbs[0] == 1 << 63;
+    match (negative, top, is_min) {
+        (false, true, _) => Err(bad("integer out of range for i256")),
+        (true, true, false) => Err(bad("integer out of range for i256")),
+        (true, _, _) => Ok(negate(limbs)),
+        _ => Ok(limbs),
+    }
+}
+
+fn u256_parts(l: Limbs) -> UInt256Parts {
+    UInt256Parts {
+        hi_hi: l[0],
+        hi_lo: l[1],
+        lo_hi: l[2],
+        lo_lo: l[3],
+    }
+}
+
+fn i256_parts(l: Limbs) -> Int256Parts {
+    Int256Parts {
+        hi_hi: l[0] as i64,
+        hi_lo: l[1],
+        lo_hi: l[2],
+        lo_lo: l[3],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,5 +938,337 @@ mod tests {
         assert_eq!(decoded[0]["event"], "transfer");
         assert_eq!(decoded[0]["data"], "42");
         assert!(decoded[0]["contract_id"].as_str().unwrap().starts_with('C'));
+    }
+
+    // ---- user-defined types & 256-bit integers ------------------------------
+
+    mod udt {
+        use super::*;
+        use serde_json::json;
+        use stellar_xdr::curr::{
+            ScSpecTypeUdt, ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0, ScSpecUdtStructFieldV0,
+            ScSpecUdtStructV0, ScSpecUdtUnionCaseTupleV0, ScSpecUdtUnionCaseV0,
+            ScSpecUdtUnionCaseVoidV0, ScSpecUdtUnionV0,
+        };
+
+        fn udt(name: &str) -> ScSpecTypeDef {
+            ScSpecTypeDef::Udt(ScSpecTypeUdt {
+                name: name.try_into().unwrap(),
+            })
+        }
+
+        fn field(name: &str, type_: ScSpecTypeDef) -> ScSpecUdtStructFieldV0 {
+            ScSpecUdtStructFieldV0 {
+                doc: "".try_into().unwrap(),
+                name: name.try_into().unwrap(),
+                type_,
+            }
+        }
+
+        fn func(name: &str, inputs: Vec<(&str, ScSpecTypeDef)>) -> ScSpecEntry {
+            ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
+                doc: "".try_into().unwrap(),
+                name: ScSymbol(name.try_into().unwrap()),
+                inputs: inputs
+                    .into_iter()
+                    .map(|(n, type_)| ScSpecFunctionInputV0 {
+                        doc: "".try_into().unwrap(),
+                        name: n.try_into().unwrap(),
+                        type_,
+                    })
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap(),
+                outputs: vec![ScSpecTypeDef::Bool].try_into().unwrap(),
+            })
+        }
+
+        /// A spec exercising every UDT shape:
+        ///   struct Order { amount: i128, buyer: Address }   (named -> map)
+        ///   struct Pair(u32, u32)                           (tuple -> vec)
+        ///   enum Status { Active = 0, Filled = 7 }
+        ///   union Action { Cancel, Bid(Address, i128) }
+        fn spec() -> Vec<u8> {
+            let entries = vec![
+                ScSpecEntry::UdtStructV0(ScSpecUdtStructV0 {
+                    doc: "".try_into().unwrap(),
+                    lib: "".try_into().unwrap(),
+                    name: "Order".try_into().unwrap(),
+                    // Declared amount-then-buyer; the encoder must sort the map.
+                    fields: vec![
+                        field("amount", ScSpecTypeDef::I128),
+                        field("buyer", ScSpecTypeDef::Address),
+                    ]
+                    .try_into()
+                    .unwrap(),
+                }),
+                ScSpecEntry::UdtStructV0(ScSpecUdtStructV0 {
+                    doc: "".try_into().unwrap(),
+                    lib: "".try_into().unwrap(),
+                    name: "Pair".try_into().unwrap(),
+                    fields: vec![
+                        field("0", ScSpecTypeDef::U32),
+                        field("1", ScSpecTypeDef::U32),
+                    ]
+                    .try_into()
+                    .unwrap(),
+                }),
+                ScSpecEntry::UdtEnumV0(ScSpecUdtEnumV0 {
+                    doc: "".try_into().unwrap(),
+                    lib: "".try_into().unwrap(),
+                    name: "Status".try_into().unwrap(),
+                    cases: vec![
+                        ScSpecUdtEnumCaseV0 {
+                            doc: "".try_into().unwrap(),
+                            name: "Active".try_into().unwrap(),
+                            value: 0,
+                        },
+                        ScSpecUdtEnumCaseV0 {
+                            doc: "".try_into().unwrap(),
+                            name: "Filled".try_into().unwrap(),
+                            value: 7,
+                        },
+                    ]
+                    .try_into()
+                    .unwrap(),
+                }),
+                ScSpecEntry::UdtUnionV0(ScSpecUdtUnionV0 {
+                    doc: "".try_into().unwrap(),
+                    lib: "".try_into().unwrap(),
+                    name: "Action".try_into().unwrap(),
+                    cases: vec![
+                        ScSpecUdtUnionCaseV0::VoidV0(ScSpecUdtUnionCaseVoidV0 {
+                            doc: "".try_into().unwrap(),
+                            name: "Cancel".try_into().unwrap(),
+                        }),
+                        ScSpecUdtUnionCaseV0::TupleV0(ScSpecUdtUnionCaseTupleV0 {
+                            doc: "".try_into().unwrap(),
+                            name: "Bid".try_into().unwrap(),
+                            type_: vec![ScSpecTypeDef::Address, ScSpecTypeDef::I128]
+                                .try_into()
+                                .unwrap(),
+                        }),
+                    ]
+                    .try_into()
+                    .unwrap(),
+                }),
+                func("submit", vec![("order", udt("Order"))]),
+                func("pair", vec![("p", udt("Pair"))]),
+                func("set_status", vec![("s", udt("Status"))]),
+                func("act", vec![("a", udt("Action"))]),
+                func(
+                    "big",
+                    vec![("u", ScSpecTypeDef::U256), ("i", ScSpecTypeDef::I256)],
+                ),
+            ];
+            entries
+                .iter()
+                .flat_map(|e| e.to_xdr(Limits::none()).unwrap())
+                .collect()
+        }
+
+        /// Encode a call and pull out the ScVal arguments we built.
+        fn args_of(function: &str, args: Value) -> Result<Vec<ScVal>, EncodeError> {
+            let call = encode_call(&spec(), C, function, &args, None)?;
+            let env = TransactionEnvelope::from_xdr_base64(&call.tx_xdr, Limits::none()).unwrap();
+            let TransactionEnvelope::Tx(v1) = env else {
+                panic!("expected v1 envelope")
+            };
+            let OperationBody::InvokeHostFunction(op) = &v1.tx.operations[0].body else {
+                panic!("expected invoke host function")
+            };
+            let HostFunction::InvokeContract(ic) = &op.host_function else {
+                panic!("expected invoke contract")
+            };
+            Ok(ic.args.to_vec())
+        }
+
+        #[test]
+        fn named_struct_becomes_a_key_sorted_map() {
+            let args = args_of("submit", json!({"order": {"buyer": G, "amount": "500"}}))
+                .expect("should encode");
+            let ScVal::Map(Some(m)) = &args[0] else {
+                panic!("expected a map, got {:?}", args[0])
+            };
+            // Sorted by symbol key: "amount" < "buyer", regardless of the order
+            // the fields were declared or supplied in.
+            let keys: Vec<String> = m
+                .iter()
+                .map(|e| match &e.key {
+                    ScVal::Symbol(s) => s.to_utf8_string_lossy(),
+                    other => panic!("expected symbol key, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(keys, vec!["amount", "buyer"]);
+            assert!(matches!(m[0].val, ScVal::I128(_)));
+            assert!(matches!(m[1].val, ScVal::Address(_)));
+        }
+
+        #[test]
+        fn tuple_struct_becomes_a_positional_vec() {
+            let args = args_of("pair", json!({"p": [1, 2]})).expect("should encode");
+            let ScVal::Vec(Some(v)) = &args[0] else {
+                panic!("expected a vec, got {:?}", args[0])
+            };
+            assert_eq!(v.to_vec(), vec![ScVal::U32(1), ScVal::U32(2)]);
+        }
+
+        #[test]
+        fn struct_rejects_a_missing_field() {
+            let err = args_of("submit", json!({"order": {"amount": "500"}})).unwrap_err();
+            assert!(
+                format!("{err}").contains("missing field \"buyer\""),
+                "unhelpful error: {err}"
+            );
+        }
+
+        #[test]
+        fn enum_accepts_case_name_or_declared_value() {
+            let by_name = args_of("set_status", json!({"s": "Filled"})).expect("by name");
+            assert_eq!(by_name[0], ScVal::U32(7));
+            let by_value = args_of("set_status", json!({"s": 7})).expect("by value");
+            assert_eq!(by_value[0], ScVal::U32(7));
+        }
+
+        #[test]
+        fn enum_rejects_undeclared_case_and_value() {
+            let err = args_of("set_status", json!({"s": "Nope"})).unwrap_err();
+            assert!(format!("{err}").contains("Active, Filled"), "got: {err}");
+            // 3 is not a declared discriminant, even though it's a valid u32.
+            let err = args_of("set_status", json!({"s": 3})).unwrap_err();
+            assert!(
+                format!("{err}").contains("not a declared value"),
+                "got: {err}"
+            );
+        }
+
+        #[test]
+        fn union_void_case_is_a_bare_name() {
+            let args = args_of("act", json!({"a": "Cancel"})).expect("should encode");
+            let ScVal::Vec(Some(v)) = &args[0] else {
+                panic!("expected a vec, got {:?}", args[0])
+            };
+            assert_eq!(v.len(), 1);
+            assert!(matches!(&v[0], ScVal::Symbol(s) if s.to_utf8_string_lossy() == "Cancel"));
+        }
+
+        #[test]
+        fn union_tuple_case_carries_its_values() {
+            let args = args_of("act", json!({"a": {"Bid": [G, "250"]}})).expect("should encode");
+            let ScVal::Vec(Some(v)) = &args[0] else {
+                panic!("expected a vec, got {:?}", args[0])
+            };
+            assert_eq!(v.len(), 3);
+            assert!(matches!(&v[0], ScVal::Symbol(s) if s.to_utf8_string_lossy() == "Bid"));
+            assert!(matches!(v[1], ScVal::Address(_)));
+            assert!(matches!(v[2], ScVal::I128(_)));
+        }
+
+        #[test]
+        fn union_rejects_wrong_arity_and_shape() {
+            let err = args_of("act", json!({"a": {"Bid": [G]}})).unwrap_err();
+            assert!(
+                format!("{err}").contains("expects 2 value(s), got 1"),
+                "got: {err}"
+            );
+            // A tuple case can't be selected by bare name.
+            let err = args_of("act", json!({"a": "Bid"})).unwrap_err();
+            assert!(
+                format!("{err}").contains("carries 2 value(s)"),
+                "got: {err}"
+            );
+            let err = args_of("act", json!({"a": {"Cancel": [], "Bid": []}})).unwrap_err();
+            assert!(format!("{err}").contains("exactly one case"), "got: {err}");
+        }
+
+        #[test]
+        fn u256_and_i256_round_trip_through_limbs() {
+            // 2^192 exercises every limb boundary: hi_hi=1, rest 0.
+            let big = "6277101735386680763835789423207666416102355444464034512896";
+            let args = args_of("big", json!({"u": big, "i": "-1"})).expect("should encode");
+            assert_eq!(
+                args[0],
+                ScVal::U256(UInt256Parts {
+                    hi_hi: 1,
+                    hi_lo: 0,
+                    lo_hi: 0,
+                    lo_lo: 0
+                })
+            );
+            // -1 is all ones in two's complement.
+            assert_eq!(
+                args[1],
+                ScVal::I256(Int256Parts {
+                    hi_hi: -1,
+                    hi_lo: u64::MAX,
+                    lo_hi: u64::MAX,
+                    lo_lo: u64::MAX
+                })
+            );
+        }
+
+        #[test]
+        fn i256_accepts_its_exact_bounds() {
+            // i256::MIN = -2^255, whose magnitude is its own two's complement.
+            let min =
+                "-57896044618658097711785492504343953926634992332820282019728792003956564819968";
+            let args = args_of("big", json!({"u": "0", "i": min})).expect("min should encode");
+            assert_eq!(
+                args[1],
+                ScVal::I256(Int256Parts {
+                    hi_hi: i64::MIN,
+                    hi_lo: 0,
+                    lo_hi: 0,
+                    lo_lo: 0
+                })
+            );
+            let max =
+                "57896044618658097711785492504343953926634992332820282019728792003956564819967";
+            let args = args_of("big", json!({"u": "0", "i": max})).expect("max should encode");
+            assert_eq!(
+                args[1],
+                ScVal::I256(Int256Parts {
+                    hi_hi: i64::MAX,
+                    hi_lo: u64::MAX,
+                    lo_hi: u64::MAX,
+                    lo_lo: u64::MAX
+                })
+            );
+        }
+
+        #[test]
+        fn out_of_range_256_bit_values_are_rejected() {
+            // 2^256 — one past u256::MAX.
+            let over =
+                "115792089237316195423570985008687907853269984665640564039457584007913129639936";
+            let err = args_of("big", json!({"u": over, "i": "0"})).unwrap_err();
+            assert!(format!("{err}").contains("out of range"), "got: {err}");
+            // 2^255 is one past i256::MAX (valid only as a negative).
+            let over_signed =
+                "57896044618658097711785492504343953926634992332820282019728792003956564819968";
+            let err = args_of("big", json!({"u": "0", "i": over_signed})).unwrap_err();
+            assert!(
+                format!("{err}").contains("out of range for i256"),
+                "got: {err}"
+            );
+            let err = args_of("big", json!({"u": "-1", "i": "0"})).unwrap_err();
+            assert!(format!("{err}").contains("unsigned"), "got: {err}");
+        }
+
+        #[test]
+        fn u256_max_is_accepted() {
+            let max =
+                "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+            let args = args_of("big", json!({"u": max, "i": "0"})).expect("should encode");
+            assert_eq!(
+                args[0],
+                ScVal::U256(UInt256Parts {
+                    hi_hi: u64::MAX,
+                    hi_lo: u64::MAX,
+                    lo_hi: u64::MAX,
+                    lo_lo: u64::MAX
+                })
+            );
+        }
     }
 }

@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 use crate::convert::to_new_event;
 use crate::rpc_client::RpcClient;
-use crate::specs::SpecCache;
+use crate::specs::{self, SpecCache};
 use crate::{cursor, keys, retention, state, store};
 
 /// How often to prune outside the retention window. Decoupled from the poll
@@ -132,7 +132,11 @@ pub async fn fetch_and_store(
 ) -> anyhow::Result<u64> {
     let mut cursor_token: Option<String> = None;
     let mut total_inserted = 0u64;
+    // Contracts seen this cycle, used to bound per-contract instance reads when
+    // no explicit CONTRACT_IDS list does it for us.
     let mut active_contracts: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let tracks_active_contracts =
+        (config.state_indexing || config.upgrade_watch) && config.contract_ids.is_empty();
     // contract -> holder addresses seen this cycle (for per-key balance snapshots).
     let mut holders_by_contract: std::collections::HashMap<
         String,
@@ -151,8 +155,8 @@ pub async fn fetch_and_store(
         for ev in &page.events {
             // Interface lookups are cached, so this is one fetch per contract.
             let spec = specs.get(pool, rpc, &ev.contract_id).await;
-            // Only needed for index-all state snapshotting (see below).
-            if config.state_indexing && config.contract_ids.is_empty() {
+            // Only needed for index-all instance reads (see below).
+            if tracks_active_contracts {
                 active_contracts.insert(ev.contract_id.clone());
             }
             let new_event = to_new_event(ev, spec.as_deref());
@@ -176,18 +180,27 @@ pub async fn fetch_and_store(
         }
     }
 
-    // Snapshot contract state (change-detected, so unchanged instances are
-    // no-op writes). With an explicit CONTRACT_IDS list we track those contracts
-    // every cycle; in index-all mode we restrict to contracts active this cycle
-    // to bound the extra RPC calls.
-    if config.state_indexing {
+    // Read each tracked contract's instance entry. With an explicit CONTRACT_IDS
+    // list we track those contracts every cycle; in index-all mode we restrict
+    // to contracts active this cycle to bound the extra RPC calls.
+    //
+    // State indexing and the upgrade watch both want this entry — for the
+    // storage map and the executable hash respectively — so whenever state
+    // indexing is on it covers both, and the upgrade watch adds no RPC calls.
+    if config.state_indexing || config.upgrade_watch {
         let targets: Vec<&String> = if config.contract_ids.is_empty() {
             active_contracts.iter().collect()
         } else {
             config.contract_ids.iter().collect()
         };
         for contract_id in targets {
-            state::snapshot(pool, rpc, specs, contract_id).await;
+            if config.state_indexing {
+                // Change-detected, so unchanged instances are no-op writes.
+                // Also notes the executable hash, detecting upgrades for free.
+                state::snapshot(pool, rpc, specs, contract_id).await;
+            } else {
+                specs::check_for_upgrade(pool, rpc, specs, contract_id).await;
+            }
         }
     }
 

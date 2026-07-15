@@ -16,8 +16,16 @@ use crate::state::AppState;
 #[derive(Deserialize)]
 pub struct CreateWebhook {
     url: String,
+    /// `"event"` (default) or `"upgrade"`. Defaulting preserves the behaviour of
+    /// every caller written before upgrade subscriptions existed.
+    #[serde(default = "default_kind")]
+    kind: String,
     contract_id: Option<String>,
     event_name: Option<String>,
+}
+
+fn default_kind() -> String {
+    "event".to_string()
 }
 
 fn random_secret() -> String {
@@ -33,14 +41,29 @@ pub async fn create_webhook(
     if !(body.url.starts_with("http://") || body.url.starts_with("https://")) {
         return Err(ApiError::bad_request("url must be http(s)://"));
     }
+    if !matches!(body.kind.as_str(), "event" | "upgrade") {
+        return Err(ApiError::bad_request(format!(
+            "unknown kind `{}`; expected `event` or `upgrade`",
+            body.kind
+        )));
+    }
+    // An upgrade fires for a whole contract, not for one of its events, so an
+    // event_name filter here would silently never match.
+    if body.kind == "upgrade" && body.event_name.is_some() {
+        return Err(ApiError::bad_request(
+            "event_name does not apply to an `upgrade` subscription; \
+             use contract_id to watch one contract, or omit it to watch all",
+        ));
+    }
     let secret = random_secret();
 
     let sub: WebhookSubscription = sqlx::query_as(
-        "INSERT INTO webhook_subscriptions (url, contract_id, event_name, secret)
-         VALUES ($1, $2, $3, $4)
-         RETURNING id, url, contract_id, event_name, secret, active, created_at",
+        "INSERT INTO webhook_subscriptions (url, kind, contract_id, event_name, secret)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, url, kind, contract_id, event_name, secret, active, created_at",
     )
     .bind(&body.url)
+    .bind(&body.kind)
     .bind(&body.contract_id)
     .bind(&body.event_name)
     .bind(&secret)
@@ -50,9 +73,10 @@ pub async fn create_webhook(
     Ok(Json(sub))
 }
 
-/// (id, url, contract_id, event_name, active, created_at)
+/// (id, url, kind, contract_id, event_name, active, created_at)
 type WebhookListRow = (
     Uuid,
+    String,
     String,
     Option<String>,
     Option<String>,
@@ -63,7 +87,7 @@ type WebhookListRow = (
 /// List subscriptions without exposing their secrets.
 pub async fn list_webhooks(State(state): State<AppState>) -> ApiResult<Json<Vec<Value>>> {
     let rows: Vec<WebhookListRow> = sqlx::query_as(
-        "SELECT id, url, contract_id, event_name, active, created_at
+        "SELECT id, url, kind, contract_id, event_name, active, created_at
              FROM webhook_subscriptions ORDER BY created_at DESC",
     )
     .fetch_all(&state.pool)
@@ -71,16 +95,19 @@ pub async fn list_webhooks(State(state): State<AppState>) -> ApiResult<Json<Vec<
 
     let out = rows
         .into_iter()
-        .map(|(id, url, contract_id, event_name, active, created_at)| {
-            json!({
-                "id": id,
-                "url": url,
-                "contract_id": contract_id,
-                "event_name": event_name,
-                "active": active,
-                "created_at": created_at,
-            })
-        })
+        .map(
+            |(id, url, kind, contract_id, event_name, active, created_at)| {
+                json!({
+                    "id": id,
+                    "url": url,
+                    "kind": kind,
+                    "contract_id": contract_id,
+                    "event_name": event_name,
+                    "active": active,
+                    "created_at": created_at,
+                })
+            },
+        )
         .collect();
     Ok(Json(out))
 }

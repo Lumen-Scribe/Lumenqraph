@@ -97,9 +97,13 @@ pub struct TokenTransfer {
 pub struct WebhookSubscription {
     pub id: Uuid,
     pub url: String,
+    /// What this subscription fires on: `"event"` (an indexed contract event) or
+    /// `"upgrade"` (the contract's on-chain interface changed).
+    pub kind: String,
     /// Filter: only events from this contract (None = any).
     pub contract_id: Option<String>,
-    /// Filter: only events with this name (None = any).
+    /// Filter: only events with this name (None = any). Ignored by `upgrade`
+    /// subscriptions, which aren't scoped to an event.
     pub event_name: Option<String>,
     /// Shared secret used to HMAC-sign delivery payloads.
     pub secret: String,

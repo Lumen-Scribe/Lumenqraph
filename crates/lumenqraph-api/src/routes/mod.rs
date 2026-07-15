@@ -46,6 +46,14 @@ pub fn router(state: AppState) -> Router {
             get(contracts::contract_interface),
         )
         .route(
+            "/contracts/:contract_id/interface/history",
+            get(contracts::contract_interface_history),
+        )
+        .route(
+            "/contracts/:contract_id/interface/diff",
+            get(contracts::contract_interface_diff),
+        )
+        .route(
             "/contracts/:contract_id/state",
             get(contracts::contract_state),
         )

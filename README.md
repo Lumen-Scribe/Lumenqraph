@@ -26,6 +26,7 @@ Tail contract events from Soroban RPC, decode their XDR to clean JSON, store the
 - [Configuration](#configuration)
 - [API](#api)
 - [Typed, self-describing decoding](#typed-self-describing-decoding)
+- [Contract upgrade watch](#contract-upgrade-watch)
 - [Read layer — `eth_call` for Soroban](#read-layer--eth_call-for-soroban)
 - [Contract state indexing](#contract-state-indexing)
 - [Per-key state indexing](#per-key-state-indexing)
@@ -60,6 +61,7 @@ Lumenqraph's angle is **simplicity, self-hostability, and typed decoding that ne
 | 🏷️ **Typed, spec-driven decoding** | Reads each contract's on-chain `contractspecv0` interface to emit **named, typed** events (`{from, to, amount: i128}`) — zero ABI upload. Serves the full decoded interface at `/contracts/:id/interface`. |
 | 📖 **Read layer (`eth_call` for Soroban)** | Invoke any contract view function read-only over REST and get a **typed** result. Arguments are type-checked against the on-chain spec before simulation. |
 | 🔮 **Transaction preview** | Dry-run *any* call (even state-changing ones) without signing or submitting, and see the typed result, the **events it would emit**, and its resource cost. Tenderly-style preview for Soroban. |
+| 🚨 **Contract upgrade watch** | Soroban contracts are upgradable *in place*. Lumenqraph keeps every version of a contract's on-chain interface and **diffs them semantically** — which functions and events were added, removed, or changed, and whether that's **breaking** — then pushes a `contract.upgraded` webhook when it happens. |
 | 🤖 **MCP server (AI-agent access)** | A [Model Context Protocol](https://modelcontextprotocol.io) server that lets Claude (or any MCP agent) discover, query, and call any indexed Soroban contract — typed and self-describing, zero hand-written schema. |
 | 🗂️ **Contract state indexing** | Optional versioned snapshots of each contract's instance storage (admin, config, TVL, counters…), decoded to JSON — historical *state*, not just events. |
 | 👛 **Per-key state indexing** | Optional versioned snapshots of *individual* storage entries — e.g. each token holder's `Balance(Address)` — discovered from the contract's own events. Per-key history, not just the instance map. |
@@ -143,6 +145,7 @@ All configuration is via environment variables (see [`.env.example`](.env.exampl
 | `POLL_INTERVAL_SECS` | `5` | How often the indexer polls for new events. |
 | `PAGE_SIZE` | `1000` | Events requested per `getEvents` page (1–10000). |
 | `START_LEDGER` | `0` | Ledger to start a fresh index from. `0` = near the tip. Clamped to RPC retention. |
+| `UPGRADE_WATCH` | on with `CONTRACT_IDS` | Detect contract upgrades, recording each new interface version and its diff. One RPC call per tracked contract per cycle, so it defaults on only when `CONTRACT_IDS` bounds that set. Free alongside `STATE_INDEXING`, which reads the same entry. See [Contract upgrade watch](#contract-upgrade-watch). |
 | `STATE_INDEXING` | `false` | Snapshot contract instance storage into `contract_state` (versioned). One extra RPC call per tracked contract per cycle; best paired with `CONTRACT_IDS`. |
 | `RETENTION_LEDGERS` | `0` | Keep only the last N ledgers of history, pruning older events (+ cascaded transfers) and superseded state versions as the tip advances. `0` = keep everything. Set it when the database has a hard size cap. ~17280 ≈ 1 day. |
 | `API_BIND_ADDR` | `0.0.0.0:8080` | API listen address. |
@@ -164,7 +167,9 @@ Base URL defaults to `http://localhost:8080`. Full reference: [docs/API.md](docs
 | `GET` | `/health` | Indexing status and chain-tip lag. *(public)* |
 | `GET` | `/metrics` | Prometheus metrics. *(public)* |
 | `GET` | `/contracts` | Contracts seen, with per-contract counts. |
-| `GET` | `/contracts/:id/interface` | The contract's decoded on-chain interface: functions, events, and user-defined types. |
+| `GET` | `/contracts/:id/interface` | The contract's decoded on-chain interface: functions, events, and user-defined types. Query: `version` (a historical version; default current). |
+| `GET` | `/contracts/:id/interface/history` | Every interface version observed, newest first, each with its diff and `breaking` flag. Query: `limit`. |
+| `GET` | `/contracts/:id/interface/diff` | What changed between two interface versions. Query: `from`, `to` (default: the latest upgrade). |
 | `GET` | `/contracts/:id/state` | Versioned snapshots of the contract's instance storage, newest first. Query: `limit` (1 = current state). |
 | `GET` | `/contracts/:id/data` | Latest value of every per-key entry (e.g. holder balances). Query: `label`, `limit`. |
 | `GET` | `/contracts/:id/data/:key_hash` | Version history of a single per-key entry. Query: `limit`. |
@@ -247,6 +252,53 @@ cargo run -p lumenqraph-indexer -- inspect <CONTRACT_ID>
 
 **Why this is a Soroban advantage.** On EVM chains, the ABI that names an event's fields lives *off-chain* — an indexer only produces human-readable data if someone verifies the contract or uploads its ABI. Soroban ships that schema *with the code*, so Lumenqraph delivers typed, self-describing data for any contract with **zero configuration**. Implementation: [`lumenqraph-core::spec`](crates/lumenqraph-core/src/spec.rs).
 
+## Contract upgrade watch
+
+A Soroban contract can be **upgraded in place**: the same `C…` address starts running new code, and exposing a new interface, at any ledger. If your dApp calls that contract, its signature can change underneath you with no warning and no notification — and today nothing in the ecosystem tells you.
+
+Because the interface ships inside the WASM, Lumenqraph can capture it at every upgrade and say exactly what changed. The indexer keeps an append-only history in `contract_spec_versions` and diffs each version against the one before it:
+
+```jsonc
+// GET /contracts/<CID>/interface/diff?from=1&to=2
+{
+  "contract_id": "CB...", "from": 1, "to": 2,
+  "diff": {
+    "breaking": true,
+    "summary": [
+      "removed function withdraw(amount: i128) -> void",
+      "changed event transfer: transfer(from: Address @topic, to: Address @topic) [single] became transfer(from: Address @topic, to: Address @data) [single]"
+    ],
+    "functions": { "added": ["pause() -> void"], "removed": ["withdraw(amount: i128) -> void"], "changed": [] },
+    "events":    { "added": [], "removed": [], "changed": [ /* … */ ] },
+    "types":     { "added": [], "removed": [], "changed": [] }
+  }
+}
+```
+
+A change is **breaking** if anything was removed or changed — i.e. an integration built against the old interface may stop working. Purely additive upgrades are not. Diffs compare each item's *rendered signature*, so a parameter that is renamed, retyped, or moved from topic to data all register — including the ones that fail silently rather than loudly.
+
+| | |
+| --- | --- |
+| `GET /contracts/:id/interface/history` | Every version observed, newest first, each with its diff and `breaking` flag |
+| `GET /contracts/:id/interface/diff?from=&to=` | Diff any two versions (defaults: the latest upgrade). Computed on demand, so `from=1&to=5` is one call |
+| `GET /contracts/:id/interface?version=N` | The interface as it was at version N — what callers were binding to then |
+| `POST /webhooks` with `{"kind": "upgrade"}` | Get pushed a signed `contract.upgraded` payload the moment it happens |
+
+```jsonc
+// The contract.upgraded webhook payload (HMAC-signed like any other delivery)
+{
+  "type": "contract.upgraded", "contract_id": "CB...", "version": 2,
+  "wasm_hash": "…", "previous_wasm_hash": "…",
+  "breaking": true, "diff": { /* as above */ }, "observed_at": "2026-07-15T…Z"
+}
+```
+
+Version 1 is a *baseline*, not an upgrade: it's the first interface we ever saw, so it has no diff (`null`, distinct from an empty diff) and fires no webhook. An upgrade that changes only the code and not the interface — a bug fix — is still recorded, with an empty, non-breaking diff.
+
+Enable it with `UPGRADE_WATCH=true`; it defaults to on whenever `CONTRACT_IDS` bounds the set of contracts to watch. See [Configuration](#configuration). Implementation: [`lumenqraph-core::diff`](crates/lumenqraph-core/src/diff.rs) and [`lumenqraph-indexer::specs`](crates/lumenqraph-indexer/src/specs.rs).
+
+**Why this is a Soroban advantage.** The same argument as typed decoding, one step further: an EVM indexer can't diff a contract's ABI across an upgrade, because the ABI was never on-chain to begin with. Soroban's is — so this is ecosystem safety infrastructure that can be built *here* and nowhere else.
+
 ## Read layer — `eth_call` for Soroban
 
 History tells you what *happened*; the read layer tells you the current *state*. `GET /contracts/:id/events` serves indexed events; `POST /contracts/:id/call` invokes a contract's **view functions** read-only — the Soroban equivalent of EVM's `eth_call`, a primitive no other Stellar indexer exposes as a service.
@@ -273,7 +325,18 @@ curl -X POST localhost:8080/contracts/<CID>/call \
 }
 ```
 
-Errors are precise and client-facing: unknown function, missing/extra argument, or a wrong-typed argument all return `400` with a message (`argument "account": invalid address strkey`) rather than a failed simulation. Reads need the contract's interface, which the indexer captures on first sighting — Stellar Asset Contracts (no WASM spec) aren't callable this way. Supported argument types today: bool, all sized integers, `i128`/`u128`, `Symbol`, `String`, `Address`, `Bytes`/`BytesN`, `Option`, `Vec`, `Tuple`, and symbol-keyed `Map`; big-int (256-bit) and user-defined-type arguments are on the roadmap. Implementation: [`lumenqraph-core::read`](crates/lumenqraph-core/src/read.rs).
+Errors are precise and client-facing: unknown function, missing/extra argument, or a wrong-typed argument all return `400` with a message (`argument "account": invalid address strkey`) rather than a failed simulation. Reads need the contract's interface, which the indexer captures on first sighting — Stellar Asset Contracts (no WASM spec) aren't callable this way. Supported argument types today: bool, all sized integers, `i128`/`u128`, `u256`/`i256` (as decimal strings), `Symbol`, `String`, `Address`, `Bytes`/`BytesN`, `Option`, `Vec`, `Tuple`, symbol-keyed `Map`, and **user-defined types** — structs, unit enums, and unions — resolved from the contract's own on-chain spec. Only `Val` (untyped by definition), `Result`, `Error`, and `MuxedAddress` remain unsupported. Implementation: [`lumenqraph-core::read`](crates/lumenqraph-core/src/read.rs).
+
+User-defined arguments follow the shape the spec declares, so there is nothing to configure:
+
+```jsonc
+{ "order":  { "amount": "500", "buyer": "GABC…" } }  // struct -> its fields
+{ "status": "Filled" }                               // unit enum -> a case name
+{ "action": { "Bid": ["GABC…", "250"] } }            // union -> case + values
+{ "action": "Cancel" }                               // union void case
+```
+
+The same naming applies coming back out: a unit enum that would decode to a bare `7` is enriched to `"Filled"`, and a union to `{"Bid": [...]}` — recursively, so UDTs nested inside `Option`/`Vec`/`Map`/tuples are named too.
 
 ### Transaction preview
 
@@ -330,7 +393,7 @@ Enable it with `STATE_INDEXING=true` (ideally alongside `CONTRACT_IDS`). Each cy
 }
 ```
 
-Reading the instance also reveals the contract's current WASM hash, so an **upgraded contract is detected automatically** — its cached interface is evicted and re-parsed on the next event, keeping enrichment and the read/MCP layers correct across upgrades. Implementation: [`lumenqraph-indexer::state`](crates/lumenqraph-indexer/src/state.rs).
+Reading the instance also reveals the contract's current WASM hash, so an **upgraded contract is detected automatically** — its interface is re-read immediately, keeping enrichment and the read/MCP layers correct across upgrades, and recording the new version and its diff (see [Contract upgrade watch](#contract-upgrade-watch)). Because state indexing already reads this entry, running it alongside the upgrade watch costs no extra RPC calls. Implementation: [`lumenqraph-indexer::state`](crates/lumenqraph-indexer/src/state.rs).
 
 ## Per-key state indexing
 
@@ -396,6 +459,7 @@ It's a standard stdio JSON-RPC server that reuses the same Postgres and read-lay
 | --- | --- |
 | `list_contracts` | See which contracts are indexed, with event counts. |
 | `get_contract_interface` | Discover a contract's functions (typed inputs/outputs), events, and user-defined types. |
+| `get_contract_upgrades` | Read a contract's interface history: every version, its diff, and whether the change was breaking. |
 | `get_contract_state` | Read a contract's current (and historical) instance storage. |
 | `get_contract_data` | Read a contract's per-key state — individual entries like token holder balances. |
 | `query_events` | Read a contract's recent events, decoded and enriched. |
@@ -456,6 +520,15 @@ Register a URL (with optional contract/event filters) and receive event pushes a
 curl -X POST localhost:8080/webhooks \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://example.com/hook","event_name":"transfer"}'
+```
+
+A subscription has a `kind`: `event` (the default — a contract emitted an event) or `upgrade` (a contract's on-chain interface changed; see [Contract upgrade watch](#contract-upgrade-watch)). The two streams are independent, so an `event` subscriber never receives an upgrade payload.
+
+```bash
+# Alert me when this contract's interface changes under my dApp.
+curl -X POST localhost:8080/webhooks \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/hook","kind":"upgrade","contract_id":"CB..."}'
 ```
 
 Verifying a delivery (Node.js):
@@ -531,8 +604,10 @@ CI runs formatting, Clippy (warnings denied), tests, and a release build against
 - [x] State indexing: per-key persistent storage (e.g. individual balances), discovered from a token's own events
 - [x] GraphQL endpoint alongside REST; cursor-based pagination
 - [x] Client SDK: TypeScript (`sdk/typescript`)
-- [ ] Read layer: user-defined-type and 256-bit-integer arguments; in-memory spec cache in the API
-- [ ] Enrichment for user-defined struct/enum/union values (naming nested UDT fields, not just event params)
+- [x] Read layer: user-defined-type (struct/enum/union) and 256-bit-integer arguments
+- [x] Enrichment for user-defined struct/enum/union values (naming nested UDT values, not just event params)
+- [x] Contract upgrade watch: versioned interface history, semantic diffs, breaking-change detection, and `contract.upgraded` webhooks
+- [ ] In-memory spec cache in the API
 - [ ] Deep historical backfill via a captive-core / data-lake source (beyond RPC's ~7-day window)
 - [ ] Additional materialized verticals (AMM swaps, liquidity, NFT mints/transfers)
 - [ ] Redis-backed rate limiting and read caching for multi-instance deployments

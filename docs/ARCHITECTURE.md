@@ -44,9 +44,18 @@ They coordinate only through Postgres — no direct RPC between services.
 2. **API** serves reads (`/contracts`, `/events`, `/transfers`), observability
    (`/health`, `/metrics`), and webhook management — behind API-key auth +
    rate limiting on data routes.
-3. **Webhooks** streams new events by monotonic `events.seq`, matches them to
-   active subscriptions, and delivers HMAC-signed payloads with exponential
-   backoff.
+3. **Webhooks** streams two sources — new events by monotonic `events.seq`, and
+   new contract upgrades by `contract_spec_versions.id` — matches each to active
+   subscriptions of the corresponding `kind`, and delivers HMAC-signed payloads
+   with exponential backoff. The two streams keep separate watermarks, so a quiet
+   period in one can't stall the other.
+
+Alongside (1), the indexer reads each tracked contract's instance entry when
+`UPGRADE_WATCH` or `STATE_INDEXING` is on. That entry reveals the contract's
+current executable hash: if it changed, the contract was upgraded in place, so
+the interface is re-read and appended to `contract_spec_versions` with a semantic
+diff against the previous version (`core::diff`). Both features read the same
+entry, so enabling both costs one call per contract per cycle, not two.
 
 ## Decoding
 

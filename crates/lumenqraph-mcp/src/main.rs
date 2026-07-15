@@ -3,9 +3,10 @@
 //! typed, self-describing access to Soroban contracts.
 //!
 //! It reuses the same Postgres the API reads and the same read-layer encoder the
-//! API calls, exposing seven tools: `list_contracts`, `get_contract_interface`,
-//! `get_contract_state`, `get_contract_data`, `query_events`, `call_contract`,
-//! and `simulate_call`. Because the interface and argument types come from each
+//! API calls, exposing eight tools: `list_contracts`, `get_contract_interface`,
+//! `get_contract_upgrades`, `get_contract_state`, `get_contract_data`,
+//! `query_events`, `call_contract`, and `simulate_call`. Because the interface
+//! and argument types come from each
 //! contract's on-chain spec, an agent can *discover* what a contract does and
 //! call it correctly — with zero hand-written schema.
 //!
@@ -207,6 +208,7 @@ mod tests {
             vec![
                 "list_contracts",
                 "get_contract_interface",
+                "get_contract_upgrades",
                 "get_contract_state",
                 "get_contract_data",
                 "query_events",

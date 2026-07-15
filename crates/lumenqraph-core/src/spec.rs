@@ -61,6 +61,11 @@ pub struct EventParam {
     pub type_name: String,
     /// "topic" (indexed) or "data" (in the event body).
     pub location: &'static str,
+    /// The structured type behind `type_name`. Kept (unserialised) because a
+    /// `Udt` type is only a *name*: enrichment needs it to look the definition
+    /// up and label the decoded value.
+    #[serde(skip)]
+    ty: ScSpecTypeDef,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -68,6 +73,8 @@ pub struct Field {
     pub name: String,
     #[serde(rename = "type")]
     pub type_name: String,
+    #[serde(skip)]
+    ty: ScSpecTypeDef,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -79,7 +86,18 @@ pub struct UdtStruct {
 #[derive(Debug, Clone, Serialize)]
 pub struct UdtUnion {
     pub name: String,
-    pub cases: Vec<String>,
+    pub cases: Vec<UnionCase>,
+}
+
+/// One variant of a union: a name, plus the types it carries (empty for a
+/// void case like `Cancel`).
+#[derive(Debug, Clone, Serialize)]
+pub struct UnionCase {
+    pub name: String,
+    #[serde(rename = "types")]
+    pub type_names: Vec<String>,
+    #[serde(skip)]
+    tys: Vec<ScSpecTypeDef>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -146,6 +164,7 @@ impl ContractSpec {
                     .map(|i| Field {
                         name: string_of(&i.name),
                         type_name: type_name(&i.type_),
+                        ty: i.type_.clone(),
                     })
                     .collect(),
                 outputs: f.outputs.iter().map(type_name).collect(),
@@ -158,6 +177,7 @@ impl ContractSpec {
                     .map(|f| Field {
                         name: string_of(&f.name),
                         type_name: type_name(&f.type_),
+                        ty: f.type_.clone(),
                     })
                     .collect(),
             }),
@@ -167,8 +187,16 @@ impl ContractSpec {
                     .cases
                     .iter()
                     .map(|c| match c {
-                        stellar_xdr::curr::ScSpecUdtUnionCaseV0::VoidV0(v) => string_of(&v.name),
-                        stellar_xdr::curr::ScSpecUdtUnionCaseV0::TupleV0(t) => string_of(&t.name),
+                        stellar_xdr::curr::ScSpecUdtUnionCaseV0::VoidV0(v) => UnionCase {
+                            name: string_of(&v.name),
+                            type_names: vec![],
+                            tys: vec![],
+                        },
+                        stellar_xdr::curr::ScSpecUdtUnionCaseV0::TupleV0(t) => UnionCase {
+                            name: string_of(&t.name),
+                            type_names: t.type_.iter().map(type_name).collect(),
+                            tys: t.type_.to_vec(),
+                        },
                     })
                     .collect(),
             }),
@@ -191,6 +219,7 @@ impl ContractSpec {
                             ScSpecEventParamLocationV0::TopicList => "topic",
                             ScSpecEventParamLocationV0::Data => "data",
                         },
+                        ty: p.type_.clone(),
                     })
                     .collect();
                 self.events.push(EventSpec {
@@ -252,7 +281,7 @@ impl ContractSpec {
             };
             params.insert(
                 p.name.clone(),
-                json!({ "type": p.type_name, "value": value }),
+                json!({ "type": p.type_name, "value": self.relabel(&value, &p.ty) }),
             );
         }
 
@@ -260,6 +289,125 @@ impl ContractSpec {
             "event": spec.name,
             "params": Value::Object(params),
         }))
+    }
+
+    /// Re-label a generically-decoded value using its declared type.
+    ///
+    /// The generic XDR decoder can only see shapes, so a user-defined type
+    /// arrives stripped of meaning: a unit enum is a bare number, and a union is
+    /// a vec whose first element happens to be a symbol. With the spec in hand we
+    /// can name them. Recurses through containers so a UDT nested inside an
+    /// `Option`/`Vec`/`Map`/tuple is named too.
+    ///
+    /// Anything we can't improve on is returned unchanged — enrichment is
+    /// best-effort and must never lose data.
+    fn relabel(&self, v: &Value, ty: &ScSpecTypeDef) -> Value {
+        use ScSpecTypeDef as T;
+        match ty {
+            T::Option(inner) => {
+                if v.is_null() {
+                    v.clone()
+                } else {
+                    self.relabel(v, &inner.value_type)
+                }
+            }
+            T::Vec(inner) => match v.as_array() {
+                Some(a) => Value::Array(
+                    a.iter()
+                        .map(|el| self.relabel(el, &inner.element_type))
+                        .collect(),
+                ),
+                None => v.clone(),
+            },
+            T::Tuple(t) => match v.as_array() {
+                // Only re-label a tuple we can line up element-for-element.
+                Some(a) if a.len() == t.value_types.len() => Value::Array(
+                    a.iter()
+                        .zip(t.value_types.iter())
+                        .map(|(el, et)| self.relabel(el, et))
+                        .collect(),
+                ),
+                _ => v.clone(),
+            },
+            T::Map(m) => match v.as_object() {
+                Some(o) => Value::Object(
+                    o.iter()
+                        .map(|(k, val)| (k.clone(), self.relabel(val, &m.value_type)))
+                        .collect(),
+                ),
+                None => v.clone(),
+            },
+            T::Udt(u) => self.relabel_udt(v, &u.name.to_utf8_string_lossy()),
+            _ => v.clone(),
+        }
+    }
+
+    fn relabel_udt(&self, v: &Value, udt_name: &str) -> Value {
+        // A unit enum decodes to its discriminant; swap in the case name.
+        if let Some(e) = self.enums.iter().find(|e| e.name == udt_name) {
+            if let Some(n) = v.as_u64() {
+                if let Some((case, _)) = e.cases.iter().find(|(_, val)| u64::from(*val) == n) {
+                    return Value::String(case.clone());
+                }
+            }
+            return v.clone();
+        }
+
+        // A union decodes to [Symbol(case), ..values]; key it by the case name,
+        // which is also the shape the read layer accepts back as input.
+        if let Some(u) = self.unions.iter().find(|u| u.name == udt_name) {
+            let Some(items) = v.as_array() else {
+                return v.clone();
+            };
+            let Some(Value::String(case_name)) = items.first() else {
+                return v.clone();
+            };
+            let Some(case) = u.cases.iter().find(|c| &c.name == case_name) else {
+                return v.clone();
+            };
+            let values = &items[1..];
+            if case.tys.is_empty() {
+                return Value::String(case.name.clone());
+            }
+            if values.len() != case.tys.len() {
+                return v.clone();
+            }
+            let labelled: Vec<Value> = values
+                .iter()
+                .zip(case.tys.iter())
+                .map(|(el, et)| self.relabel(el, et))
+                .collect();
+            return json!({ case.name.clone(): labelled });
+        }
+
+        // A struct already decodes to a field-named object (or a positional vec
+        // for a tuple struct); recurse so nested UDTs inside it get named.
+        if let Some(s) = self.structs.iter().find(|s| s.name == udt_name) {
+            if let Some(o) = v.as_object() {
+                return Value::Object(
+                    o.iter()
+                        .map(|(k, val)| {
+                            let relabelled = match s.fields.iter().find(|f| &f.name == k) {
+                                Some(f) => self.relabel(val, &f.ty),
+                                None => val.clone(),
+                            };
+                            (k.clone(), relabelled)
+                        })
+                        .collect(),
+                );
+            }
+            if let Some(a) = v.as_array() {
+                if a.len() == s.fields.len() {
+                    return Value::Array(
+                        a.iter()
+                            .zip(s.fields.iter())
+                            .map(|(el, f)| self.relabel(el, &f.ty))
+                            .collect(),
+                    );
+                }
+            }
+        }
+        v.clone()
     }
 
     /// A stable JSON view of the whole interface, for `GET /contracts/:id/interface`.
@@ -569,5 +717,143 @@ mod tests {
             value_type: Box::new(ScSpecTypeDef::U64),
         }));
         assert_eq!(type_name(&opt_u64), "Option<u64>");
+    }
+
+    // ---- naming user-defined values in enriched events ----------------------
+
+    mod udt_enrichment {
+        use super::*;
+        use stellar_xdr::curr::{
+            ScSpecTypeUdt, ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0, ScSpecUdtUnionCaseTupleV0,
+            ScSpecUdtUnionCaseV0, ScSpecUdtUnionCaseVoidV0, ScSpecUdtUnionV0,
+        };
+
+        fn udt(name: &str) -> ScSpecTypeDef {
+            ScSpecTypeDef::Udt(ScSpecTypeUdt {
+                name: name.try_into().unwrap(),
+            })
+        }
+
+        // enum Status { Active = 0, Filled = 7 }
+        fn status_enum() -> ScSpecEntry {
+            let case = |name: &str, value: u32| ScSpecUdtEnumCaseV0 {
+                doc: "".try_into().unwrap(),
+                name: name.try_into().unwrap(),
+                value,
+            };
+            ScSpecEntry::UdtEnumV0(ScSpecUdtEnumV0 {
+                doc: "".try_into().unwrap(),
+                lib: "".try_into().unwrap(),
+                name: "Status".try_into().unwrap(),
+                cases: vec![case("Active", 0), case("Filled", 7)]
+                    .try_into()
+                    .unwrap(),
+            })
+        }
+
+        // union Action { Cancel, Bid(Status) }  -- payload is itself a UDT, so
+        // this also covers recursion into a case's values.
+        fn action_union() -> ScSpecEntry {
+            ScSpecEntry::UdtUnionV0(ScSpecUdtUnionV0 {
+                doc: "".try_into().unwrap(),
+                lib: "".try_into().unwrap(),
+                name: "Action".try_into().unwrap(),
+                cases: vec![
+                    ScSpecUdtUnionCaseV0::VoidV0(ScSpecUdtUnionCaseVoidV0 {
+                        doc: "".try_into().unwrap(),
+                        name: "Cancel".try_into().unwrap(),
+                    }),
+                    ScSpecUdtUnionCaseV0::TupleV0(ScSpecUdtUnionCaseTupleV0 {
+                        doc: "".try_into().unwrap(),
+                        name: "Bid".try_into().unwrap(),
+                        type_: vec![udt("Status")].try_into().unwrap(),
+                    }),
+                ]
+                .try_into()
+                .unwrap(),
+            })
+        }
+
+        /// `changed(status: <ty>)` with the param as single-value data.
+        fn changed_event(ty: ScSpecTypeDef) -> ScSpecEntry {
+            ScSpecEntry::EventV0(ScSpecEventV0 {
+                doc: "".try_into().unwrap(),
+                lib: "".try_into().unwrap(),
+                name: ScSymbol("changed".try_into().unwrap()),
+                prefix_topics: vec![ScSymbol("changed".try_into().unwrap())]
+                    .try_into()
+                    .unwrap(),
+                params: vec![ScSpecEventParamV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "status".try_into().unwrap(),
+                    type_: ty,
+                    location: ScSpecEventParamLocationV0::Data,
+                }]
+                .try_into()
+                .unwrap(),
+                data_format: ScSpecEventDataFormat::SingleValue,
+            })
+        }
+
+        fn enrich(entries: &[ScSpecEntry], value: Value) -> Value {
+            let spec = ContractSpec::from_spec_xdr(&spec_section(entries)).unwrap();
+            spec.enrich_event("changed", &[json!("changed")], &value)
+                .expect("should enrich")
+        }
+
+        #[test]
+        fn enum_discriminant_becomes_its_case_name() {
+            let entries = [status_enum(), changed_event(udt("Status"))];
+            // Without the spec this is just `7`, which tells a reader nothing.
+            let out = enrich(&entries, json!(7));
+            assert_eq!(out["params"]["status"]["value"], "Filled");
+            assert_eq!(out["params"]["status"]["type"], "Status");
+        }
+
+        #[test]
+        fn unknown_enum_discriminant_is_left_alone() {
+            // A value the spec doesn't declare (e.g. spec drifted from the
+            // deployed code) must pass through rather than vanish.
+            let entries = [status_enum(), changed_event(udt("Status"))];
+            let out = enrich(&entries, json!(3));
+            assert_eq!(out["params"]["status"]["value"], 3);
+        }
+
+        #[test]
+        fn union_void_case_becomes_its_name() {
+            let entries = [status_enum(), action_union(), changed_event(udt("Action"))];
+            let out = enrich(&entries, json!(["Cancel"]));
+            assert_eq!(out["params"]["status"]["value"], "Cancel");
+        }
+
+        #[test]
+        fn union_tuple_case_is_keyed_and_recurses_into_its_payload() {
+            let entries = [status_enum(), action_union(), changed_event(udt("Action"))];
+            // ["Bid", 7] -> {"Bid": ["Filled"]}: the case is named, and the
+            // nested Status enum inside it is named too.
+            let out = enrich(&entries, json!(["Bid", 7]));
+            assert_eq!(out["params"]["status"]["value"], json!({"Bid": ["Filled"]}));
+        }
+
+        #[test]
+        fn enums_nested_in_containers_are_named() {
+            let vec_of_status = ScSpecTypeDef::Vec(Box::new(stellar_xdr::curr::ScSpecTypeVec {
+                element_type: Box::new(udt("Status")),
+            }));
+            let entries = [status_enum(), changed_event(vec_of_status)];
+            let out = enrich(&entries, json!([0, 7]));
+            assert_eq!(
+                out["params"]["status"]["value"],
+                json!(["Active", "Filled"])
+            );
+        }
+
+        #[test]
+        fn a_malformed_union_value_passes_through_unchanged() {
+            let entries = [status_enum(), action_union(), changed_event(udt("Action"))];
+            // Wrong arity for Bid: keep the raw decode rather than guess.
+            let out = enrich(&entries, json!(["Bid", 7, 9]));
+            assert_eq!(out["params"]["status"]["value"], json!(["Bid", 7, 9]));
+        }
     }
 }

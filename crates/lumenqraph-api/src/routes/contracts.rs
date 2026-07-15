@@ -3,11 +3,15 @@
 //!
 //! `GET /contracts/:id/interface` — the contract's decoded on-chain interface
 //! (functions, events, and user-defined types), parsed from its deployed WASM.
+//!
+//! `GET /contracts/:id/interface/history` and `/interface/diff` — the upgrade
+//! watch: a Soroban contract can be upgraded in place, so its interface is a
+//! time series, and these serve its versions and what changed between them.
 
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use chrono::{DateTime, Utc};
-use lumenqraph_core::Contract;
+use lumenqraph_core::{Contract, ContractSpec, SpecDiff};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::types::Json as SqlxJson;
@@ -31,10 +35,21 @@ pub async fn list_contracts(State(state): State<AppState>) -> ApiResult<Json<Vec
     Ok(Json(contracts))
 }
 
+#[derive(Deserialize)]
+pub struct InterfaceQuery {
+    /// A historical version to serve instead of the current interface.
+    version: Option<i32>,
+}
+
 pub async fn contract_interface(
     State(state): State<AppState>,
     Path(contract_id): Path<String>,
+    Query(q): Query<InterfaceQuery>,
 ) -> ApiResult<Json<Value>> {
+    if let Some(version) = q.version {
+        return contract_interface_at_version(&state, &contract_id, version).await;
+    }
+
     let row: Option<(SqlxJson<Value>, bool, DateTime<Utc>)> = sqlx::query_as(
         "SELECT interface, has_events, fetched_at
          FROM contract_specs WHERE contract_id = $1",
@@ -54,6 +69,192 @@ pub async fn contract_interface(
             "no on-chain interface indexed for this contract yet",
         )),
     }
+}
+
+/// The interface as it was at one historical version — what the contract's
+/// callers were binding to back then, which the current interface can't tell you
+/// once the contract has been upgraded.
+async fn contract_interface_at_version(
+    state: &AppState,
+    contract_id: &str,
+    version: i32,
+) -> ApiResult<Json<Value>> {
+    let row: Option<(SqlxJson<Value>, String, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT interface, wasm_hash, observed_at FROM contract_spec_versions
+         WHERE contract_id = $1 AND version = $2",
+    )
+    .bind(contract_id)
+    .bind(version)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    match row {
+        Some((interface, wasm_hash, observed_at)) => Ok(Json(json!({
+            "contract_id": contract_id,
+            "version": version,
+            "wasm_hash": wasm_hash,
+            "observed_at": observed_at,
+            "interface": interface.0,
+        }))),
+        None => Err(ApiError::not_found(format!(
+            "no version {version} recorded for this contract"
+        ))),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct HistoryQuery {
+    /// How many versions to return, newest first.
+    #[serde(default = "default_history_limit")]
+    limit: i64,
+}
+
+fn default_history_limit() -> i64 {
+    50
+}
+
+/// `GET /contracts/:id/interface/history` — every interface version we've
+/// observed for this contract, newest first, each with the diff against the one
+/// before it. The full interface of each version is omitted (fetch it with
+/// `/interface?version=N`); the diff is what's interesting here.
+pub async fn contract_interface_history(
+    State(state): State<AppState>,
+    Path(contract_id): Path<String>,
+    Query(q): Query<HistoryQuery>,
+) -> ApiResult<Json<Value>> {
+    let limit = q.limit.clamp(1, 200);
+    // (version, wasm_hash, previous_wasm_hash, diff, breaking, observed_at)
+    type VersionRow = (
+        i32,
+        String,
+        Option<String>,
+        Option<SqlxJson<Value>>,
+        bool,
+        DateTime<Utc>,
+    );
+    let rows: Vec<VersionRow> = sqlx::query_as(
+        "SELECT version, wasm_hash, previous_wasm_hash, diff, breaking, observed_at
+         FROM contract_spec_versions
+         WHERE contract_id = $1
+         ORDER BY version DESC LIMIT $2",
+    )
+    .bind(&contract_id)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Err(ApiError::not_found(
+            "no on-chain interface indexed for this contract yet",
+        ));
+    }
+
+    let versions: Vec<Value> = rows
+        .into_iter()
+        .map(
+            |(version, wasm_hash, previous_wasm_hash, diff, breaking, observed_at)| {
+                json!({
+                    "version": version,
+                    "wasm_hash": wasm_hash,
+                    "previous_wasm_hash": previous_wasm_hash,
+                    // Null on version 1: a baseline has nothing to be diffed
+                    // against, which is not the same as an empty diff.
+                    "diff": diff.map(|d| d.0),
+                    "breaking": breaking,
+                    "observed_at": observed_at,
+                })
+            },
+        )
+        .collect();
+
+    Ok(Json(json!({
+        "contract_id": contract_id,
+        "count": versions.len(),
+        "versions": versions,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct DiffQuery {
+    /// Defaults to the version before `to`.
+    from: Option<i32>,
+    /// Defaults to the newest version.
+    to: Option<i32>,
+}
+
+/// `GET /contracts/:id/interface/diff?from=&to=` — what changed between any two
+/// interface versions.
+///
+/// Computed on demand from each version's stored spec section rather than read
+/// from the `diff` column, which only ever holds consecutive diffs: this way you
+/// can ask "what changed between v1 and v5" in one call, not four.
+pub async fn contract_interface_diff(
+    State(state): State<AppState>,
+    Path(contract_id): Path<String>,
+    Query(q): Query<DiffQuery>,
+) -> ApiResult<Json<Value>> {
+    let latest: Option<i32> = sqlx::query_scalar(
+        "SELECT max(version) FROM contract_spec_versions WHERE contract_id = $1",
+    )
+    .bind(&contract_id)
+    .fetch_one(&state.pool)
+    .await?;
+    let Some(latest) = latest else {
+        return Err(ApiError::not_found(
+            "no on-chain interface indexed for this contract yet",
+        ));
+    };
+
+    let to = q.to.unwrap_or(latest);
+    let from = q.from.unwrap_or(to - 1);
+    if from < 1 {
+        return Err(ApiError::bad_request(format!(
+            "no version to diff against: this contract has only version {latest} on record, \
+             so there is no earlier interface to compare it to"
+        )));
+    }
+    if from == to {
+        return Err(ApiError::bad_request(
+            "`from` and `to` are the same version; nothing to diff",
+        ));
+    }
+
+    let old = load_spec(&state, &contract_id, from).await?;
+    let new = load_spec(&state, &contract_id, to).await?;
+    let diff = SpecDiff::between(&old, &new);
+
+    Ok(Json(json!({
+        "contract_id": contract_id,
+        "from": from,
+        "to": to,
+        "diff": diff.to_json(),
+    })))
+}
+
+/// Load and re-parse one version's interface from its stored raw spec section.
+async fn load_spec(state: &AppState, contract_id: &str, version: i32) -> ApiResult<ContractSpec> {
+    let section: Option<String> = sqlx::query_scalar(
+        "SELECT spec_section FROM contract_spec_versions
+         WHERE contract_id = $1 AND version = $2",
+    )
+    .bind(contract_id)
+    .bind(version)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let Some(section) = section else {
+        return Err(ApiError::not_found(format!(
+            "no version {version} recorded for this contract"
+        )));
+    };
+
+    let bytes = hex::decode(&section)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("corrupt spec section: {e}")))?;
+    ContractSpec::from_spec_xdr(&bytes).ok_or_else(|| {
+        ApiError::Internal(anyhow::anyhow!(
+            "stored spec section for version {version} could not be parsed"
+        ))
+    })
 }
 
 #[derive(Deserialize)]

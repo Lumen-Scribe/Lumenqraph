@@ -40,25 +40,35 @@ pub struct Config {
     /// a hard size cap (e.g. a 500MB free tier) that an unbounded index would
     /// hit; see `retention`.
     pub retention_ledgers: i64,
+    /// When true, check whether a tracked contract's executable has changed and,
+    /// if so, re-read its interface and append a `contract_spec_versions` row
+    /// with the diff (see `specs`). Costs one RPC call per tracked contract per
+    /// cycle, so it defaults to on only when `CONTRACT_IDS` bounds that set;
+    /// in index-all mode it must be enabled explicitly, and then only covers
+    /// contracts active in the cycle. `STATE_INDEXING` already reads each
+    /// instance and detects upgrades for free, so this adds no calls alongside it.
+    pub upgrade_watch: bool,
 }
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
+        let contract_ids: Vec<String> = std::env::var("CONTRACT_IDS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
         Ok(Self {
             database_url: env("DATABASE_URL")?,
             rpc_url: env("RPC_URL")?,
-            contract_ids: std::env::var("CONTRACT_IDS")
-                .unwrap_or_default()
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
             poll_interval_secs: env_parse("POLL_INTERVAL_SECS", 5)?,
             page_size: env_parse("PAGE_SIZE", 1000)?,
             start_ledger: env_parse("START_LEDGER", 0)?,
             max_catchup_ledgers: env_parse("MAX_CATCHUP_LEDGERS", 4000)?,
             state_indexing: env_bool("STATE_INDEXING", false),
             key_indexing: env_bool("KEY_INDEXING", false),
+            upgrade_watch: env_bool("UPGRADE_WATCH", !contract_ids.is_empty()),
+            contract_ids,
             balance_key_symbol: std::env::var("BALANCE_KEY_SYMBOL")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
