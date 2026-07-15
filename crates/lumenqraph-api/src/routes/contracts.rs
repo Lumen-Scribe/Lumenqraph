@@ -8,15 +8,18 @@
 //! watch: a Soroban contract can be upgraded in place, so its interface is a
 //! time series, and these serve its versions and what changed between them.
 
+use std::sync::Arc;
+
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use chrono::{DateTime, Utc};
-use lumenqraph_core::{Contract, ContractSpec, SpecDiff};
+use lumenqraph_core::{Contract, SpecDiff};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::types::Json as SqlxJson;
 
 use crate::error::{ApiError, ApiResult};
+use crate::specs::CachedSpec;
 use crate::state::AppState;
 
 pub async fn list_contracts(State(state): State<AppState>) -> ApiResult<Json<Vec<Contract>>> {
@@ -221,7 +224,8 @@ pub async fn contract_interface_diff(
 
     let old = load_spec(&state, &contract_id, from).await?;
     let new = load_spec(&state, &contract_id, to).await?;
-    let diff = SpecDiff::between(&old, &new);
+    // Both are Some: load_spec rejects an unparseable version above.
+    let diff = SpecDiff::between(old.parsed.as_ref().unwrap(), new.parsed.as_ref().unwrap());
 
     Ok(Json(json!({
         "contract_id": contract_id,
@@ -231,30 +235,23 @@ pub async fn contract_interface_diff(
     })))
 }
 
-/// Load and re-parse one version's interface from its stored raw spec section.
-async fn load_spec(state: &AppState, contract_id: &str, version: i32) -> ApiResult<ContractSpec> {
-    let section: Option<String> = sqlx::query_scalar(
-        "SELECT spec_section FROM contract_spec_versions
-         WHERE contract_id = $1 AND version = $2",
-    )
-    .bind(contract_id)
-    .bind(version)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    let Some(section) = section else {
-        return Err(ApiError::not_found(format!(
-            "no version {version} recorded for this contract"
-        )));
-    };
-
-    let bytes = hex::decode(&section)
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("corrupt spec section: {e}")))?;
-    ContractSpec::from_spec_xdr(&bytes).ok_or_else(|| {
-        ApiError::Internal(anyhow::anyhow!(
+/// One version's parsed interface, from the cache (versions are immutable, so
+/// this is a pure hit after the first read).
+async fn load_spec(
+    state: &AppState,
+    contract_id: &str,
+    version: i32,
+) -> ApiResult<Arc<CachedSpec>> {
+    let spec = state
+        .specs
+        .at_version(&state.pool, contract_id, version)
+        .await?;
+    if spec.parsed.is_none() {
+        return Err(ApiError::Internal(anyhow::anyhow!(
             "stored spec section for version {version} could not be parsed"
-        ))
-    })
+        )));
+    }
+    Ok(spec)
 }
 
 #[derive(Deserialize)]

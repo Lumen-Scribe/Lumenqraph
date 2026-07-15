@@ -6,6 +6,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
+#[derive(Debug)]
 pub enum ApiError {
     /// A client-facing status + message (4xx).
     Status(StatusCode, String),

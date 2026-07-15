@@ -30,3 +30,8 @@ hex.workspace = true
 reqwest.workspace = true
 rand = "0.8"
 base64 = "0.22"
+
+[dev-dependencies]
+# Only for building contract-spec fixtures in the spec-cache tests; the API
+# itself never touches XDR directly.
+stellar-xdr.workspace = true

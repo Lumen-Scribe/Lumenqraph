@@ -607,7 +607,7 @@ CI runs formatting, Clippy (warnings denied), tests, and a release build against
 - [x] Read layer: user-defined-type (struct/enum/union) and 256-bit-integer arguments
 - [x] Enrichment for user-defined struct/enum/union values (naming nested UDT values, not just event params)
 - [x] Contract upgrade watch: versioned interface history, semantic diffs, breaking-change detection, and `contract.upgraded` webhooks
-- [ ] In-memory spec cache in the API
+- [x] In-memory spec cache in the API (hash-validated, so an upgrade is never served stale)
 - [ ] Deep historical backfill via a captive-core / data-lake source (beyond RPC's ~7-day window)
 - [ ] Additional materialized verticals (AMM swaps, liquidity, NFT mints/transfers)
 - [ ] Redis-backed rate limiting and read caching for multi-instance deployments

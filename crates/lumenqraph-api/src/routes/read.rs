@@ -12,7 +12,6 @@
 use axum::extract::{Path, State};
 use axum::Json;
 use lumenqraph_core::read::{self, EncodeError};
-use lumenqraph_core::ContractSpec;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -20,30 +19,14 @@ use crate::error::{ApiError, ApiResult};
 use crate::rpc::SimOutcome;
 use crate::state::AppState;
 
-/// Load a contract's stored raw spec section (hex). `None` if not indexed yet.
-async fn load_spec_section(state: &AppState, contract_id: &str) -> ApiResult<Vec<u8>> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT spec_section FROM contract_specs WHERE contract_id = $1")
-            .bind(contract_id)
-            .fetch_optional(&state.pool)
-            .await?;
-    let hex_section = row.map(|r| r.0).filter(|s| !s.is_empty()).ok_or_else(|| {
-        ApiError::not_found(
-            "no interface indexed for this contract yet (the indexer fetches it \
-             on first sighting; Stellar Asset Contracts have no callable spec)",
-        )
-    })?;
-    hex::decode(&hex_section).map_err(|_| ApiError::from(anyhow::anyhow!("corrupt stored spec")))
-}
-
 pub async fn list_functions(
     State(state): State<AppState>,
     Path(contract_id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let section = load_spec_section(&state, &contract_id).await?;
+    let spec = state.specs.current(&state.pool, &contract_id).await?;
     Ok(Json(json!({
         "contract_id": contract_id,
-        "functions": read::functions(&section),
+        "functions": read::functions(&spec.section),
     })))
 }
 
@@ -65,10 +48,10 @@ pub async fn call_function(
     Path(contract_id): Path<String>,
     Json(req): Json<CallRequest>,
 ) -> ApiResult<Json<Value>> {
-    let section = load_spec_section(&state, &contract_id).await?;
+    let spec = state.specs.current(&state.pool, &contract_id).await?;
 
     let call = read::encode_call(
-        &section,
+        &spec.section,
         &contract_id,
         &req.function,
         &req.args,
@@ -101,10 +84,10 @@ pub async fn simulate_call(
     Path(contract_id): Path<String>,
     Json(req): Json<CallRequest>,
 ) -> ApiResult<Json<Value>> {
-    let section = load_spec_section(&state, &contract_id).await?;
+    let spec = state.specs.current(&state.pool, &contract_id).await?;
 
     let call = read::encode_call(
-        &section,
+        &spec.section,
         &contract_id,
         &req.function,
         &req.args,
@@ -120,8 +103,7 @@ pub async fn simulate_call(
             latest_ledger,
         } => {
             // Enrich emitted events from this contract with its interface.
-            let spec = ContractSpec::from_spec_xdr(&section);
-            let decoded_events = read::decode_events(&events, &contract_id, spec.as_ref());
+            let decoded_events = read::decode_events(&events, &contract_id, spec.parsed.as_ref());
             Ok(Json(json!({
                 "contract_id": contract_id,
                 "function": req.function,

@@ -9,6 +9,7 @@ mod metrics;
 mod rate_limit;
 mod routes;
 mod rpc;
+mod specs;
 mod state;
 
 use std::sync::atomic::AtomicU64;
@@ -64,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
         limiter: Arc::new(RateLimiter::new()),
         http_requests: Arc::new(AtomicU64::new(0)),
         rpc: rpc::RpcClient::new(rpc_url),
+        specs: Arc::new(specs::SpecCache::new()),
     };
 
     let app = routes::router(state)

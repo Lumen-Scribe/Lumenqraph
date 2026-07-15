@@ -50,7 +50,8 @@ jobs:
       # once drops the tables out from under the other.
       - name: Test (Postgres-backed)
         run: |
-          cargo test -p lumenqraph-indexer -- --ignored --test-threads=1
+          cargo test -p lumenqraph-indexer  -- --ignored --test-threads=1
           cargo test -p lumenqraph-webhooks -- --ignored --test-threads=1
+          cargo test -p lumenqraph-api      -- --ignored --test-threads=1
       - name: Build (release)
         run: cargo build --workspace --release

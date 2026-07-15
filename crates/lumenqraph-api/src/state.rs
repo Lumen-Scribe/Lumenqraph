@@ -7,6 +7,7 @@ use sqlx::PgPool;
 
 use crate::rate_limit::RateLimiter;
 use crate::rpc::RpcClient;
+use crate::specs::SpecCache;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -19,4 +20,7 @@ pub struct AppState {
     pub http_requests: Arc<AtomicU64>,
     /// Soroban RPC client, for the read layer (`POST /contracts/:id/call`).
     pub rpc: RpcClient,
+    /// Parsed contract interfaces, so the read layer doesn't re-fetch and
+    /// re-parse a contract's spec section on every call.
+    pub specs: Arc<SpecCache>,
 }
