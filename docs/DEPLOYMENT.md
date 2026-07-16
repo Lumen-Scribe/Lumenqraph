@@ -78,6 +78,22 @@ and log a gap rather than stall, because public RPC rejects a `getEvents` more
 than a few thousand ledgers behind the tip. That's the honest trade for a free
 demo — a continuous index needs an always-on worker and a retaining RPC.
 
+### Serving testnet from the same container
+
+A deployment indexes exactly one network, but the free container can host two:
+set `TESTNET_DATABASE_URL` (plus `TESTNET_CONTRACT_IDS`) and
+`run-all-in-one.sh` starts a second indexer+API pair against Soroban testnet on
+an internal port, which the public API reverse-proxies under `/testnet`
+(`INSTANCE_MOUNTS`). One origin, both networks; the explorer's network selector
+discovers the mount via `/health` and switches with one click.
+
+For the second database, reuse the same Supabase project — run
+`CREATE DATABASE lumenqraph_testnet;` in its SQL editor, then use the same
+pooler connection string with the database name swapped. Both databases share
+the project's 500MB, so keep the testnet allowlist curated and
+`TESTNET_RETENTION_LEDGERS` short (the default in `render.yaml` is ~1 day —
+testnet is a scratch network, nobody needs deep history there).
+
 ## Production checklist
 
 - [ ] `DATABASE_URL` → managed Postgres with TLS (`sslmode=require`).

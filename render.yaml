@@ -67,3 +67,21 @@ services:
 
       - key: KEY_INDEXING
         value: "true"
+
+      # ---- Optional second network in the same container --------------------
+      # Setting TESTNET_DATABASE_URL makes run-all-in-one.sh start a second
+      # indexer+api pair against Soroban testnet, reverse-proxied by the public
+      # API under /testnet (one origin, both networks — the explorer's network
+      # selector discovers it automatically via /health "mounts"). Use a second
+      # *database* in the same Supabase project (CREATE DATABASE …_testnet):
+      # both share the project's 500MB, so keep the testnet CONTRACT_IDS
+      # curated and the retention window short.
+      - key: TESTNET_DATABASE_URL
+        sync: false
+
+      - key: TESTNET_CONTRACT_IDS
+        sync: false
+
+      # ~1 day. Testnet is a scratch network; a short window is plenty.
+      - key: TESTNET_RETENTION_LEDGERS
+        value: "17280"
