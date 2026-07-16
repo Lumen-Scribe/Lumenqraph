@@ -18,7 +18,9 @@ services:
     type: web
     runtime: docker
     plan: free
-    region: oregon
+    # Keep this near the Supabase project's region: every indexer query crosses
+    # this gap. The demo DB lives in eu-west-1 (Ireland) -> frankfurt.
+    region: frankfurt
     dockerfilePath: ./Dockerfile
     dockerContext: .
     # Overrides the image's default CMD (api only) to run indexer + api together.
