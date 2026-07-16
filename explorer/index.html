@@ -522,11 +522,16 @@ async function renderInterface(cid, version) {
     .map(([name, sig]) => `<tr><td><code>${esc(name)}</code></td><td><code>${esc(sig)}</code></td></tr>`).join('');
   // When pinned to a historical version, say so loudly — otherwise this reads
   // as the contract's current interface, which it isn't.
+  // A typed TS client generated from this exact interface (version-pinned when
+  // viewing history) — the on-chain spec turned into code you can import.
+  const sdkHref = `${base()}/contracts/${cid}/sdk?lang=ts${version ? `&version=${version}` : ''}`;
+  const sdkLink = `<a href="${sdkHref}" download="${esc(cid)}${version ? `.v${version}` : ''}.ts" title="Typed, zero-dependency client generated from this interface">TypeScript client ⬇</a>`;
   const head = version
     ? `<div class="summary"><span>Interface at <strong>v${version}</strong></span>
          <span class="muted">·</span><span class="muted">observed ${fmtDate(iface.observed_at)}</span>
-         <span class="muted">·</span><a href="#" onclick="setTab('interface');return false;">show current</a></div>`
-    : `<div class="muted" style="padding:.4rem .6rem">${(i.functions||[]).length} functions · ${(i.events||[]).length} events · ${typeRows(i).length} types${iface.fetched_at ? ' · fetched ' + fmtDate(iface.fetched_at) : ''}</div>`;
+         <span class="muted">·</span><a href="#" onclick="setTab('interface');return false;">show current</a>
+         <span class="muted">·</span>${sdkLink}</div>`
+    : `<div class="muted" style="padding:.4rem .6rem">${(i.functions||[]).length} functions · ${(i.events||[]).length} events · ${typeRows(i).length} types${iface.fetched_at ? ' · fetched ' + fmtDate(iface.fetched_at) : ''} · ${sdkLink}</div>`;
   const section = (label, col, rows) =>
     rows ? `<div style="height:.6rem"></div><table><thead><tr><th>${label}</th><th>${col}</th></tr></thead><tbody>${rows}</tbody></table>` : '';
   $('detail').innerHTML =
