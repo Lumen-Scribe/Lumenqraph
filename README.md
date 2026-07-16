@@ -13,6 +13,13 @@ Tail contract events from Soroban RPC, decode their XDR to clean JSON, store the
 
 [Quick start](#quick-start) · [API](#api) · [Architecture](#architecture) · [Docs](docs/) · [Roadmap](#roadmap) · [Contributing](#contributing)
 
+### 🔭 [Live demo → lumenqraph.onrender.com](https://lumenqraph.onrender.com)
+
+Indexing Stellar **mainnet** right now. Below: the [Aquarius AMM](https://aqua.network) swap router's
+75-function typed interface, parsed straight from its **on-chain** WASM spec — no ABI upload, no config.
+
+![The Lumenqraph explorer showing the Aquarius router's typed interface, decoded live from the contract's on-chain spec](docs/images/explorer-interface.png)
+
 </div>
 
 ---
