@@ -11,10 +11,13 @@ pub mod webhooks;
 
 use async_graphql::http::GraphiQLSource;
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
+use axum::http::{header, HeaderValue};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{delete, get, post};
 use axum::{middleware, Extension, Router};
+use tower::Layer;
 use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::auth::auth_and_rate_limit;
 use crate::graphql::{self, AppSchema};
@@ -103,7 +106,15 @@ pub fn router(state: AppState) -> Router {
     // container image can point at wherever the assets are COPYed.
     let explorer_dir = std::env::var("EXPLORER_DIR").unwrap_or_else(|_| "explorer".to_string());
     if std::path::Path::new(&explorer_dir).is_dir() {
-        app.fallback_service(ServeDir::new(explorer_dir))
+        // `no-cache` means "revalidate before using", not "don't cache":
+        // ServeDir serves Last-Modified, so an unchanged explorer costs a 304 —
+        // but a deploy shows up on the next load instead of whenever the
+        // browser's heuristic cache happens to expire.
+        let revalidate = SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        );
+        app.fallback_service(revalidate.layer(ServeDir::new(explorer_dir)))
     } else {
         app
     }
