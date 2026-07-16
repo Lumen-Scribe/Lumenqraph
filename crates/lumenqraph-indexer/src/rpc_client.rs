@@ -72,6 +72,39 @@ struct Pagination {
     cursor: Option<String>,
 }
 
+/// getEvents allows at most this many contract IDs in one filter…
+const MAX_IDS_PER_FILTER: usize = 5;
+/// …and at most this many filters in one request.
+const MAX_FILTERS: usize = 5;
+
+/// Spread the watchlist across getEvents filters (the filters are OR'd by the
+/// RPC). An empty watchlist stays a single bare `contract` filter, which
+/// matches every contract's events.
+fn event_filters(contract_ids: &[String]) -> anyhow::Result<Vec<EventFilter>> {
+    if contract_ids.len() > MAX_IDS_PER_FILTER * MAX_FILTERS {
+        return Err(anyhow!(
+            "getEvents supports at most {} contract IDs ({} filters x {} IDs); got {}",
+            MAX_IDS_PER_FILTER * MAX_FILTERS,
+            MAX_FILTERS,
+            MAX_IDS_PER_FILTER,
+            contract_ids.len()
+        ));
+    }
+    if contract_ids.is_empty() {
+        return Ok(vec![EventFilter {
+            filter_type: "contract",
+            contract_ids: vec![],
+        }]);
+    }
+    Ok(contract_ids
+        .chunks(MAX_IDS_PER_FILTER)
+        .map(|chunk| EventFilter {
+            filter_type: "contract",
+            contract_ids: chunk.to_vec(),
+        })
+        .collect())
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct GetEventsResult {
@@ -161,6 +194,9 @@ impl RpcClient {
 
     /// Fetch a page of events. Pass `start_ledger` on the first page of a scan,
     /// or `cursor` to continue a previous page (never both).
+    ///
+    /// RPC caps a getEvents filter at 5 contract IDs and a request at 5
+    /// filters, so the watchlist is spread across filters — up to 25 IDs total.
     pub async fn get_events(
         &self,
         start_ledger: Option<i64>,
@@ -170,10 +206,7 @@ impl RpcClient {
     ) -> anyhow::Result<GetEventsResult> {
         let params = GetEventsParams {
             start_ledger: if cursor.is_some() { None } else { start_ledger },
-            filters: vec![EventFilter {
-                filter_type: "contract",
-                contract_ids: contract_ids.to_vec(),
-            }],
+            filters: event_filters(contract_ids)?,
             pagination: Pagination { limit, cursor },
             xdr_format: "base64",
         };
@@ -339,4 +372,47 @@ struct LedgerEntryItem {
     xdr: String,
     #[serde(default)]
     last_modified_ledger_seq: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("C{i}")).collect()
+    }
+
+    #[test]
+    fn empty_watchlist_is_one_bare_filter() {
+        let filters = event_filters(&[]).unwrap();
+        assert_eq!(filters.len(), 1);
+        assert!(filters[0].contract_ids.is_empty());
+    }
+
+    #[test]
+    fn five_ids_fit_in_one_filter() {
+        let filters = event_filters(&ids(5)).unwrap();
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].contract_ids.len(), 5);
+    }
+
+    #[test]
+    fn seven_ids_split_across_two_filters() {
+        // The regression that stalled the live indexer: >5 IDs in one filter
+        // is rejected by RPC with -32602.
+        let filters = event_filters(&ids(7)).unwrap();
+        assert_eq!(filters.len(), 2);
+        assert_eq!(filters[0].contract_ids.len(), 5);
+        assert_eq!(filters[1].contract_ids.len(), 2);
+    }
+
+    #[test]
+    fn twenty_five_ids_are_the_ceiling() {
+        let filters = event_filters(&ids(25)).unwrap();
+        assert_eq!(filters.len(), 5);
+        assert!(filters.iter().all(|f| f.contract_ids.len() == 5));
+
+        let err = event_filters(&ids(26)).err().unwrap().to_string();
+        assert!(err.contains("at most 25"), "unexpected error: {err}");
+    }
 }
