@@ -53,6 +53,11 @@ pub struct FunctionSpec {
 pub struct EventSpec {
     pub name: String,
     pub doc: String,
+    /// The literal symbols the contract emits at the front of the topic list.
+    /// This is what actually appears on-chain as `topic[0..n]` — it need not
+    /// match `name` (e.g. an event *named* `MarketPnlUpdate` emitted under the
+    /// topic `mkt_pnl`), so enrichment must match on it, not on the name.
+    pub prefix_topics: Vec<String>,
     pub params: Vec<EventParam>,
     /// How the non-topic data is laid out: "single" | "vec" | "map".
     pub data_format: &'static str,
@@ -149,12 +154,19 @@ impl ContractSpec {
     }
 
     fn reindex(&mut self) {
-        self.events_by_name = self
-            .events
-            .iter()
-            .enumerate()
-            .map(|(i, e)| (e.name.clone(), i))
-            .collect();
+        // Key each event by what shows up as `topic[0]` on-chain: its first
+        // prefix topic. The declared name is kept as a fallback key, both for
+        // events whose prefix simply is their name and for callers looking an
+        // event up by name (the prefix key wins on collision).
+        self.events_by_name.clear();
+        for (i, e) in self.events.iter().enumerate() {
+            self.events_by_name.entry(e.name.clone()).or_insert(i);
+        }
+        for (i, e) in self.events.iter().enumerate() {
+            if let Some(first) = e.prefix_topics.first() {
+                self.events_by_name.insert(first.clone(), i);
+            }
+        }
     }
 
     fn push_entry(&mut self, entry: ScSpecEntry) {
@@ -230,6 +242,11 @@ impl ContractSpec {
                 self.events.push(EventSpec {
                     name: ev.name.to_utf8_string_lossy(),
                     doc: string_of(&ev.doc),
+                    prefix_topics: ev
+                        .prefix_topics
+                        .iter()
+                        .map(|s| s.to_utf8_string_lossy())
+                        .collect(),
                     params,
                     data_format: match ev.data_format {
                         ScSpecEventDataFormat::SingleValue => "single",
@@ -260,9 +277,12 @@ impl ContractSpec {
     ) -> Option<Value> {
         let spec = self.events.get(*self.events_by_name.get(event_name)?)?;
 
-        // Topic params bind to topics after the name symbol (index 0); data
+        // Topic params bind to topics after the emitted prefix symbols; data
         // params bind to the event body according to the declared data format.
-        let topic_vals = decoded_topics.get(1..).unwrap_or(&[]);
+        // A spec with no prefix topics still matched on `topic[0]`, so that
+        // symbol is a prefix in practice — skip at least one.
+        let skip = spec.prefix_topics.len().max(1);
+        let topic_vals = decoded_topics.get(skip..).unwrap_or(&[]);
         let mut topic_iter = topic_vals.iter();
 
         // Pre-split the data side so each data param can be pulled by position
@@ -679,6 +699,54 @@ mod tests {
         assert!(spec
             .enrich_event("mint", &[json!("mint")], &json!(1))
             .is_none());
+    }
+
+    // An event's on-chain topic symbol need not match its declared name:
+    // `MarketPnlUpdate` here is emitted under the topic `mkt_pnl`. Enrichment
+    // must match what the chain actually says (seen live on a testnet perps
+    // DEX, where every event went unenriched before this was handled).
+    #[test]
+    fn events_match_on_their_emitted_prefix_topic_not_their_name() {
+        let entry = ScSpecEntry::EventV0(ScSpecEventV0 {
+            doc: "".try_into().unwrap(),
+            lib: "".try_into().unwrap(),
+            name: ScSymbol("MarketPnlUpdate".try_into().unwrap()),
+            prefix_topics: vec![ScSymbol("mkt_pnl".try_into().unwrap())]
+                .try_into()
+                .unwrap(),
+            params: vec![
+                ScSpecEventParamV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "market".try_into().unwrap(),
+                    type_: ScSpecTypeDef::Symbol,
+                    location: ScSpecEventParamLocationV0::TopicList,
+                },
+                ScSpecEventParamV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "pnl".try_into().unwrap(),
+                    type_: ScSpecTypeDef::I128,
+                    location: ScSpecEventParamLocationV0::Data,
+                },
+            ]
+            .try_into()
+            .unwrap(),
+            data_format: ScSpecEventDataFormat::SingleValue,
+        });
+        let spec = ContractSpec::from_spec_xdr(&spec_section(&[entry])).unwrap();
+
+        // topic[0] is the prefix symbol, not the name.
+        let topics = vec![json!("mkt_pnl"), json!("ETHUSD")];
+        let out = spec
+            .enrich_event("mkt_pnl", &topics, &json!("-42"))
+            .expect("should match on the prefix topic");
+        assert_eq!(out["event"], "MarketPnlUpdate");
+        assert_eq!(out["params"]["market"]["value"], "ETHUSD");
+        assert_eq!(out["params"]["pnl"]["value"], "-42");
+
+        // The declared name still works as a lookup key (fallback).
+        assert!(spec
+            .enrich_event("MarketPnlUpdate", &topics, &json!("-42"))
+            .is_some());
     }
 
     fn push_leb(out: &mut Vec<u8>, mut v: u32) {
