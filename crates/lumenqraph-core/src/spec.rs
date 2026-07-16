@@ -291,6 +291,15 @@ impl ContractSpec {
         }))
     }
 
+    /// Re-label a generically-decoded value using its declared type. Public
+    /// entry point for the read layer: naming the UDT values inside a call
+    /// result puts it in the same shape the encoder accepts back as *input*
+    /// (enum case names, `{Case: [..]}` unions), so a client can round-trip
+    /// values without translating between two dialects.
+    pub fn relabel_value(&self, v: &Value, ty: &ScSpecTypeDef) -> Value {
+        self.relabel(v, ty)
+    }
+
     /// Re-label a generically-decoded value using its declared type.
     ///
     /// The generic XDR decoder can only see shapes, so a user-defined type

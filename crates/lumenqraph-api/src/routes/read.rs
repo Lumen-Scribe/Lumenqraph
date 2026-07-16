@@ -67,7 +67,7 @@ pub async fn call_function(
         } => Ok(Json(json!({
             "contract_id": contract_id,
             "function": req.function,
-            "result": read::decode_result(&result_xdr, &call.output_type),
+            "result": read::decode_result(&result_xdr, &call, spec.parsed.as_ref()),
             "simulated_at_ledger": latest_ledger,
         }))),
         // A trap / bad call is the caller's problem, not a 500.
@@ -107,7 +107,7 @@ pub async fn simulate_call(
             Ok(Json(json!({
                 "contract_id": contract_id,
                 "function": req.function,
-                "result": read::decode_result(&result_xdr, &call.output_type),
+                "result": read::decode_result(&result_xdr, &call, spec.parsed.as_ref()),
                 "events": decoded_events,
                 "min_resource_fee": min_resource_fee,
                 "simulated_at_ledger": latest_ledger,

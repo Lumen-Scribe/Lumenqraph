@@ -53,6 +53,9 @@ pub enum EncodeError {
 pub struct EncodedCall {
     pub tx_xdr: String,
     pub output_type: String,
+    /// The structured form of `output_type`, kept so [`decode_result`] can name
+    /// user-defined values in the result. `None` for a void function.
+    pub output_ty: Option<ScSpecTypeDef>,
 }
 
 /// Encode a typed contract read into a simulation transaction.
@@ -86,9 +89,9 @@ pub fn encode_call(
         scvals.push(json_to_scval(jv, &input.type_, &name, &entries)?);
     }
 
-    let output_type = func
-        .outputs
-        .first()
+    let output_ty = func.outputs.first().cloned();
+    let output_type = output_ty
+        .as_ref()
         .map(type_name)
         .unwrap_or_else(|| "void".to_string());
 
@@ -97,6 +100,7 @@ pub fn encode_call(
     Ok(EncodedCall {
         tx_xdr,
         output_type,
+        output_ty,
     })
 }
 
@@ -556,10 +560,19 @@ fn build_read_tx(
 }
 
 /// Decode a simulation's base64 `ScVal` result and label it with its type.
-pub fn decode_result(result_xdr: &str, output_type: &str) -> Value {
+///
+/// With the parsed spec in hand, user-defined values in the result are *named*:
+/// an enum discriminant becomes its case name, a union becomes `{Case: [..]}` —
+/// the same shapes [`encode_call`] accepts as arguments, so results can be fed
+/// straight back into another call.
+pub fn decode_result(result_xdr: &str, call: &EncodedCall, spec: Option<&ContractSpec>) -> Value {
+    let mut value = crate::xdr::decode_scval_base64(result_xdr);
+    if let (Some(spec), Some(ty)) = (spec, call.output_ty.as_ref()) {
+        value = spec.relabel_value(&value, ty);
+    }
     serde_json::json!({
-        "type": output_type,
-        "value": crate::xdr::decode_scval_base64(result_xdr),
+        "type": call.output_type,
+        "value": value,
     })
 }
 
@@ -882,6 +895,65 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, EncodeError::BadArgument { .. }));
+    }
+
+    #[test]
+    fn decode_result_names_udt_values_with_the_spec() {
+        use stellar_xdr::curr::{ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0};
+
+        // enum Status { Active = 0, Filled = 7 }; status() -> Status
+        let mut spec = Vec::new();
+        spec.extend(
+            ScSpecEntry::UdtEnumV0(ScSpecUdtEnumV0 {
+                doc: "".try_into().unwrap(),
+                lib: "".try_into().unwrap(),
+                name: "Status".try_into().unwrap(),
+                cases: vec![
+                    ScSpecUdtEnumCaseV0 {
+                        doc: "".try_into().unwrap(),
+                        name: "Active".try_into().unwrap(),
+                        value: 0,
+                    },
+                    ScSpecUdtEnumCaseV0 {
+                        doc: "".try_into().unwrap(),
+                        name: "Filled".try_into().unwrap(),
+                        value: 7,
+                    },
+                ]
+                .try_into()
+                .unwrap(),
+            })
+            .to_xdr(Limits::none())
+            .unwrap(),
+        );
+        spec.extend(
+            ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
+                doc: "".try_into().unwrap(),
+                name: ScSymbol("status".try_into().unwrap()),
+                inputs: vec![].try_into().unwrap(),
+                outputs: vec![ScSpecTypeDef::Udt(stellar_xdr::curr::ScSpecTypeUdt {
+                    name: "Status".try_into().unwrap(),
+                })]
+                .try_into()
+                .unwrap(),
+            })
+            .to_xdr(Limits::none())
+            .unwrap(),
+        );
+
+        let call = encode_call(&spec, C, "status", &serde_json::json!({}), None).unwrap();
+        assert_eq!(call.output_type, "Status");
+        let result_xdr = ScVal::U32(7).to_xdr_base64(Limits::none()).unwrap();
+
+        // Without the spec the result is a meaningless discriminant…
+        let raw = decode_result(&result_xdr, &call, None);
+        assert_eq!(raw["value"], 7);
+
+        // …with it, the case is named — in the shape the encoder accepts back.
+        let parsed = ContractSpec::from_spec_xdr(&spec).unwrap();
+        let named = decode_result(&result_xdr, &call, Some(&parsed));
+        assert_eq!(named["value"], "Filled");
+        assert_eq!(named["type"], "Status");
     }
 
     #[test]

@@ -56,7 +56,7 @@ fn simulate_decimals_on_testnet() {
     );
     let xdr = result["results"][0]["xdr"].as_str().expect("result xdr");
 
-    let decoded = decode_result(xdr, &call.output_type);
+    let decoded = decode_result(xdr, &call, None);
     println!("decoded decimals(): {decoded}");
     // Native SAC reports 7 decimals; assert we decoded a concrete number.
     assert_eq!(decoded["type"], "u32");

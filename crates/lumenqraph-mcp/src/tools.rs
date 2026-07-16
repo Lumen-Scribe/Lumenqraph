@@ -385,6 +385,8 @@ async fn call_contract(
 
     let call = read::encode_call(&section, contract_id, function, &args, source_account)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Parsed spec: names UDT values in the result (and enriches preview events).
+    let spec = ContractSpec::from_spec_xdr(&section);
 
     match state.rpc.simulate(&call.tx_xdr).await? {
         SimOutcome::Ok {
@@ -396,11 +398,10 @@ async fn call_contract(
             let mut out = json!({
                 "contract_id": contract_id,
                 "function": function,
-                "result": read::decode_result(&result_xdr, &call.output_type),
+                "result": read::decode_result(&result_xdr, &call, spec.as_ref()),
                 "simulated_at_ledger": latest_ledger,
             });
             if preview {
-                let spec = ContractSpec::from_spec_xdr(&section);
                 out["events"] = json!(read::decode_events(&events, contract_id, spec.as_ref()));
                 out["min_resource_fee"] = json!(min_resource_fee);
             }
