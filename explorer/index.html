@@ -224,6 +224,9 @@ function seLink(type, val, n = 8) {
 let selected = null;
 let tab = 'events';
 let healthTimer = null;
+// Sibling instances the connected API advertises in /health (name -> path),
+// kept across reconnects so switching networks still knows the way back.
+let mounts = {};
 // When set, the Interface tab shows this historical version instead of the
 // current one (set by clicking a version in the upgrade timeline).
 let ifaceVersion = null;
@@ -277,17 +280,29 @@ function baseChanged() {
   connect();
 }
 
-/// The user picked a network: jump to the API base last seen serving it.
+/// The user picked a network: jump to the API base last seen serving it, or
+/// to a mount the connected API advertises (a sibling instance served under a
+/// path prefix of the same origin — how the hosted demo exposes testnet).
 function netChanged() {
   const want = seNet() === 'public' ? 'mainnet' : 'testnet';
   const saved = localStorage.getItem('lq.base.' + want);
   if (saved !== null && saved !== $('base').value) {
     $('base').value = saved;
     toast(`Switching to the ${want} API…`);
+  } else if (saved === null && mounts[want]) {
+    $('base').value = mountBase(mounts[want]);
+    toast(`Switching to the ${want} API…`);
   } else if (saved === null) {
     toast(`No ${want} API known yet — enter its URL in the API base field.`);
   }
   connect();
+}
+
+/// Resolve a mount path ("/testnet") against the origin of the current base.
+function mountBase(path) {
+  const b = base();
+  if (!b) return path; // same origin
+  try { return new URL(b, location.href).origin + path; } catch { return path; }
 }
 
 async function loadHealth() {
@@ -306,6 +321,7 @@ async function loadHealth() {
     else if (lag > 50) { cls = 'warn'; label = 'lagging'; }
     $('statusDot').className = 'dot ' + cls;
     $('statusText').textContent = h.network ? `${label} · ${h.network}` : label;
+    if (h.mounts) mounts = { ...mounts, ...h.mounts };
     syncNetwork(h.network);
   } catch (e) {
     $('statusDot').className = 'dot crit';
