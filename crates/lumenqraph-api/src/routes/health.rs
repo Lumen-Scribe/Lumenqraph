@@ -15,8 +15,18 @@ pub async fn health(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     .fetch_optional(&state.pool)
     .await?;
 
+    // Which network this deployment indexes, from the RPC itself (cached after
+    // the first successful probe) — lets clients like the explorer adapt
+    // instead of asking the user. `null` if the RPC is unreachable right now.
+    let passphrase = state.rpc.network_passphrase().await;
+    let network = passphrase.as_deref().map(network_name);
+
     let Some((last, tip, ingested, errors, updated_at)) = status else {
-        return Ok(Json(json!({ "status": "starting" })));
+        return Ok(Json(json!({
+            "status": "starting",
+            "network": network,
+            "network_passphrase": passphrase,
+        })));
     };
 
     let lag_ledgers = (tip - last).max(0);
@@ -26,6 +36,8 @@ pub async fn health(State(state): State<AppState>) -> ApiResult<Json<Value>> {
 
     Ok(Json(json!({
         "status": if healthy { "ok" } else { "degraded" },
+        "network": network,
+        "network_passphrase": passphrase,
         "last_processed_ledger": last,
         "chain_tip_ledger": tip,
         "lag_ledgers": lag_ledgers,
@@ -33,4 +45,14 @@ pub async fn health(State(state): State<AppState>) -> ApiResult<Json<Value>> {
         "events_ingested_total": ingested,
         "errors_total": errors,
     })))
+}
+
+/// Short name for the well-known Stellar network passphrases.
+fn network_name(passphrase: &str) -> &'static str {
+    match passphrase {
+        "Public Global Stellar Network ; September 2015" => "mainnet",
+        "Test SDF Network ; September 2015" => "testnet",
+        "Test SDF Future Network ; October 2022" => "futurenet",
+        _ => "custom",
+    }
 }

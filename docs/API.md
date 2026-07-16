@@ -11,10 +11,16 @@ are always public. Rate-limit breaches return `429`; bad/revoked keys `401`.
 
 ### `GET /health`
 ```json
-{ "status": "ok", "last_processed_ledger": 3550886, "chain_tip_ledger": 3550886,
+{ "status": "ok", "network": "mainnet",
+  "network_passphrase": "Public Global Stellar Network ; September 2015",
+  "last_processed_ledger": 3550886, "chain_tip_ledger": 3550886,
   "lag_ledgers": 0, "seconds_since_cursor_update": 1,
   "events_ingested_total": 4895, "errors_total": 0 }
 ```
+`network` is which Stellar network this deployment indexes (`mainnet` /
+`testnet` / `futurenet` / `custom`), asked of the RPC itself and cached — so
+clients (like the explorer) can adapt instead of asking the user. `null` while
+the RPC is unreachable.
 
 ### `GET /metrics`
 Prometheus text: `lumenqraph_indexer_lag_ledgers`, `lumenqraph_events_total`,

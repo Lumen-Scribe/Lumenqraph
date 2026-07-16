@@ -1,14 +1,21 @@
-//! Minimal Soroban RPC client for the read layer: just `simulateTransaction`,
-//! used to execute contract view functions read-only.
+//! Minimal Soroban RPC client for the read layer: `simulateTransaction` (to
+//! execute contract view functions read-only) and `getNetwork` (so the API can
+//! report which network it indexes).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
+use tokio::sync::OnceCell;
 
 #[derive(Clone)]
 pub struct RpcClient {
     http: reqwest::Client,
     url: String,
+    /// The RPC's network passphrase, fetched once on first use. A deployment
+    /// never changes network mid-flight, so a success is cached for good;
+    /// failures are not cached, so a flaky first probe gets retried.
+    passphrase: Arc<OnceCell<String>>,
 }
 
 /// The outcome of a simulation: either the result (base64 `ScVal`) plus the
@@ -65,7 +72,43 @@ impl RpcClient {
         Self {
             http,
             url: url.into(),
+            passphrase: Arc::new(OnceCell::new()),
         }
+    }
+
+    /// The network passphrase this RPC serves, e.g.
+    /// `"Public Global Stellar Network ; September 2015"`. `None` if the RPC
+    /// can't be reached right now (in which case a later call retries).
+    pub async fn network_passphrase(&self) -> Option<String> {
+        self.passphrase
+            .get_or_try_init(|| async {
+                #[derive(Deserialize)]
+                struct Network {
+                    passphrase: String,
+                }
+                let req = serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "getNetwork"
+                });
+                #[derive(Deserialize)]
+                struct Env {
+                    result: Option<Network>,
+                }
+                let env: Env = self
+                    .http
+                    .post(&self.url)
+                    .json(&req)
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                env.result
+                    .map(|n| n.passphrase)
+                    .ok_or_else(|| anyhow::anyhow!("rpc returned no network"))
+            })
+            .await
+            .ok()
+            .cloned()
     }
 
     /// Simulate a base64 transaction envelope. `Ok(SimOutcome::Error)` carries a
