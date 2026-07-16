@@ -157,13 +157,12 @@
       <span class="tag">Explorer &amp; self-host dashboard</span>
     </div>
     <div class="conn">
-      <input id="base" size="26" value="" placeholder="API base (blank = same origin)" title="API base URL — leave blank when the page is served by/behind the API" />
-      <input id="key" size="16" placeholder="x-api-key (optional)" />
-      <select id="senet" title="Stellar.Expert network for ↗ links">
+      <input id="base" size="26" value="" placeholder="API base (blank = same origin)" title="API base URL — leave blank when the page is served by/behind the API" onchange="baseChanged()" />
+      <input id="key" size="16" placeholder="x-api-key (optional)" onchange="connect()" />
+      <select id="senet" title="Network — auto-detected from the connected API; pick one to switch to its remembered API base" onchange="netChanged()">
         <option value="public">mainnet</option>
         <option value="testnet">testnet</option>
       </select>
-      <button class="primary" onclick="connect()">Load</button>
     </div>
   </header>
 
@@ -181,7 +180,7 @@
     <!-- Contracts -->
     <aside class="panel">
       <h2>Indexed contracts</h2>
-      <ul class="clist" id="clist"><li class="muted" style="cursor:default">Connect to load…</li></ul>
+      <ul class="clist" id="clist"><li class="muted" style="cursor:default">Loading…</li></ul>
     </aside>
 
     <!-- Detail -->
@@ -257,11 +256,38 @@ async function get(path) {
   return r.json();
 }
 
+// ---- Connection ------------------------------------------------------------
+// There is no Connect/Load button: the page connects on load and reconnects
+// whenever the base, key, or network changes. Settings persist per browser.
+
 function connect() {
+  localStorage.setItem('lq.base', $('base').value);
+  localStorage.setItem('lq.key', $('key').value);
   loadHealth();
   loadContracts();
   if (healthTimer) clearInterval(healthTimer);
-  healthTimer = setInterval(loadHealth, 10000);
+  // Health drives the KPI row; the contract list refreshes more gently so it
+  // doesn't reshuffle under the cursor.
+  let tick = 0;
+  healthTimer = setInterval(() => { loadHealth(); if (++tick % 3 === 0) loadContracts(); }, 10000);
+}
+
+function baseChanged() {
+  // A new base means we no longer know the network; health will re-detect it.
+  connect();
+}
+
+/// The user picked a network: jump to the API base last seen serving it.
+function netChanged() {
+  const want = seNet() === 'public' ? 'mainnet' : 'testnet';
+  const saved = localStorage.getItem('lq.base.' + want);
+  if (saved !== null && saved !== $('base').value) {
+    $('base').value = saved;
+    toast(`Switching to the ${want} API…`);
+  } else if (saved === null) {
+    toast(`No ${want} API known yet — enter its URL in the API base field.`);
+  }
+  connect();
 }
 
 async function loadHealth() {
@@ -279,11 +305,25 @@ async function loadHealth() {
     else if (lag > 500) { cls = 'crit'; label = 'far behind'; }
     else if (lag > 50) { cls = 'warn'; label = 'lagging'; }
     $('statusDot').className = 'dot ' + cls;
-    $('statusText').textContent = label;
+    $('statusText').textContent = h.network ? `${label} · ${h.network}` : label;
+    syncNetwork(h.network);
   } catch (e) {
     $('statusDot').className = 'dot crit';
     $('statusText').textContent = 'unreachable';
     toast('Health: ' + e.message);
+  }
+}
+
+/// The API reports which network it indexes; follow it rather than asking.
+/// Keeps the ↗ links honest and remembers which base serves which network so
+/// the selector can switch back and forth without retyping URLs.
+function syncNetwork(network) {
+  if (network !== 'mainnet' && network !== 'testnet') return;
+  localStorage.setItem('lq.base.' + network, $('base').value);
+  const val = network === 'mainnet' ? 'public' : 'testnet';
+  if (seNet() !== val) {
+    $('senet').value = val;
+    toast(`This API indexes ${network} — links updated.`);
   }
 }
 
@@ -553,8 +593,11 @@ async function decodeAny() {
   catch (e) { $('detail').innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
 }
 
-// Auto-connect on load. With a blank base, calls are same-origin — so the page
-// works when served by (or behind a proxy in front of) the API, with no CORS.
+// Auto-connect on load, restoring the last-used connection. With a blank base,
+// calls are same-origin — so the page works when served by (or behind a proxy
+// in front of) the API, with no CORS and no setup.
+$('base').value = localStorage.getItem('lq.base') ?? '';
+$('key').value = localStorage.getItem('lq.key') ?? '';
 connect();
 </script>
 </body>
