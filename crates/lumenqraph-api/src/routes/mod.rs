@@ -4,16 +4,20 @@
 pub mod contracts;
 pub mod events;
 pub mod health;
+pub mod proxy;
 pub mod read;
 pub mod sdk;
 pub mod transfers;
 pub mod webhooks;
 
+use std::sync::Arc;
+
 use async_graphql::http::GraphiQLSource;
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
+use axum::extract::Request;
 use axum::http::{header, HeaderValue};
 use axum::response::{Html, IntoResponse};
-use axum::routing::{delete, get, post};
+use axum::routing::{any, delete, get, post};
 use axum::{middleware, Extension, Router};
 use tower::Layer;
 use tower_http::services::ServeDir;
@@ -98,7 +102,31 @@ pub fn router(state: AppState) -> Router {
             auth_and_rate_limit,
         ));
 
-    let app = public.merge(protected).with_state(state);
+    let mut app = public.merge(protected).with_state(state.clone());
+
+    // Sibling instances under a path prefix (see `proxy`). Registered outside
+    // the auth middleware: each upstream enforces its own policy.
+    if !state.mounts.is_empty() {
+        let client = Arc::new(reqwest::Client::new());
+        for (name, upstream) in state.mounts.iter() {
+            let (client, upstream, prefix) = (
+                Arc::clone(&client),
+                Arc::new(upstream.clone()),
+                Arc::new(format!("/{name}")),
+            );
+            let handler = move |req: Request| {
+                proxy::proxy(
+                    Arc::clone(&client),
+                    Arc::clone(&upstream),
+                    Arc::clone(&prefix),
+                    req,
+                )
+            };
+            app = app
+                .route(&format!("/{name}"), any(handler.clone()))
+                .route(&format!("/{name}/*rest"), any(handler));
+        }
+    }
 
     // Serve the static explorer UI at the same origin as the API (so it needs
     // no CORS and no configured API base). Falls back to it for any unmatched

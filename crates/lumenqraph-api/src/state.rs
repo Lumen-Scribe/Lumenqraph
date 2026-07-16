@@ -23,4 +23,7 @@ pub struct AppState {
     /// Parsed contract interfaces, so the read layer doesn't re-fetch and
     /// re-parse a contract's spec section on every call.
     pub specs: Arc<SpecCache>,
+    /// Sibling instances mounted under a path prefix (name, upstream URL) —
+    /// see `routes::proxy`. Advertised in `/health` for client discovery.
+    pub mounts: Arc<Vec<(String, String)>>,
 }

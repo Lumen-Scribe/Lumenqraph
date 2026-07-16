@@ -20,12 +20,22 @@ pub async fn health(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     // instead of asking the user. `null` if the RPC is unreachable right now.
     let passphrase = state.rpc.network_passphrase().await;
     let network = passphrase.as_deref().map(network_name);
+    // Sibling instances mounted under this origin (e.g. {"testnet": "/testnet"})
+    // so clients can discover other networks without configuration.
+    let mounts = (!state.mounts.is_empty()).then(|| {
+        state
+            .mounts
+            .iter()
+            .map(|(name, _)| (name.clone(), Value::String(format!("/{name}"))))
+            .collect::<serde_json::Map<String, Value>>()
+    });
 
     let Some((last, tip, ingested, errors, updated_at)) = status else {
         return Ok(Json(json!({
             "status": "starting",
             "network": network,
             "network_passphrase": passphrase,
+            "mounts": mounts,
         })));
     };
 
@@ -38,6 +48,7 @@ pub async fn health(State(state): State<AppState>) -> ApiResult<Json<Value>> {
         "status": if healthy { "ok" } else { "degraded" },
         "network": network,
         "network_passphrase": passphrase,
+        "mounts": mounts,
         "last_processed_ledger": last,
         "chain_tip_ledger": tip,
         "lag_ledgers": lag_ledgers,

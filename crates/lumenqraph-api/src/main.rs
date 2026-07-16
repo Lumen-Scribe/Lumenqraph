@@ -66,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
         http_requests: Arc::new(AtomicU64::new(0)),
         rpc: rpc::RpcClient::new(rpc_url),
         specs: Arc::new(specs::SpecCache::new()),
+        mounts: Arc::new(routes::proxy::mounts_from_env()),
     };
 
     let app = routes::router(state)

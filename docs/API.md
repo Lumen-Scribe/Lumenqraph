@@ -22,6 +22,11 @@ are always public. Rate-limit breaches return `429`; bad/revoked keys `401`.
 clients (like the explorer) can adapt instead of asking the user. `null` while
 the RPC is unreachable.
 
+When the operator has mounted sibling instances (`INSTANCE_MOUNTS`, e.g. the
+hosted demo serving a testnet deployment under the same origin), `/health` also
+advertises them as `"mounts": { "testnet": "/testnet" }` — every endpoint
+documented here works under that prefix, served by the sibling.
+
 ### `GET /metrics`
 Prometheus text: `lumenqraph_indexer_lag_ledgers`, `lumenqraph_events_total`,
 `lumenqraph_indexer_ingested_total`, `lumenqraph_indexer_errors_total`,
