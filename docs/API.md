@@ -164,6 +164,30 @@ baseline version, or if `from` == `to`; `404` for an unknown version.
 `breaking` is true when anything was removed or changed — an integration built
 against the old interface may no longer work. Additions alone are not breaking.
 
+## Generated typed clients
+
+### `GET /contracts/:id/sdk`
+A ready-to-use, typed TypeScript client for the contract, generated on demand
+from its on-chain interface — the codegen equivalent of everything above. Save
+it and call the contract with full type safety and zero dependencies:
+
+```bash
+curl -o contract.ts "$BASE/contracts/CB.../sdk?lang=ts"
+```
+```ts
+import { ContractClient } from "./contract";
+const c = new ContractClient({ baseUrl: "https://lumenqraph.onrender.com" });
+const pool = await c.get_pool_info(); // typed from the chain's own schema
+```
+
+Query: `lang` (`ts`, the default and only target so far; anything else is a
+`400`) and `version` (generate from a historical interface version — the client
+your integration was built against *before* an upgrade). Structs become
+interfaces, unit enums become case-name literal types, unions become
+`"Case" | { Case: [...] }` shapes — and because `/call` results are named with
+the same spec, what a call returns is exactly what the next call accepts.
+Generation is deterministic: same interface version, same file.
+
 ## Webhooks (authenticated)
 
 ### `POST /webhooks`

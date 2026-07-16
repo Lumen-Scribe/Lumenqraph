@@ -5,6 +5,7 @@ pub mod contracts;
 pub mod events;
 pub mod health;
 pub mod read;
+pub mod sdk;
 pub mod transfers;
 pub mod webhooks;
 
@@ -65,6 +66,7 @@ pub fn router(state: AppState) -> Router {
             "/contracts/:contract_id/data/:key_hash",
             get(contracts::contract_data_key),
         )
+        .route("/contracts/:contract_id/sdk", get(sdk::contract_sdk))
         .route(
             "/contracts/:contract_id/functions",
             get(read::list_functions),
