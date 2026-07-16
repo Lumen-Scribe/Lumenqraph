@@ -1,6 +1,7 @@
 //! Shared types and logic used by every Lumenqraph service. Defining the event
 //! schema and decoding once here means services can never drift.
 
+pub mod codegen;
 pub mod diff;
 pub mod error;
 pub mod models;

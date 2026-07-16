@@ -43,6 +43,10 @@ pub struct FunctionSpec {
     pub doc: String,
     pub inputs: Vec<Field>,
     pub outputs: Vec<String>,
+    /// The structured types behind `outputs`, for consumers (like codegen) that
+    /// need more than the rendered names.
+    #[serde(skip)]
+    pub(crate) output_tys: Vec<ScSpecTypeDef>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -65,7 +69,7 @@ pub struct EventParam {
     /// `Udt` type is only a *name*: enrichment needs it to look the definition
     /// up and label the decoded value.
     #[serde(skip)]
-    ty: ScSpecTypeDef,
+    pub(crate) ty: ScSpecTypeDef,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -74,7 +78,7 @@ pub struct Field {
     #[serde(rename = "type")]
     pub type_name: String,
     #[serde(skip)]
-    ty: ScSpecTypeDef,
+    pub(crate) ty: ScSpecTypeDef,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -97,7 +101,7 @@ pub struct UnionCase {
     #[serde(rename = "types")]
     pub type_names: Vec<String>,
     #[serde(skip)]
-    tys: Vec<ScSpecTypeDef>,
+    pub(crate) tys: Vec<ScSpecTypeDef>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -168,6 +172,7 @@ impl ContractSpec {
                     })
                     .collect(),
                 outputs: f.outputs.iter().map(type_name).collect(),
+                output_tys: f.outputs.to_vec(),
             }),
             ScSpecEntry::UdtStructV0(s) => self.structs.push(UdtStruct {
                 name: string_of(&s.name),
