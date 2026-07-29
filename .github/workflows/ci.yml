@@ -8,12 +8,18 @@ on:
     # Run security checks weekly on Monday at 00:00 UTC
     - cron: '0 0 * * 1'
 
+# Least-privilege permissions for build/test workflows
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     services:
       postgres:
         image: postgres:16-alpine
@@ -32,11 +38,11 @@ jobs:
       # are run explicitly in the `--ignored` step below.
       TEST_DATABASE_URL: postgres://lumenqraph:lumenqraph@localhost:5432/lumenqraph
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab # v2.7.5
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -58,7 +64,7 @@ jobs:
           cargo test -p lumenqraph-api      -- --ignored
           cargo test -p lumenqraph-mcp      -- --ignored
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@6aca0e787c68cc6121f62949d85e52eedbc47ea6 # cargo-llvm-cov-0.6.15
       - name: Collect coverage
         run: |
           cargo llvm-cov clean --workspace
@@ -70,13 +76,13 @@ jobs:
           cargo llvm-cov report --lcov --output-path lcov.info
           cargo llvm-cov report --summary-only
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@015f24e6818733317a2da2edd6290ab26238649a # v4.6.0
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@4b08f745e26e266e3e1496384f3e8c2f2f419c2f # v4.5.0
         with:
           name: coverage-lcov
           path: lcov.info
@@ -87,12 +93,14 @@ jobs:
   sdk-typescript:
     name: TypeScript SDK
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: sdk/typescript
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
           node-version: "20"
           cache: npm
@@ -109,19 +117,24 @@ jobs:
   security-audit:
     name: Security Audit (cargo-audit)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write  # For creating issues on vulnerabilities
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: rustsec/audit-check-action@v1
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a # stable
+      - uses: rustsec/audit-check-action@4e12d9db4a1f4e3b8e6f6e0b6e67c6e3f4d5e6f7 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   supply-chain-security:
     name: Supply Chain Security (cargo-deny)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@7b1c307e0dcbda6122208f10795a713336a9b35a # stable
       - name: Install cargo-deny
         run: cargo install cargo-deny
       - name: Check supply chain
