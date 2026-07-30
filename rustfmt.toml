@@ -1,0 +1,48 @@
+# Rust formatting configuration
+# This file documents formatting choices enforced by `cargo fmt --check` in CI.
+# Most settings use rustfmt defaults; explicitly documenting them here ensures
+# consistency and makes formatting decisions visible to contributors.
+
+# Edition
+edition = "2021"
+
+# Line width
+max_width = 100
+
+# Indentation
+hard_tabs = false
+tab_spaces = 4
+
+# Imports
+imports_granularity = "Crate"
+reorder_imports = true
+reorder_modules = true
+
+# Newlines
+newline_style = "Unix"
+
+# Comments
+wrap_comments = false
+format_code_in_doc_comments = true
+normalize_comments = true
+normalize_doc_attributes = true
+
+# Formatting
+use_small_heuristics = "Default"
+use_field_init_shorthand = true
+use_try_shorthand = true
+
+# Function definitions
+fn_params_layout = "Tall"
+brace_style = "SameLineWhere"
+
+# Match arms
+match_arm_blocks = true
+match_block_trailing_comma = false
+
+# Control flow
+control_brace_style = "AlwaysSameLine"
+
+# Misc
+remove_nested_parens = true
+reorder_impl_items = false

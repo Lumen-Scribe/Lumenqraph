@@ -1,0 +1,28 @@
+# Clippy configuration
+# Documents lint thresholds and tuning applied in CI via `clippy -D warnings`.
+
+# Cognitive complexity threshold
+# Functions exceeding this score trigger clippy::cognitive_complexity
+cognitive-complexity-threshold = 30
+
+# Type complexity threshold
+# Types more complex than this trigger clippy::type_complexity
+type-complexity-threshold = 250
+
+# Too many arguments threshold
+too-many-arguments-threshold = 8
+
+# Too many lines threshold
+too-many-lines-threshold = 150
+
+# Disallowed methods
+# Methods that should never be used in this codebase
+disallowed-methods = []
+
+# Disallowed types
+# Types that should never be used in this codebase
+disallowed-types = []
+
+# Allow certain lints that are too noisy or not applicable
+# (Note: These are documented here but must be configured via #[allow] attributes
+# or command-line flags, as clippy.toml doesn't support an 'allow' field)
