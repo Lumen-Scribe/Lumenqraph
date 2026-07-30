@@ -23,6 +23,10 @@ pub struct CreateWebhook {
     kind: String,
     contract_id: Option<String>,
     event_name: Option<String>,
+    /// Optional backfill: "last N", a ledger number, or a timestamp (ISO-8601).
+    /// Defaults to current watermark (no backfill).
+    #[serde(default)]
+    since: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -58,8 +62,6 @@ pub async fn create_webhook(
             body.kind
         )));
     }
-    // An upgrade fires for a whole contract, not for one of its events, so an
-    // event_name filter here would silently never match.
     if body.kind == "upgrade" && body.event_name.is_some() {
         return Err(ApiError::bad_request(
             "event_name does not apply to an `upgrade` subscription; \
@@ -68,9 +70,18 @@ pub async fn create_webhook(
     }
     let secret = random_secret();
 
+    let starting_seq = if let Some(ref since) = body.since {
+        calculate_starting_seq(&state.pool, since).await?
+    } else {
+        0
+    };
+
+    let encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY")
+        .unwrap_or_else(|_| "default-key-for-testing".to_string());
+
     let sub: WebhookSubscription = sqlx::query_as(
-        "INSERT INTO webhook_subscriptions (url, kind, contract_id, event_name, secret)
-         VALUES ($1, $2, $3, $4, $5)
+        "INSERT INTO webhook_subscriptions (url, kind, contract_id, event_name, secret, encrypted_secret, starting_seq)
+         VALUES ($1, $2, $3, $4, $5, pgp_sym_encrypt($5, $7), $6)
          RETURNING id, url, kind, contract_id, event_name, secret, active, created_at",
     )
     .bind(&body.url)
@@ -78,10 +89,41 @@ pub async fn create_webhook(
     .bind(&body.contract_id)
     .bind(&body.event_name)
     .bind(&secret)
+    .bind(starting_seq)
+    .bind(&encryption_key)
     .fetch_one(&state.pool)
     .await?;
 
     Ok(Json(sub))
+}
+
+async fn calculate_starting_seq(pool: &sqlx::PgPool, since: &str) -> ApiResult<i64> {
+    if since.starts_with("last ") {
+        let count_str = since.strip_prefix("last ").unwrap_or("0");
+        let count: i64 = count_str.parse()
+            .map_err(|_| ApiError::bad_request("invalid 'last N' format; expected 'last <number>'"))?;
+        let current_max: i64 = sqlx::query_scalar("SELECT COALESCE(max(seq), 0) FROM events")
+            .fetch_one(pool)
+            .await?;
+        Ok((current_max - count).max(0))
+    } else if let Ok(ledger) = since.parse::<i64>() {
+        let seq: Option<i64> = sqlx::query_scalar("SELECT min(seq) FROM events WHERE ledger >= $1")
+            .bind(ledger)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+        Ok(seq.unwrap_or(0))
+    } else {
+        let ts = chrono::DateTime::parse_from_rfc3339(since)
+            .map_err(|_| ApiError::bad_request("invalid timestamp format; expected ISO-8601"))?
+            .with_timezone(&chrono::Utc);
+        let seq: Option<i64> = sqlx::query_scalar("SELECT min(seq) FROM events WHERE ledger_closed_at >= $1")
+            .bind(ts)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+        Ok(seq.unwrap_or(0))
+    }
 }
 
 /// (id, url, kind, contract_id, event_name, active, created_at, auto_disabled_at, auto_disabled_reason)

@@ -47,13 +47,6 @@ async fn enqueue_events(pool: &PgPool, batch: i64) -> anyhow::Result<u64> {
     .fetch_one(pool)
     .await?;
 
-    // Advance the watermark by at most `batch` toward the global max seq.
-    // Using the *global* max (not the max within the window) is essential:
-    // `seq` is a BIGSERIAL that also increments on `ON CONFLICT DO NOTHING`, so
-    // re-fetching the tip each cycle burns seq values and leaves gaps. If a gap
-    // ever exceeds `batch`, a window-local max would be NULL and this watermark
-    // would stall forever. Stepping toward the global max always makes progress
-    // (empty gaps simply enqueue nothing), so the pipeline can never wedge.
     let global_max: i64 = sqlx::query_scalar("SELECT COALESCE(max(seq), 0) FROM events")
         .fetch_one(pool)
         .await?;
@@ -63,10 +56,6 @@ async fn enqueue_events(pool: &PgPool, batch: i64) -> anyhow::Result<u64> {
     }
     let upper = (last_seq + batch).min(global_max);
 
-    // Wrap the INSERT and watermark UPDATE atomically so a crash between the two
-    // can never leave deliveries inserted without the watermark advanced.
-    // ON CONFLICT DO NOTHING remains as defense-in-depth for any duplicate that
-    // could theoretically arrive via a concurrent enqueue.
     let mut tx = pool.begin().await?;
 
     let created = sqlx::query(
@@ -78,7 +67,7 @@ async fn enqueue_events(pool: &PgPool, batch: i64) -> anyhow::Result<u64> {
           AND s.kind = 'event'
           AND (s.contract_id IS NULL OR s.contract_id = e.contract_id)
           AND (s.event_name  IS NULL OR s.event_name  = e.event_name)
-         WHERE e.seq > $1 AND e.seq <= $2
+         WHERE e.seq > GREATEST(s.starting_seq, $1) AND e.seq <= $2
          ON CONFLICT (subscription_id, event_id) DO NOTHING",
     )
     .bind(last_seq)
@@ -182,8 +171,12 @@ struct DueDelivery {
 /// tagged, since they're a new shape and a consumer receiving one should be able
 /// to tell what it is.
 async fn fetch_due(pool: &PgPool, batch: i64) -> anyhow::Result<Vec<DueDelivery>> {
+    let encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY")
+        .unwrap_or_else(|_| "default-key-for-testing".to_string());
+
     let rows: Vec<(i64, String, i32, String, String, Json<serde_json::Value>)> = sqlx::query_as(
-        "SELECT d.id, s.id, d.attempts, s.url, s.secret,
+        "SELECT d.id, s.id, d.attempts, s.url,
+                COALESCE(pgp_sym_decrypt(s.encrypted_secret, $1), s.secret),
                 CASE WHEN d.upgrade_id IS NOT NULL THEN
                     jsonb_build_object(
                         'type',               'contract.upgraded',
@@ -202,8 +195,9 @@ async fn fetch_due(pool: &PgPool, batch: i64) -> anyhow::Result<Vec<DueDelivery>
          LEFT JOIN contract_spec_versions v ON v.id = d.upgrade_id
          WHERE d.status = 'pending' AND d.next_attempt_at <= now()
          ORDER BY d.next_attempt_at
-         LIMIT $1",
+         LIMIT $2",
     )
+    .bind(&encryption_key)
     .bind(batch)
     .fetch_all(pool)
     .await?;

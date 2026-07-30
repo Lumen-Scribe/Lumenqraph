@@ -129,16 +129,19 @@ pub async fn insert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result
                 transfers.iter().map(|t| t.to_addr.clone()).collect();
             let t_amounts: Vec<String> = transfers.iter().map(|t| t.amount.clone()).collect();
             let t_kinds: Vec<String> = transfers.iter().map(|t| t.kind.clone()).collect();
+            let t_amounts_numeric: Vec<Option<sqlx::types::Decimal>> = transfers.iter().map(|t| {
+                t.amount.parse::<sqlx::types::Decimal>().ok()
+            }).collect();
             let t_ledgers: Vec<i64> = transfers.iter().map(|t| t.ledger).collect();
             let t_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
                 transfers.iter().map(|t| t.ledger_closed_at).collect();
 
             sqlx::query(
                 "INSERT INTO token_transfers
-                    (event_id, contract_id, from_addr, to_addr, amount, kind, ledger, ledger_closed_at)
+                    (event_id, contract_id, from_addr, to_addr, amount, kind, amount_numeric, ledger, ledger_closed_at)
                  SELECT * FROM UNNEST(
-                    $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::bigint[], $8::timestamptz[]
-                 ) AS t(event_id, contract_id, from_addr, to_addr, amount, kind, ledger, ledger_closed_at)
+                    $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::numeric[], $8::bigint[], $9::timestamptz[]
+                 ) AS t(event_id, contract_id, from_addr, to_addr, amount, kind, amount_numeric, ledger, ledger_closed_at)
                  ON CONFLICT (event_id) DO NOTHING",
             )
             .bind(&t_event_ids)
@@ -147,6 +150,7 @@ pub async fn insert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result
             .bind(&t_to_addrs)
             .bind(&t_amounts)
             .bind(&t_kinds)
+            .bind(&t_amounts_numeric)
             .bind(&t_ledgers)
             .bind(&t_closed_ats)
             .execute(&mut *tx)
@@ -210,10 +214,11 @@ pub async fn upsert_events(
             inserted += 1;
             // Project transfer for new inserts
             if let Some(t) = extract_transfer(e) {
+                let amount_numeric = t.amount.parse::<sqlx::types::Decimal>().ok();
                 let _ = sqlx::query(
                     "INSERT INTO token_transfers
-                        (event_id, contract_id, from_addr, to_addr, amount, kind, ledger, ledger_closed_at)
-                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                        (event_id, contract_id, from_addr, to_addr, amount, kind, amount_numeric, ledger, ledger_closed_at)
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
                      ON CONFLICT (event_id) DO NOTHING",
                 )
                 .bind(&t.event_id)
@@ -222,6 +227,7 @@ pub async fn upsert_events(
                 .bind(&t.to_addr)
                 .bind(&t.amount)
                 .bind(&t.kind)
+                .bind(amount_numeric)
                 .bind(t.ledger)
                 .bind(t.ledger_closed_at)
                 .execute(&mut *tx)

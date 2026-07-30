@@ -18,6 +18,7 @@
 //! contract whose state last changed before the window would read as having no
 //! state at all.
 
+use chrono::{Duration, Utc};
 use sqlx::PgPool;
 use tracing::{info, warn};
 
@@ -94,6 +95,36 @@ pub async fn prune(pool: &PgPool, tip: i64, retention_ledgers: i64) -> anyhow::R
     Ok(total)
 }
 
+/// Delete webhook deliveries (delivered/failed only) older than `retention_days`.
+/// Pending deliveries are kept untouched. Returns the total rows deleted.
+pub async fn prune_webhook_deliveries(pool: &PgPool, retention_days: i64) -> anyhow::Result<u64> {
+    if retention_days <= 0 {
+        return Ok(0);
+    }
+
+    let cutoff = Utc::now() - Duration::days(retention_days);
+
+    let deleted = prune_batched_webhooks(
+        pool,
+        "DELETE FROM webhook_deliveries WHERE id IN (
+             SELECT id FROM webhook_deliveries
+              WHERE status IN ('delivered', 'failed')
+                AND created_at < $1
+              ORDER BY created_at LIMIT $2
+         )",
+        cutoff,
+    )
+    .await?;
+
+    if deleted > 0 {
+        info!(
+            cutoff_date = %cutoff,
+            retention_days, deleted, "pruned old webhook deliveries"
+        );
+    }
+    Ok(deleted)
+}
+
 /// Run `sql` (bound: $1 = cutoff ledger, $2 = batch size) until it stops
 /// deleting or hits the per-pass ceiling.
 async fn prune_batched(pool: &PgPool, sql: &str, cutoff: i64) -> anyhow::Result<u64> {
@@ -117,6 +148,30 @@ async fn prune_batched(pool: &PgPool, sql: &str, cutoff: i64) -> anyhow::Result<
         deleted,
         cutoff_ledger = cutoff,
         "retention pass hit its batch ceiling; more rows remain (will continue next pass)"
+    );
+    Ok(deleted)
+}
+
+/// Run `sql` (bound: $1 = cutoff datetime, $2 = batch size) for webhook deliveries until
+/// it stops deleting or hits the per-pass ceiling.
+async fn prune_batched_webhooks(pool: &PgPool, sql: &str, cutoff: chrono::DateTime<chrono::Utc>) -> anyhow::Result<u64> {
+    let mut deleted = 0u64;
+    for _ in 0..MAX_BATCHES {
+        let n = sqlx::query(sql)
+            .bind(cutoff)
+            .bind(BATCH)
+            .execute(pool)
+            .await?
+            .rows_affected();
+        deleted += n;
+        if n < BATCH as u64 {
+            return Ok(deleted);
+        }
+    }
+    warn!(
+        deleted,
+        cutoff_date = %cutoff,
+        "webhook retention pass hit its batch ceiling; more rows remain (will continue next pass)"
     );
     Ok(deleted)
 }
