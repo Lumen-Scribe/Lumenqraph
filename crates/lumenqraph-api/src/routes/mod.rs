@@ -199,7 +199,13 @@ pub fn router(state: AppState) -> Router {
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-cache"),
         );
-        app.fallback_service(revalidate.layer(ServeDir::new(explorer_dir)))
+        // Strict CSP: disallow inline scripts and restrict sources to same-origin only.
+        // Protects against stored XSS from malicious contract data in the explorer UI.
+        let csp = SetResponseHeaderLayer::if_not_present(
+            header::HeaderName::from_static("content-security-policy"),
+            HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'"),
+        );
+        app.fallback_service(csp.layer(revalidate.layer(ServeDir::new(explorer_dir))))
     } else {
         app
     }
