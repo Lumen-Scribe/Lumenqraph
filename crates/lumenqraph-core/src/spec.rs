@@ -1091,14 +1091,12 @@ mod tests {
                 prefix_topics: vec![ScSymbol("mint".try_into().unwrap())]
                     .try_into()
                     .unwrap(),
-                params: vec![
-                    ScSpecEventParamV0 {
-                        doc: "".try_into().unwrap(),
-                        name: "amount".try_into().unwrap(),
-                        type_: ScSpecTypeDef::I128,
-                        location: ScSpecEventParamLocationV0::Data,
-                    },
-                ]
+                params: vec![ScSpecEventParamV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "amount".try_into().unwrap(),
+                    type_: ScSpecTypeDef::I128,
+                    location: ScSpecEventParamLocationV0::Data,
+                }]
                 .try_into()
                 .unwrap(),
                 data_format: ScSpecEventDataFormat::Vec,
@@ -1171,10 +1169,7 @@ mod tests {
 
             assert_eq!(enriched["event"], "opened");
             assert_eq!(enriched["params"]["pos"]["type"], "Position");
-            assert_eq!(
-                enriched["params"]["pos"]["value"]["borrower"],
-                "GBORROW"
-            );
+            assert_eq!(enriched["params"]["pos"]["value"]["borrower"], "GBORROW");
             assert_eq!(enriched["params"]["pos"]["value"]["debt"], "50000");
         }
 

@@ -473,7 +473,10 @@ mod tests {
             .try_into()
             .unwrap(),
         });
-        let new = spec_of(&[func("balance", &[], Some(ScSpecTypeDef::I128)), position_struct]);
+        let new = spec_of(&[
+            func("balance", &[], Some(ScSpecTypeDef::I128)),
+            position_struct,
+        ]);
         let d = SpecDiff::between(&old, &new);
         assert!(!d.breaking);
         assert_eq!(d.types.added.len(), 1);
@@ -488,17 +491,18 @@ mod tests {
             doc: "".try_into().unwrap(),
             lib: "".try_into().unwrap(),
             name: "Position".try_into().unwrap(),
-            fields: vec![
-                ScSpecUdtStructFieldV0 {
-                    doc: "".try_into().unwrap(),
-                    name: "borrower".try_into().unwrap(),
-                    type_: ScSpecTypeDef::Address,
-                },
-            ]
+            fields: vec![ScSpecUdtStructFieldV0 {
+                doc: "".try_into().unwrap(),
+                name: "borrower".try_into().unwrap(),
+                type_: ScSpecTypeDef::Address,
+            }]
             .try_into()
             .unwrap(),
         });
-        let old = spec_of(&[func("balance", &[], Some(ScSpecTypeDef::I128)), position_struct]);
+        let old = spec_of(&[
+            func("balance", &[], Some(ScSpecTypeDef::I128)),
+            position_struct,
+        ]);
         let new = spec_of(&[func("balance", &[], Some(ScSpecTypeDef::I128))]);
         let d = SpecDiff::between(&old, &new);
         assert!(d.breaking);
@@ -513,13 +517,11 @@ mod tests {
             doc: "".try_into().unwrap(),
             lib: "".try_into().unwrap(),
             name: "Position".try_into().unwrap(),
-            fields: vec![
-                ScSpecUdtStructFieldV0 {
-                    doc: "".try_into().unwrap(),
-                    name: "amount".try_into().unwrap(),
-                    type_: ScSpecTypeDef::I128,
-                },
-            ]
+            fields: vec![ScSpecUdtStructFieldV0 {
+                doc: "".try_into().unwrap(),
+                name: "amount".try_into().unwrap(),
+                type_: ScSpecTypeDef::I128,
+            }]
             .try_into()
             .unwrap(),
         });
@@ -528,13 +530,11 @@ mod tests {
             doc: "".try_into().unwrap(),
             lib: "".try_into().unwrap(),
             name: "Position".try_into().unwrap(),
-            fields: vec![
-                ScSpecUdtStructFieldV0 {
-                    doc: "".try_into().unwrap(),
-                    name: "amount".try_into().unwrap(),
-                    type_: ScSpecTypeDef::U128,
-                },
-            ]
+            fields: vec![ScSpecUdtStructFieldV0 {
+                doc: "".try_into().unwrap(),
+                name: "amount".try_into().unwrap(),
+                type_: ScSpecTypeDef::U128,
+            }]
             .try_into()
             .unwrap(),
         });
@@ -625,7 +625,7 @@ mod tests {
 
     #[test]
     fn an_added_union_case_is_not_breaking() {
-        use stellar_xdr::curr::{ScSpecUdtUnionCaseVoidV0, ScSpecUdtUnionCaseV0, ScSpecUdtUnionV0};
+        use stellar_xdr::curr::{ScSpecUdtUnionCaseV0, ScSpecUdtUnionCaseVoidV0, ScSpecUdtUnionV0};
 
         let old = spec_of(&[func("balance", &[], Some(ScSpecTypeDef::I128))]);
         let action_union = ScSpecEntry::UdtUnionV0(ScSpecUdtUnionV0 {
@@ -645,7 +645,10 @@ mod tests {
             .try_into()
             .unwrap(),
         });
-        let new = spec_of(&[func("balance", &[], Some(ScSpecTypeDef::I128)), action_union]);
+        let new = spec_of(&[
+            func("balance", &[], Some(ScSpecTypeDef::I128)),
+            action_union,
+        ]);
         let d = SpecDiff::between(&old, &new);
         assert!(!d.breaking);
         assert_eq!(d.types.added.len(), 1);
@@ -654,7 +657,7 @@ mod tests {
 
     #[test]
     fn a_removed_union_case_is_breaking() {
-        use stellar_xdr::curr::{ScSpecUdtUnionCaseVoidV0, ScSpecUdtUnionCaseV0, ScSpecUdtUnionV0};
+        use stellar_xdr::curr::{ScSpecUdtUnionCaseV0, ScSpecUdtUnionCaseVoidV0, ScSpecUdtUnionV0};
 
         let action_old = ScSpecEntry::UdtUnionV0(ScSpecUdtUnionV0 {
             doc: "".try_into().unwrap(),
@@ -711,7 +714,11 @@ mod tests {
             func("balance", &[], Some(ScSpecTypeDef::I128)),
             event(
                 "mint",
-                &[("amount", ScSpecTypeDef::I128, ScSpecEventParamLocationV0::Data)],
+                &[(
+                    "amount",
+                    ScSpecTypeDef::I128,
+                    ScSpecEventParamLocationV0::Data,
+                )],
             ),
         ]);
         let d = SpecDiff::between(&old, &new);
@@ -740,7 +747,11 @@ mod tests {
             func("withdraw", &[], None),
             event(
                 "burn",
-                &[("amount", ScSpecTypeDef::I128, ScSpecEventParamLocationV0::Data)],
+                &[(
+                    "amount",
+                    ScSpecTypeDef::I128,
+                    ScSpecEventParamLocationV0::Data,
+                )],
             ),
             position_struct.clone(),
         ]);
@@ -749,7 +760,11 @@ mod tests {
             func("pause", &[], None),
             event(
                 "mint",
-                &[("amount", ScSpecTypeDef::I128, ScSpecEventParamLocationV0::Data)],
+                &[(
+                    "amount",
+                    ScSpecTypeDef::I128,
+                    ScSpecEventParamLocationV0::Data,
+                )],
             ),
         ]);
 

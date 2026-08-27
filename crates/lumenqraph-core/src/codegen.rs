@@ -644,7 +644,10 @@ mod tests {
 
     #[test]
     fn generates_valid_prelude_with_contract_id() {
-        let ts = typescript_client(C, &spec(&[function("balance", "", vec![], Some(ScSpecTypeDef::I128))]));
+        let ts = typescript_client(
+            C,
+            &spec(&[function("balance", "", vec![], Some(ScSpecTypeDef::I128))]),
+        );
         assert!(ts.starts_with("// Typed client for the Soroban contract"));
         assert!(ts.contains(C));
         assert!(ts.contains("export class ContractClient"));
