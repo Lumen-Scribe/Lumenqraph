@@ -1,0 +1,19 @@
+{
+  "name": "lumenqraph-explorer",
+  "version": "0.1.0",
+  "description": "Lumenqraph blockchain explorer web UI",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/main.ts --bundle --minify --outfile=dist/explorer.js && node scripts/build.mjs",
+    "dev": "esbuild src/main.ts --bundle --watch --outfile=dist/explorer.js",
+    "lint": "eslint src --max-warnings=0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.20.0",
+    "esbuild": "^0.24.2",
+    "eslint": "^9.20.0",
+    "typescript": "^5.4.0",
+    "typescript-eslint": "^8.24.0"
+  }
+}
