@@ -43,21 +43,28 @@ If you see "query not prepared" errors during build, run the command above with 
 
 `cargo test --workspace` skips anything marked `#[ignore]`, which is every test
 that needs a real database (retention pruning, contract-spec versioning, webhook
-enqueue). To run those, point `TEST_DATABASE_URL` at a database you don't mind
-losing — each test resets the schema to isolate itself:
+enqueue). To run those locally with a single command:
 
 ```bash
-docker run -d --rm --name lq-test-pg \
-  -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=lumenqraph -p 55433:5432 postgres:16-alpine
-
-export TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/lumenqraph
-cargo test -p lumenqraph-indexer  -- --ignored --test-threads=1
-cargo test -p lumenqraph-webhooks -- --ignored --test-threads=1
+make test-db
 ```
 
-`--test-threads=1` is required, not a preference: each test runs
-`DROP SCHEMA public CASCADE` to start clean, so two running at once will drop
-the tables out from under each other.
+This target automatically:
+- Ensures the Postgres container is running (`make db`)
+- Sets `TEST_DATABASE_URL` to the local database
+- Runs all ignored tests with `--test-threads=1` for proper isolation
+
+Each test resets the schema to isolate itself. `--test-threads=1` is required, not a preference: each test runs `DROP SCHEMA public CASCADE` to start clean, so two running at once will drop the tables out from under each other.
+
+If you need to run tests against a custom database, you can still use the manual approach:
+
+```bash
+export TEST_DATABASE_URL=postgres://user:password@host:port/dbname
+cargo test -p lumenqraph-indexer  -- --ignored --test-threads=1
+cargo test -p lumenqraph-webhooks -- --ignored --test-threads=1
+cargo test -p lumenqraph-api      -- --ignored --test-threads=1
+cargo test -p lumenqraph-mcp      -- --ignored --test-threads=1
+```
 
 CI runs all of the above against a Postgres service.
 

@@ -22,14 +22,14 @@ build: ## Build the workspace
 test: ## Run tests (unit + integration, no Postgres required)
 	cargo test --workspace
 
-test-db: ## Run Postgres-backed tests (requires TEST_DATABASE_URL or a running local Postgres)
+test-db: db ## Run Postgres-backed tests (requires TEST_DATABASE_URL or a running local Postgres)
 	@if [ -z "$$TEST_DATABASE_URL" ]; then \
 	  export TEST_DATABASE_URL=postgres://lumenqraph:lumenqraph@localhost:5432/lumenqraph; \
 	fi; \
-	cargo test -p lumenqraph-indexer  -- --ignored; \
-	cargo test -p lumenqraph-webhooks -- --ignored; \
-	cargo test -p lumenqraph-api      -- --ignored; \
-	cargo test -p lumenqraph-mcp      -- --ignored
+	cargo test -p lumenqraph-indexer  -- --ignored --test-threads=1; \
+	cargo test -p lumenqraph-webhooks -- --ignored --test-threads=1; \
+	cargo test -p lumenqraph-api      -- --ignored --test-threads=1; \
+	cargo test -p lumenqraph-mcp      -- --ignored --test-threads=1
 
 fmt: ## Format
 	cargo fmt --all
