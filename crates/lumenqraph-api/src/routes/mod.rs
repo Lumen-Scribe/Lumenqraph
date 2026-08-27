@@ -30,7 +30,7 @@ use tower::Layer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
-use crate::auth::{auth_and_rate_limit, rpc_auth_and_rate_limit};
+use crate::auth::{auth_and_rate_limit, concurrency_limit, rpc_auth_and_rate_limit};
 use crate::graphql::{self, AppSchema};
 use crate::metrics;
 use crate::state::AppState;
@@ -156,6 +156,10 @@ pub fn router(state: AppState) -> Router {
         .merge(protected)
         .merge(rpc_routes)
         .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            concurrency_limit,
+        ))
         .layer(middleware::from_fn(move |req: Request, next: Next| {
             let collector = metrics_collector.clone();
             collector.middleware(req, next)

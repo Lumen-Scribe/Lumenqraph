@@ -10,6 +10,7 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::warn;
@@ -298,6 +299,40 @@ pub async fn rpc_auth_and_rate_limit(
     Ok(response)
 }
 
+/// Per-IP concurrency limiter middleware. Rejects requests when a single IP
+/// has too many in-flight requests, preventing slowloris-style attacks.
+pub async fn concurrency_limit(
+    State(state): State<AppState>,
+    ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let client_ip = extract_client_ip(&headers, Some(socket_addr));
+    let status = state.concurrency_limiter.acquire(&client_ip, state.max_concurrent_per_ip);
+
+    if !status.allowed {
+        let body = json!({
+            "code": "rate_limited",
+            "error": format!(
+                "too many concurrent requests from this IP (limit: {})",
+                status.limit
+            )
+        });
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+    }
+
+    // Insert the client IP into extensions so release middleware can access it.
+    req.extensions_mut().insert(client_ip.clone());
+
+    let response = next.run(req).await;
+
+    // Release the slot after request completes.
+    state.concurrency_limiter.release(&client_ip);
+
+    response
+}
+
 // ---- HTTP-level integration tests ----------------------------------------
 //
 // These tests boot the real Axum router against a live Postgres instance and
@@ -350,6 +385,11 @@ mod integration_tests {
     }
 
     fn make_state(pool: PgPool, require_auth: bool, anon_rate: i32) -> AppState {
+        use crate::concurrency_limit::ConcurrencyLimiter;
+        use crate::metrics_middleware::MetricsCollector;
+        use crate::call_cache::CallCache;
+        use crate::read_cost_limit::ReadCostLimitConfig;
+
         AppState {
             pool,
             require_auth,
@@ -362,6 +402,16 @@ mod integration_tests {
             rpc_limiter: Arc::new(RateLimiter::new()),
             rpc_require_auth: false,
             rpc_anon_rate_limit: 100,
+            metrics: Arc::new(MetricsCollector::new()),
+            call_cache: Arc::new(CallCache::new(100, 5)),
+            build_info: Arc::new(crate::state::BuildInfo {
+                version: "test".to_string(),
+                commit: "test".to_string(),
+                build_time: "test".to_string(),
+            }),
+            concurrency_limiter: Arc::new(ConcurrencyLimiter::new()),
+            max_concurrent_per_ip: 100,
+            read_cost_limit_config: ReadCostLimitConfig::default(),
         }
     }
 
