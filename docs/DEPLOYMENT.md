@@ -21,7 +21,8 @@ assets (the Docker image ships them at `/app/explorer`).
 ```bash
 docker compose -f docker-compose.full.yml up --build -d
 ```
-One image holds all three binaries; each service overrides `command:`.## Managed Deploy (Fly.io)
+One image holds all three binaries; each service overrides `command:`.
+## Managed Deploy (Fly.io)
 
 Fly.io is the recommended hosting platform for running Lumenqraph in production. The repository ships with a pre-configured [`fly.toml`](../fly.toml) that defines three distinct process groups:
 1. `api`: Exposes the public REST/GraphQL API and serves the static explorer UI.
@@ -87,7 +88,6 @@ fly scale vm shared-cpu-1x --memory 512 --process-group api
 #### 6. Deploy
 Deploy the configuration:
 ```bash
-fly deploy
 ```
 Once deployed, check health and access the explorer UI:
 ```bash
@@ -95,6 +95,31 @@ curl https://<your-app>.fly.dev/health
 open https://<your-app>.fly.dev/
 ```
 
+### Multi-Replica Rate Limiting
+
+When running multiple API replicas behind a load balancer, the default in-memory rate limiter enforces limits **per instance** — a client can multiply their effective allowance by the number of replicas.
+
+To enforce **global rate limits across all replicas**, use the Redis-backed rate limiter:
+
+1. **Provision a Redis instance** (e.g., Fly Redis, Upstash, or any managed Redis)
+2. **Set the backend configuration:**
+
+```bash
+fly secrets set RATE_LIMIT_BACKEND="redis"
+fly secrets set REDIS_URL="redis://your-redis-host:6379"
+```
+
+3. **Deploy:**
+
+```bash
+fly deploy
+```
+
+The Redis backend uses a sliding window algorithm with atomic Lua scripts to ensure accurate, globally-consistent rate limiting. If Redis becomes unavailable, the rate limiter fails open (allows requests) to preserve API availability.
+
+For single-instance deployments or when per-instance limits are acceptable, keep the default `RATE_LIMIT_BACKEND=memory` (no Redis required).
+
+---
 ---
 
 ## Free-Tier Deploy (Render + Supabase)

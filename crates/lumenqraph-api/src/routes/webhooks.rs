@@ -101,21 +101,28 @@ pub async fn create_webhook(
 
     let sub: WebhookSubscription = sqlx::query_as(
         "INSERT INTO webhook_subscriptions (url, kind, contract_id, event_name, secret, encrypted_secret, starting_seq)
-         VALUES ($1, $2, $3, $4, $5, pgp_sym_encrypt($5, $7), $6)
-         RETURNING id, url, kind, contract_id, event_name, secret, active, created_at",
+         VALUES ($1, $2, $3, $4, '[encrypted]', pgp_sym_encrypt($5, $6), $7)
+         RETURNING id, url, kind, contract_id, event_name, '[encrypted]' as secret, active, created_at",
     )
     .bind(&body.url)
     .bind(&body.kind)
     .bind(&body.contract_id)
     .bind(&body.event_name)
     .bind(&secret)
-    .bind(starting_seq)
     .bind(&encryption_key)
+    .bind(starting_seq)
     .fetch_one(&state.pool)
     .await?;
 
     log_webhook_action(&state.pool, "webhook_create", &sub.id.to_string()).await;
-    Ok(Json(sub))
+    
+    // Return the secret in the response (this is the only time it's exposed)
+    let mut response = serde_json::to_value(&sub)?;
+    if let Some(obj) = response.as_object_mut() {
+        obj.insert("secret".to_string(), serde_json::Value::String(secret));
+    }
+    
+    Ok(Json(serde_json::from_value(response)?))
 }
 
 async fn calculate_starting_seq(pool: &sqlx::PgPool, since: &str) -> ApiResult<i64> {

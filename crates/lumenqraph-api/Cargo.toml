@@ -37,6 +37,7 @@ utoipa-redoc = { version = "4", features = ["axum"] }
 futures = "0.3"
 parking_lot = "0.12"
 lru = "0.12"
+redis = "0.24"
 
 [dev-dependencies]
 # Only for building contract-spec fixtures in the spec-cache tests; the API

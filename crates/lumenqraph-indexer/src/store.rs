@@ -173,72 +173,157 @@ pub async fn upsert_events(
     if events.is_empty() {
         return Ok((0, 0));
     }
-    let mut tx = pool.begin().await?;
-    let mut inserted = 0u64;
-    let mut updated = 0u64;
+
+    // Collect column arrays for the UNNEST batch upsert
+    let mut event_ids: Vec<String> = Vec::with_capacity(events.len());
+    let mut contract_ids: Vec<String> = Vec::with_capacity(events.len());
+    let mut ledgers: Vec<i64> = Vec::with_capacity(events.len());
+    let mut closed_ats: Vec<chrono::DateTime<chrono::Utc>> = Vec::with_capacity(events.len());
+    let mut event_types: Vec<String> = Vec::with_capacity(events.len());
+    let mut topics_json: Vec<String> = Vec::with_capacity(events.len());
+    let mut decoded_topics_json: Vec<String> = Vec::with_capacity(events.len());
+    let mut event_names: Vec<Option<String>> = Vec::with_capacity(events.len());
+    let mut values: Vec<String> = Vec::with_capacity(events.len());
+    let mut decoded_values_json: Vec<String> = Vec::with_capacity(events.len());
+    let mut enriched_json: Vec<Option<String>> = Vec::with_capacity(events.len());
+    let mut tx_hashes: Vec<String> = Vec::with_capacity(events.len());
+    let mut in_successful_calls: Vec<bool> = Vec::with_capacity(events.len());
+    let mut paging_tokens: Vec<String> = Vec::with_capacity(events.len());
 
     for e in events {
-        let topics = serde_json::to_value(&e.topics)?;
-        let decoded_topics = serde_json::to_value(&e.decoded_topics)?;
-        let result = sqlx::query(
-            "INSERT INTO events (
-                event_id, contract_id, ledger, ledger_closed_at, event_type,
-                topics, decoded_topics, event_name, value, decoded_value,
-                enriched, tx_hash, in_successful_call, paging_token
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-             ON CONFLICT (event_id) DO UPDATE SET
-                decoded_topics = EXCLUDED.decoded_topics,
-                decoded_value = EXCLUDED.decoded_value,
-                enriched = EXCLUDED.enriched",
-        )
-        .bind(&e.event_id)
-        .bind(&e.contract_id)
-        .bind(e.ledger)
-        .bind(e.ledger_closed_at)
-        .bind(&e.event_type)
-        .bind(&topics)
-        .bind(&decoded_topics)
-        .bind(&e.event_name)
-        .bind(&e.value)
-        .bind(&e.decoded_value)
-        .bind(&e.enriched)
-        .bind(&e.tx_hash)
-        .bind(e.in_successful_call)
-        .bind(&e.paging_token)
-        .execute(&mut *tx)
-        .await?;
+        event_ids.push(e.event_id.clone());
+        contract_ids.push(e.contract_id.clone());
+        ledgers.push(e.ledger);
+        closed_ats.push(e.ledger_closed_at);
+        event_types.push(e.event_type.clone());
+        topics_json.push(serde_json::to_string(&e.topics)?);
+        decoded_topics_json.push(serde_json::to_string(&e.decoded_topics)?);
+        event_names.push(e.event_name.clone());
+        values.push(e.value.clone());
+        decoded_values_json.push(serde_json::to_string(&e.decoded_value)?);
+        enriched_json.push(
+            e.enriched
+                .as_ref()
+                .map(|v| serde_json::to_string(v))
+                .transpose()?,
+        );
+        tx_hashes.push(e.tx_hash.clone());
+        in_successful_calls.push(e.in_successful_call);
+        paging_tokens.push(e.paging_token.clone());
+    }
 
-        let rows_affected = result.rows_affected();
-        if rows_affected == 1 {
-            // New insert
+    let mut tx = pool.begin().await?;
+
+    // Single batch upsert with RETURNING to distinguish inserts from updates
+    let rows = sqlx::query(
+        "INSERT INTO events (
+            event_id, contract_id, ledger, ledger_closed_at, event_type,
+            topics, decoded_topics, event_name, value, decoded_value,
+            enriched, tx_hash, in_successful_call, paging_token
+         )
+         SELECT
+            event_id, contract_id, ledger, ledger_closed_at, event_type,
+            topics::jsonb, decoded_topics::jsonb, event_name, value,
+            decoded_value::jsonb, enriched::jsonb, tx_hash, in_successful_call, paging_token
+         FROM UNNEST(
+            $1::text[], $2::text[], $3::bigint[], $4::timestamptz[], $5::text[],
+            $6::text[], $7::text[], $8::text[], $9::text[], $10::text[],
+            $11::text[], $12::text[], $13::bool[], $14::text[]
+         ) AS t(
+            event_id, contract_id, ledger, ledger_closed_at, event_type,
+            topics, decoded_topics, event_name, value, decoded_value,
+            enriched, tx_hash, in_successful_call, paging_token
+         )
+         ON CONFLICT (event_id) DO UPDATE SET
+            decoded_topics = EXCLUDED.decoded_topics,
+            decoded_value = EXCLUDED.decoded_value,
+            enriched = EXCLUDED.enriched
+         RETURNING event_id, (xmax = 0) AS inserted",
+    )
+    .bind(&event_ids)
+    .bind(&contract_ids)
+    .bind(&ledgers)
+    .bind(&closed_ats)
+    .bind(&event_types)
+    .bind(&topics_json)
+    .bind(&decoded_topics_json)
+    .bind(&event_names)
+    .bind(&values)
+    .bind(&decoded_values_json)
+    .bind(&enriched_json)
+    .bind(&tx_hashes)
+    .bind(&in_successful_calls)
+    .bind(&paging_tokens)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut inserted = 0u64;
+    let mut updated = 0u64;
+    let mut inserted_ids = std::collections::HashSet::new();
+
+    for row in rows {
+        let event_id: String = row.try_get("event_id")?;
+        let is_insert: bool = row.try_get("inserted")?;
+        if is_insert {
             inserted += 1;
-            // Project transfer for new inserts
-            if let Some(t) = extract_transfer(e) {
-                let amount_numeric = t.amount.parse::<sqlx::types::Decimal>().ok();
-                let _ = sqlx::query(
-                    "INSERT INTO token_transfers
-                        (event_id, contract_id, from_addr, to_addr, amount, kind, amount_numeric, ledger, ledger_closed_at)
-                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-                     ON CONFLICT (event_id) DO NOTHING",
-                )
-                .bind(&t.event_id)
-                .bind(&t.contract_id)
-                .bind(&t.from_addr)
-                .bind(&t.to_addr)
-                .bind(&t.amount)
-                .bind(&t.kind)
-                .bind(amount_numeric)
-                .bind(t.ledger)
-                .bind(t.ledger_closed_at)
-                .execute(&mut *tx)
-                .await?;
-            }
-        } else if rows_affected == 2 {
-            // Existing row was updated
+            inserted_ids.insert(event_id);
+        } else {
             updated += 1;
-            debug!(event_id = %e.event_id, "event updated due to shallow reorg");
         }
     }
+
+    if updated > 0 {
+        debug!(count = updated, "events updated due to shallow reorg");
+    }
+
+    // Project token_transfers only for newly inserted events
+    if inserted > 0 {
+        let transfers: Vec<Transfer> = events
+            .iter()
+            .filter(|e| inserted_ids.contains(&e.event_id))
+            .filter_map(|e| extract_transfer(e))
+            .collect();
+
+        if !transfers.is_empty() {
+            let t_event_ids: Vec<String> =
+                transfers.iter().map(|t| t.event_id.clone()).collect();
+            let t_contract_ids: Vec<String> =
+                transfers.iter().map(|t| t.contract_id.clone()).collect();
+            let t_from_addrs: Vec<Option<String>> =
+                transfers.iter().map(|t| t.from_addr.clone()).collect();
+            let t_to_addrs: Vec<Option<String>> =
+                transfers.iter().map(|t| t.to_addr.clone()).collect();
+            let t_amounts: Vec<String> = transfers.iter().map(|t| t.amount.clone()).collect();
+            let t_kinds: Vec<String> = transfers.iter().map(|t| t.kind.clone()).collect();
+            let t_amounts_numeric: Vec<Option<sqlx::types::Decimal>> = transfers.iter().map(|t| {
+                t.amount.parse::<sqlx::types::Decimal>().ok()
+            }).collect();
+            let t_ledgers: Vec<i64> = transfers.iter().map(|t| t.ledger).collect();
+            let t_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
+                transfers.iter().map(|t| t.ledger_closed_at).collect();
+
+            sqlx::query(
+                "INSERT INTO token_transfers
+                    (event_id, contract_id, from_addr, to_addr, amount, kind, amount_numeric, ledger, ledger_closed_at)
+                 SELECT * FROM UNNEST(
+                    $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::numeric[], $8::bigint[], $9::timestamptz[]
+                 ) AS t(event_id, contract_id, from_addr, to_addr, amount, kind, amount_numeric, ledger, ledger_closed_at)
+                 ON CONFLICT (event_id) DO NOTHING",
+            )
+            .bind(&t_event_ids)
+            .bind(&t_contract_ids)
+            .bind(&t_from_addrs)
+            .bind(&t_to_addrs)
+            .bind(&t_amounts)
+            .bind(&t_kinds)
+            .bind(&t_amounts_numeric)
+            .bind(&t_ledgers)
+            .bind(&t_closed_ats)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+
     tx.commit().await?;
     Ok((inserted, updated))
 }
