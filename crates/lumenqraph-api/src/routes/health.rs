@@ -46,7 +46,9 @@ pub async fn health(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let lag_ledgers = (tip - last).max(0);
     let secs_since_update = (chrono::Utc::now() - updated_at).num_seconds();
     // Stale if the cursor hasn't advanced recently, or we're far behind.
-    let healthy = secs_since_update <= 120 && lag_ledgers < 100;
+    let max_stale_secs = env_parse("HEALTH_MAX_STALE_SECS", 120i64);
+    let max_lag_ledgers = env_parse("HEALTH_MAX_LAG_LEDGERS", 100i64);
+    let healthy = secs_since_update <= max_stale_secs && lag_ledgers < max_lag_ledgers;
 
     Ok(Json(json!({
         "status": if healthy { "ok" } else { "degraded" },
