@@ -1,4 +1,4 @@
-import { getBase, getHeaders } from './api';
+import { getBase } from './api';
 import type { EventRecord, Transfer, ContractFunction, ContractEvent, ContractStruct, ContractUnion, ContractEnum, VersionInfo, VersionDiff, DiffSection } from './types';
 
 function $<T extends HTMLElement>(id: string): T {
@@ -173,7 +173,6 @@ function sigCell(sig: string, doc?: string): string {
 }
 
 export function renderInterface(iface: Record<string, unknown>, version?: number, cid?: string): string {
-  const tn = (t: unknown): string => (t && typeof t === 'object') ? JSON.stringify(t) : String(t ?? '?');
   const i = (iface.interface as Record<string, unknown> | undefined) || iface;
   const fns = ((i.functions || []) as ContractFunction[])
     .map(f => `<tr><td><code>${esc(f.name)}</code></td><td>${sigCell(fnSig(f), f.doc)}</td></tr>`).join('');

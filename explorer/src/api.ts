@@ -16,7 +16,9 @@ export async function get<T>(path: string): Promise<T> {
     try {
       const b = await r.json() as { error?: string };
       if (b.error) msg = b.error;
-    } catch {}
+    } catch {
+      // Ignore JSON parse errors, use HTTP status text
+    }
     throw new Error(msg);
   }
   return r.json() as Promise<T>;
