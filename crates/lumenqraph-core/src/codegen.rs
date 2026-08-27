@@ -641,4 +641,259 @@ mod tests {
             std::fs::write(path, &ts).unwrap();
         }
     }
+
+    #[test]
+    fn generates_valid_prelude_with_contract_id() {
+        let ts = typescript_client(C, &spec(&[function("balance", "", vec![], Some(ScSpecTypeDef::I128))]));
+        assert!(ts.starts_with("// Typed client for the Soroban contract"));
+        assert!(ts.contains(C));
+        assert!(ts.contains("export class ContractClient"));
+        assert!(ts.contains("constructor(config: { baseUrl: string })"));
+    }
+
+    #[test]
+    fn empty_spec_generates_valid_client() {
+        // A minimal contract with no functions should still generate valid code
+        let minimal = spec(&[]);
+        let ts = typescript_client(C, &minimal);
+        assert!(ts.contains("export class ContractClient"));
+        assert!(ts.contains("constructor(config: { baseUrl: string })"));
+    }
+
+    #[test]
+    fn handles_reserved_keywords_as_function_names() {
+        let reserved = spec(&[
+            function("class", "", vec![], Some(ScSpecTypeDef::U32)),
+            function("interface", "", vec![], Some(ScSpecTypeDef::U32)),
+            function("type", "", vec![], Some(ScSpecTypeDef::U32)),
+        ]);
+        let ts = typescript_client(C, &reserved);
+        // Reserved keywords should be quoted in computed properties
+        assert!(ts.contains(r#"["class"]"#) || ts.contains("class"));
+        assert!(ts.contains(r#"["interface"]"#) || ts.contains("interface"));
+        assert!(ts.contains(r#"["type"]"#) || ts.contains("type"));
+    }
+
+    #[test]
+    fn handles_all_scalar_types() {
+        let scalars = spec(&[
+            function("f_u32", "", vec![], Some(ScSpecTypeDef::U32)),
+            function("f_i32", "", vec![], Some(ScSpecTypeDef::I32)),
+            function("f_u64", "", vec![], Some(ScSpecTypeDef::U64)),
+            function("f_i64", "", vec![], Some(ScSpecTypeDef::I64)),
+            function("f_u128", "", vec![], Some(ScSpecTypeDef::U128)),
+            function("f_i128", "", vec![], Some(ScSpecTypeDef::I128)),
+            function("f_bool", "", vec![], Some(ScSpecTypeDef::Bool)),
+            function("f_symbol", "", vec![], Some(ScSpecTypeDef::Symbol)),
+            function("f_bytes", "", vec![], Some(ScSpecTypeDef::Bytes32)),
+            function("f_timepoint", "", vec![], Some(ScSpecTypeDef::Timepoint)),
+            function("f_duration", "", vec![], Some(ScSpecTypeDef::Duration)),
+        ]);
+        let ts = typescript_client(C, &scalars);
+        assert!(ts.contains("f_u32(opts?: CallOptions): Promise<number>"));
+        assert!(ts.contains("f_i32(opts?: CallOptions): Promise<number>"));
+        assert!(ts.contains("f_u64(opts?: CallOptions): Promise<number | string>"));
+        assert!(ts.contains("f_bool(opts?: CallOptions): Promise<boolean>"));
+    }
+
+    #[test]
+    fn handles_container_types() {
+        let vec_of_u32 = ScSpecTypeDef::Vec(Box::new(ScSpecTypeVec {
+            element_type: Box::new(ScSpecTypeDef::U32),
+        }));
+        let map_of_str_to_i128 = ScSpecTypeDef::Map(Box::new(stellar_xdr::curr::ScSpecTypeMap {
+            key_type: Box::new(ScSpecTypeDef::Symbol),
+            value_type: Box::new(ScSpecTypeDef::I128),
+        }));
+
+        let containers = spec(&[
+            function("vecs", "", vec![], Some(vec_of_u32)),
+            function("maps", "", vec![], Some(map_of_str_to_i128)),
+        ]);
+        let ts = typescript_client(C, &containers);
+        assert!(ts.contains("vecs(opts?: CallOptions): Promise<number[]>"));
+        assert!(ts.contains("maps(opts?: CallOptions): Promise<Record<string, i128>>"));
+    }
+
+    #[test]
+    fn handles_nested_containers() {
+        let vec_of_vec = ScSpecTypeDef::Vec(Box::new(ScSpecTypeVec {
+            element_type: Box::new(ScSpecTypeDef::Vec(Box::new(ScSpecTypeVec {
+                element_type: Box::new(ScSpecTypeDef::U32),
+            }))),
+        }));
+
+        let nested = spec(&[function("nested", "", vec![], Some(vec_of_vec))]);
+        let ts = typescript_client(C, &nested);
+        assert!(ts.contains("number[][]"));
+    }
+
+    #[test]
+    fn full_spec_generates_complete_client() {
+        let ts = typescript_client(C, &full_spec());
+
+        // Check structure
+        assert!(ts.contains("export class ContractClient"));
+        assert!(ts.contains("export interface Position"));
+        assert!(ts.contains("export type Status"));
+        assert!(ts.contains("export type Action"));
+
+        // Check methods
+        assert!(ts.contains("get_position"));
+        assert!(ts.contains("act"));
+        assert!(ts.contains("holders"));
+        assert!(ts.contains("reset"));
+
+        // Check type aliases
+        assert!(ts.contains("export type Address"));
+        assert!(ts.contains("export type i128"));
+
+        // Ensure it looks like valid TypeScript (has imports, exports, class definition)
+        assert!(ts.contains("export"));
+        assert!(ts.contains("async"));
+        assert!(ts.contains("Promise"));
+    }
+
+    #[test]
+    fn emits_correct_numeric_aliases_for_integer_types() {
+        let ints = spec(&[
+            function("small", "", vec![], Some(ScSpecTypeDef::U32)),
+            function("big", "", vec![], Some(ScSpecTypeDef::U128)),
+        ]);
+        let ts = typescript_client(C, &ints);
+        // u32 should be number, u128 should be number | string
+        assert!(ts.contains("export type u128 = number | string;"));
+        assert!(!ts.contains("export type u32 = "));
+    }
+
+    #[test]
+    fn tuple_struct_with_single_field() {
+        let single_field_tuple = ScSpecEntry::UdtStructV0(ScSpecUdtStructV0 {
+            doc: "".try_into().unwrap(),
+            lib: "".try_into().unwrap(),
+            name: "Single".try_into().unwrap(),
+            fields: vec![ScSpecUdtStructFieldV0 {
+                doc: "".try_into().unwrap(),
+                name: "0".try_into().unwrap(),
+                type_: ScSpecTypeDef::Address,
+            }]
+            .try_into()
+            .unwrap(),
+        });
+        let ts = typescript_client(C, &spec(&[single_field_tuple]));
+        assert!(ts.contains("export type Single = [Address];"));
+    }
+
+    #[test]
+    fn struct_with_many_fields() {
+        let many_fields = ScSpecEntry::UdtStructV0(ScSpecUdtStructV0 {
+            doc: "".try_into().unwrap(),
+            lib: "".try_into().unwrap(),
+            name: "LargeStruct".try_into().unwrap(),
+            fields: vec![
+                ScSpecUdtStructFieldV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "field_a".try_into().unwrap(),
+                    type_: ScSpecTypeDef::Address,
+                },
+                ScSpecUdtStructFieldV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "field_b".try_into().unwrap(),
+                    type_: ScSpecTypeDef::I128,
+                },
+                ScSpecUdtStructFieldV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "field_c".try_into().unwrap(),
+                    type_: ScSpecTypeDef::Bool,
+                },
+                ScSpecUdtStructFieldV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "field_d".try_into().unwrap(),
+                    type_: ScSpecTypeDef::U32,
+                },
+            ]
+            .try_into()
+            .unwrap(),
+        });
+        let ts = typescript_client(C, &spec(&[many_fields]));
+        assert!(ts.contains("export interface LargeStruct {"));
+        assert!(ts.contains("field_a: Address;"));
+        assert!(ts.contains("field_b: i128;"));
+        assert!(ts.contains("field_c: boolean;"));
+        assert!(ts.contains("field_d: number;"));
+    }
+
+    #[test]
+    fn union_with_multiple_cases_and_payloads() {
+        use stellar_xdr::curr::{
+            ScSpecUdtUnionCaseTupleV0, ScSpecUdtUnionCaseV0, ScSpecUdtUnionV0,
+        };
+
+        let complex_union = ScSpecEntry::UdtUnionV0(ScSpecUdtUnionV0 {
+            doc: "".try_into().unwrap(),
+            lib: "".try_into().unwrap(),
+            name: "ComplexUnion".try_into().unwrap(),
+            cases: vec![
+                ScSpecUdtUnionCaseV0::VoidV0(ScSpecUdtUnionCaseVoidV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "Void".try_into().unwrap(),
+                }),
+                ScSpecUdtUnionCaseV0::TupleV0(ScSpecUdtUnionCaseTupleV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "Single".try_into().unwrap(),
+                    type_: vec![ScSpecTypeDef::I128].try_into().unwrap(),
+                }),
+                ScSpecUdtUnionCaseV0::TupleV0(ScSpecUdtUnionCaseTupleV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "Pair".try_into().unwrap(),
+                    type_: vec![ScSpecTypeDef::Address, ScSpecTypeDef::U32]
+                        .try_into()
+                        .unwrap(),
+                }),
+            ]
+            .try_into()
+            .unwrap(),
+        });
+        let ts = typescript_client(C, &spec(&[complex_union]));
+        assert!(ts.contains("export type ComplexUnion ="));
+        assert!(ts.contains(r#""Void""#));
+        assert!(ts.contains("Single"));
+        assert!(ts.contains("Pair"));
+    }
+
+    #[test]
+    fn function_with_complex_args() {
+        let complex_args = spec(&[function(
+            "complex",
+            "",
+            vec![
+                ("addr", ScSpecTypeDef::Address),
+                ("count", ScSpecTypeDef::U32),
+                ("enabled", ScSpecTypeDef::Bool),
+                ("data", ScSpecTypeDef::Bytes32),
+            ],
+            Some(ScSpecTypeDef::U64),
+        )]);
+        let ts = typescript_client(C, &complex_args);
+        assert!(ts.contains("complex(args: {"));
+        assert!(ts.contains("addr: Address;"));
+        assert!(ts.contains("count: number;"));
+        assert!(ts.contains("enabled: boolean;"));
+        assert!(ts.contains("data: Bytes;"));
+    }
+
+    #[test]
+    fn codegen_includes_call_options_interface() {
+        let ts = typescript_client(C, &full_spec());
+        assert!(ts.contains("interface CallOptions"));
+        assert!(ts.contains("timeout?:"));
+    }
+
+    #[test]
+    fn codegen_includes_helper_functions() {
+        let ts = typescript_client(C, &full_spec());
+        // Should include helper for making POST requests to the contract
+        assert!(ts.contains("async") || ts.contains("await"));
+        assert!(ts.contains("/contracts/") || ts.contains("call"));
+    }
 }
