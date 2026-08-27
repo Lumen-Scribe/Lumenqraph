@@ -31,6 +31,7 @@
     "lint": "eslint src --max-warnings=0",
     "test": "vitest run",
     "test:watch": "vitest",
+    "docs": "typedoc src/index.ts --out docs --readme README.md",
     "codegen": "openapi-typescript ../../openapi.yaml -o generated/api.d.ts",
     "codegen:check": "node scripts/check-codegen.mjs",
     "prepublishOnly": "npm run build"
@@ -46,6 +47,7 @@
     "@eslint/js": "^9.20.0",
     "eslint": "^9.20.0",
     "openapi-typescript": "^7.13.0",
+    "typedoc": "^0.28.20",
     "typescript": "^5.4.0",
     "typescript-eslint": "^8.24.0",
     "vitest": "^3.2.7"

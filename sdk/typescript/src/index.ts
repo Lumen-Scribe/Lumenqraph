@@ -171,6 +171,11 @@ export interface ClientOptions {
   retry?: RetryOptions;
 }
 
+export interface RequestOptions {
+  /** Optional AbortSignal to cancel the request. */
+  signal?: AbortSignal;
+}
+
 /** Error thrown for any non-2xx API response. */
 export class LumenqraphError extends Error {
   constructor(
@@ -222,91 +227,91 @@ export class LumenqraphClient {
   // ---- REST ----
 
   /** Liveness + indexing-lag report. */
-  health(): Promise<Json> {
-    return this.get("/health");
+  health(opts: RequestOptions = {}): Promise<Json> {
+    return this.get("/health", {}, opts.signal);
   }
 
   /** Contracts the indexer has seen, with per-contract event counts. */
-  listContracts(): Promise<Contract[]> {
-    return this.get("/contracts");
+  listContracts(opts: RequestOptions = {}): Promise<Contract[]> {
+    return this.get("/contracts", {}, opts.signal);
   }
 
   /** A contract's decoded on-chain interface (functions, events, types). */
-  getInterface(contractId: string): Promise<Json> {
-    return this.get(`/contracts/${enc(contractId)}/interface`);
+  getInterface(contractId: string, opts: RequestOptions = {}): Promise<Json> {
+    return this.get(`/contracts/${enc(contractId)}/interface`, {}, opts.signal);
   }
 
   /** Versioned instance-storage snapshots, newest first (`limit=1` = current). */
-  getState(contractId: string, opts: { limit?: number } = {}): Promise<ContractState> {
-    return this.get(`/contracts/${enc(contractId)}/state`, { limit: opts.limit });
+  getState(contractId: string, opts: { limit?: number; signal?: AbortSignal } = {}): Promise<ContractState> {
+    return this.get(`/contracts/${enc(contractId)}/state`, { limit: opts.limit }, opts.signal);
   }
 
   /** Latest value of every per-key entry (e.g. holder balances). */
   getData(
     contractId: string,
-    opts: { label?: string; limit?: number } = {},
+    opts: { label?: string; limit?: number; signal?: AbortSignal } = {},
   ): Promise<ContractData> {
     return this.get(`/contracts/${enc(contractId)}/data`, {
       label: opts.label,
       limit: opts.limit,
-    });
+    }, opts.signal);
   }
 
   /** The version history of a single per-key entry (e.g. one balance). */
   getDataKey(
     contractId: string,
     keyHash: string,
-    opts: { limit?: number } = {},
+    opts: { limit?: number; signal?: AbortSignal } = {},
   ): Promise<DataKeyHistory> {
     return this.get(`/contracts/${enc(contractId)}/data/${enc(keyHash)}`, {
       limit: opts.limit,
-    });
+    }, opts.signal);
   }
 
   /** Recent events for a contract, newest first (limit/offset). */
   listEvents(
     contractId: string,
-    opts: { limit?: number; offset?: number; eventName?: string } = {},
+    opts: { limit?: number; offset?: number; eventName?: string; signal?: AbortSignal } = {},
   ): Promise<EventRecord[]> {
     return this.get(`/contracts/${enc(contractId)}/events`, {
       limit: opts.limit,
       offset: opts.offset,
       event_name: opts.eventName,
-    });
+    }, opts.signal);
   }
 
   /** Materialized SEP-41 transfers, newest first (limit/offset). */
   listTransfers(
     contractId?: string,
-    opts: { limit?: number; offset?: number } = {},
+    opts: { limit?: number; offset?: number; signal?: AbortSignal } = {},
   ): Promise<Transfer[]> {
     const path = contractId
       ? `/contracts/${enc(contractId)}/transfers`
       : `/transfers`;
-    return this.get(path, { limit: opts.limit, offset: opts.offset });
+    return this.get(path, { limit: opts.limit, offset: opts.offset }, opts.signal);
   }
 
   /** A contract's callable view functions and their typed signatures. */
-  listFunctions(contractId: string): Promise<Json> {
-    return this.get(`/contracts/${enc(contractId)}/functions`);
+  listFunctions(contractId: string, opts: RequestOptions = {}): Promise<Json> {
+    return this.get(`/contracts/${enc(contractId)}/functions`, {}, opts.signal);
   }
 
   /** Invoke a view function read-only and get a typed result. */
-  call(contractId: string, opts: CallOptions): Promise<CallResult> {
+  call(contractId: string, opts: CallOptions & RequestOptions): Promise<CallResult> {
     return this.post(`/contracts/${enc(contractId)}/call`, {
       function: opts.function,
       args: opts.args ?? null,
       source_account: opts.sourceAccount,
-    });
+    }, opts.signal);
   }
 
   /** Dry-run any call and preview its result, emitted events, and cost. */
-  simulate(contractId: string, opts: CallOptions): Promise<CallResult> {
+  simulate(contractId: string, opts: CallOptions & RequestOptions): Promise<CallResult> {
     return this.post(`/contracts/${enc(contractId)}/simulate`, {
       function: opts.function,
       args: opts.args ?? null,
       source_account: opts.sourceAccount,
-    });
+    }, opts.signal);
   }
 
   // ---- GraphQL ----
@@ -315,10 +320,12 @@ export class LumenqraphClient {
   async graphql<T = Json>(
     query: string,
     variables: Record<string, unknown> = {},
+    opts: RequestOptions = {},
   ): Promise<T> {
     const body = await this.post<{ data?: T; errors?: { message: string }[] }>(
       "/graphql",
       { query, variables },
+      opts.signal,
     );
     if (body.errors?.length) {
       throw new LumenqraphError(
@@ -333,7 +340,7 @@ export class LumenqraphClient {
   /** One cursor page of events via GraphQL. */
   async eventsPage(
     contractId: string,
-    opts: { first?: number; after?: string; eventName?: string } = {},
+    opts: { first?: number; after?: string; eventName?: string; signal?: AbortSignal } = {},
   ): Promise<Page<EventRecord>> {
     const query = `
       query Events($id: String!, $name: String, $first: Int, $after: String) {
@@ -355,7 +362,7 @@ export class LumenqraphClient {
       name: opts.eventName ?? null,
       first: opts.first ?? 50,
       after: opts.after ?? null,
-    });
+    }, { signal: opts.signal });
     return {
       nodes: data.events.edges.map((e) => e.node as unknown as EventRecord),
       endCursor: data.events.pageInfo.endCursor,
@@ -369,7 +376,7 @@ export class LumenqraphClient {
    */
   async *paginateEvents(
     contractId: string,
-    opts: { pageSize?: number; eventName?: string } = {},
+    opts: { pageSize?: number; eventName?: string; signal?: AbortSignal } = {},
   ): AsyncGenerator<EventRecord> {
     let after: string | undefined;
     for (;;) {
@@ -377,6 +384,7 @@ export class LumenqraphClient {
         first: opts.pageSize ?? 100,
         after,
         eventName: opts.eventName,
+        signal: opts.signal,
       });
       for (const node of page.nodes) yield node;
       if (!page.hasNextPage || !page.endCursor) return;
@@ -389,24 +397,25 @@ export class LumenqraphClient {
   private async get<T = Json>(
     path: string,
     query: Record<string, unknown> = {},
+    signal?: AbortSignal,
   ): Promise<T> {
     const url = new URL(this.baseUrl + path);
     for (const [k, v] of Object.entries(query)) {
       if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
     }
-    return this.request<T>(url.toString(), { method: "GET" });
+    return this.request<T>(url.toString(), { method: "GET" }, signal);
   }
 
-  private post<T = Json>(path: string, body: unknown): Promise<T> {
+  private post<T = Json>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
     return this.request<T>(this.baseUrl + path, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
-    });
+    }, signal);
   }
 
   /**
-   * Core fetch wrapper with retry + timeout (#81).
+   * Core fetch wrapper with retry + timeout (#81, #142).
    *
    * Retry policy:
    *  - Network errors (fetch throws) are always retried.
@@ -416,16 +425,28 @@ export class LumenqraphClient {
    *
    * Each attempt gets its own `AbortController` so the timeout window resets
    * after every retry — a slow response on attempt 1 doesn't eat the budget
-   * for attempt 2.
+   * for attempt 2. An external AbortSignal is checked before attempting retries,
+   * allowing cancellation from the caller.
    */
-  private async request<T>(url: string, init: RequestInit): Promise<T> {
+  private async request<T>(url: string, init: RequestInit, signal?: AbortSignal): Promise<T> {
     const { maxRetries, baseDelayMs, maxDelayMs, timeoutMs } = this.retry;
     let attempt = 0;
 
     for (;;) {
+      // Check if externally aborted before making the request.
+      if (signal?.aborted) {
+        const err = new Error("AbortError");
+        err.name = "AbortError";
+        throw err;
+      }
+
       // Fresh AbortController each attempt so the timeout window resets.
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+      // Listen for external abort signal and propagate it.
+      const abortListener = () => controller.abort();
+      signal?.addEventListener("abort", abortListener);
 
       let res: Response;
       let text: string;
@@ -448,6 +469,7 @@ export class LumenqraphClient {
         throw err;
       } finally {
         clearTimeout(timer);
+        signal?.removeEventListener("abort", abortListener);
       }
 
       const parsed = text ? safeJson(text) : null;
