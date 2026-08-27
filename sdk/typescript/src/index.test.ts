@@ -44,6 +44,9 @@ function mockFetch(responses: Array<{ status: number; body: unknown }>) {
       ok: r.status >= 200 && r.status < 300,
       status: r.status,
       statusText: r.status === 200 ? "OK" : "Error",
+      headers: {
+        get: () => null,
+      },
       text: () => Promise.resolve(text),
     });
   });
@@ -213,7 +216,12 @@ describe("error handling", () => {
   });
 
   it("falls back to status text when body has no error field", async () => {
-    const f = mockFetch([{ status: 503, body: "Service Unavailable" }]);
+    const f = mockFetch([
+      { status: 503, body: "Service Unavailable" },
+      { status: 503, body: "Service Unavailable" },
+      { status: 503, body: "Service Unavailable" },
+      { status: 503, body: "Service Unavailable" },
+    ]);
     await expect(client(f).listContracts()).rejects.toThrow(LumenqraphError);
   });
 
