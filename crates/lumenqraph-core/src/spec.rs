@@ -938,4 +938,333 @@ mod tests {
             assert_eq!(out["params"]["status"]["value"], json!(["Bid", 7, 9]));
         }
     }
+
+    mod enrich_event_negative_cases {
+        use super::*;
+        use stellar_xdr::curr::{
+            ScSpecEventParamV0, ScSpecEventV0, ScSpecUdtStructFieldV0, ScSpecUdtStructV0, ScSymbol,
+            VecM,
+        };
+
+        #[test]
+        fn enrichment_returns_none_for_unknown_event() {
+            let body = spec_section(&[transfer_event_entry()]);
+            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+            assert!(spec
+                .enrich_event("unknown", &[json!("unknown")], &json!(0))
+                .is_none());
+        }
+
+        #[test]
+        fn enrichment_with_fewer_topics_than_expected_fills_with_null() {
+            let body = spec_section(&[transfer_event_entry()]);
+            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+
+            // Only one topic when we expect two (from, to)
+            let topics = vec![json!("transfer"), json!("GFROM")];
+            let value = json!("105000000");
+            let enriched = spec.enrich_event("transfer", &topics, &value).unwrap();
+
+            assert_eq!(enriched["event"], "transfer");
+            assert_eq!(enriched["params"]["from"]["value"], "GFROM");
+            assert_eq!(enriched["params"]["to"]["value"], Value::Null);
+            assert_eq!(enriched["params"]["amount"]["value"], "105000000");
+        }
+
+        #[test]
+        fn enrichment_with_more_topics_than_expected_ignores_extra() {
+            let body = spec_section(&[transfer_event_entry()]);
+            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+
+            // Extra topics beyond what the spec expects
+            let topics = vec![
+                json!("transfer"),
+                json!("GFROM"),
+                json!("GTO"),
+                json!("EXTRA"),
+            ];
+            let value = json!("105000000");
+            let enriched = spec.enrich_event("transfer", &topics, &value).unwrap();
+
+            assert_eq!(enriched["params"]["from"]["value"], "GFROM");
+            assert_eq!(enriched["params"]["to"]["value"], "GTO");
+            assert_eq!(enriched["params"]["amount"]["value"], "105000000");
+        }
+
+        #[test]
+        fn enrichment_handles_vec_data_format() {
+            use stellar_xdr::curr::{ScSpecEventDataFormat, ScSpecEventParamLocationV0};
+
+            let vec_event = ScSpecEntry::EventV0(ScSpecEventV0 {
+                doc: "".try_into().unwrap(),
+                lib: "".try_into().unwrap(),
+                name: ScSymbol("mint".try_into().unwrap()),
+                prefix_topics: vec![ScSymbol("mint".try_into().unwrap())]
+                    .try_into()
+                    .unwrap(),
+                params: vec![
+                    ScSpecEventParamV0 {
+                        doc: "".try_into().unwrap(),
+                        name: "to".try_into().unwrap(),
+                        type_: ScSpecTypeDef::Address,
+                        location: ScSpecEventParamLocationV0::TopicList,
+                    },
+                    ScSpecEventParamV0 {
+                        doc: "".try_into().unwrap(),
+                        name: "amount".try_into().unwrap(),
+                        type_: ScSpecTypeDef::I128,
+                        location: ScSpecEventParamLocationV0::Data,
+                    },
+                    ScSpecEventParamV0 {
+                        doc: "".try_into().unwrap(),
+                        name: "timestamp".try_into().unwrap(),
+                        type_: ScSpecTypeDef::U64,
+                        location: ScSpecEventParamLocationV0::Data,
+                    },
+                ]
+                .try_into()
+                .unwrap(),
+                data_format: ScSpecEventDataFormat::Vec,
+            });
+
+            let body = spec_section(&[vec_event]);
+            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+
+            let topics = vec![json!("mint"), json!("GTO")];
+            let value = json!(["105000000", "1234567890"]);
+            let enriched = spec.enrich_event("mint", &topics, &value).unwrap();
+
+            assert_eq!(enriched["params"]["to"]["value"], "GTO");
+            assert_eq!(enriched["params"]["amount"]["value"], "105000000");
+            assert_eq!(enriched["params"]["timestamp"]["value"], "1234567890");
+        }
+
+        #[test]
+        fn enrichment_handles_map_data_format() {
+            use stellar_xdr::curr::{ScSpecEventDataFormat, ScSpecEventParamLocationV0};
+
+            let map_event = ScSpecEntry::EventV0(ScSpecEventV0 {
+                doc: "".try_into().unwrap(),
+                lib: "".try_into().unwrap(),
+                name: ScSymbol("transfer".try_into().unwrap()),
+                prefix_topics: vec![ScSymbol("transfer".try_into().unwrap())]
+                    .try_into()
+                    .unwrap(),
+                params: vec![
+                    ScSpecEventParamV0 {
+                        doc: "".try_into().unwrap(),
+                        name: "from".try_into().unwrap(),
+                        type_: ScSpecTypeDef::Address,
+                        location: ScSpecEventParamLocationV0::TopicList,
+                    },
+                    ScSpecEventParamV0 {
+                        doc: "".try_into().unwrap(),
+                        name: "amount".try_into().unwrap(),
+                        type_: ScSpecTypeDef::I128,
+                        location: ScSpecEventParamLocationV0::Data,
+                    },
+                ]
+                .try_into()
+                .unwrap(),
+                data_format: ScSpecEventDataFormat::Map,
+            });
+
+            let body = spec_section(&[map_event]);
+            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+
+            let topics = vec![json!("transfer"), json!("GFROM")];
+            let value = json!({"amount": "100000"});
+            let enriched = spec.enrich_event("transfer", &topics, &value).unwrap();
+
+            assert_eq!(enriched["params"]["from"]["value"], "GFROM");
+            assert_eq!(enriched["params"]["amount"]["value"], "100000");
+        }
+
+        #[test]
+        fn enrichment_with_mismatched_vec_data_falls_back_to_null() {
+            use stellar_xdr::curr::{ScSpecEventDataFormat, ScSpecEventParamLocationV0};
+
+            let vec_event = ScSpecEntry::EventV0(ScSpecEventV0 {
+                doc: "".try_into().unwrap(),
+                lib: "".try_into().unwrap(),
+                name: ScSymbol("mint".try_into().unwrap()),
+                prefix_topics: vec![ScSymbol("mint".try_into().unwrap())]
+                    .try_into()
+                    .unwrap(),
+                params: vec![
+                    ScSpecEventParamV0 {
+                        doc: "".try_into().unwrap(),
+                        name: "amount".try_into().unwrap(),
+                        type_: ScSpecTypeDef::I128,
+                        location: ScSpecEventParamLocationV0::Data,
+                    },
+                ]
+                .try_into()
+                .unwrap(),
+                data_format: ScSpecEventDataFormat::Vec,
+            });
+
+            let body = spec_section(&[vec_event]);
+            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+
+            // Data is not a vec (it's a single value)
+            let topics = vec![json!("mint")];
+            let value = json!("100000");
+            let enriched = spec.enrich_event("mint", &topics, &value).unwrap();
+
+            // Param should be null since we can't extract from non-vec
+            assert_eq!(enriched["params"]["amount"]["value"], Value::Null);
+        }
+
+        #[test]
+        fn enrichment_with_struct_type() {
+            use stellar_xdr::curr::{
+                ScSpecEventDataFormat, ScSpecEventParamLocationV0, ScSpecTypeUdt,
+            };
+
+            let position_struct = ScSpecEntry::UdtStructV0(ScSpecUdtStructV0 {
+                doc: "".try_into().unwrap(),
+                lib: "".try_into().unwrap(),
+                name: "Position".try_into().unwrap(),
+                fields: vec![
+                    ScSpecUdtStructFieldV0 {
+                        doc: "".try_into().unwrap(),
+                        name: "borrower".try_into().unwrap(),
+                        type_: ScSpecTypeDef::Address,
+                    },
+                    ScSpecUdtStructFieldV0 {
+                        doc: "".try_into().unwrap(),
+                        name: "debt".try_into().unwrap(),
+                        type_: ScSpecTypeDef::I128,
+                    },
+                ]
+                .try_into()
+                .unwrap(),
+            });
+
+            let position_event = ScSpecEntry::EventV0(ScSpecEventV0 {
+                doc: "".try_into().unwrap(),
+                lib: "".try_into().unwrap(),
+                name: ScSymbol("opened".try_into().unwrap()),
+                prefix_topics: vec![ScSymbol("opened".try_into().unwrap())]
+                    .try_into()
+                    .unwrap(),
+                params: vec![ScSpecEventParamV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "pos".try_into().unwrap(),
+                    type_: ScSpecTypeDef::Udt(ScSpecTypeUdt {
+                        name: "Position".try_into().unwrap(),
+                    }),
+                    location: ScSpecEventParamLocationV0::Data,
+                }]
+                .try_into()
+                .unwrap(),
+                data_format: ScSpecEventDataFormat::SingleValue,
+            });
+
+            let body = spec_section(&[position_struct, position_event]);
+            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+
+            let topics = vec![json!("opened")];
+            let value = json!({"borrower": "GBORROW", "debt": "50000"});
+            let enriched = spec.enrich_event("opened", &topics, &value).unwrap();
+
+            assert_eq!(enriched["event"], "opened");
+            assert_eq!(enriched["params"]["pos"]["type"], "Position");
+            assert_eq!(
+                enriched["params"]["pos"]["value"]["borrower"],
+                "GBORROW"
+            );
+            assert_eq!(enriched["params"]["pos"]["value"]["debt"], "50000");
+        }
+
+        #[test]
+        fn enrichment_is_best_effort_and_doesnt_lose_data() {
+            // If a value doesn't match what the spec expects, it should be
+            // returned unchanged rather than being lost or corrupted
+            let body = spec_section(&[transfer_event_entry()]);
+            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+
+            // Pass a number where an address is expected - should still enrich
+            let topics = vec![json!("transfer"), json!(123), json!(456)];
+            let value = json!("105000000");
+            let enriched = spec.enrich_event("transfer", &topics, &value).unwrap();
+
+            assert_eq!(enriched["params"]["from"]["value"], 123);
+            assert_eq!(enriched["params"]["to"]["value"], 456);
+        }
+
+        #[test]
+        fn enrichment_with_optional_param_none() {
+            use stellar_xdr::curr::{
+                ScSpecEventDataFormat, ScSpecEventParamLocationV0, ScSpecTypeOption,
+            };
+
+            let optional_event = ScSpecEntry::EventV0(ScSpecEventV0 {
+                doc: "".try_into().unwrap(),
+                lib: "".try_into().unwrap(),
+                name: ScSymbol("optional_test".try_into().unwrap()),
+                prefix_topics: vec![ScSymbol("optional_test".try_into().unwrap())]
+                    .try_into()
+                    .unwrap(),
+                params: vec![ScSpecEventParamV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "value".try_into().unwrap(),
+                    type_: ScSpecTypeDef::Option(Box::new(ScSpecTypeOption {
+                        value_type: Box::new(ScSpecTypeDef::I128),
+                    })),
+                    location: ScSpecEventParamLocationV0::Data,
+                }]
+                .try_into()
+                .unwrap(),
+                data_format: ScSpecEventDataFormat::SingleValue,
+            });
+
+            let body = spec_section(&[optional_event]);
+            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+
+            let topics = vec![json!("optional_test")];
+            let value = Value::Null;
+            let enriched = spec.enrich_event("optional_test", &topics, &value).unwrap();
+
+            assert_eq!(enriched["params"]["value"]["value"], Value::Null);
+        }
+
+        #[test]
+        fn enrichment_with_optional_param_some() {
+            use stellar_xdr::curr::{
+                ScSpecEventDataFormat, ScSpecEventParamLocationV0, ScSpecTypeOption,
+            };
+
+            let optional_event = ScSpecEntry::EventV0(ScSpecEventV0 {
+                doc: "".try_into().unwrap(),
+                lib: "".try_into().unwrap(),
+                name: ScSymbol("optional_test".try_into().unwrap()),
+                prefix_topics: vec![ScSymbol("optional_test".try_into().unwrap())]
+                    .try_into()
+                    .unwrap(),
+                params: vec![ScSpecEventParamV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "value".try_into().unwrap(),
+                    type_: ScSpecTypeDef::Option(Box::new(ScSpecTypeOption {
+                        value_type: Box::new(ScSpecTypeDef::I128),
+                    })),
+                    location: ScSpecEventParamLocationV0::Data,
+                }]
+                .try_into()
+                .unwrap(),
+                data_format: ScSpecEventDataFormat::SingleValue,
+            });
+
+            let body = spec_section(&[optional_event]);
+            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+
+            let topics = vec![json!("optional_test")];
+            let value = json!("42");
+            let enriched = spec.enrich_event("optional_test", &topics, &value).unwrap();
+
+            assert_eq!(enriched["params"]["value"]["value"], "42");
+            assert_eq!(enriched["params"]["value"]["type"], "Option<i128>");
+        }
+    }
 }
