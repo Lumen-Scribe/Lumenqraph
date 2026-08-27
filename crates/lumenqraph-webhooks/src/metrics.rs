@@ -6,8 +6,9 @@ use axum::extract::State;
 use axum::http::header;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::{Router, Server};
+use axum::{Json, Router, Server};
 use chrono::Utc;
+use serde_json::json;
 use sqlx::PgPool;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,6 +23,7 @@ pub async fn start_metrics_server(pool: Arc<PgPool>, bind_addr: &str) -> anyhow:
     let state = MetricsState { pool };
 
     let app = Router::new()
+        .route("/health", get(health))
         .route("/metrics", get(metrics))
         .with_state(state);
 
@@ -46,6 +48,34 @@ pub async fn start_metrics_server(pool: Arc<PgPool>, bind_addr: &str) -> anyhow:
     });
 
     Ok(())
+}
+
+async fn health(State(state): State<MetricsState>) -> impl IntoResponse {
+    match gather_metrics(&state.pool).await {
+        Ok(metrics) => {
+            let health_status = if metrics.pending_count < 1000 {
+                "ok"
+            } else {
+                "degraded"
+            };
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({
+                    "status": health_status,
+                    "pending_count": metrics.pending_count,
+                    "oldest_pending_age_seconds": metrics.oldest_pending_age_secs,
+                    "failed_count": metrics.failed_count,
+                })),
+            )
+        }
+        Err(_) => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "unavailable",
+                "error": "failed to fetch webhook metrics"
+            })),
+        ),
+    }
 }
 
 async fn metrics(State(state): State<MetricsState>) -> impl IntoResponse {
