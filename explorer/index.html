@@ -158,7 +158,7 @@
     </div>
     <div class="conn">
       <input id="base" size="26" value="" placeholder="API base (blank = same origin)" title="API base URL — leave blank when the page is served by/behind the API" onchange="baseChanged()" />
-      <input id="key" size="16" placeholder="x-api-key (optional)" onchange="connect()" />
+      <input id="key" size="16" placeholder="API key (if required)" title="x-api-key header — required if the API enforces authentication (REQUIRE_API_KEY=true)" onchange="connect()" />
       <select id="senet" title="Network — auto-detected from the connected API; pick one to switch to its remembered API base" onchange="netChanged()">
         <option value="public">mainnet</option>
         <option value="testnet">testnet</option>
@@ -253,6 +253,9 @@ async function get(path) {
   const r = await fetch(base() + path, { headers: headers() });
   if (!r.ok) {
     let msg = 'HTTP ' + r.status;
+    if (r.status === 401) {
+      msg = 'Authentication required — enter your API key above and try again';
+    }
     try { const b = await r.json(); if (b.error) msg = b.error; } catch {}
     throw new Error(msg);
   }
@@ -325,7 +328,11 @@ async function loadHealth() {
     syncNetwork(h.network);
   } catch (e) {
     $('statusDot').className = 'dot crit';
-    $('statusText').textContent = 'unreachable';
+    if (e.message.includes('401')) {
+      $('statusText').textContent = 'authentication required';
+    } else {
+      $('statusText').textContent = 'unreachable';
+    }
     toast('Health: ' + e.message);
   }
 }
