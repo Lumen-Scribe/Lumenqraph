@@ -14,6 +14,50 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use config::Config;
 
+async fn connect_with_retry(database_url: &str, max_retries: u32) -> anyhow::Result<sqlx::PgPool> {
+    let mut attempt = 0;
+    let mut retry_delay = Duration::from_secs(1);
+    let max_delay = Duration::from_secs(30);
+    loop {
+        match PgPoolOptions::new()
+            .max_connections(env_parse_u32("DATABASE_MAX_CONNECTIONS", 5))
+            .min_connections(env_parse_u32("DATABASE_MIN_CONNECTIONS", 1))
+            .acquire_timeout(Duration::from_secs(env_parse_u64(
+                "DATABASE_ACQUIRE_TIMEOUT_SECS",
+                30,
+            )))
+            .idle_timeout(Duration::from_secs(env_parse_u64(
+                "DATABASE_IDLE_TIMEOUT_SECS",
+                600,
+            )))
+            .connect(database_url)
+            .await
+        {
+            Ok(pool) => {
+                if attempt > 0 {
+                    info!(attempt, "successfully connected to Postgres after retries");
+                }
+                return Ok(pool);
+            }
+            Err(e) if attempt < max_retries => {
+                attempt += 1;
+                tracing::warn!(
+                    error = %e,
+                    attempt,
+                    max_retries,
+                    retry_delay_secs = retry_delay.as_secs(),
+                    "failed to connect to Postgres, retrying…"
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(max_delay);
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("failed to connect to Postgres after {max_retries} retries: {e}"));
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
@@ -23,20 +67,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env()?;
-    let pool = PgPoolOptions::new()
-        .max_connections(env_parse_u32("DATABASE_MAX_CONNECTIONS", 5))
-        .min_connections(env_parse_u32("DATABASE_MIN_CONNECTIONS", 1))
-        .acquire_timeout(Duration::from_secs(env_parse_u64(
-            "DATABASE_ACQUIRE_TIMEOUT_SECS",
-            30,
-        )))
-        .idle_timeout(Duration::from_secs(env_parse_u64(
-            "DATABASE_IDLE_TIMEOUT_SECS",
-            600,
-        )))
-        .connect(&config.database_url)
-        .await
-        .context("failed to connect to Postgres")?;
+    let max_connect_retries = env_parse_u32("DATABASE_CONNECT_RETRIES", 30);
+    let pool = connect_with_retry(&config.database_url, max_connect_retries).await?;
 
     let http = reqwest::Client::builder()
         .connect_timeout(config.connect_timeout())
