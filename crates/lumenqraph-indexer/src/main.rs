@@ -19,6 +19,7 @@ mod config;
 mod convert;
 mod cursor;
 mod deep_backfill;
+mod http;
 mod keys;
 mod poller;
 mod reenrich;
@@ -172,6 +173,13 @@ async fn main() -> anyhow::Result<()> {
         poll_secs = config.poll_interval_secs,
         "starting lumenqraph indexer (live)"
     );
+
+    // Start health/metrics HTTP server if configured
+    if let Ok(health_addr) = std::env::var("INDEXER_HEALTH_ADDR") {
+        let pool_arc = std::sync::Arc::new(pool.clone());
+        http::start_http_server(pool_arc, &health_addr).await?;
+    }
+
     let result = poller::run(pool.clone(), rpc, config).await;
 
     // Release the advisory lock on shutdown.

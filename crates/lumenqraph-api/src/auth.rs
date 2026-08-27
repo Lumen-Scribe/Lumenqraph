@@ -11,6 +11,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use sha2::{Digest, Sha256};
+use sqlx::PgPool;
+use tracing::warn;
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -125,6 +127,29 @@ fn extract_client_ip(headers: &HeaderMap, socket_addr: Option<SocketAddr>) -> St
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+async fn log_audit_event(
+    pool: &PgPool,
+    key_hash_prefix: &str,
+    route: &str,
+    method: &str,
+    status_code: u16,
+) {
+    let truncated_prefix = key_hash_prefix.chars().take(8).collect::<String>();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO audit_log (key_hash_prefix, route, http_method, status_code)
+         VALUES ($1, $2, $3, $4)"
+    )
+    .bind(&truncated_prefix)
+    .bind(route)
+    .bind(method)
+    .bind(status_code as i32)
+    .execute(pool)
+    .await
+    {
+        warn!(error = %e, "failed to log audit event");
+    }
+}
+
 pub async fn auth_and_rate_limit(
     State(state): State<AppState>,
     ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
@@ -134,7 +159,11 @@ pub async fn auth_and_rate_limit(
 ) -> ApiResult<Response> {
     state.http_requests.fetch_add(1, Ordering::Relaxed);
 
-    let (identity, limit) = match extract_key(&headers) {
+    let method = req.method().to_string();
+    let uri = req.uri().to_string();
+    let route = uri.split('?').next().unwrap_or("").to_string();
+
+    let (identity, limit, is_authenticated) = match extract_key(&headers) {
         Some(key) => {
             let hash = hash_key(&key);
             let row: Option<(bool, i32)> = sqlx::query_as(
@@ -144,9 +173,15 @@ pub async fn auth_and_rate_limit(
             .fetch_optional(&state.pool)
             .await?;
             match row {
-                Some((false, limit)) => (format!("key:{hash}"), limit),
-                Some((true, _)) => return Err(ApiError::unauthorized("API key revoked")),
-                None => return Err(ApiError::unauthorized("invalid API key")),
+                Some((false, limit)) => (format!("key:{hash}"), limit, true),
+                Some((true, _)) => {
+                    log_audit_event(&state.pool, &hash, &route, &method, 401).await;
+                    return Err(ApiError::unauthorized("API key revoked"))
+                },
+                None => {
+                    log_audit_event(&state.pool, &hash, &route, &method, 401).await;
+                    return Err(ApiError::unauthorized("invalid API key"))
+                },
             }
         }
         None => {
@@ -154,7 +189,7 @@ pub async fn auth_and_rate_limit(
                 return Err(ApiError::unauthorized("missing API key"));
             }
             let client_ip = extract_client_ip(&headers, Some(socket_addr));
-            (format!("anon:{client_ip}"), state.anon_rate_limit)
+            (format!("anon:{client_ip}"), state.anon_rate_limit, false)
         }
     };
 
@@ -178,10 +213,23 @@ pub async fn auth_and_rate_limit(
             rl_status.tokens_remaining.to_string().parse().unwrap_or_else(|_| "0".parse().unwrap()),
         );
 
+        if is_authenticated {
+            let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
+            log_audit_event(&state.pool, hash_prefix, &route, &method, 429).await;
+        }
+
         return Ok(response);
     }
 
-    Ok(next.run(req).await)
+    let response = next.run(req).await;
+    let status = response.status().as_u16();
+
+    if is_authenticated {
+        let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
+        log_audit_event(&state.pool, hash_prefix, &route, &method, status).await;
+    }
+
+    Ok(response)
 }
 
 /// Middleware for expensive RPC-backed routes that hit upstream Soroban RPC.
@@ -196,7 +244,11 @@ pub async fn rpc_auth_and_rate_limit(
 ) -> ApiResult<Response> {
     state.http_requests.fetch_add(1, Ordering::Relaxed);
 
-    let (identity, limit) = match extract_key(&headers) {
+    let method = req.method().to_string();
+    let uri = req.uri().to_string();
+    let route = uri.split('?').next().unwrap_or("").to_string();
+
+    let (identity, limit, is_authenticated) = match extract_key(&headers) {
         Some(key) => {
             let hash = hash_key(&key);
             let row: Option<(bool, i32)> = sqlx::query_as(
@@ -206,9 +258,15 @@ pub async fn rpc_auth_and_rate_limit(
             .fetch_optional(&state.pool)
             .await?;
             match row {
-                Some((false, limit)) => (format!("key:{hash}"), limit),
-                Some((true, _)) => return Err(ApiError::unauthorized("API key revoked")),
-                None => return Err(ApiError::unauthorized("invalid API key")),
+                Some((false, limit)) => (format!("key:{hash}"), limit, true),
+                Some((true, _)) => {
+                    log_audit_event(&state.pool, &hash, &route, &method, 401).await;
+                    return Err(ApiError::unauthorized("API key revoked"))
+                },
+                None => {
+                    log_audit_event(&state.pool, &hash, &route, &method, 401).await;
+                    return Err(ApiError::unauthorized("invalid API key"))
+                },
             }
         }
         None => {
@@ -217,15 +275,27 @@ pub async fn rpc_auth_and_rate_limit(
                     "RPC routes require API key; missing or invalid key",
                 ));
             }
-            ("anon".to_string(), state.rpc_anon_rate_limit)
+            ("anon".to_string(), state.rpc_anon_rate_limit, false)
         }
     };
 
     if !state.rpc_limiter.check(&identity, limit).allowed {
+        if is_authenticated {
+            let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
+            log_audit_event(&state.pool, hash_prefix, &route, &method, 429).await;
+        }
         return Err(ApiError::too_many_requests());
     }
 
-    Ok(next.run(req).await)
+    let response = next.run(req).await;
+    let status = response.status().as_u16();
+
+    if is_authenticated {
+        let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
+        log_audit_event(&state.pool, hash_prefix, &route, &method, status).await;
+    }
+
+    Ok(response)
 }
 
 // ---- HTTP-level integration tests ----------------------------------------
