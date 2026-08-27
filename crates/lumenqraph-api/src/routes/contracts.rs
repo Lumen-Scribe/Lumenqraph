@@ -14,7 +14,7 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use lumenqraph_core::{Contract, SpecDiff};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::types::Json as SqlxJson;
 
@@ -22,11 +22,35 @@ use crate::error::{ApiError, ApiResult};
 use crate::specs::CachedSpec;
 use crate::state::AppState;
 
-pub async fn list_contracts(State(state): State<AppState>) -> ApiResult<Json<Vec<Contract>>> {
+#[derive(Deserialize)]
+pub struct ContractsQuery {
+    #[serde(default = "default_limit")]
+    limit: i64,
+    #[serde(default)]
+    offset: i64,
+}
+
+fn default_limit() -> i64 {
+    200
+}
+
+#[derive(Serialize)]
+pub struct ContractsResponse {
+    pub data: Vec<Contract>,
+    pub has_more: bool,
+}
+
+pub async fn list_contracts(
+    State(state): State<AppState>,
+    Query(q): Query<ContractsQuery>,
+) -> ApiResult<Json<ContractsResponse>> {
     // Query from the contract_summaries table (maintained by a trigger on events inserts)
     // instead of computing a GROUP BY on every request. This provides constant-time
     // performance independent of the total event count, making the explorer's landing
     // page (which relies on this endpoint) performant at scale.
+    let limit = q.limit.clamp(1, 500);
+    let offset = q.offset.max(0);
+
     let contracts: Vec<Contract> = sqlx::query_as(
         "SELECT contract_id,
                 event_count,
@@ -34,12 +58,25 @@ pub async fn list_contracts(State(state): State<AppState>) -> ApiResult<Json<Vec
                 last_seen_ledger
          FROM contract_summaries
          WHERE event_count > 0
-         ORDER BY event_count DESC",
+         ORDER BY event_count DESC
+         LIMIT $1 OFFSET $2",
     )
+    .bind(limit + 1)
+    .bind(offset)
     .fetch_all(&state.pool)
     .await?;
 
-    Ok(Json(contracts))
+    let has_more = contracts.len() as i64 > limit;
+    let result_contracts = if has_more {
+        contracts.into_iter().take(limit as usize).collect()
+    } else {
+        contracts
+    };
+
+    Ok(Json(ContractsResponse {
+        data: result_contracts,
+        has_more,
+    }))
 }
 
 #[derive(Deserialize)]

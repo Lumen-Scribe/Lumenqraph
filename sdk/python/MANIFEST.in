@@ -1,0 +1,4 @@
+include README.md
+include LICENSE
+recursive-include lumenqraph *.py py.typed
+recursive-include tests *.py

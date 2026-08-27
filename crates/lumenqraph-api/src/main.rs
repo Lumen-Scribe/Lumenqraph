@@ -28,6 +28,7 @@ use axum::http;
 use axum::middleware;
 use sqlx::postgres::PgPoolOptions;
 use tower_http::compression::CompressionLayer;
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -128,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
     let rpc_url = std::env::var("RPC_URL")
         .unwrap_or_else(|_| "https://soroban-testnet.stellar.org".to_string());
     let rpc_timeout_secs: u64 = env_parse("RPC_TIMEOUT_SECS", 30u64);
+    let request_timeout_secs: u64 = env_parse("API_REQUEST_TIMEOUT_SECS", 60u64);
 
     let pool = PgPoolOptions::new()
         .max_connections(env_parse("DATABASE_MAX_CONNECTIONS", 10u32))
@@ -179,9 +181,11 @@ async fn main() -> anyhow::Result<()> {
     let cors_layer = build_cors_layer();
     let max_body_bytes = env_parse::<u32>("API_MAX_BODY_BYTES", 256 * 1024);
     info!(max_body_bytes, "enforcing request body size limit");
+    info!(request_timeout_secs, "enforcing request timeout");
 
     let app = routes::router(state)
         .layer(DefaultBodyLimit::max(max_body_bytes as usize))
+        .layer(TimeoutLayer::new(Duration::from_secs(request_timeout_secs)))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .layer(cors_layer);
