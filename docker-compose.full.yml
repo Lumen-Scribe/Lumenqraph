@@ -1,6 +1,8 @@
 # Full local stack: Postgres + all three services, built from the Dockerfile.
 # For dev with only Postgres, use docker-compose.yml instead.
 #
+# IMPORTANT: Set WEBHOOK_ENCRYPTION_KEY in your environment before starting:
+#   export WEBHOOK_ENCRYPTION_KEY=$(openssl rand -hex 32)
 #   docker compose -f docker-compose.full.yml up --build
 
 services:
@@ -49,6 +51,7 @@ services:
       API_BIND_ADDR: 0.0.0.0:8080
       REQUIRE_API_KEY: ${REQUIRE_API_KEY:-false}
       ANON_RATE_LIMIT_PER_MIN: ${ANON_RATE_LIMIT_PER_MIN:-60}
+      WEBHOOK_ENCRYPTION_KEY: ${WEBHOOK_ENCRYPTION_KEY}
       RUST_LOG: ${RUST_LOG:-info}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
@@ -66,6 +69,7 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgres://lumenqraph:lumenqraph@postgres:5432/lumenqraph
+      WEBHOOK_ENCRYPTION_KEY: ${WEBHOOK_ENCRYPTION_KEY}
       RUST_LOG: ${RUST_LOG:-info}
 
 volumes:

@@ -81,9 +81,29 @@ Prometheus text: `lumenqraph_indexer_lag_ledgers`, `lumenqraph_events_total`,
 Contracts seen, with `event_count`, `first_seen_ledger`, `last_seen_ledger`.
 
 ### `GET /contracts/:id/events`
-Query: `limit` (1–1000, default 50), `offset`, `event_name` (e.g. `transfer`).
+Query: `limit` (1–1000, default 50), `offset`, `event_name` (e.g. `transfer`),
+`after` (cursor for pagination).
+
+**Pagination:** Use cursor pagination (`after` parameter) for production use.
+Offset pagination is **deprecated** due to linear performance degradation and is
+capped at 10,000 rows. For deeper pages, use the `next_cursor` from the previous
+response as the `after` parameter.
+
+**Filtering:** The `param` filter matches against the `enriched` JSON field using
+containment queries (e.g., `?param={"from":"GXXX"}`). The enriched column has a
+GIN index for efficient filtering.
+
 Each row has raw base64 (`topics`, `value`) **and** decoded JSON
 (`decoded_topics`, `decoded_value`), plus `event_name`, `tx_hash`, `ledger`, …
+
+Response:
+```json
+{
+  "data": [...],
+  "has_more": true,
+  "next_cursor": "3550885:0015250934946869248-0000000000"
+}
+```
 
 ### `GET /events/:event_id`
 Fetch a **single** event by its unique `event_id`. Returns the full event row

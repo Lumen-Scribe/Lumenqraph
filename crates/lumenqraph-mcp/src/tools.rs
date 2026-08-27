@@ -231,9 +231,11 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> anyhow::Result<&'a str> {
 
 async fn list_contracts(state: &State) -> anyhow::Result<Value> {
     let rows: Vec<Contract> = sqlx::query_as(
-        "SELECT contract_id, count(*)::bigint AS event_count,
-                min(ledger) AS first_seen_ledger, max(ledger) AS last_seen_ledger
-         FROM events GROUP BY contract_id ORDER BY event_count DESC LIMIT 200",
+        "SELECT contract_id, event_count, first_seen_ledger, last_seen_ledger
+         FROM contract_summaries
+         WHERE event_count > 0
+         ORDER BY event_count DESC
+         LIMIT 200",
     )
     .fetch_all(&state.pool)
     .await?;
