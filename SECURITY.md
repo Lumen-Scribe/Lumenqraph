@@ -82,6 +82,37 @@ When deploying Lumenqraph in production:
 
    These endpoints proxy requests to upstream Soroban RPC and share quota with the indexer — limiting them separately prevents a single caller from exhausting the entire RPC allocation.
 
+9. **Webhook secret encryption**: Store webhook signing secrets encrypted at rest:
+
+   ```bash
+   # Set a strong encryption key (required for production)
+   WEBHOOK_ENCRYPTION_KEY=$(openssl rand -hex 32)
+   ```
+
+   The encryption key is used with PostgreSQL's `pgp_sym_encrypt()` to protect webhook secrets. After deploying with this variable set, run migration `0016_webhook_secret_encryption_backfill.sql` to encrypt existing secrets.
+
+   **Key rotation procedure:**
+   
+   If you need to rotate the encryption key:
+   
+   1. Keep the old key available temporarily
+   2. Deploy the new key to all instances
+   3. Run this migration with both keys available:
+   
+   ```sql
+   -- Decrypt with old key, re-encrypt with new key
+   UPDATE webhook_subscriptions
+   SET encrypted_secret = pgp_sym_encrypt(
+       pgp_sym_decrypt(encrypted_secret, 'OLD_KEY'),
+       'NEW_KEY'
+   )
+   WHERE encrypted_secret IS NOT NULL;
+   ```
+   
+   4. Remove the old key after verifying all webhooks work
+   
+   Note: The plaintext `secret` column is retained for backward compatibility during rolling deployments. A future migration will drop it once all instances are updated.
+
 ### For Developers
 
 When contributing to Lumenqraph:

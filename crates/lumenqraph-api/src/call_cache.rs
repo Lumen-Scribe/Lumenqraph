@@ -77,8 +77,30 @@ impl CallCache {
         Key {
             contract_id: contract_id.to_string(),
             function: function.to_string(),
-            args: serde_json::to_string(args).unwrap_or_default(),
+            args: normalize_json(args),
         }
+    }
+}
+
+/// Recursively sort JSON object keys to produce a canonical representation
+/// for cache key generation, ensuring {"a":1,"b":2} and {"b":2,"a":1} produce
+/// identical keys.
+fn normalize_json(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let mut sorted: Vec<_> = map.iter().collect();
+            sorted.sort_by_key(|(k, _)| *k);
+            let normalized_pairs: Vec<String> = sorted
+                .into_iter()
+                .map(|(k, v)| format!("\"{}\":{}", k, normalize_json(v)))
+                .collect();
+            format!("{{{}}}", normalized_pairs.join(","))
+        }
+        Value::Array(arr) => {
+            let normalized_items: Vec<String> = arr.iter().map(normalize_json).collect();
+            format!("[{}]", normalized_items.join(","))
+        }
+        _ => serde_json::to_string(value).unwrap_or_default(),
     }
 }
 
@@ -118,5 +140,24 @@ mod tests {
         assert!(cache.get("C1", "a", &json!({})).is_none());
         assert!(cache.get("C1", "b", &json!({})).is_some());
         assert!(cache.get("C1", "c", &json!({})).is_some());
+    }
+
+    #[test]
+    fn identical_args_with_different_key_ordering_produce_cache_hit() {
+        let cache = CallCache::new(10, 60);
+        // Insert with one key order
+        cache.insert("C1", "transfer", &json!({"from": "G1", "to": "G2"}), json!(true));
+        // Retrieve with different key order - should hit cache
+        let result = cache.get("C1", "transfer", &json!({"to": "G2", "from": "G1"}));
+        assert_eq!(result, Some(json!(true)), "cache should hit for args with different key order");
+    }
+
+    #[test]
+    fn nested_objects_are_normalized() {
+        let cache = CallCache::new(10, 60);
+        let args1 = json!({"outer": {"b": 2, "a": 1}, "x": 10});
+        let args2 = json!({"x": 10, "outer": {"a": 1, "b": 2}});
+        cache.insert("C1", "fn", &args1, json!("result"));
+        assert_eq!(cache.get("C1", "fn", &args2), Some(json!("result")));
     }
 }

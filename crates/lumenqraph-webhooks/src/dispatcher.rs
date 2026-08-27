@@ -176,7 +176,7 @@ async fn fetch_due(pool: &PgPool, batch: i64) -> anyhow::Result<Vec<DueDelivery>
 
     let rows: Vec<(i64, String, i32, String, String, Json<serde_json::Value>)> = sqlx::query_as(
         "SELECT d.id, s.id, d.attempts, s.url,
-                COALESCE(pgp_sym_decrypt(s.encrypted_secret, $1), s.secret),
+                pgp_sym_decrypt(s.encrypted_secret, $1),
                 CASE WHEN d.upgrade_id IS NOT NULL THEN
                     jsonb_build_object(
                         'type',               'contract.upgraded',
