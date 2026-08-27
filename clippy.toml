@@ -1,0 +1,8 @@
+# Clippy lint configuration
+# Documents the linting rules enforced by CI
+
+# Maximum cognitive complexity before clippy warns
+cognitive-complexity-threshold = 30
+
+# Enforce all warnings as errors in CI
+# Run: cargo clippy --workspace --all-targets -- -D warnings
