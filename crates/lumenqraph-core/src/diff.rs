@@ -448,4 +448,332 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn an_added_struct_is_not_breaking() {
+        use stellar_xdr::curr::{ScSpecUdtStructFieldV0, ScSpecUdtStructV0};
+
+        let old = spec_of(&[func("balance", &[], Some(ScSpecTypeDef::I128))]);
+        let position_struct = ScSpecEntry::UdtStructV0(ScSpecUdtStructV0 {
+            doc: "".try_into().unwrap(),
+            lib: "".try_into().unwrap(),
+            name: "Position".try_into().unwrap(),
+            fields: vec![
+                ScSpecUdtStructFieldV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "borrower".try_into().unwrap(),
+                    type_: ScSpecTypeDef::Address,
+                },
+                ScSpecUdtStructFieldV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "amount".try_into().unwrap(),
+                    type_: ScSpecTypeDef::I128,
+                },
+            ]
+            .try_into()
+            .unwrap(),
+        });
+        let new = spec_of(&[
+            func("balance", &[], Some(ScSpecTypeDef::I128)),
+            position_struct,
+        ]);
+        let d = SpecDiff::between(&old, &new);
+        assert!(!d.breaking);
+        assert_eq!(d.types.added.len(), 1);
+        assert!(d.types.added[0].contains("struct Position"));
+    }
+
+    #[test]
+    fn a_removed_struct_is_breaking() {
+        use stellar_xdr::curr::{ScSpecUdtStructFieldV0, ScSpecUdtStructV0};
+
+        let position_struct = ScSpecEntry::UdtStructV0(ScSpecUdtStructV0 {
+            doc: "".try_into().unwrap(),
+            lib: "".try_into().unwrap(),
+            name: "Position".try_into().unwrap(),
+            fields: vec![ScSpecUdtStructFieldV0 {
+                doc: "".try_into().unwrap(),
+                name: "borrower".try_into().unwrap(),
+                type_: ScSpecTypeDef::Address,
+            }]
+            .try_into()
+            .unwrap(),
+        });
+        let old = spec_of(&[
+            func("balance", &[], Some(ScSpecTypeDef::I128)),
+            position_struct,
+        ]);
+        let new = spec_of(&[func("balance", &[], Some(ScSpecTypeDef::I128))]);
+        let d = SpecDiff::between(&old, &new);
+        assert!(d.breaking);
+        assert_eq!(d.types.removed.len(), 1);
+    }
+
+    #[test]
+    fn a_changed_struct_field_type_is_breaking() {
+        use stellar_xdr::curr::{ScSpecUdtStructFieldV0, ScSpecUdtStructV0};
+
+        let position_old = ScSpecEntry::UdtStructV0(ScSpecUdtStructV0 {
+            doc: "".try_into().unwrap(),
+            lib: "".try_into().unwrap(),
+            name: "Position".try_into().unwrap(),
+            fields: vec![ScSpecUdtStructFieldV0 {
+                doc: "".try_into().unwrap(),
+                name: "amount".try_into().unwrap(),
+                type_: ScSpecTypeDef::I128,
+            }]
+            .try_into()
+            .unwrap(),
+        });
+
+        let position_new = ScSpecEntry::UdtStructV0(ScSpecUdtStructV0 {
+            doc: "".try_into().unwrap(),
+            lib: "".try_into().unwrap(),
+            name: "Position".try_into().unwrap(),
+            fields: vec![ScSpecUdtStructFieldV0 {
+                doc: "".try_into().unwrap(),
+                name: "amount".try_into().unwrap(),
+                type_: ScSpecTypeDef::U128,
+            }]
+            .try_into()
+            .unwrap(),
+        });
+
+        let old = spec_of(&[position_old]);
+        let new = spec_of(&[position_new]);
+        let d = SpecDiff::between(&old, &new);
+        assert!(d.breaking);
+        assert_eq!(d.types.changed.len(), 1);
+        assert!(d.types.changed[0].from.contains("i128"));
+        assert!(d.types.changed[0].to.contains("u128"));
+    }
+
+    #[test]
+    fn an_added_enum_is_not_breaking() {
+        use stellar_xdr::curr::{ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0};
+
+        let old = spec_of(&[func("balance", &[], Some(ScSpecTypeDef::I128))]);
+        let status_enum = ScSpecEntry::UdtEnumV0(ScSpecUdtEnumV0 {
+            doc: "".try_into().unwrap(),
+            lib: "".try_into().unwrap(),
+            name: "Status".try_into().unwrap(),
+            cases: vec![
+                ScSpecUdtEnumCaseV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "Active".try_into().unwrap(),
+                    value: 0,
+                },
+                ScSpecUdtEnumCaseV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "Inactive".try_into().unwrap(),
+                    value: 1,
+                },
+            ]
+            .try_into()
+            .unwrap(),
+        });
+        let new = spec_of(&[func("balance", &[], Some(ScSpecTypeDef::I128)), status_enum]);
+        let d = SpecDiff::between(&old, &new);
+        assert!(!d.breaking);
+        assert_eq!(d.types.added.len(), 1);
+        assert!(d.types.added[0].contains("enum Status"));
+    }
+
+    #[test]
+    fn a_removed_enum_case_is_breaking() {
+        use stellar_xdr::curr::{ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0};
+
+        let status_old = ScSpecEntry::UdtEnumV0(ScSpecUdtEnumV0 {
+            doc: "".try_into().unwrap(),
+            lib: "".try_into().unwrap(),
+            name: "Status".try_into().unwrap(),
+            cases: vec![
+                ScSpecUdtEnumCaseV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "Active".try_into().unwrap(),
+                    value: 0,
+                },
+                ScSpecUdtEnumCaseV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "Inactive".try_into().unwrap(),
+                    value: 1,
+                },
+            ]
+            .try_into()
+            .unwrap(),
+        });
+
+        let status_new = ScSpecEntry::UdtEnumV0(ScSpecUdtEnumV0 {
+            doc: "".try_into().unwrap(),
+            lib: "".try_into().unwrap(),
+            name: "Status".try_into().unwrap(),
+            cases: vec![ScSpecUdtEnumCaseV0 {
+                doc: "".try_into().unwrap(),
+                name: "Active".try_into().unwrap(),
+                value: 0,
+            }]
+            .try_into()
+            .unwrap(),
+        });
+
+        let old = spec_of(&[status_old]);
+        let new = spec_of(&[status_new]);
+        let d = SpecDiff::between(&old, &new);
+        assert!(d.breaking);
+        assert_eq!(d.types.changed.len(), 1);
+    }
+
+    #[test]
+    fn an_added_union_case_is_not_breaking() {
+        use stellar_xdr::curr::{ScSpecUdtUnionCaseV0, ScSpecUdtUnionCaseVoidV0, ScSpecUdtUnionV0};
+
+        let old = spec_of(&[func("balance", &[], Some(ScSpecTypeDef::I128))]);
+        let action_union = ScSpecEntry::UdtUnionV0(ScSpecUdtUnionV0 {
+            doc: "".try_into().unwrap(),
+            lib: "".try_into().unwrap(),
+            name: "Action".try_into().unwrap(),
+            cases: vec![
+                ScSpecUdtUnionCaseV0::VoidV0(ScSpecUdtUnionCaseVoidV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "Cancel".try_into().unwrap(),
+                }),
+                ScSpecUdtUnionCaseV0::VoidV0(ScSpecUdtUnionCaseVoidV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "Execute".try_into().unwrap(),
+                }),
+            ]
+            .try_into()
+            .unwrap(),
+        });
+        let new = spec_of(&[
+            func("balance", &[], Some(ScSpecTypeDef::I128)),
+            action_union,
+        ]);
+        let d = SpecDiff::between(&old, &new);
+        assert!(!d.breaking);
+        assert_eq!(d.types.added.len(), 1);
+        assert!(d.types.added[0].contains("union Action"));
+    }
+
+    #[test]
+    fn a_removed_union_case_is_breaking() {
+        use stellar_xdr::curr::{ScSpecUdtUnionCaseV0, ScSpecUdtUnionCaseVoidV0, ScSpecUdtUnionV0};
+
+        let action_old = ScSpecEntry::UdtUnionV0(ScSpecUdtUnionV0 {
+            doc: "".try_into().unwrap(),
+            lib: "".try_into().unwrap(),
+            name: "Action".try_into().unwrap(),
+            cases: vec![
+                ScSpecUdtUnionCaseV0::VoidV0(ScSpecUdtUnionCaseVoidV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "Cancel".try_into().unwrap(),
+                }),
+                ScSpecUdtUnionCaseV0::VoidV0(ScSpecUdtUnionCaseVoidV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "Execute".try_into().unwrap(),
+                }),
+            ]
+            .try_into()
+            .unwrap(),
+        });
+
+        let action_new = ScSpecEntry::UdtUnionV0(ScSpecUdtUnionV0 {
+            doc: "".try_into().unwrap(),
+            lib: "".try_into().unwrap(),
+            name: "Action".try_into().unwrap(),
+            cases: vec![ScSpecUdtUnionCaseV0::VoidV0(ScSpecUdtUnionCaseVoidV0 {
+                doc: "".try_into().unwrap(),
+                name: "Cancel".try_into().unwrap(),
+            })]
+            .try_into()
+            .unwrap(),
+        });
+
+        let old = spec_of(&[action_old]);
+        let new = spec_of(&[action_new]);
+        let d = SpecDiff::between(&old, &new);
+        assert!(d.breaking);
+        assert_eq!(d.types.changed.len(), 1);
+    }
+
+    #[test]
+    fn a_renamed_function_shows_as_removed_and_added() {
+        let old = spec_of(&[func("withdraw", &[("amount", ScSpecTypeDef::I128)], None)]);
+        let new = spec_of(&[func("pull", &[("amount", ScSpecTypeDef::I128)], None)]);
+        let d = SpecDiff::between(&old, &new);
+        assert!(d.breaking);
+        assert_eq!(d.functions.added.len(), 1);
+        assert_eq!(d.functions.removed.len(), 1);
+        assert!(d.functions.changed.is_empty());
+    }
+
+    #[test]
+    fn an_added_event_is_not_breaking() {
+        let old = spec_of(&[func("balance", &[], Some(ScSpecTypeDef::I128))]);
+        let new = spec_of(&[
+            func("balance", &[], Some(ScSpecTypeDef::I128)),
+            event(
+                "mint",
+                &[(
+                    "amount",
+                    ScSpecTypeDef::I128,
+                    ScSpecEventParamLocationV0::Data,
+                )],
+            ),
+        ]);
+        let d = SpecDiff::between(&old, &new);
+        assert!(!d.breaking);
+        assert_eq!(d.events.added.len(), 1);
+    }
+
+    #[test]
+    fn multiple_changes_are_all_tracked() {
+        use stellar_xdr::curr::{ScSpecUdtStructFieldV0, ScSpecUdtStructV0};
+
+        let position_struct = ScSpecEntry::UdtStructV0(ScSpecUdtStructV0 {
+            doc: "".try_into().unwrap(),
+            lib: "".try_into().unwrap(),
+            name: "Position".try_into().unwrap(),
+            fields: vec![ScSpecUdtStructFieldV0 {
+                doc: "".try_into().unwrap(),
+                name: "amount".try_into().unwrap(),
+                type_: ScSpecTypeDef::I128,
+            }]
+            .try_into()
+            .unwrap(),
+        });
+
+        let old = spec_of(&[
+            func("withdraw", &[], None),
+            event(
+                "burn",
+                &[(
+                    "amount",
+                    ScSpecTypeDef::I128,
+                    ScSpecEventParamLocationV0::Data,
+                )],
+            ),
+            position_struct.clone(),
+        ]);
+
+        let new = spec_of(&[
+            func("pause", &[], None),
+            event(
+                "mint",
+                &[(
+                    "amount",
+                    ScSpecTypeDef::I128,
+                    ScSpecEventParamLocationV0::Data,
+                )],
+            ),
+        ]);
+
+        let d = SpecDiff::between(&old, &new);
+        assert!(d.breaking);
+        assert_eq!(d.functions.removed.len(), 1);
+        assert_eq!(d.functions.added.len(), 1);
+        assert_eq!(d.events.removed.len(), 1);
+        assert_eq!(d.events.added.len(), 1);
+        assert_eq!(d.types.removed.len(), 1);
+    }
 }
