@@ -9,10 +9,30 @@ use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
+use sqlx::PgPool;
+use tracing::warn;
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::url_validation;
+
+async fn log_webhook_action(
+    pool: &PgPool,
+    action_type: &str,
+    resource_id: &str,
+) {
+    if let Err(e) = sqlx::query(
+        "INSERT INTO audit_log (key_hash_prefix, route, http_method, status_code, action_type, resource_id)
+         VALUES ('webhook', '/webhooks', 'MUTATION', 200, $1, $2)"
+    )
+    .bind(action_type)
+    .bind(resource_id)
+    .execute(pool)
+    .await
+    {
+        warn!(error = %e, "failed to log webhook action");
+    }
+}
 
 #[derive(Deserialize)]
 pub struct CreateWebhook {
@@ -94,6 +114,7 @@ pub async fn create_webhook(
     .fetch_one(&state.pool)
     .await?;
 
+    log_webhook_action(&state.pool, "webhook_create", &sub.id.to_string()).await;
     Ok(Json(sub))
 }
 
@@ -226,6 +247,7 @@ pub async fn update_webhook(
     .ok_or_else(|| ApiError::not_found("subscription not found"))?;
 
     let (id, url, kind, contract_id, event_name, active, created_at) = sub;
+    log_webhook_action(&state.pool, "webhook_update", &id.to_string()).await;
     Ok(Json(json!({
         "id": id,
         "url": url,
@@ -249,6 +271,7 @@ pub async fn delete_webhook(
     if affected == 0 {
         return Err(ApiError::not_found("subscription not found"));
     }
+    log_webhook_action(&state.pool, "webhook_delete", &id.to_string()).await;
     Ok(Json(json!({ "deleted": id })))
 }
 

@@ -11,6 +11,8 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use lumenqraph_core::{Contract, SpecDiff};
@@ -89,16 +91,17 @@ pub async fn contract_interface(
     State(state): State<AppState>,
     Path(contract_id): Path<String>,
     Query(q): Query<InterfaceQuery>,
-) -> ApiResult<Json<Value>> {
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
     if !lumenqraph_core::is_valid_contract_id(&contract_id) {
         return Err(ApiError::bad_request("invalid contract id"));
     }
     if let Some(version) = q.version {
-        return contract_interface_at_version(&state, &contract_id, version).await;
+        return contract_interface_at_version(&state, &contract_id, version, &headers).await;
     }
 
-    let row: Option<(SqlxJson<Value>, bool, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT interface, has_events, fetched_at
+    let row: Option<(SqlxJson<Value>, bool, DateTime<Utc>, String)> = sqlx::query_as(
+        "SELECT interface, has_events, fetched_at, wasm_hash
          FROM contract_specs WHERE contract_id = $1",
     )
     .bind(&contract_id)
@@ -106,12 +109,20 @@ pub async fn contract_interface(
     .await?;
 
     match row {
-        Some((interface, has_events, fetched_at)) => Ok(Json(json!({
-            "contract_id": contract_id,
-            "has_events": has_events,
-            "fetched_at": fetched_at,
-            "interface": interface.0,
-        }))),
+        Some((interface, has_events, fetched_at, wasm_hash)) => {
+            let etag = generate_etag(&wasm_hash);
+            if check_if_none_match(&headers, &etag) {
+                return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
+            }
+            let mut response = Json(json!({
+                "contract_id": contract_id,
+                "has_events": has_events,
+                "fetched_at": fetched_at,
+                "interface": interface.0,
+            })).into_response();
+            response.headers_mut().insert(header::ETAG, etag.parse().unwrap());
+            Ok(response)
+        },
         None => Err(ApiError::not_found(
             "no on-chain interface indexed for this contract yet",
         )),
@@ -125,7 +136,8 @@ async fn contract_interface_at_version(
     state: &AppState,
     contract_id: &str,
     version: i32,
-) -> ApiResult<Json<Value>> {
+    headers: &HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
     let row: Option<(SqlxJson<Value>, String, DateTime<Utc>)> = sqlx::query_as(
         "SELECT interface, wasm_hash, observed_at FROM contract_spec_versions
          WHERE contract_id = $1 AND version = $2",
@@ -136,13 +148,21 @@ async fn contract_interface_at_version(
     .await?;
 
     match row {
-        Some((interface, wasm_hash, observed_at)) => Ok(Json(json!({
-            "contract_id": contract_id,
-            "version": version,
-            "wasm_hash": wasm_hash,
-            "observed_at": observed_at,
-            "interface": interface.0,
-        }))),
+        Some((interface, wasm_hash, observed_at)) => {
+            let etag = generate_etag(&wasm_hash);
+            if check_if_none_match(headers, &etag) {
+                return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
+            }
+            let mut response = Json(json!({
+                "contract_id": contract_id,
+                "version": version,
+                "wasm_hash": wasm_hash,
+                "observed_at": observed_at,
+                "interface": interface.0,
+            })).into_response();
+            response.headers_mut().insert(header::ETAG, etag.parse().unwrap());
+            Ok(response)
+        },
         None => Err(ApiError::not_found(format!(
             "no version {version} recorded for this contract"
         ))),
@@ -168,11 +188,31 @@ pub async fn contract_interface_history(
     State(state): State<AppState>,
     Path(contract_id): Path<String>,
     Query(q): Query<HistoryQuery>,
-) -> ApiResult<Json<Value>> {
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
     if !lumenqraph_core::is_valid_contract_id(&contract_id) {
         return Err(ApiError::bad_request("invalid contract id"));
     }
     let limit = q.limit.clamp(1, 200);
+    // Get the latest version for ETag
+    let latest_version: Option<i32> = sqlx::query_scalar(
+        "SELECT max(version) FROM contract_spec_versions WHERE contract_id = $1",
+    )
+    .bind(&contract_id)
+    .fetch_one(&state.pool)
+    .await?;
+
+    let Some(latest_version) = latest_version else {
+        return Err(ApiError::not_found(
+            "no on-chain interface indexed for this contract yet",
+        ));
+    };
+
+    let etag = generate_etag(&format!("{}:{}", contract_id, latest_version));
+    if check_if_none_match(&headers, &etag) {
+        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
+    }
+
     // (version, wasm_hash, previous_wasm_hash, diff, breaking, observed_at)
     type VersionRow = (
         i32,
@@ -193,12 +233,6 @@ pub async fn contract_interface_history(
     .fetch_all(&state.pool)
     .await?;
 
-    if rows.is_empty() {
-        return Err(ApiError::not_found(
-            "no on-chain interface indexed for this contract yet",
-        ));
-    }
-
     let versions: Vec<Value> = rows
         .into_iter()
         .map(
@@ -217,11 +251,13 @@ pub async fn contract_interface_history(
         )
         .collect();
 
-    Ok(Json(json!({
+    let mut response = Json(json!({
         "contract_id": contract_id,
         "count": versions.len(),
         "versions": versions,
-    })))
+    })).into_response();
+    response.headers_mut().insert(header::ETAG, etag.parse().unwrap());
+    Ok(response)
 }
 
 #[derive(Deserialize)]
@@ -321,7 +357,8 @@ pub async fn contract_state(
     State(state): State<AppState>,
     Path(contract_id): Path<String>,
     Query(q): Query<StateQuery>,
-) -> ApiResult<Json<Value>> {
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
     if !lumenqraph_core::is_valid_contract_id(&contract_id) {
         return Err(ApiError::bad_request("invalid contract id"));
     }
@@ -343,17 +380,25 @@ pub async fn contract_state(
         ));
     }
 
+    let latest_ledger = rows[0].0;
+    let etag = generate_etag(&format!("{}:{}", contract_id, latest_ledger));
+    if check_if_none_match(&headers, &etag) {
+        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
+    }
+
     let versions: Vec<Value> = rows
         .into_iter()
         .map(|(ledger, storage, captured_at)| {
             json!({ "ledger": ledger, "storage": storage.0, "captured_at": captured_at })
         })
         .collect();
-    Ok(Json(json!({
+    let mut response = Json(json!({
         "contract_id": contract_id,
         "count": versions.len(),
         "versions": versions,
-    })))
+    })).into_response();
+    response.headers_mut().insert(header::ETAG, etag.parse().unwrap());
+    Ok(response)
 }
 
 #[derive(Deserialize)]
