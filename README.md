@@ -12,7 +12,7 @@ Tail contract events from Soroban RPC, decode their XDR to clean JSON, store the
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 [![Built for Stellar](https://img.shields.io/badge/built%20for-Stellar%20Soroban-black.svg)](https://stellar.org/soroban)
 
-[Quick start](#quick-start) · [API](#api) · [Architecture](#architecture) · [Docs](docs/) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Security](SECURITY.md) · [Roadmap](#roadmap) · [Contributing](#contributing)
+[Quick start](#quick-start) · [API](#api) · [Architecture](#architecture) · [Docs](docs/) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Security](SECURITY.md) · [Code of Conduct](CODE_OF_CONDUCT.md) · [Roadmap](#roadmap) · [Contributing](#contributing)
 
 ### 🔭 [Live demo → lumenqraph.onrender.com](https://lumenqraph.onrender.com)
 
@@ -691,7 +691,7 @@ Contributions toward any of these are very welcome — see [Contributing](#contr
 
 ## Contributing
 
-Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for the dev setup and conventions. Good first issues are labelled in the [issue tracker](https://github.com/Lumen-Scribe/Lumenqraph/issues).
+Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for the dev setup and conventions, and review our [Code of Conduct](CODE_OF_CONDUCT.md). Good first issues are labelled in the [issue tracker](https://github.com/Lumen-Scribe/Lumenqraph/issues).
 
 See [CHANGELOG.md](CHANGELOG.md) for release history and versioning policy.
 

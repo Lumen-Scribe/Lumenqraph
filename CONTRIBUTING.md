@@ -1,6 +1,6 @@
 # Contributing
 
-Before contributing, please review the [Troubleshooting & FAQ guide](docs/TROUBLESHOOTING.md) for details on common operational issues and setup challenges.
+Before contributing, please review the [Troubleshooting & FAQ guide](docs/TROUBLESHOOTING.md) for details on common operational issues and setup challenges, and our [Code of Conduct](CODE_OF_CONDUCT.md) for community standards and expectations.
 
 ## Security
 
