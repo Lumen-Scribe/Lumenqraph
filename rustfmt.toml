@@ -1,0 +1,14 @@
+# Rust formatting configuration
+# Documents the formatting style enforced by CI
+
+edition = "2021"
+max_width = 100
+hard_tabs = false
+tab_spaces = 4
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true
+force_explicit_abi = true
+reorder_imports = true
+reorder_modules = true
+remove_nested_parens = true

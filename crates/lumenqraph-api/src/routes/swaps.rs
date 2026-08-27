@@ -34,6 +34,8 @@ fn default_limit() -> i64 {
 #[derive(Serialize)]
 pub struct SwapsResponse {
     pub data: Vec<AmmSwap>,
+    /// Whether there are more results available.
+    pub has_more: bool,
     /// Opaque cursor to fetch the next page. Null if this is the last page.
     pub next_cursor: Option<String>,
 }
@@ -104,6 +106,8 @@ pub async fn list_swaps(
     };
 
     Ok(Json(SwapsResponse {
+        data: result_swaps,
+        has_more: has_next_page,
         next_cursor: if has_next_page {
             result_swaps
                 .last()
@@ -111,6 +115,5 @@ pub async fn list_swaps(
         } else {
             None
         },
-        data: result_swaps,
     }))
 }

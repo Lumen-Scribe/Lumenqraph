@@ -53,7 +53,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 url = "2"
 axum = "0.7"
 tower = "0.5"
-tower-http = { version = "0.5", features = ["trace", "cors", "fs", "set-header", "compression-gzip", "compression-br"] }
+tower-http = { version = "0.5", features = ["trace", "cors", "fs", "set-header", "compression-gzip", "compression-br", "timeout"] }
 # Pinned to the 7.0.x line that targets axum 0.7 (7.0.11+ moved to axum 0.8,
 # which would clash with the rest of the stack).
 async-graphql = { version = "=7.0.7", features = ["chrono"] }
