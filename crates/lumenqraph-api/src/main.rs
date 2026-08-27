@@ -36,6 +36,50 @@ use call_cache::CallCache;
 use rate_limit::RateLimiter;
 use state::{AppState, BuildInfo};
 
+async fn connect_with_retry(database_url: &str, max_retries: u32) -> anyhow::Result<sqlx::PgPool> {
+    let mut attempt = 0;
+    let mut retry_delay = Duration::from_secs(1);
+    let max_delay = Duration::from_secs(30);
+    loop {
+        match PgPoolOptions::new()
+            .max_connections(env_parse("DATABASE_MAX_CONNECTIONS", 10u32))
+            .min_connections(env_parse("DATABASE_MIN_CONNECTIONS", 1u32))
+            .acquire_timeout(Duration::from_secs(env_parse(
+                "DATABASE_ACQUIRE_TIMEOUT_SECS",
+                30u64,
+            )))
+            .idle_timeout(Duration::from_secs(env_parse(
+                "DATABASE_IDLE_TIMEOUT_SECS",
+                600u64,
+            )))
+            .connect(database_url)
+            .await
+        {
+            Ok(pool) => {
+                if attempt > 0 {
+                    info!(attempt, "successfully connected to Postgres after retries");
+                }
+                return Ok(pool);
+            }
+            Err(e) if attempt < max_retries => {
+                attempt += 1;
+                tracing::warn!(
+                    error = %e,
+                    attempt,
+                    max_retries,
+                    retry_delay_secs = retry_delay.as_secs(),
+                    "failed to connect to Postgres, retrying…"
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(max_delay);
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("failed to connect to Postgres after {max_retries} retries: {e}"));
+            }
+        }
+    }
+}
+
 fn env_bool(key: &str, default: bool) -> bool {
     std::env::var(key)
         .ok()
@@ -129,20 +173,8 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "https://soroban-testnet.stellar.org".to_string());
     let rpc_timeout_secs: u64 = env_parse("RPC_TIMEOUT_SECS", 30u64);
 
-    let pool = PgPoolOptions::new()
-        .max_connections(env_parse("DATABASE_MAX_CONNECTIONS", 10u32))
-        .min_connections(env_parse("DATABASE_MIN_CONNECTIONS", 1u32))
-        .acquire_timeout(Duration::from_secs(env_parse(
-            "DATABASE_ACQUIRE_TIMEOUT_SECS",
-            30u64,
-        )))
-        .idle_timeout(Duration::from_secs(env_parse(
-            "DATABASE_IDLE_TIMEOUT_SECS",
-            600u64,
-        )))
-        .connect(&database_url)
-        .await
-        .context("failed to connect to Postgres")?;
+    let max_connect_retries = env_parse("DATABASE_CONNECT_RETRIES", 30u32);
+    let pool = connect_with_retry(&database_url, max_connect_retries).await?;
 
     let call_cache = Arc::new(CallCache::new(
         env_parse("CALL_CACHE_MAX_ENTRIES", 1000usize),
