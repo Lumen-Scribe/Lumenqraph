@@ -35,6 +35,8 @@ fn default_limit() -> i64 {
 pub struct TransfersResponse {
     /// The transfer rows in the result set.
     pub data: Vec<TokenTransfer>,
+    /// Whether there are more results available.
+    pub has_more: bool,
     /// Opaque cursor to fetch the next page. Null if this is the last page.
     pub next_cursor: Option<String>,
 }
@@ -102,6 +104,8 @@ pub async fn list_transfers(
     };
 
     Ok(Json(TransfersResponse {
+        data: result_transfers,
+        has_more: has_next_page,
         next_cursor: if has_next_page {
             result_transfers
                 .last()
@@ -109,6 +113,5 @@ pub async fn list_transfers(
         } else {
             None
         },
-        data: result_transfers,
     }))
 }

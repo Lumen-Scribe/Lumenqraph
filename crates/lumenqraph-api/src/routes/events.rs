@@ -54,6 +54,8 @@ fn default_limit() -> i64 {
 pub struct EventsResponse {
     /// The event rows in the result set.
     pub data: Vec<EventRow>,
+    /// Whether there are more results available.
+    pub has_more: bool,
     /// Opaque cursor to fetch the next page. Null if this is the last page.
     pub next_cursor: Option<String>,
 }
@@ -201,6 +203,7 @@ pub async fn list_events(
 
     Ok(Json(EventsResponse {
         data: result_events,
+        has_more: has_next_page,
         next_cursor,
     }))
 }
@@ -254,14 +257,22 @@ pub async fn transaction_events(
          LIMIT $2",
     )
     .bind(&tx_hash)
-    .bind(limit)
+    .bind(limit + 1)
     .fetch_all(&state.pool)
     .await?;
 
+    let has_more = events.len() as i64 > limit;
+    let result_events = if has_more {
+        events.into_iter().take(limit as usize).collect()
+    } else {
+        events
+    };
+
     Ok(Json(TxEventsResponse {
         tx_hash,
-        count: events.len(),
-        data: events,
+        count: result_events.len(),
+        has_more,
+        data: result_events,
     }))
 }
 
@@ -277,6 +288,8 @@ pub struct TxEventsResponse {
     pub tx_hash: String,
     /// Number of events in this response.
     pub count: usize,
+    /// Whether there are more results available (if limit was reached).
+    pub has_more: bool,
     /// The event rows, ordered by ledger and event_id ascending.
     pub data: Vec<EventRow>,
 }
