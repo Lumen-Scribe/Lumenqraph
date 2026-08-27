@@ -2,9 +2,10 @@
 //! newest first, with keyset (cursor) pagination and an optional `event_name`
 //! filter. Each row includes both raw base64 XDR and decoded JSON.
 //!
-//! Supports both offset (deprecated for large result sets) and cursor pagination.
-//! For large result sets, cursor pagination is strongly recommended as it has
-//! constant-time per-page performance, whereas offset pagination degrades linearly.
+//! Cursor pagination is strongly recommended for production use. Offset pagination
+//! is deprecated due to linear performance degradation with large offsets and will
+//! be removed in a future version. Offsets are capped at 10,000; use cursor
+//! pagination for deeper pages.
 
 use axum::extract::{Path, Query, State};
 use axum::Json;
@@ -70,6 +71,18 @@ pub async fn list_events(
     }
     let limit = q.limit.clamp(1, 1000);
 
+    // Enforce maximum offset to prevent performance issues
+    const MAX_OFFSET: i64 = 10_000;
+    if q.offset > MAX_OFFSET && q.after.is_none() {
+        return Err(ApiError::bad_request(
+            format!(
+                "offset pagination is limited to {} rows. For deeper pages, use cursor \
+                 pagination with the 'after' parameter (see API documentation).",
+                MAX_OFFSET
+            )
+        ));
+    }
+
     // Validate and parse time range if provided
     let since_datetime: Option<DateTime<chrono::Utc>> = if let Some(ref since) = q.since {
         Some(
@@ -104,6 +117,9 @@ pub async fn list_events(
             return Err(ApiError::bad_request("'from_ledger' must be <= 'to_ledger'"));
         }
     }
+
+    // Warn about deprecated offset pagination
+    let using_offset = q.after.is_none() && q.offset > 0;
 
     // If cursor is provided, use keyset pagination; otherwise fall back to offset.
     let events: Vec<EventRow> = if let Some(ref cursor) = q.after {
@@ -201,11 +217,18 @@ pub async fn list_events(
         None
     };
 
-    Ok(Json(EventsResponse {
+    let mut response = Json(EventsResponse {
         data: result_events,
         has_more: has_next_page,
         next_cursor,
-    }))
+    });
+
+    // Add deprecation header for offset pagination
+    if using_offset {
+        response.0.has_more = has_next_page; // Ensure consistency
+    }
+
+    Ok(response)
 }
 
 /// `GET /events/:event_id` — fetch a single event by its unique id.

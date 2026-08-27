@@ -1,5 +1,9 @@
 # Local Postgres for development. In production, point DATABASE_URL at a
 # managed instance (Neon/Supabase) instead of running this.
+#
+# IMPORTANT: Set WEBHOOK_ENCRYPTION_KEY in your environment before starting services.
+# Generate with: openssl rand -hex 32
+# The API and webhooks services will refuse to start without this variable.
 services:
   postgres:
     image: postgres:16-alpine

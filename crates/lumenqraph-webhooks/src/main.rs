@@ -66,6 +66,14 @@ async fn main() -> anyhow::Result<()> {
         .with(fmt::layer())
         .init();
 
+    // Validate webhook encryption key is set for production security
+    if std::env::var("WEBHOOK_ENCRYPTION_KEY").is_err() {
+        anyhow::bail!(
+            "WEBHOOK_ENCRYPTION_KEY must be set (generate with: openssl rand -hex 32). \
+             The default test key provides no security and must not be used in production."
+        );
+    }
+
     let config = Config::from_env()?;
     let max_connect_retries = env_parse_u32("DATABASE_CONNECT_RETRIES", 30);
     let pool = connect_with_retry(&config.database_url, max_connect_retries).await?;
