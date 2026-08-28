@@ -45,6 +45,8 @@ pub struct EventsQuery {
     topic3: Option<String>,
     /// Optional parameter filter: filter by parameter name:value (e.g., from=GXXXX).
     param: Option<String>,
+    /// Optional filter to return only events from successful contract calls (default: false, returns all).
+    successful_only: Option<bool>,
 }
 
 fn default_limit() -> i64 {
@@ -141,6 +143,7 @@ pub async fn list_events(
                AND ($9::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, $9::jsonb))
                AND ($10::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, jsonb_null::jsonb, $10::jsonb))
                AND ($11::text IS NULL OR enriched @> ($11::jsonb))
+               AND ($15::boolean IS NULL OR in_successful_call = $15)
                AND ($12::bigint IS NULL OR ledger < $12 OR (ledger = $12 AND event_id < $13))
              ORDER BY ledger DESC, event_id DESC
              LIMIT $14",
@@ -159,6 +162,7 @@ pub async fn list_events(
         .bind(page_config.after_ledger)
         .bind(page_config.after_event_id)
         .bind(limit + 1)
+        .bind(q.successful_only)
         .fetch_all(&state.pool)
         .await?
     } else {
@@ -180,6 +184,7 @@ pub async fn list_events(
                AND ($9::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, $9::jsonb))
                AND ($10::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, jsonb_null::jsonb, $10::jsonb))
                AND ($11::text IS NULL OR enriched @> ($11::jsonb))
+               AND ($14::boolean IS NULL OR in_successful_call = $14)
              ORDER BY ledger DESC, event_id DESC
              LIMIT $12 OFFSET $13",
         )
@@ -196,6 +201,7 @@ pub async fn list_events(
         .bind(&q.param)
         .bind(limit)
         .bind(offset)
+        .bind(q.successful_only)
         .fetch_all(&state.pool)
         .await?
     };
@@ -276,11 +282,13 @@ pub async fn transaction_events(
                 enriched, tx_hash, in_successful_call, paging_token, created_at
          FROM events
          WHERE tx_hash = $1
+           AND ($3::boolean IS NULL OR in_successful_call = $3)
          ORDER BY ledger ASC, event_id ASC
          LIMIT $2",
     )
     .bind(&tx_hash)
     .bind(limit + 1)
+    .bind(q.successful_only)
     .fetch_all(&state.pool)
     .await?;
 
@@ -303,6 +311,8 @@ pub async fn transaction_events(
 pub struct TxEventsQuery {
     /// Maximum events to return (1–1000, default 100).
     limit: Option<i64>,
+    /// Optional filter to return only events from successful contract calls (default: false, returns all).
+    successful_only: Option<bool>,
 }
 
 #[derive(Serialize)]
