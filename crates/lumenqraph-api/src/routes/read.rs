@@ -104,7 +104,15 @@ pub async fn call_function(
             Ok(Json(response))
         }
         // A trap / bad call is the caller's problem, not a 500.
-        SimOutcome::Error(msg) => Err(ApiError::simulation_failed(format!("simulation failed: {msg}"))),
+        SimOutcome::Error(msg) => {
+            // Log the full upstream detail server-side; only return a concise,
+            // sanitised copy to the caller (see issue #154).
+            tracing::warn!(rpc_error = %msg, "contract simulation failed");
+            Err(ApiError::simulation_failed(format!(
+                "simulation failed: {}",
+                lumenqraph_core::sanitize::sanitize_simulation_error(&msg)
+            )))
+        }
     }
 }
 
@@ -164,7 +172,15 @@ pub async fn simulate_call(
                 "simulated_at_ledger": latest_ledger,
             })))
         }
-        SimOutcome::Error(msg) => Err(ApiError::simulation_failed(format!("simulation failed: {msg}"))),
+        SimOutcome::Error(msg) => {
+            // Log the full upstream detail server-side; only return a concise,
+            // sanitised copy to the caller (see issue #154).
+            tracing::warn!(rpc_error = %msg, "contract simulation failed");
+            Err(ApiError::simulation_failed(format!(
+                "simulation failed: {}",
+                lumenqraph_core::sanitize::sanitize_simulation_error(&msg)
+            )))
+        }
     }
 }
 
@@ -502,5 +518,74 @@ mod tests {
             msg.contains("account"),
             "error should name the bad argument: {msg}"
         );
+    }
+
+    // ── simulation error is bounded + sanitised (issue #154) ───────────────
+
+    /// Stand up an in-process Soroban-RPC stub that always answers
+    /// `simulateTransaction` with a huge, detail-laden error message, and
+    /// return the base URL it is listening on.
+    async fn error_rpc_server() -> String {
+        // A long, messy upstream error that echoes internal detail + control
+        // chars (newlines, tabs, a NUL byte) — exactly what we must not leak.
+        let raw = format!(
+            "host function call failed at endpoint https://internal.rpc/simulate\x00\n\t XDR=AAAA{} contract trapped: arithmetic overflow in __check_auth",
+            "Z".repeat(1000),
+        );
+        let app = Router::new().route(
+            "/",
+            post(move |axum::Json(_): axum::Json<serde_json::Value>| async move {
+                axum::Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": { "error": raw }
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// Construct an `AppState` with a seeded cache and a real `RpcClient`
+    /// pointed at `rpc_url`.
+    fn make_state_with_rpc(contract_id: &str, spec_section: Vec<u8>, rpc_url: String) -> AppState {
+        let mut state = make_state(contract_id, spec_section);
+        state.rpc = RpcClient::new(rpc_url, 30);
+        state
+    }
+
+    #[tokio::test]
+    async fn simulation_error_is_bounded_and_sanitised() {
+        let contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let rpc_url = error_rpc_server().await;
+        let state = make_state_with_rpc(contract, single_fn_spec("balance"), rpc_url);
+        let app = app_for(state);
+
+        let (status, body) = call(
+            app,
+            &format!("/contracts/{contract}/simulate"),
+            json!({ "function": "balance", "args": { "account": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF" } }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let code = body["code"].as_str().unwrap();
+        assert_eq!(code, "simulation_failed");
+        let msg = body["error"].as_str().unwrap();
+
+        // Bounded length — never the raw multi-hundred-char upstream blob.
+        assert!(
+            msg.chars().count() <= lumenqraph_core::sanitize::MAX_SIMULATION_ERROR_LEN + "simulation failed: ".len(),
+            "client error must be bounded, got: {msg}"
+        );
+        // Internal detail must not leak through.
+        assert!(!msg.contains("https://internal.rpc"), "leaked endpoint: {msg}");
+        assert!(!msg.contains("AAAA"), "leaked XDR blob: {msg}");
+        assert!(!msg.contains('\n') && !msg.contains('\t') && !msg.contains('\x00'), "control char leaked: {msg}");
+        assert!(msg.contains("simulation failed"), "expected prefix: {msg}");
     }
 }

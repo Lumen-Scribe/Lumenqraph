@@ -16,6 +16,7 @@ pub mod diff;
 pub mod error;
 pub mod models;
 pub mod read;
+pub mod sanitize;
 pub mod spec;
 pub mod xdr;
 
