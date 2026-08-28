@@ -513,7 +513,9 @@ async fn load_spec_at_version(
     }
 
     let section = hex::decode(&hex_section)?;
-    Ok(Arc::new(ContractSpec::from_spec_xdr(&section)))
+    let spec = ContractSpec::from_spec_xdr(&section)
+        .ok_or_else(|| anyhow::anyhow!("spec section for version {version} contains invalid XDR or has no entries"))?;
+    Ok(Arc::new(spec))
 }
 
 /// Backs both `call_contract` (view read) and `simulate_call` (full preview).
