@@ -9,6 +9,7 @@ use lumenqraph_core::NewEvent;
 use sqlx::{PgPool, Row};
 use tracing::{debug, info, warn};
 
+use crate::config::Config;
 use crate::convert::to_new_event;
 use crate::rpc_client::RpcClient;
 use crate::specs::SpecCache;
@@ -16,8 +17,8 @@ use crate::specs::SpecCache;
 /// Run a complete re-enrichment pass: find all events where enriched IS NULL
 /// AND event_name IS NOT NULL, re-enrich them against the (now-cached) spec,
 /// and update the database.
-pub async fn run_reenrich(pool: PgPool, rpc: RpcClient) -> anyhow::Result<()> {
-    let specs = SpecCache::new();
+pub async fn run_reenrich(pool: PgPool, rpc: RpcClient, config: Config) -> anyhow::Result<()> {
+    let specs = SpecCache::new(config.spec_cache_max_entries);
     let mut processed = 0u64;
     let mut updated = 0u64;
 

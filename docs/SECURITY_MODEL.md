@@ -265,15 +265,15 @@ GRAPHQL_INTROSPECTION_ENABLED=false  # Default
 
 ### 5. CORS Misconfiguration
 
-**Risk:** If `API_CORS_ALLOWED_ORIGINS` is set to `*`, browsers leak session cookies.
+**Risk:** If `CORS_ALLOWED_ORIGINS` is set to `*`, browsers leak session cookies.
 
-**Mitigation:** Use specific origins or `same_origin`
+**Mitigation:** Use specific origins or leave unset for default (same-origin only)
 ```bash
-# Default (safe)
-API_CORS_ALLOWED_ORIGINS="same_origin"
+# Default (safe) — no CORS headers, browsers enforce same-origin
+# (leave CORS_ALLOWED_ORIGINS unset)
 
 # Specific list
-API_CORS_ALLOWED_ORIGINS="https://app1.example.com,https://app2.example.com"
+CORS_ALLOWED_ORIGINS="https://app1.example.com,https://app2.example.com"
 ```
 
 ### 6. Unencrypted Database Connection
@@ -351,7 +351,7 @@ RPC_TIMEOUT_SECS=30
 
 # ---- Authentication ----
 REQUIRE_API_KEY=true
-API_CORS_ALLOWED_ORIGINS="https://app.example.com"
+CORS_ALLOWED_ORIGINS="https://app.example.com"
 
 # ---- Rate Limiting ----
 ANON_RATE_LIMIT_PER_MIN=20

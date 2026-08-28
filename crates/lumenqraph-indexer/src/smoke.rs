@@ -177,7 +177,9 @@ mod tests {
             upgrade_watch: false,
             reorg_overlap_ledgers: 0,
             rpc_timeout_secs: 30,
+            enrichment_warn_threshold: 0.5,
             key_templates: vec![],
+            spec_cache_max_entries: 2000,
         }
     }
 
@@ -212,9 +214,9 @@ mod tests {
 
         let rpc = RpcClient::new(&rpc_url, 30);
         let config = test_config(&rpc_url, 2);
-        let specs = SpecCache::new();
+        let specs = SpecCache::new(config.spec_cache_max_entries);
 
-        let inserted = poller::fetch_and_store(&pool, &rpc, &config, &specs, 500, 1000)
+        let (inserted, _) = poller::fetch_and_store(&pool, &rpc, &config, &specs, 500, 1000)
             .await
             .expect("indexer cycle");
 

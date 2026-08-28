@@ -148,7 +148,9 @@ mod tests {
             upgrade_watch: false,
             reorg_overlap_ledgers: 0,
             rpc_timeout_secs: 30,
+            enrichment_warn_threshold: 0.5,
             key_templates: vec![],
+            spec_cache_max_entries: 2000,
         }
     }
 
@@ -182,9 +184,9 @@ mod tests {
 
         let rpc = RpcClient::new(&rpc_url, 30);
         let config = test_config(&rpc_url, 2);
-        let specs = SpecCache::new();
+        let specs = SpecCache::new(2000);
 
-        let inserted = fetch_and_store(&pool, &rpc, &config, &specs, 500, 1000)
+        let (inserted, _) = fetch_and_store(&pool, &rpc, &config, &specs, 500, 1000)
             .await
             .expect("fetch_and_store");
 
@@ -231,8 +233,8 @@ mod tests {
         let config = test_config(&rpc_url, 2);
 
         // First run: all three events are new.
-        let specs = SpecCache::new();
-        let first = fetch_and_store(&pool, &rpc, &config, &specs, 500, 1000)
+        let specs = SpecCache::new(2000);
+        let (first, _) = fetch_and_store(&pool, &rpc, &config, &specs, 500, 1000)
             .await
             .expect("first run");
         assert_eq!(first, 3);
@@ -240,8 +242,8 @@ mod tests {
         // Second run against a fresh mock that serves the same pages.
         let rpc_url2 = spawn_mock_rpc(1000, make_pages()).await;
         let rpc2 = RpcClient::new(&rpc_url2, 30);
-        let specs2 = SpecCache::new();
-        let second = fetch_and_store(&pool, &rpc2, &config, &specs2, 500, 1000)
+        let specs2 = SpecCache::new(2000);
+        let (second, _) = fetch_and_store(&pool, &rpc2, &config, &specs2, 500, 1000)
             .await
             .expect("second run");
 
@@ -277,9 +279,9 @@ mod tests {
 
         let rpc = RpcClient::new(&rpc_url, 30);
         let config = test_config(&rpc_url, 2);
-        let specs = SpecCache::new();
+        let specs = SpecCache::new(2000);
 
-        let inserted = fetch_and_store(&pool, &rpc, &config, &specs, 500, 1000)
+        let (inserted, _) = fetch_and_store(&pool, &rpc, &config, &specs, 500, 1000)
             .await
             .expect("fetch_and_store");
 
@@ -342,8 +344,8 @@ pub async fn run(
     }
     info!(from = start, to = tip, "starting backfill");
 
-    let specs = SpecCache::new();
-    let inserted = fetch_and_store(&pool, &rpc, &config, &specs, start, tip).await?;
+    let specs = SpecCache::new(config.spec_cache_max_entries);
+    let (inserted, _) = fetch_and_store(&pool, &rpc, &config, &specs, start, tip).await?;
     cursor::write_progress(&pool, tip, tip, inserted).await?;
     info!(inserted, up_to_ledger = tip, "backfill complete");
     Ok(())

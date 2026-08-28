@@ -17,10 +17,10 @@
 //! upgraded in place, its interface is a time series, and this is how we record
 //! what changed and when.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use lru::LruCache;
 use lumenqraph_core::{ContractSpec, SpecDiff};
 use sqlx::PgPool;
 use tracing::{debug, info, warn};
@@ -55,14 +55,17 @@ impl Default for Cached {
 /// TTL for transient fetch errors before retrying.
 const FETCH_ERROR_TTL: Duration = Duration::from_secs(60);
 
-#[derive(Default)]
 pub struct SpecCache {
-    inner: Mutex<HashMap<String, Cached>>,
+    inner: Mutex<LruCache<String, Cached>>,
 }
 
 impl SpecCache {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            inner: Mutex::new(LruCache::new(
+                std::num::NonZeroUsize::new(max_entries).expect("max_entries must be > 0"),
+            )),
+        }
     }
 
     /// Return the spec for a contract if it is already in the in-memory cache,
@@ -86,6 +89,7 @@ impl SpecCache {
         pool: &PgPool,
         rpc: &RpcClient,
         contract_id: &str,
+        ledger: i64,
     ) -> Option<Arc<ContractSpec>> {
         // Lock only to read/insert — never held across the network fetch.
         if let Some(cached) = self.inner.lock().unwrap().get(contract_id).cloned() {
@@ -100,7 +104,7 @@ impl SpecCache {
                 }
             }
         }
-        let (spec, wasm_hash, is_permanent) = load(pool, rpc, contract_id).await;
+        let (spec, wasm_hash, is_permanent) = load(pool, rpc, contract_id, ledger).await;
         let cached_spec = match spec {
             Some(s) => CachedSpec::Spec(s.clone()),
             None => {
@@ -140,6 +144,7 @@ impl SpecCache {
         rpc: &RpcClient,
         contract_id: &str,
         current_hash: &str,
+        ledger: i64,
     ) {
         // Only the check holds the lock; the reload below must not.
         let is_stale = {
@@ -158,7 +163,7 @@ impl SpecCache {
                 wasm_hash = current_hash,
                 "contract upgraded; re-reading interface"
             );
-            let _ = self.get(pool, rpc, contract_id).await;
+            let _ = self.get(pool, rpc, contract_id, ledger).await;
         }
     }
 }
@@ -175,11 +180,12 @@ pub async fn check_for_upgrade(
     rpc: &RpcClient,
     specs: &SpecCache,
     contract_id: &str,
+    ledger: i64,
 ) {
     match rpc.get_contract_instance(contract_id).await {
         Ok(Some(instance)) => {
             if let Some(hash) = &instance.wasm_hash {
-                specs.note_wasm_hash(pool, rpc, contract_id, hash).await;
+                specs.note_wasm_hash(pool, rpc, contract_id, hash, instance.last_modified_ledger).await;
             }
         }
         // No instance entry (e.g. archived), or the contract is a SAC with no
@@ -197,6 +203,7 @@ async fn load(
     pool: &PgPool,
     rpc: &RpcClient,
     contract_id: &str,
+    ledger: i64,
 ) -> (Option<Arc<ContractSpec>>, Option<String>, bool) {
     let (wasm_hash, wasm) = match rpc.get_contract_wasm(contract_id).await {
         Ok(Some(w)) => w,
@@ -234,7 +241,7 @@ async fn load(
     }
     // Independent of the upsert above: that keeps only the current interface,
     // this appends to the history. A failure here must not cost us the spec.
-    if let Err(e) = record_version(pool, contract_id, &wasm_hash, &spec_section, &spec).await {
+    if let Err(e) = record_version(pool, contract_id, &wasm_hash, &spec_section, &spec, ledger).await {
         warn!(contract_id, error = %e, "failed to record contract spec version");
     }
     (Some(Arc::new(spec)), Some(wasm_hash), true)
@@ -252,6 +259,7 @@ async fn record_version(
     wasm_hash: &str,
     spec_section: &str,
     spec: &ContractSpec,
+    ledger: i64,
 ) -> anyhow::Result<()> {
     let previous: Option<(i32, String, String)> = sqlx::query_as(
         "SELECT version, wasm_hash, spec_section FROM contract_spec_versions
@@ -285,8 +293,8 @@ async fn record_version(
 
     sqlx::query(
         "INSERT INTO contract_spec_versions
-            (contract_id, version, wasm_hash, previous_wasm_hash, interface, spec_section, diff, breaking)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            (contract_id, version, wasm_hash, previous_wasm_hash, interface, spec_section, diff, breaking, ledger)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (contract_id, version) DO NOTHING",
     )
     .bind(contract_id)
@@ -297,6 +305,7 @@ async fn record_version(
     .bind(spec_section)
     .bind(diff.as_ref().map(|d| d.to_json()))
     .bind(diff.as_ref().is_some_and(|d| d.breaking))
+    .bind(ledger)
     .execute(pool)
     .await?;
     Ok(())
@@ -430,7 +439,7 @@ mod tests {
     async fn first_interface_is_a_baseline_with_no_diff() {
         let pool = fixture().await;
         let (section, spec) = spec_with(&["balance"]);
-        record_version(&pool, "C1", "hash1", &section, &spec)
+        record_version(&pool, "C1", "hash1", &section, &spec, 100)
             .await
             .unwrap();
 
@@ -503,7 +512,7 @@ mod tests {
     async fn a_code_only_upgrade_is_recorded_as_a_non_breaking_empty_diff() {
         let pool = fixture().await;
         let (section, spec) = spec_with(&["balance"]);
-        record_version(&pool, "C1", "hash1", &section, &spec)
+        record_version(&pool, "C1", "hash1", &section, &spec, 100)
             .await
             .unwrap();
         // New code, identical interface — e.g. a bug fix. Still an upgrade worth

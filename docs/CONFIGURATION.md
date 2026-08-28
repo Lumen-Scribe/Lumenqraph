@@ -288,14 +288,14 @@ The API service serves indexed data over HTTP, with rate limiting and optional A
 
 ### CORS
 
-#### `API_CORS_ALLOWED_ORIGINS`
+#### `CORS_ALLOWED_ORIGINS`
 | Property | Value |
 |----------|-------|
-| **Default** | `same_origin` |
+| **Default** | (unset — no CORS headers added) |
 | **Example** | `https://app.example.com,https://dashboard.example.com` or `*` |
-| **Valid Range** | `same_origin` \| `*` \| comma-separated HTTPS URLs |
+| **Valid Range** | (empty/unset) \| `*` \| comma-separated HTTPS URLs |
 | **Services** | API |
-| **Tradeoff** | **Security** vs **Flexibility**: `same_origin` = strict (recommended). `*` = permissive but leaks session cookies to all origins (risky). Specific list = balance. Recommended: Use specific origins for production |
+| **Tradeoff** | **Security** vs **Flexibility**: (unset) = strict, browsers enforce same-origin by default (recommended). `*` = permissive but leaks session cookies to all origins (risky). Specific list = balance. Recommended: Use specific origins for production, leave unset for development |
 
 ### GraphQL
 
@@ -503,7 +503,7 @@ RATE_LIMIT_TRUST_XFF=true  # Only if behind trusted reverse proxy
 GRAPHQL_INTROSPECTION_ENABLED=false
 GRAPHQL_MAX_DEPTH=10
 GRAPHQL_MAX_COMPLEXITY=500
-API_CORS_ALLOWED_ORIGINS="https://app.example.com,https://dashboard.example.com"
+CORS_ALLOWED_ORIGINS="https://app.example.com,https://dashboard.example.com"
 
 # Webhooks
 WEBHOOK_ENCRYPTION_KEY="$(openssl rand -hex 32)"
@@ -541,7 +541,7 @@ Lumenqraph validates configuration at startup. Examples of validation errors:
 ❌ POLL_INTERVAL_SECS cannot be zero; clamping to 1
 ❌ RETENTION_LEDGERS cannot be negative; clamping to 0
 ❌ BALANCE_KEY_DURABILITY "invalid" not recognized; expected "persistent" or "temporary"
-❌ invalid origin in API_CORS_ALLOWED_ORIGINS: "not-a-url", skipping
+❌ invalid origin in CORS_ALLOWED_ORIGINS: "not-a-url", skipping
 ```
 
 Fix errors by adjusting `.env` and restarting.

@@ -85,14 +85,115 @@ pub async fn prune(pool: &PgPool, tip: i64, retention_ledgers: i64) -> anyhow::R
     )
     .await?;
 
-    let total = events + state + data;
+    let specs = prune_batched(
+        pool,
+        "DELETE FROM contract_spec_versions WHERE ctid IN (
+             SELECT csv.ctid FROM contract_spec_versions csv
+              WHERE csv.ledger < $1
+                AND csv.version < (
+                    SELECT MAX(x.version) FROM contract_spec_versions x
+                     WHERE x.contract_id = csv.contract_id
+                )
+              LIMIT $2
+         )",
+        cutoff,
+    )
+    .await?;
+
+    let total = events + state + data + specs;
     if total > 0 {
         info!(
             cutoff_ledger = cutoff,
-            events, state, data, "pruned history outside the retention window"
+            events, state, data, specs, "pruned history outside the retention window"
         );
     }
     Ok(total)
+}
+
+/// Delete old contract spec versions, respecting both the retention window and the
+/// minimum number of versions to keep per contract.
+///
+/// Deletes versions that are:
+/// 1. Outside the retention window (ledger < cutoff), AND
+/// 2. NOT among the newest N versions per contract (where N = spec_version_retention)
+///
+/// If spec_version_retention is 0, uses only the retention window (like other tables).
+pub async fn prune_spec_versions(
+    pool: &PgPool,
+    tip: i64,
+    retention_ledgers: i64,
+    spec_version_retention: i64,
+) -> anyhow::Result<u64> {
+    if retention_ledgers <= 0 {
+        return Ok(0);
+    }
+    let cutoff = tip - retention_ledgers;
+    if cutoff <= 0 {
+        // Window is longer than the chain's history so far; nothing to drop.
+        return Ok(0);
+    }
+
+    if spec_version_retention <= 0 {
+        // No minimum version requirement; use only the retention window.
+        // Keep the current version (newest version per contract).
+        return prune_batched(
+            pool,
+            "DELETE FROM contract_spec_versions WHERE ctid IN (
+                 SELECT csv.ctid FROM contract_spec_versions csv
+                  WHERE csv.ledger < $1
+                    AND csv.version < (
+                        SELECT MAX(x.version) FROM contract_spec_versions x
+                         WHERE x.contract_id = csv.contract_id
+                    )
+                  LIMIT $2
+             )",
+            cutoff,
+        )
+        .await;
+    }
+
+    // Keep the newest spec_version_retention versions per contract, even if outside window.
+    let mut deleted = 0u64;
+    for _ in 0..MAX_BATCHES {
+        let n = sqlx::query(
+            "DELETE FROM contract_spec_versions WHERE ctid IN (
+                 SELECT csv.ctid FROM contract_spec_versions csv
+                  WHERE csv.ledger < $1
+                    AND csv.version < (
+                        SELECT COALESCE(
+                            (SELECT MIN(v.version) FROM (
+                                SELECT version FROM contract_spec_versions
+                                 WHERE contract_id = csv.contract_id
+                                 ORDER BY version DESC
+                                 LIMIT $3 OFFSET 1
+                            ) v),
+                            0
+                        )
+                    )
+                  LIMIT $2
+             )",
+        )
+        .bind(cutoff)
+        .bind(BATCH)
+        .bind(spec_version_retention)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        deleted += n;
+        if n < BATCH as u64 {
+            break;
+        }
+    }
+
+    if deleted > 0 {
+        info!(
+            cutoff_ledger = cutoff,
+            spec_version_retention,
+            deleted,
+            "pruned old contract spec versions outside the retention window"
+        );
+    }
+    Ok(deleted)
 }
 
 /// Delete webhook deliveries (delivered/failed only) older than `retention_days`.

@@ -105,6 +105,10 @@ async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
             body.push_str("# HELP lumenqraph_indexer_errors_total Total indexer errors\n");
             body.push_str("# TYPE lumenqraph_indexer_errors_total counter\n");
             body.push_str(&format!("lumenqraph_indexer_errors_total {}\n", metrics.errors_total));
+
+            body.push_str("# HELP lumenqraph_enrichment_rate Fraction of events successfully enriched (0.0 to 1.0)\n");
+            body.push_str("# TYPE lumenqraph_enrichment_rate gauge\n");
+            body.push_str(&format!("lumenqraph_enrichment_rate {}\n", metrics.enrichment_rate));
         }
         Err(e) => {
             error!(error = %e, "failed to gather indexer metrics");
@@ -157,22 +161,31 @@ struct IndexerMetrics {
     secs_since_update: i64,
     events_ingested_total: i64,
     errors_total: i64,
+    enrichment_rate: f64,
 }
 
 async fn gather_metrics(pool: &PgPool) -> anyhow::Result<IndexerMetrics> {
-    let status: Option<(i64, i64, i64, i64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-        "SELECT last_processed_ledger, chain_tip_ledger, events_ingested_total, errors_total, updated_at
+    let status: Option<(i64, i64, i64, i64, i64, i64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT last_processed_ledger, chain_tip_ledger, events_ingested_total, errors_total, events_enriched_total, events_not_enriched_total, updated_at
          FROM indexer_cursor WHERE id = 1",
     )
     .fetch_optional(pool)
     .await?;
 
-    let Some((last, tip, events, errors, updated_at)) = status else {
+    let Some((last, tip, events, errors, enriched, not_enriched, updated_at)) = status else {
         anyhow::bail!("indexer cursor not initialized");
     };
 
     let lag_ledgers = (tip - last).max(0);
     let secs_since_update = (Utc::now() - updated_at).num_seconds();
+
+    // Calculate enrichment rate
+    let total_enriched = enriched + not_enriched;
+    let enrichment_rate = if total_enriched > 0 {
+        enriched as f64 / total_enriched as f64
+    } else {
+        1.0 // Default to 1.0 (100%) if no events yet
+    };
 
     Ok(IndexerMetrics {
         last_processed_ledger: last,
@@ -181,6 +194,7 @@ async fn gather_metrics(pool: &PgPool) -> anyhow::Result<IndexerMetrics> {
         secs_since_update,
         events_ingested_total: events,
         errors_total: errors,
+        enrichment_rate,
     })
 }
 
