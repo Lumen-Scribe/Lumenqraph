@@ -236,8 +236,15 @@ The contract's callable functions with typed inputs/outputs.
 ```json
 { "contract_id": "CB...", "functions": [
   { "name": "balance", "inputs": [{ "name": "id", "type": "Address" }],
-    "outputs": ["i128"] }] }
+    "outputs": ["i128"], "is_view": true }] }
 ```
+`is_view` is a **best-effort** heuristic, not a guarantee: Soroban's
+`contractspecv0` carries no `view`/`mutable` keyword (unlike Solidity's ABI),
+so it is inferred from the function's output type (`void` usually means a
+state change) and its name (a known mutating prefix like `set_`, `transfer`,
+`mint`, `withdraw`, `upgrade`, …). A function marked `is_view: true` is
+probably safe via `/call`; when in doubt, or when `is_view` is `false`, prefer
+`/simulate`.
 
 ### `POST /contracts/:id/call`
 Invoke a **view** function read-only and return a typed result.
