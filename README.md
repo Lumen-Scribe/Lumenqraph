@@ -194,6 +194,10 @@ All configuration is via environment variables (see [`.env.example`](.env.exampl
 | `WEBHOOK_TICK_SECS` | `3` | Webhook dispatcher poll interval. |
 | `WEBHOOK_BATCH_SIZE` | `100` | Deliveries processed per tick. |
 | `WEBHOOK_MAX_ATTEMPTS` | `6` | Delivery attempts before a webhook is marked failed. |
+| `READYZ_LAG_THRESHOLD` | `100` | Max ledger lag (in ledgers) for `/readyz` to return 200. |
+| `READYZ_MAX_AGE_SECS` | `120` | Max age of indexer cursor (in seconds) for `/readyz` to return 200. |
+| `HEALTH_MAX_LAG_LEDGERS` | `100` | Max ledger lag for `/health` to show "ok" status. |
+| `HEALTH_MAX_STALE_SECS` | `120` | Max age of indexer cursor (in seconds) for `/health` to show "ok" status. |
 | `RUST_LOG` | `info` | Log filter (`tracing` syntax). |
 
 ## API

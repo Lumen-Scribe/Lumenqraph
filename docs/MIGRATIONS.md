@@ -46,7 +46,7 @@ Document any manual cleanup SQL for your specific migration and test it on a non
    - Resume ingestion. The indexer will catch up from its stored `last_processed_ledger`.
 
 **3. Write a forward-fix migration** (if backup restoration is not feasible):
-   - Create a new migration (e.g., `0015_fix_0014.sql`) that reverses the problematic change additively:
+   - Create a new migration (e.g., `0021_fix_0018.sql`) that reverses the problematic change additively:
      - If a column type was changed incorrectly, add a new column with the correct type and backfill it.
      - If a constraint was too strict, relax it.
    - Deploy the fix migration and a new application version that uses the corrected schema.
@@ -82,7 +82,7 @@ These migrations are **cumulative and foundational**. Rolling back any of them r
 3. Fix the migration SQL.
 4. Re-run migrations from a clean state.
 
-### 0014: tx_hash index (issue #124)
+### 0016: tx_hash index (issue #124)
 
 **Rollback**: Drop the index. The application will still work; queries by transaction hash will just be slower.
 
@@ -93,7 +93,7 @@ DROP INDEX IF EXISTS idx_events_tx_hash;
 **Forward-fix**: If the index was incorrectly defined (wrong columns, wrong order), create a new migration adding the corrected index and dropping the old one:
 
 ```sql
--- 0015_fix_tx_hash_index.sql
+-- 0021_fix_tx_hash_index.sql
 DROP INDEX IF EXISTS idx_events_tx_hash;
 CREATE INDEX idx_events_tx_hash_v2 ON events (tx_hash, ledger ASC);
 ```

@@ -243,7 +243,7 @@ pub async fn update_webhook(
         "UPDATE webhook_subscriptions
          SET active = $2, contract_id = $3, event_name = $4
          WHERE id = $1
-         RETURNING id, url, kind, contract_id, event_name, active, created_at",
+         RETURNING id, url, kind, contract_id, event_name, active, created_at, auto_disabled_at, auto_disabled_reason",
     )
     .bind(id)
     .bind(active)
@@ -253,7 +253,7 @@ pub async fn update_webhook(
     .await?
     .ok_or_else(|| ApiError::not_found("subscription not found"))?;
 
-    let (id, url, kind, contract_id, event_name, active, created_at) = sub;
+    let (id, url, kind, contract_id, event_name, active, created_at, auto_disabled_at, auto_disabled_reason) = sub;
     log_webhook_action(&state.pool, "webhook_update", &id.to_string()).await;
     Ok(Json(json!({
         "id": id,
@@ -263,6 +263,8 @@ pub async fn update_webhook(
         "event_name": event_name,
         "active": active,
         "created_at": created_at,
+        "auto_disabled_at": auto_disabled_at,
+        "auto_disabled_reason": auto_disabled_reason,
     })))
 }
 

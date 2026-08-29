@@ -227,6 +227,10 @@ async fn main() -> anyhow::Result<()> {
             max_request_size: env_parse("READ_MAX_REQUEST_SIZE", 256 * 1024),
             max_args_size: env_parse("READ_MAX_ARGS_SIZE", 128 * 1024),
         },
+        readyz_lag_threshold: env_parse("READYZ_LAG_THRESHOLD", 100i64),
+        readyz_max_age_secs: env_parse("READYZ_MAX_AGE_SECS", 120i64),
+        health_max_lag_ledgers: env_parse("HEALTH_MAX_LAG_LEDGERS", 100i64),
+        health_max_stale_secs: env_parse("HEALTH_MAX_STALE_SECS", 120i64),
     };
 
     let cors_layer = build_cors_layer();

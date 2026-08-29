@@ -89,7 +89,7 @@ When deploying Lumenqraph in production:
    WEBHOOK_ENCRYPTION_KEY=$(openssl rand -hex 32)
    ```
 
-   The encryption key is used with PostgreSQL's `pgp_sym_encrypt()` to protect webhook secrets. After deploying with this variable set, run migration `0016_webhook_secret_encryption_backfill.sql` to encrypt existing secrets.
+   The encryption key is used with PostgreSQL's `pgp_sym_encrypt()` to protect webhook secrets. After deploying with this variable set, run migration `0020_webhook_secret_encryption_backfill.sql` to encrypt existing secrets.
 
    **Key rotation procedure:**
    

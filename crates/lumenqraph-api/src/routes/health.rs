@@ -46,9 +46,7 @@ pub async fn health(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let lag_ledgers = (tip - last).max(0);
     let secs_since_update = (chrono::Utc::now() - updated_at).num_seconds();
     // Stale if the cursor hasn't advanced recently, or we're far behind.
-    let max_stale_secs = env_parse("HEALTH_MAX_STALE_SECS", 120i64);
-    let max_lag_ledgers = env_parse("HEALTH_MAX_LAG_LEDGERS", 100i64);
-    let healthy = secs_since_update <= max_stale_secs && lag_ledgers < max_lag_ledgers;
+    let healthy = secs_since_update <= state.health_max_stale_secs && lag_ledgers < state.health_max_lag_ledgers;
 
     Ok(Json(json!({
         "status": if healthy { "ok" } else { "degraded" },
@@ -100,10 +98,7 @@ pub async fn readyz(State(state): State<AppState>) -> (StatusCode, Option<Json<V
         let secs_since_update = (chrono::Utc::now() - updated_at).num_seconds();
 
         // Ready if recent activity and not too far behind
-        let lag_threshold = env_parse("READYZ_LAG_THRESHOLD", 100i64);
-        let max_age_secs = env_parse("READYZ_MAX_AGE_SECS", 120i64);
-
-        if secs_since_update <= max_age_secs && lag_ledgers < lag_threshold {
+        if secs_since_update <= state.readyz_max_age_secs && lag_ledgers < state.readyz_lag_threshold {
             (StatusCode::OK, None)
         } else {
             (StatusCode::SERVICE_UNAVAILABLE, None)
@@ -121,11 +116,4 @@ fn network_name(passphrase: &str) -> &'static str {
         "Test SDF Future Network ; October 2022" => "futurenet",
         _ => "custom",
     }
-}
-
-fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
 }

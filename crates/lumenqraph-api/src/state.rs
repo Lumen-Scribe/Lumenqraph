@@ -52,6 +52,14 @@ pub struct AppState {
     pub max_concurrent_per_ip: usize,
     /// Cost limiting config for read routes (/call, /simulate).
     pub read_cost_limit_config: ReadCostLimitConfig,
+    /// Max ledger lag for readyz to return 200, in ledgers.
+    pub readyz_lag_threshold: i64,
+    /// Max age of cursor update for readyz to return 200, in seconds.
+    pub readyz_max_age_secs: i64,
+    /// Max ledger lag for /health to show "ok" status, in ledgers.
+    pub health_max_lag_ledgers: i64,
+    /// Max age of cursor update for /health to show "ok" status, in seconds.
+    pub health_max_stale_secs: i64,
 }
 
 pub struct BuildInfo {
