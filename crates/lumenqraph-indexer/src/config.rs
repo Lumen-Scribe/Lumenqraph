@@ -52,6 +52,12 @@ pub struct Config {
     /// a hard size cap (e.g. a 500MB free tier) that an unbounded index would
     /// hit; see `retention`.
     pub retention_ledgers: i64,
+    /// Keep only the last N versions of each contract's spec in `contract_spec_versions`,
+    /// pruning older versions once they fall outside the retention window. 0 (default)
+    /// => keep everything. Newest N versions per contract are always preserved even if
+    /// outside the window. When `RETENTION_LEDGERS` is set, specs outside the window
+    /// are pruned unless they're among the newest N for their contract.
+    pub spec_version_retention: i64,
     /// When true, check whether a tracked contract's executable has changed and,
     /// if so, re-read its interface and append a `contract_spec_versions` row
     /// with the diff (see `specs`). Costs one RPC call per tracked contract per
@@ -72,6 +78,15 @@ pub struct Config {
     /// indefinitely. Default 30 matches the previous hardcoded value.
     /// Raise for slow/paid endpoints; lower for tight liveness requirements.
     pub rpc_timeout_secs: u64,
+    /// Warn if the not-enriched fraction (not_enriched / total) exceeds this
+    /// threshold in a single cycle. 0.5 = warn if >50% of events fail enrichment.
+    /// 0.0 = never warn; 1.0+ = warn only if 100%+ fail (never). Default 0.5.
+    pub enrichment_warn_threshold: f64,
+    /// Maximum number of entries in the in-memory spec cache before evicting
+    /// least-recently-used entries. Prevents unbounded memory growth when
+    /// indexing all contracts. Evicted entries are re-fetched from the database
+    /// on next miss. Default: 2000.
+    pub spec_cache_max_entries: usize,
 }
 
 impl Config {
@@ -98,8 +113,10 @@ impl Config {
         let page_size = env_parse("PAGE_SIZE", 1000)?;
         let max_catchup_ledgers = env_parse("MAX_CATCHUP_LEDGERS", 4000)?;
         let retention_ledgers = env_parse("RETENTION_LEDGERS", 0)?;
+        let spec_version_retention = env_parse("SPEC_VERSION_RETENTION", 0)?;
         let reorg_overlap_ledgers = env_parse("REORG_OVERLAP_LEDGERS", 0)?;
         let rpc_timeout_secs = env_parse("RPC_TIMEOUT_SECS", 30u64)?;
+        let spec_cache_max_entries = env_parse("SPEC_CACHE_MAX_ENTRIES", 2000usize)?;
 
         // Validate and clamp PAGE_SIZE to RPC documented bounds (1–10000).
         let page_size = clamp_with_warning("PAGE_SIZE", page_size, 1, 10000);
@@ -122,6 +139,18 @@ impl Config {
             retention_ledgers
         };
 
+        // Validate SPEC_VERSION_RETENTION minimum (0 = disabled).
+        let spec_version_retention = if spec_version_retention < 0 {
+            tracing::warn!(
+                requested = spec_version_retention,
+                clamped_to = 0,
+                "SPEC_VERSION_RETENTION cannot be negative; clamping to 0 (disabled)"
+            );
+            0
+        } else {
+            spec_version_retention
+        };
+
         // Validate REORG_OVERLAP_LEDGERS minimum (0 = disabled).
         let reorg_overlap_ledgers = if reorg_overlap_ledgers < 0 {
             tracing::warn!(
@@ -136,6 +165,22 @@ impl Config {
 
         // Validate RPC_TIMEOUT_SECS minimum (must be at least 1s).
         let rpc_timeout_secs = clamp_with_warning("RPC_TIMEOUT_SECS", rpc_timeout_secs, 1, u64::MAX);
+
+        // Validate SPEC_CACHE_MAX_ENTRIES minimum (must be at least 1).
+        let spec_cache_max_entries = clamp_with_warning("SPEC_CACHE_MAX_ENTRIES", spec_cache_max_entries, 1, usize::MAX);
+
+        // Parse ENRICHMENT_WARN_THRESHOLD (0.0-1.0, default 0.5).
+        let enrichment_warn_threshold: f64 = env_parse("ENRICHMENT_WARN_THRESHOLD", 0.5)?;
+        let enrichment_warn_threshold = if enrichment_warn_threshold < 0.0 || enrichment_warn_threshold > 1.0 {
+            tracing::warn!(
+                requested = enrichment_warn_threshold,
+                clamped_to = 0.5,
+                "ENRICHMENT_WARN_THRESHOLD must be between 0.0 and 1.0; clamping to 0.5"
+            );
+            0.5
+        } else {
+            enrichment_warn_threshold
+        };
 
         // Validate BALANCE_KEY_DURABILITY (must be "persistent" or "temporary").
         let balance_key_durability = std::env::var("BALANCE_KEY_DURABILITY")
@@ -205,9 +250,12 @@ impl Config {
                 .unwrap_or_else(|| "Balance".to_string()),
             balance_key_durability,
             retention_ledgers,
+            spec_version_retention,
             reorg_overlap_ledgers,
             rpc_timeout_secs,
+            enrichment_warn_threshold,
             key_templates,
+            spec_cache_max_entries,
         })
     }
 }

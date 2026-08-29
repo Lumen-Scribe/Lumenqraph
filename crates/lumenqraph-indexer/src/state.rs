@@ -44,7 +44,7 @@ async fn try_snapshot(
 
     // Reading the instance revealed the current executable — detect upgrades.
     if let Some(hash) = &instance.wasm_hash {
-        specs.note_wasm_hash(pool, rpc, contract_id, hash).await;
+        specs.note_wasm_hash(pool, rpc, contract_id, hash, instance.last_modified_ledger).await;
     }
 
     // Change detection: the instance's lastModifiedLedgerSeq only advances when
@@ -117,7 +117,7 @@ async fn try_snapshot_instances_batch(
 
         // Reading the instance revealed the current executable — detect upgrades.
         if let Some(hash) = &instance.wasm_hash {
-            specs.note_wasm_hash(pool, rpc, contract_id, hash).await;
+            specs.note_wasm_hash(pool, rpc, contract_id, hash, instance.last_modified_ledger).await;
         }
 
         // Change detection: the instance's lastModifiedLedgerSeq only advances when

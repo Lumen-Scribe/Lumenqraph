@@ -36,7 +36,7 @@ pub async fn run(pool: PgPool, rpc: RpcClient, config: Config) -> anyhow::Result
     let mut backoff = base_interval;
     // One spec cache for the process lifetime: each contract's interface is
     // fetched and parsed once, then reused to enrich every event.
-    let specs = SpecCache::new();
+    let specs = SpecCache::new(config.spec_cache_max_entries);
     // None => prune on the first cycle that reaches the tip, so a deployment
     // that switches retention on starts reclaiming immediately.
     let mut last_prune: Option<Instant> = None;
@@ -56,6 +56,20 @@ pub async fn run(pool: PgPool, rpc: RpcClient, config: Config) -> anyhow::Result
                             retention::prune(&pool, ledger, config.retention_ledgers).await
                         {
                             warn!(error = %e, "retention prune failed");
+                        }
+                        // Prune old spec versions (if enabled)
+                        if config.spec_version_retention > 0 {
+                            if let Err(e) =
+                                retention::prune_spec_versions(
+                                    &pool,
+                                    ledger,
+                                    config.retention_ledgers,
+                                    config.spec_version_retention,
+                                )
+                                .await
+                            {
+                                warn!(error = %e, "spec version retention prune failed");
+                            }
                         }
                         last_prune = Some(Instant::now());
                     }
@@ -129,7 +143,29 @@ async fn poll_once(
         start = clamped;
     }
 
-    let inserted = fetch_and_store(pool, rpc, config, specs, start, latest).await?;
+    let (inserted, enrichment) = fetch_and_store(pool, rpc, config, specs, start, latest).await?;
+
+    // Check enrichment coverage and warn if it drops significantly
+    if enrichment.enriched_count > 0 || enrichment.not_enriched_count > 0 {
+        let total = enrichment.enriched_count + enrichment.not_enriched_count;
+        if total > 0 {
+            let enrichment_rate = enrichment.enriched_count as f64 / total as f64;
+            let not_enriched_fraction = enrichment.not_enriched_count as f64 / total as f64;
+
+            // Emit warning if enrichment rate is below threshold
+            if not_enriched_fraction > config.enrichment_warn_threshold {
+                warn!(
+                    enrichment_rate = enrichment_rate,
+                    not_enriched_fraction = not_enriched_fraction,
+                    threshold = config.enrichment_warn_threshold,
+                    enriched_count = enrichment.enriched_count,
+                    not_enriched_count = enrichment.not_enriched_count,
+                    total_events = total,
+                    "enrichment coverage dropped below threshold"
+                );
+            }
+        }
+    }
 
     // Trailing re-scan for shallow reorg detection.
     // If configured, re-fetch the last N ledgers with upsert semantics to catch
@@ -165,16 +201,22 @@ async fn poll_once(
     Ok(Some(latest))
 }
 
+/// Enrichment metrics for a cycle.
+pub struct EnrichmentMetrics {
+    pub enriched_count: u64,
+    pub not_enriched_count: u64,
+}
+
 /// Page through events from `start` to the tip, storing each page. Shared by the
-/// live poller and the backfill command.
+/// live poller and the backfill command. Returns (total_inserted, enrichment_metrics).
 pub async fn fetch_and_store(
     pool: &PgPool,
     rpc: &RpcClient,
     config: &Config,
     specs: &SpecCache,
     start: i64,
-    _tip: i64,
-) -> anyhow::Result<u64> {
+    tip: i64,
+) -> anyhow::Result<(u64, EnrichmentMetrics)> {
     let mut cursor_token: Option<String> = None;
     let mut total_inserted = 0u64;
     let mut enriched_count = 0u64;
@@ -206,7 +248,7 @@ pub async fn fetch_and_store(
         let mut batch: Vec<NewEvent> = Vec::with_capacity(page.events.len());
         for ev in &page.events {
             // Interface lookups are cached, so this is one fetch per contract.
-            let spec = specs.get(pool, rpc, &ev.contract_id).await;
+            let spec = specs.get(pool, rpc, &ev.contract_id, ev.ledger).await;
             // Only needed for index-all instance reads (see below).
             if tracks_active_contracts {
                 active_contracts.insert(ev.contract_id.clone());
@@ -274,7 +316,7 @@ pub async fn fetch_and_store(
             // Upgrade watch in index-all mode: batch the instance reads,
             // then check for upgrades.
             for contract_id in &targets {
-                specs::check_for_upgrade(pool, rpc, specs, contract_id).await;
+                specs::check_for_upgrade(pool, rpc, specs, contract_id, tip).await;
             }
         }
     }
@@ -305,7 +347,13 @@ pub async fn fetch_and_store(
         )
         .await;
     }
-    Ok(total_inserted)
+    Ok((
+        total_inserted,
+        EnrichmentMetrics {
+            enriched_count,
+            not_enriched_count,
+        },
+    ))
 }
 
 /// Re-fetch events from a range of recently-closed ledgers and upsert them,
@@ -344,7 +392,7 @@ async fn fetch_and_upsert(
                 }
                 return Ok(total_updated);
             }
-            let spec = specs.get(pool, rpc, &ev.contract_id).await;
+            let spec = specs.get(pool, rpc, &ev.contract_id, ev.ledger).await;
             let new_event = to_new_event(ev, spec.as_deref());
             // Track enrichment coverage: count enriched vs not-enriched events
             if new_event.enriched.is_some() {

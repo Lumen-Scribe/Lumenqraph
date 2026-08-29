@@ -66,6 +66,7 @@ stellar-xdr = { version = "23", default-features = false, features = [
     "curr",
     "base64",
 ] }
+lru = "0.12"
 
 [profile.release]
 opt-level = 3

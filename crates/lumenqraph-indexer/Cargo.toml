@@ -25,6 +25,7 @@ stellar-xdr.workspace = true
 hex.workspace = true
 sha2.workspace = true
 uuid.workspace = true
+lru.workspace = true
 
 [dev-dependencies]
 axum.workspace = true

@@ -122,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
 
     if args.get(1).map(String::as_str) == Some("reenrich") {
         info!("running in reenrich mode");
-        let result = reenrich::run_reenrich(pool.clone(), rpc).await;
+        let result = reenrich::run_reenrich(pool.clone(), rpc, config).await;
 
         // Release the advisory lock on exit.
         info!("releasing indexer leader lock");

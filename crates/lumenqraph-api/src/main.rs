@@ -111,23 +111,16 @@ fn version_string() -> String {
 fn build_cors_layer() -> tower_http::cors::CorsLayer {
     use tower_http::cors::CorsLayer;
 
-    let origins_str = std::env::var("API_CORS_ALLOWED_ORIGINS")
-        .unwrap_or_else(|_| "same_origin".to_string());
+    let origins_str = std::env::var("CORS_ALLOWED_ORIGINS").unwrap_or_else(|_| String::new());
 
     if origins_str == "*" {
         info!("CORS: allowing all origins (permissive mode)");
         CorsLayer::permissive()
-    } else if origins_str.to_lowercase() == "same_origin" || origins_str.is_empty() {
-        info!("CORS: allowing same-origin requests only");
-        CorsLayer::very_permissive()
-            .allow_methods([
-                axum::http::Method::GET,
-                axum::http::Method::POST,
-                axum::http::Method::PATCH,
-                axum::http::Method::OPTIONS,
-                axum::http::Method::DELETE,
-            ])
-            .allow_headers([axum::http::header::CONTENT_TYPE])
+    } else if origins_str.is_empty() {
+        info!("CORS: no allowed origins configured; browsers will enforce same-origin policy by default");
+        // Return a minimal CorsLayer with no allowed origins configured.
+        // This means no CORS headers will be added, preserving the current behavior.
+        CorsLayer::new()
     } else {
         info!("CORS: allowing specific origins");
         let origins: Vec<&str> = origins_str
@@ -136,25 +129,27 @@ fn build_cors_layer() -> tower_http::cors::CorsLayer {
             .filter(|s| !s.is_empty())
             .collect();
 
-        let mut cors = CorsLayer::new();
+        let mut cors = CorsLayer::new()
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::PATCH,
+                axum::http::Method::OPTIONS,
+                axum::http::Method::DELETE,
+            ])
+            .allow_headers([axum::http::header::CONTENT_TYPE]);
+
         for origin_str in origins {
             match origin_str.parse::<http::HeaderValue>() {
                 Ok(origin) => {
                     cors = cors.allow_origin(origin);
                 }
                 Err(_) => {
-                    info!(origin = origin_str, "invalid origin in API_CORS_ALLOWED_ORIGINS, skipping");
+                    info!(origin = origin_str, "invalid origin in CORS_ALLOWED_ORIGINS, skipping");
                 }
             }
         }
-        cors.allow_methods([
-            axum::http::Method::GET,
-            axum::http::Method::POST,
-            axum::http::Method::PATCH,
-            axum::http::Method::OPTIONS,
-            axum::http::Method::DELETE,
-        ])
-        .allow_headers([axum::http::header::CONTENT_TYPE])
+        cors
     }
 }
 
