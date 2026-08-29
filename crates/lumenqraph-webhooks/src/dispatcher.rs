@@ -29,6 +29,11 @@ use futures::stream::{self, StreamExt};
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Identifies the sending binary's actual release to webhook consumers who key
+/// off `User-Agent` for debugging, so delivery logs can be traced back to the
+/// version that sent them.
+const USER_AGENT: &str = concat!("lumenqraph-webhooks/", env!("CARGO_PKG_VERSION"));
+
 /// Enqueue deliveries for everything new in both streams. Returns how many
 /// delivery rows were created.
 pub async fn enqueue(pool: &PgPool, batch: i64) -> anyhow::Result<u64> {
@@ -337,7 +342,7 @@ async fn send(http: &reqwest::Client, d: &DueDelivery, config: &Config) -> anyho
         .header("X-Lumenqraph-Timestamp", timestamp)
         .header("X-Lumenqraph-Attempt", d.attempts.to_string())
         .header("X-Lumenqraph-Event", event_type)
-        .header("User-Agent", "lumenqraph-webhooks/0.1")
+        .header("User-Agent", USER_AGENT)
         .body(body)
         .build()
         .context("failed to build request")?;

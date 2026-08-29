@@ -104,8 +104,34 @@ pub fn encode_call(
     })
 }
 
+/// Name prefixes conventionally used by state-changing Soroban functions.
+/// Soroban's `contractspecv0` carries no `view`/`mutable` keyword (unlike
+/// Solidity), so this is the naming half of the `is_view` heuristic — best
+/// effort, not a guarantee.
+const MUTATING_PREFIXES: &[&str] = &[
+    "set_", "init", "mint", "burn", "transfer", "approve", "withdraw", "deposit",
+    "pause", "unpause", "upgrade", "admin_", "remove_", "add_", "create_", "delete_",
+    "update_", "cancel", "claim", "deploy", "revoke", "grant", "lock", "unlock",
+];
+
+/// Best-effort guess at whether a function is read-only (safe via `/call`) or
+/// state-changing (only safe via `/simulate`). Soroban's `contractspecv0` has
+/// no `view` keyword, so this combines two weak signals: a `void` return type
+/// almost always means the function mutates state (a pure read has something
+/// to return), and a name matching a well-known mutating prefix.
+fn is_view_heuristic(f: &ScSpecFunctionV0) -> bool {
+    let is_void_output = f.outputs.is_empty();
+    let name = f.name.to_utf8_string_lossy().to_lowercase();
+    let matches_mutating_prefix = MUTATING_PREFIXES.iter().any(|p| name.starts_with(p));
+    !is_void_output && !matches_mutating_prefix
+}
+
 /// List a contract's callable functions (name, typed inputs, output type),
 /// derived from the raw spec section. Handy for a `/functions` endpoint.
+///
+/// Each entry also carries a best-effort `is_view` indicator (see
+/// [`is_view_heuristic`]) — callers wanting to avoid accidental state
+/// mutations should still prefer `/simulate` over `/call` when in doubt.
 pub fn functions(spec_section: &[u8]) -> Vec<Value> {
     parse_entries(spec_section)
         .into_iter()
@@ -117,6 +143,7 @@ pub fn functions(spec_section: &[u8]) -> Vec<Value> {
                     "type": type_name(&i.type_),
                 })).collect::<Vec<_>>(),
                 "outputs": f.outputs.iter().map(type_name).collect::<Vec<_>>(),
+                "is_view": is_view_heuristic(&f),
             })),
             _ => None,
         })

@@ -10,13 +10,24 @@
 //!
 //! A contract *can* be upgraded in place, and serving its old interface would
 //! mean type-checking calls against a signature the chain no longer has — in a
-//! project whose whole point is detecting exactly that change. So this doesn't
-//! cache on a timer and hope. Instead it keeps the contract's `wasm_hash`
-//! alongside the parse and revalidates on every lookup:
+//! project whose whole point is detecting exactly that change. It would also
+//! mean this cache could silently outlive an upgrade the *indexer's own*
+//! `SpecCache` already detected and recorded, since the two run in separate
+//! processes with no direct notification between them. So this doesn't cache
+//! on a timer and hope. Instead it keeps the contract's `wasm_hash` and
+//! `contract_specs.fetched_at` alongside the parse and revalidates both on
+//! every lookup:
 //!
-//! - the validating query is a primary-key lookup returning one short hash, and
+//! - the validating query is a primary-key lookup returning one short hash and
+//!   one timestamp, and
 //! - the work it avoids is the large `spec_section` transfer, the hex decode,
 //!   and the XDR parse.
+//!
+//! `wasm_hash` alone already forces a refetch on any genuine upgrade; `fetched_at`
+//! is compared alongside it so that *any* write to the row — including one this
+//! cache wasn't specifically watching for — is never missed, rather than trusting
+//! hash equality as the sole word on freshness. See `docs/ARCHITECTURE.md` for the
+//! full invalidation strategy.
 //!
 //! So a hit still costs one cheap round trip and is always correct, which is the
 //! right trade for a cache guarding a correctness-critical value.
@@ -27,6 +38,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use chrono::{DateTime, Utc};
 use lumenqraph_core::ContractSpec;
 use sqlx::PgPool;
 
@@ -49,8 +61,12 @@ pub struct CachedSpec {
 
 #[derive(Default)]
 pub struct SpecCache {
-    /// contract_id -> (wasm_hash the entry was parsed from, entry)
-    current: RwLock<HashMap<String, (String, Arc<CachedSpec>)>>,
+    /// contract_id -> (wasm_hash the entry was parsed from, contract_specs.fetched_at
+    /// at parse time, entry). `wasm_hash` changing is the primary invalidation
+    /// signal (a real upgrade); `fetched_at` is compared alongside it so a write
+    /// to the row is never missed even in the cases hash equality alone wouldn't
+    /// cover.
+    current: RwLock<HashMap<String, (String, DateTime<Utc>, Arc<CachedSpec>)>>,
     /// (contract_id, version) -> entry. Immutable once observed.
     versions: RwLock<HashMap<(String, i32), Arc<CachedSpec>>>,
 }
@@ -67,19 +83,20 @@ impl SpecCache {
         // In tests the cache may be pre-populated via `seed()` to avoid a DB
         // round-trip. A seeded entry uses the sentinel hash "test-hash".
         #[cfg(test)]
-        if let Some((hash, spec)) = self.current.read().unwrap().get(contract_id) {
+        if let Some((hash, _, spec)) = self.current.read().unwrap().get(contract_id) {
             if hash == "test-hash" {
                 return Ok(Arc::clone(spec));
             }
         }
 
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT wasm_hash FROM contract_specs WHERE contract_id = $1")
-                .bind(contract_id)
-                .fetch_optional(pool)
-                .await?;
-        let wasm_hash = match row.map(|r| r.0) {
-            Some(hash) => hash,
+        let row: Option<(String, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT wasm_hash, fetched_at FROM contract_specs WHERE contract_id = $1",
+        )
+        .bind(contract_id)
+        .fetch_optional(pool)
+        .await?;
+        let (wasm_hash, fetched_at) = match row {
+            Some((hash, fetched_at)) => (hash, fetched_at),
             None => {
                 // Not in contract_specs; check if it's a SAC (has events but no WASM)
                 let has_events: Option<(i64,)> = sqlx::query_as(
@@ -99,11 +116,15 @@ impl SpecCache {
             }
         };
 
-        if let Some((hash, spec)) = self.current.read().unwrap().get(contract_id) {
-            if *hash == wasm_hash {
+        // `wasm_hash` changing means the contract was upgraded; `fetched_at` is
+        // compared alongside it so any write to this row — including one made
+        // by a code path this cache doesn't specifically know about — is never
+        // missed, with no reliance on a TTL.
+        if let Some((hash, cached_fetched_at, spec)) = self.current.read().unwrap().get(contract_id) {
+            if *hash == wasm_hash && *cached_fetched_at >= fetched_at {
                 return Ok(Arc::clone(spec));
             }
-            // Fall through: the contract was upgraded, so re-read it.
+            // Fall through: the contract's spec row changed since we cached it.
         }
 
         let section: Option<(String,)> =
@@ -121,7 +142,7 @@ impl SpecCache {
         if map.len() >= MAX_ENTRIES {
             map.clear();
         }
-        map.insert(contract_id.to_string(), (wasm_hash, Arc::clone(&entry)));
+        map.insert(contract_id.to_string(), (wasm_hash, fetched_at, Arc::clone(&entry)));
         Ok(entry)
     }
 
@@ -164,10 +185,10 @@ impl SpecCache {
     #[cfg(test)]
     pub fn seed(&self, contract_id: &str, spec: CachedSpec) {
         let arc = Arc::new(spec);
-        self.current
-            .write()
-            .unwrap()
-            .insert(contract_id.to_string(), ("test-hash".to_string(), arc));
+        self.current.write().unwrap().insert(
+            contract_id.to_string(),
+            ("test-hash".to_string(), Utc::now(), arc),
+        );
     }
 }
 

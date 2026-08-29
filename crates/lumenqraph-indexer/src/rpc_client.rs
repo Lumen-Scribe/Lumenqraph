@@ -21,6 +21,11 @@ pub struct RpcClient {
     pub calls_failed_32001: std::sync::atomic::AtomicU64,
 }
 
+/// Identifies the sending binary's actual release to RPC operators who key off
+/// `User-Agent` for debugging, so request logs can be traced back to the
+/// version that sent them.
+const USER_AGENT: &str = concat!("lumenqraph-indexer/", env!("CARGO_PKG_VERSION"));
+
 #[derive(Serialize)]
 struct RpcRequest<'a, P> {
     jsonrpc: &'a str,
@@ -209,6 +214,7 @@ impl RpcClient {
                 .http
                 .post(&self.url)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::USER_AGENT, USER_AGENT)
                 .body(body.clone())
                 .send()
                 .await;

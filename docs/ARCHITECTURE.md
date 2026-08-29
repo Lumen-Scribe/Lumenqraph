@@ -68,6 +68,30 @@ symbols/strings → strings, addresses → `G…`/`C…` strkeys (base32 +
 CRC16-XModem), bytes → hex, vecs/maps → arrays/objects. Raw base64 is always
 retained alongside the decoded JSON, so decoding is never lossy.
 
+## Spec cache invalidation
+
+Both the indexer and the API keep their own in-memory cache of a contract's
+parsed interface (`indexer::specs::SpecCache` and `api::specs::SpecCache`
+respectively) — the API needs it for `/functions`, `/call`, `/simulate`, and
+diff endpoints; the indexer needs it to enrich events without re-parsing on
+every one. They are separate processes with separate caches, so an upgrade
+detected by the indexer is not automatically visible to the API.
+
+Rather than rely on a TTL — which would leave a window where the API serves a
+stale interface after the indexer has already recorded the new one — the API's
+cache revalidates against Postgres on every lookup, keyed on both
+`contract_specs.wasm_hash` and `contract_specs.fetched_at`. `wasm_hash`
+changing is what actually signals an upgrade; `fetched_at` is compared
+alongside it so any write to that row is caught even in cases hash equality
+alone wouldn't cover (e.g. a hash collision, or the row being rewritten by a
+future code path this cache doesn't know about). Together they mean any write
+the indexer makes is visible to the API's cache on its very next lookup, with
+no staleness window to tune.
+
+This costs one small, indexed query per lookup (`wasm_hash`, `fetched_at`) —
+the section itself (large, and requiring an XDR re-parse) is only re-fetched
+when that comparison actually detects a change.
+
 ## Idempotency & reorgs
 
 ### Guarantee and limitations
