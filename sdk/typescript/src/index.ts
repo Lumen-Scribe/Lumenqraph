@@ -98,6 +98,12 @@ export interface DataKeyHistory {
   versions: { ledger: number; value: Json; captured_at: string }[];
 }
 
+export interface EventsResponse {
+  data: EventRecord[];
+  has_more: boolean;
+  next_cursor: string | null;
+}
+
 export interface CallResult {
   contract_id: string;
   function: string;
@@ -272,7 +278,7 @@ export class LumenqraphClient {
   listEvents(
     contractId: string,
     opts: { limit?: number; offset?: number; eventName?: string; signal?: AbortSignal } = {},
-  ): Promise<EventRecord[]> {
+  ): Promise<EventsResponse> {
     return this.get(`/contracts/${enc(contractId)}/events`, {
       limit: opts.limit,
       offset: opts.offset,
@@ -389,6 +395,54 @@ export class LumenqraphClient {
       for (const node of page.nodes) yield node;
       if (!page.hasNextPage || !page.endCursor) return;
       after = page.endCursor;
+    }
+  }
+
+  /**
+   * Async iterator over *all* of a contract's events via REST cursor pagination.
+   * Supports richer filters (topic, param, ledger range, time range) compared to GraphQL.
+   * Transparently fetches page after page until all events are consumed.
+   */
+  async *paginateEventsRest(
+    contractId: string,
+    opts: {
+      limit?: number;
+      eventName?: string;
+      fromLedger?: number;
+      toLedger?: number;
+      since?: string;
+      until?: string;
+      topic0?: string;
+      topic1?: string;
+      topic2?: string;
+      topic3?: string;
+      param?: string;
+      signal?: AbortSignal;
+    } = {},
+  ): AsyncGenerator<EventRecord> {
+    let nextCursor: string | undefined;
+    for (;;) {
+      const response = await this.get<EventsResponse>(
+        `/contracts/${enc(contractId)}/events`,
+        {
+          limit: opts.limit ?? 100,
+          event_name: opts.eventName,
+          from_ledger: opts.fromLedger,
+          to_ledger: opts.toLedger,
+          since: opts.since,
+          until: opts.until,
+          topic0: opts.topic0,
+          topic1: opts.topic1,
+          topic2: opts.topic2,
+          topic3: opts.topic3,
+          param: opts.param,
+          after: nextCursor,
+        },
+        opts.signal,
+      );
+      for (const event of response.data) yield event;
+      if (!response.next_cursor || !response.has_more) return;
+      nextCursor = response.next_cursor;
     }
   }
 

@@ -24,8 +24,10 @@ use axum::extract::Request;
 use axum::http::{header, HeaderValue};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse};
+use axum::Json;
 use axum::routing::{any, delete, get, patch, post};
 use axum::{middleware, Extension, Router};
+use serde_json::json;
 use tower::Layer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -48,7 +50,13 @@ async fn graphiql() -> impl IntoResponse {
         .unwrap_or(false);
 
     if !introspection_enabled {
-        return (axum::http::StatusCode::NOT_FOUND, "").into_response();
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "GraphQL introspection is disabled",
+                "message": "Use POST /graphql for queries. Introspection is not available in this environment."
+            }))
+        ).into_response();
     }
 
     Html(GraphiQLSource::build().endpoint("/graphql").finish()).into_response()

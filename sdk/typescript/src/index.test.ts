@@ -86,7 +86,7 @@ describe("URL construction", () => {
   });
 
   it("listEvents appends limit, offset, and event_name", async () => {
-    const f = mockFetch([{ status: 200, body: [] }]);
+    const f = mockFetch([{ status: 200, body: { data: [], has_more: false, next_cursor: null } }]);
     await client(f).listEvents("C1", {
       limit: 10,
       offset: 20,
