@@ -563,6 +563,14 @@ async fn call_contract(
             }
             Ok(out)
         }
-        SimOutcome::Error(msg) => anyhow::bail!("simulation failed: {msg}"),
+        SimOutcome::Error(msg) => {
+            // Log the full upstream detail server-side; only return a concise,
+            // sanitised copy to the MCP client (see issue #154).
+            tracing::warn!(rpc_error = %msg, "contract simulation failed");
+            anyhow::bail!(
+                "simulation failed: {}",
+                lumenqraph_core::sanitize::sanitize_simulation_error(&msg)
+            )
+        }
     }
 }
