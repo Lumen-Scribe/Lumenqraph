@@ -123,6 +123,38 @@ export interface CallOptions {
   sourceAccount?: string;
 }
 
+export interface Webhook {
+  id: string;
+  url: string;
+  subscriptions: string[];
+  active: boolean;
+  secret: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WebhookDelivery {
+  id: string;
+  webhook_id: string;
+  status: "pending" | "success" | "failed";
+  status_code?: number;
+  error?: string;
+  attempts: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateWebhookOptions {
+  url: string;
+  subscriptions?: string[];
+}
+
+export interface UpdateWebhookOptions {
+  url?: string;
+  subscriptions?: string[];
+  active?: boolean;
+}
+
 /** A Relay-style page returned by the GraphQL cursor connections. */
 export interface Page<T> {
   nodes: T[];
@@ -320,6 +352,43 @@ export class LumenqraphClient {
     }, opts.signal);
   }
 
+  // ---- Webhooks ----
+
+  /** Create a new webhook subscription. Returns the webhook with its secret. */
+  createWebhook(opts: CreateWebhookOptions & RequestOptions): Promise<Webhook> {
+    return this.post("/webhooks", {
+      url: opts.url,
+      subscriptions: opts.subscriptions ?? [],
+    }, opts.signal);
+  }
+
+  /** List all webhooks for this instance. */
+  listWebhooks(opts: RequestOptions = {}): Promise<Webhook[]> {
+    return this.get("/webhooks", {}, opts.signal);
+  }
+
+  /** Delete a webhook by ID. */
+  deleteWebhook(id: string, opts: RequestOptions = {}): Promise<void> {
+    return this.delete(`/webhooks/${enc(id)}`, opts.signal);
+  }
+
+  /** Update a webhook's URL, subscriptions, or active status. */
+  updateWebhook(id: string, opts: UpdateWebhookOptions & RequestOptions): Promise<Webhook> {
+    return this.post(`/webhooks/${enc(id)}`, {
+      url: opts.url,
+      subscriptions: opts.subscriptions,
+      active: opts.active,
+    }, opts.signal);
+  }
+
+  /** List delivery attempts for a webhook. */
+  listDeliveries(id: string, opts: { limit?: number; offset?: number; signal?: AbortSignal } = {}): Promise<WebhookDelivery[]> {
+    return this.get(`/webhooks/${enc(id)}/deliveries`, {
+      limit: opts.limit,
+      offset: opts.offset,
+    }, opts.signal);
+  }
+
   // ---- GraphQL ----
 
   /** Execute a raw GraphQL query against `/graphql`. */
@@ -465,6 +534,12 @@ export class LumenqraphClient {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
+    }, signal);
+  }
+
+  private async delete<T = Json>(path: string, signal?: AbortSignal): Promise<T> {
+    return this.request<T>(this.baseUrl + path, {
+      method: "DELETE",
     }, signal);
   }
 
