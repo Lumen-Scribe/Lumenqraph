@@ -147,6 +147,7 @@ impl OpenApiBuilder {
         get_metrics,
         list_contracts,
         get_contract_interface,
+        refresh_contract,
         list_contract_events,
         get_event_by_id,
         list_transaction_events,
@@ -203,6 +204,19 @@ pub async fn list_contracts() {}
     tag = "Contracts"
 )]
 pub async fn get_contract_interface() {}
+
+#[utoipa::path(
+    post,
+    path = "/contracts/{contract_id}/refresh",
+    params(("contract_id" = String, Path, description = "Soroban contract ID")),
+    responses(
+        (status = 200, description = "Refreshed contract interface specification", body = ContractInterfaceResponse),
+        (status = 400, description = "Invalid contract ID or unparseable WASM spec", body = ErrorResponse),
+        (status = 404, description = "Contract not found or Stellar Asset Contract", body = ErrorResponse)
+    ),
+    tag = "Contracts"
+)]
+pub async fn refresh_contract() {}
 
 #[utoipa::path(
     get,

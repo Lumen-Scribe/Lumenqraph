@@ -550,3 +550,156 @@ pub async fn contract_data_key(
         "versions": versions,
     })))
 }
+
+/// `POST /contracts/:id/refresh` — clears the in-memory cached spec and
+/// forces an immediate re-fetch of the contract's on-chain interface from
+/// Soroban RPC, updating `contract_specs` and `contract_spec_versions`.
+pub async fn refresh_contract(
+    State(state): State<AppState>,
+    Path(contract_id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
+        return Err(ApiError::bad_request("invalid contract id"));
+    }
+
+    // Clear from in-memory cache
+    state.specs.invalidate(&contract_id);
+
+    // Re-fetch from Soroban RPC
+    let wasm_res = state
+        .rpc
+        .get_contract_wasm(&contract_id)
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("failed to fetch contract WASM from RPC: {e}")))?;
+
+    let (wasm_hash, wasm_bytes, ledger) = match wasm_res {
+        Some(w) => w,
+        None => {
+            // Check if there are events for this contract (to distinguish SAC)
+            let has_events: Option<(i64,)> = sqlx::query_as(
+                "SELECT 1 FROM events WHERE contract_id = $1 LIMIT 1"
+            )
+            .bind(&contract_id)
+            .fetch_optional(&state.pool)
+            .await?;
+            if has_events.is_some() {
+                return Err(ApiError::not_found(
+                    "Stellar Asset Contract: no on-chain WASM interface. \
+                     SACs publish only standard SEP-41 token conventions; \
+                     use token metadata endpoints instead of /call."
+                ));
+            }
+            return Err(ApiError::not_found(
+                "contract not found on-chain or has no deployed WASM",
+            ));
+        }
+    };
+
+    let Some(spec) = lumenqraph_core::ContractSpec::from_wasm(&wasm_bytes) else {
+        return Err(ApiError::bad_request(
+            "contract has deployed WASM but no valid contractspecv0 section",
+        ));
+    };
+
+    let spec_section = lumenqraph_core::spec::spec_section_of(&wasm_bytes)
+        .map(hex::encode)
+        .unwrap_or_default();
+
+    // Persist refreshed spec to database
+    sqlx::query(
+        "INSERT INTO contract_specs (contract_id, wasm_hash, interface, spec_section, has_events, fetched_at)
+         VALUES ($1, $2, $3, $4, $5, now())
+         ON CONFLICT (contract_id) DO UPDATE
+           SET wasm_hash = EXCLUDED.wasm_hash,
+               interface = EXCLUDED.interface,
+               spec_section = EXCLUDED.spec_section,
+               has_events = EXCLUDED.has_events,
+               fetched_at = now()",
+    )
+    .bind(&contract_id)
+    .bind(&wasm_hash)
+    .bind(spec.to_interface_json())
+    .bind(&spec_section)
+    .bind(spec.has_events())
+    .execute(&state.pool)
+    .await?;
+
+    // Record spec version history
+    if let Err(e) = record_spec_version(&state.pool, &contract_id, &wasm_hash, &spec_section, &spec, ledger).await {
+        tracing::warn!(contract_id = %contract_id, error = %e, "failed to record refreshed spec version");
+    }
+
+    let fetched_at = Utc::now();
+    Ok(Json(json!({
+        "contract_id": contract_id,
+        "has_events": spec.has_events(),
+        "fetched_at": fetched_at,
+        "interface": spec.to_interface_json(),
+    })))
+}
+
+fn diff_against(previous_section: &str, new_spec: &lumenqraph_core::ContractSpec) -> Option<SpecDiff> {
+    let bytes = hex::decode(previous_section).ok()?;
+    let previous = lumenqraph_core::ContractSpec::from_spec_xdr(&bytes)?;
+    Some(SpecDiff::between(&previous, new_spec))
+}
+
+async fn record_spec_version(
+    pool: &sqlx::PgPool,
+    contract_id: &str,
+    wasm_hash: &str,
+    spec_section: &str,
+    spec: &lumenqraph_core::ContractSpec,
+    ledger: i64,
+) -> anyhow::Result<()> {
+    let previous: Option<(i32, String, String)> = sqlx::query_as(
+        "SELECT version, wasm_hash, spec_section FROM contract_spec_versions
+         WHERE contract_id = $1 ORDER BY version DESC LIMIT 1",
+    )
+    .bind(contract_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let (version, previous_hash, diff) = match previous {
+        Some((_, ref prev_hash, _)) if prev_hash == wasm_hash => return Ok(()),
+        Some((prev_version, prev_hash, prev_section)) => {
+            let diff = diff_against(&prev_section, spec);
+            (prev_version + 1, Some(prev_hash), diff)
+        }
+        None => (1, None, None),
+    };
+
+    sqlx::query(
+        "INSERT INTO contract_spec_versions
+            (contract_id, version, wasm_hash, previous_wasm_hash, interface, spec_section, diff, breaking, ledger)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (contract_id, version) DO NOTHING",
+    )
+    .bind(contract_id)
+    .bind(version)
+    .bind(wasm_hash)
+    .bind(previous_hash)
+    .bind(spec.to_interface_json())
+    .bind(spec_section)
+    .bind(diff.as_ref().map(|d| d.to_json()))
+    .bind(diff.as_ref().is_some_and(|d| d.breaking))
+    .bind(ledger)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn generate_etag(val: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(val.as_bytes());
+    format!("\"{}\"", hex::encode(h.finalize()))
+}
+
+fn check_if_none_match(headers: &HeaderMap, etag: &str) -> bool {
+    if let Some(req_etag) = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) {
+        req_etag.trim() == etag || req_etag.trim() == "*"
+    } else {
+        false
+    }
+}

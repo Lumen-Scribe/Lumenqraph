@@ -2,10 +2,15 @@
 //! execute contract view functions read-only) and `getNetwork` (so the API can
 //! report which network it indexes).
 
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
+use stellar_xdr::curr::{
+    ContractDataDurability, ContractExecutable, LedgerEntryData, LedgerKey, LedgerKeyContractCode,
+    LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal, WriteXdr,
+};
 use tokio::sync::OnceCell;
 
 #[derive(Clone)]
@@ -61,6 +66,27 @@ struct SimulateResult {
 #[derive(Deserialize)]
 struct SimResultItem {
     xdr: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LedgerEntriesResult {
+    #[serde(default)]
+    entries: Option<Vec<LedgerEntryItem>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LedgerEntryItem {
+    xdr: String,
+    #[serde(default)]
+    last_modified_ledger_seq: i64,
+}
+
+#[derive(Deserialize)]
+struct LedgerEntriesEnvelope {
+    result: Option<LedgerEntriesResult>,
+    error: Option<RpcError>,
 }
 
 impl RpcClient {
@@ -150,6 +176,85 @@ impl RpcClient {
             None => Ok(SimOutcome::Error(
                 "simulation returned no result value".to_string(),
             )),
+        }
+    }
+
+    /// Fetch and XDR-decode a single ledger entry by key, with the ledger it was
+    /// last modified at. `None` if absent.
+    async fn get_ledger_entry(
+        &self,
+        key: &LedgerKey,
+    ) -> anyhow::Result<Option<(LedgerEntryData, i64)>> {
+        let key_b64 = key
+            .to_xdr_base64(Limits::none())
+            .map_err(|e| anyhow::anyhow!("encode ledger key: {e}"))?;
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getLedgerEntries",
+            "params": { "keys": [key_b64] }
+        });
+        let env: LedgerEntriesEnvelope = self
+            .http
+            .post(&self.url)
+            .json(&req)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        if let Some(e) = env.error {
+            return Err(anyhow::anyhow!("rpc error: {}", e.message));
+        }
+        let result = env
+            .result
+            .ok_or_else(|| anyhow::anyhow!("rpc returned no result"))?;
+        let Some(first) = result.entries.unwrap_or_default().into_iter().next() else {
+            return Ok(None);
+        };
+        let data = LedgerEntryData::from_xdr_base64(&first.xdr, Limits::none())
+            .map_err(|e| anyhow::anyhow!("decode ledger entry: {e}"))?;
+        Ok(Some((data, first.last_modified_ledger_seq)))
+    }
+
+    /// Fetch a contract's deployed WASM (hex hash, raw bytes, and last modified ledger seq).
+    /// Returns `Ok(None)` for contracts with no WASM (e.g. a Stellar Asset Contract)
+    /// or when the ledger entries are not found.
+    pub async fn get_contract_wasm(
+        &self,
+        contract_id: &str,
+    ) -> anyhow::Result<Option<(String, Vec<u8>, i64)>> {
+        let addr = ScAddress::from_str(contract_id)
+            .map_err(|e| anyhow::anyhow!("invalid contract id {contract_id}: {e}"))?;
+
+        let instance_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: addr,
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+        });
+        let Some((entry, ledger_seq)) = self.get_ledger_entry(&instance_key).await? else {
+            return Ok(None);
+        };
+        let wasm_hash = match entry {
+            LedgerEntryData::ContractData(cd) => match cd.val {
+                ScVal::ContractInstance(inst) => match inst.executable {
+                    ContractExecutable::Wasm(hash) => hash,
+                    ContractExecutable::StellarAsset => return Ok(None),
+                },
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+
+        let hash_hex = hex::encode(wasm_hash.0);
+        let code_key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: wasm_hash });
+        let Some((entry, _)) = self.get_ledger_entry(&code_key).await? else {
+            return Ok(None);
+        };
+        match entry {
+            LedgerEntryData::ContractCode(cc) => Ok(Some((hash_hex, cc.code.into(), ledger_seq))),
+            _ => Ok(None),
         }
     }
 }

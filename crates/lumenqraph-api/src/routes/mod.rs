@@ -101,6 +101,10 @@ pub fn router(state: AppState) -> Router {
             get(contracts::contract_interface_diff),
         )
         .route(
+            "/contracts/:contract_id/refresh",
+            post(contracts::refresh_contract),
+        )
+        .route(
             "/contracts/:contract_id/state",
             get(contracts::contract_state),
         )
