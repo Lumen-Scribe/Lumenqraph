@@ -240,6 +240,9 @@ async fn main() -> anyhow::Result<()> {
         readyz_max_age_secs: env_parse("READYZ_MAX_AGE_SECS", 120i64),
         health_max_lag_ledgers: env_parse("HEALTH_MAX_LAG_LEDGERS", 100i64),
         health_max_stale_secs: env_parse("HEALTH_MAX_STALE_SECS", 120i64),
+        webhook_limiter: Arc::new(RateLimiter::new()),
+        webhook_anon_rate_limit: env_parse("WEBHOOK_CREATION_RATE_LIMIT_PER_MIN", 10),
+        webhook_max_subscriptions: env_parse("WEBHOOK_MAX_SUBSCRIPTIONS", 100usize),
     };
 
     let cors_layer = build_cors_layer();

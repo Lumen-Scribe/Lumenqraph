@@ -32,7 +32,9 @@ use tower::Layer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
-use crate::auth::{auth_and_rate_limit, concurrency_limit, rpc_auth_and_rate_limit};
+use crate::auth::{
+    auth_and_rate_limit, concurrency_limit, rpc_auth_and_rate_limit, webhook_auth_and_rate_limit,
+};
 use crate::graphql::{self, AppSchema};
 use crate::metrics;
 use crate::state::AppState;
@@ -144,7 +146,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/webhooks",
-            post(webhooks::create_webhook).get(webhooks::list_webhooks),
+            get(webhooks::list_webhooks),
         )
         .route("/webhooks/:id", delete(webhooks::delete_webhook).patch(webhooks::update_webhook))
         .route("/webhooks/:id/deliveries", get(webhooks::list_webhook_deliveries))
@@ -159,10 +161,19 @@ pub fn router(state: AppState) -> Router {
             auth_and_rate_limit,
         ));
 
+    // Webhook creation route with separate, lower rate limiting (prevents subscription spam).
+    let webhook_create_routes = Router::new()
+        .route("/webhooks", post(webhooks::create_webhook))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            webhook_auth_and_rate_limit,
+        ));
+
     let metrics_collector = state.metrics.clone();
     let mut app = public
         .merge(protected)
         .merge(rpc_routes)
+        .merge(webhook_create_routes)
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),

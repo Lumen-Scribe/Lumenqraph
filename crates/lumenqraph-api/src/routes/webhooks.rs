@@ -73,6 +73,18 @@ pub async fn create_webhook(
     State(state): State<AppState>,
     Json(body): Json<CreateWebhook>,
 ) -> ApiResult<Json<WebhookSubscription>> {
+    if state.webhook_max_subscriptions > 0 {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_subscriptions")
+            .fetch_one(&state.pool)
+            .await?;
+        if count as usize >= state.webhook_max_subscriptions {
+            return Err(ApiError::bad_request(format!(
+                "maximum webhook subscriptions limit reached ({})",
+                state.webhook_max_subscriptions
+            )));
+        }
+    }
+
     url_validation::validate_webhook_url(&body.url)
         .map_err(|e| ApiError::bad_request(format!("invalid webhook url: {}", e)))?;
 

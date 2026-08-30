@@ -300,6 +300,13 @@ mod tests {
             concurrency_limiter: Arc::new(ConcurrencyLimiter::new()),
             max_concurrent_per_ip: 100,
             read_cost_limit_config: ReadCostLimitConfig::default(),
+            readyz_lag_threshold: 100,
+            readyz_max_age_secs: 120,
+            health_max_lag_ledgers: 100,
+            health_max_stale_secs: 120,
+            webhook_limiter: Arc::new(RateLimiter::new()),
+            webhook_anon_rate_limit: 10,
+            webhook_max_subscriptions: 100,
         }
     }
 

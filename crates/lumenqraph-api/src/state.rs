@@ -60,6 +60,12 @@ pub struct AppState {
     pub health_max_lag_ledgers: i64,
     /// Max age of cursor update for /health to show "ok" status, in seconds.
     pub health_max_stale_secs: i64,
+    /// Rate limiter for webhook subscription creation (POST /webhooks).
+    pub webhook_limiter: Arc<RateLimiter>,
+    /// Requests/min allowed for unauthenticated callers creating webhooks.
+    pub webhook_anon_rate_limit: i32,
+    /// Maximum total webhook subscriptions allowed across the system.
+    pub webhook_max_subscriptions: usize,
 }
 
 pub struct BuildInfo {
