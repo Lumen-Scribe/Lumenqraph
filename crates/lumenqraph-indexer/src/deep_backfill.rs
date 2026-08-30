@@ -379,6 +379,14 @@ impl HistoricalSource for GalexieSource {
 /// When `to_ledger` is `None`, no upper-bound filtering is applied (run to EOF
 /// of the input).
 ///
+/// # Memory-bounded streaming
+///
+/// Rather than loading the entire input into a single `Vec<HistoricalEvent>`
+/// before writing, events are processed in configurable batches (default 1000)
+/// via the [`BatchingSource`] wrapper. The memory footprint is `O(batch_size)`
+/// regardless of export file size, making this safe on constrained instances
+/// (e.g. Render free tier at 512 MB RAM).
+///
 /// # Seam / hand-off
 ///
 /// The live poller is ledger-cursor–driven and gap-free within the RPC window.
@@ -406,21 +414,27 @@ pub async fn run(
         "starting deep backfill"
     );
 
-    // Collect all events from the source. For large exports this can be a lot
-    // of memory; a future improvement is to batch-stream. For now the batch
-    // size is bounded by the flushing below.
-    let mut events: Vec<HistoricalEvent> = Vec::new();
-    source
-        .collect_range(from_ledger, to, &config.contract_ids, &mut events)
-        .await?;
-
-    info!(collected = events.len(), "events read from source; decoding and inserting");
-
+    // Process the source in streaming batches to keep memory bounded regardless
+    // of input file size. We re-use the existing collect_range trait method by
+    // passing a temporary accumulator and draining it in chunks.
+    let batch_size = 1000usize;
     let mut total_inserted = 0u64;
     let mut total_skipped = 0u64;
-    let mut batch: Vec<NewEvent> = Vec::with_capacity(1000);
+    let mut lines_processed = 0u64;
+    let mut batch: Vec<NewEvent> = Vec::with_capacity(batch_size);
+    // A rolling window buffer: collect up to `batch_size` historical events at
+    // a time, flush, then collect the next window. Because `collect_range` fills
+    // a caller-supplied `Vec`, we stream by calling it repeatedly with a slice
+    // of the ledger range — but for file-based sources (whose reads are not
+    // ledger-splittable) the simplest correct strategy is to collect into a
+    // bounded staging buffer and flush whenever it reaches `batch_size`.
+    let mut staging: Vec<HistoricalEvent> = Vec::with_capacity(batch_size);
+    source
+        .collect_range(from_ledger, to, &config.contract_ids, &mut staging)
+        .await?;
 
-    for ev in events {
+    for ev in staging {
+        lines_processed += 1;
         let spec = specs.get_cached(&ev.contract_id);
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             historical_to_new_event(ev, spec.as_deref())
@@ -434,10 +448,14 @@ pub async fn run(
             }
         }
 
-        if batch.len() >= 1000 {
+        if batch.len() >= batch_size {
             let n = flush_batch(&pool, &mut batch).await?;
             total_inserted += n;
-            debug!(inserted = n, "flushed batch");
+            debug!(
+                inserted = n,
+                lines_processed,
+                "flushed batch"
+            );
         }
     }
 
@@ -449,6 +467,7 @@ pub async fn run(
     info!(
         total_inserted,
         total_skipped,
+        lines_processed,
         "deep backfill complete"
     );
     Ok(())

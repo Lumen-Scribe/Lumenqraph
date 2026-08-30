@@ -105,15 +105,17 @@ pub async fn list_swaps(
         (false, swaps)
     };
 
+    let next_cursor = if has_next_page {
+        result_swaps
+            .last()
+            .map(|s| pagination::encode_cursor(s.ledger, &s.event_id))
+    } else {
+        None
+    };
+
     Ok(Json(SwapsResponse {
         data: result_swaps,
         has_more: has_next_page,
-        next_cursor: if has_next_page {
-            result_swaps
-                .last()
-                .map(|s| pagination::encode_cursor(s.ledger, &s.event_id))
-        } else {
-            None
-        },
+        next_cursor,
     }))
 }

@@ -147,6 +147,54 @@ Materialized SEP-41 transfers. Query: `limit`, `offset`, `from`, `to`.
    "ledger": 3550885, "event_id": "..." }]
 ```
 
+### `GET /contracts/:id/swaps`
+Materialized AMM swap events, newest first. Query: `limit` (1–1000, default 50),
+`offset`, `after` (cursor), `sender`, `sell_token`, `buy_token`.
+```json
+{
+  "data": [
+    { "event_id": "...", "contract_id": "CB...", "sender": "G...",
+      "sell_token": "C...", "buy_token": "C...",
+      "sell_amount": "1000000000", "buy_amount": "987654321",
+      "ledger": 3550885, "ledger_closed_at": "2026-07-15T..." }
+  ],
+  "has_more": false,
+  "next_cursor": null
+}
+```
+
+### `GET /contracts/:id/nfts`
+Materialized NFT events (mint/transfer/burn), newest first. Query: `limit`
+(1–1000, default 50), `offset`, `after` (cursor), `kind` (`mint`|`transfer`|`burn`),
+`from`, `to`, `token_id`.
+```json
+{
+  "data": [
+    { "event_id": "...", "contract_id": "CB...", "event_kind": "transfer",
+      "from_addr": "G...", "to_addr": "G...", "token_id": "42",
+      "ledger": 3550885, "ledger_closed_at": "2026-07-15T..." }
+  ],
+  "has_more": false,
+  "next_cursor": null
+}
+```
+
+### `GET /contracts/:id/liquidity`
+Materialized liquidity events (add/remove), newest first. Query: `limit`
+(1–1000, default 50), `offset`, `after` (cursor), `kind` (`add`|`remove`),
+`provider`.
+```json
+{
+  "data": [
+    { "event_id": "...", "contract_id": "CB...", "event_kind": "add",
+      "provider": "G...", "amount_a": "500000000", "amount_b": "500000000",
+      "shares": "999999", "ledger": 3550885, "ledger_closed_at": "2026-07-15T..." }
+  ],
+  "has_more": false,
+  "next_cursor": null
+}
+```
+
 ### `GET /contracts/:id/interface`
 The decoded on-chain interface: `functions`, `events`, `structs`, `unions`,
 `enums`. Query: `version` (a historical version; default is the current one).
@@ -404,9 +452,14 @@ Returns the updated subscription (secrets omitted). Allows:
 - Updating `contract_id` and `event_name` filters (same validation as creation)
 
 ### `GET /webhooks/:id/deliveries`
-Delivery history and status for a subscription. Returns paginated recent
-deliveries (most recent first, limited to 50) with status, attempt count, error
-details, and timestamps. Also includes summary counts (delivered/failed/pending).
+Delivery history and status for a subscription, most recent first.
+
+Query parameters:
+- `limit` — rows to return (1–500, default 50)
+- `offset` — rows to skip for pagination (default 0)
+
+Response includes `total_count` for computing total pages and `has_more` for
+detecting whether another page exists.
 
 ```json
 {
@@ -420,9 +473,13 @@ details, and timestamps. Also includes summary counts (delivered/failed/pending)
       "created_at": "2026-07-15T12:34:55Z"
     }
   ],
+  "total_count": 312,
+  "limit": 50,
+  "offset": 0,
+  "has_more": true,
   "summary": {
-    "delivered": 95,
-    "failed": 5,
+    "delivered": 300,
+    "failed": 12,
     "pending": 0
   }
 }

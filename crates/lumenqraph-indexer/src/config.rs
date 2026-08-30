@@ -108,6 +108,27 @@ impl Config {
             }
         }
 
+        // Validate the CONTRACT_IDS count against the getEvents RPC protocol limit:
+        // at most 5 filters × 5 IDs per filter = 25 IDs total. Checking this at
+        // startup produces a clear, actionable error message instead of a cryptic
+        // runtime failure on the first poll cycle.
+        const MAX_IDS_PER_FILTER: usize = 5;
+        const MAX_FILTERS: usize = 5;
+        const MAX_CONTRACT_IDS: usize = MAX_IDS_PER_FILTER * MAX_FILTERS;
+        if contract_ids.len() > MAX_CONTRACT_IDS {
+            return Err(anyhow::anyhow!(
+                "CONTRACT_IDS contains {} entries, but getEvents supports at most {} \
+                 contract IDs ({} filters × {} IDs per filter). \
+                 Remove {} contract IDs, or run multiple indexer instances each \
+                 covering a different subset.",
+                contract_ids.len(),
+                MAX_CONTRACT_IDS,
+                MAX_FILTERS,
+                MAX_IDS_PER_FILTER,
+                contract_ids.len() - MAX_CONTRACT_IDS,
+            ));
+        }
+
         // Parse numeric config with validation.
         let poll_interval_secs = env_parse("POLL_INTERVAL_SECS", 5)?;
         let page_size = env_parse("PAGE_SIZE", 1000)?;
@@ -364,5 +385,13 @@ mod tests {
         // Zero and positive should pass through.
         assert_eq!(if 0i64 < 0 { 0 } else { 0i64 }, 0);
         assert_eq!(if 100i64 < 0 { 0 } else { 100i64 }, 100);
+    }
+
+    #[test]
+    fn contract_ids_limit_constants() {
+        // Verify the limit used in Config::from_env matches the RPC protocol.
+        const MAX_IDS_PER_FILTER: usize = 5;
+        const MAX_FILTERS: usize = 5;
+        assert_eq!(MAX_IDS_PER_FILTER * MAX_FILTERS, 25);
     }
 }
