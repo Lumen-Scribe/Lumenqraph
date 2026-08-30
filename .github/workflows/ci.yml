@@ -86,6 +86,11 @@ jobs:
           cargo test -p lumenqraph-webhooks -- --ignored --test-threads=1
           cargo test -p lumenqraph-api      -- --ignored --test-threads=1
           cargo test -p lumenqraph-mcp      -- --ignored --test-threads=1
+      # The end-to-end smoke test is gated behind the `smoke-tests` feature so it
+      # never compiles into a plain `cargo test`. It uses a mock RPC (no live
+      # network); run it explicitly here where Postgres is available.
+      - name: Test (smoke, end-to-end)
+        run: cargo test -p lumenqraph-indexer --features smoke-tests smoke -- --ignored --test-threads=1
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7
       - name: Collect coverage
