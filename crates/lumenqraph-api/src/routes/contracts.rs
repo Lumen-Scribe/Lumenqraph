@@ -374,9 +374,19 @@ pub async fn contract_state(
     .await?;
 
     if rows.is_empty() {
+        // Check if state indexing is disabled by seeing if any state exists at all.
+        let any_state_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM contract_state LIMIT 1)")
+            .fetch_one(&state.pool)
+            .await?;
+
+        if !any_state_exists {
+            return Err(ApiError::feature_disabled(
+                "state indexing is disabled",
+            ));
+        }
+
         return Err(ApiError::not_found(
-            "no state snapshots for this contract (state indexing may be disabled, \
-             or the contract hasn't been active since it was enabled)",
+            "no state snapshots for this contract",
         ));
     }
 
@@ -458,9 +468,19 @@ pub async fn contract_data(
     .await?;
 
     if rows.is_empty() {
+        // Check if key indexing is disabled by seeing if any data exists at all.
+        let any_data_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM contract_data LIMIT 1)")
+            .fetch_one(&state.pool)
+            .await?;
+
+        if !any_data_exists {
+            return Err(ApiError::feature_disabled(
+                "key indexing is disabled",
+            ));
+        }
+
         return Err(ApiError::not_found(
-            "no per-key data snapshots for this contract (key indexing may be disabled, \
-             or no tracked keys have been active since it was enabled)",
+            "no per-key data snapshots for this contract",
         ));
     }
 

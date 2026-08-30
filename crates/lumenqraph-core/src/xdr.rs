@@ -45,10 +45,10 @@ pub fn decode_scval_base64(b64: &str) -> Value {
             let mut cur = Cursor::new(&bytes);
             match cur.read_scval() {
                 Some(v) => v,
-                None => json!({ "_xdr": b64 }),
+                None => json!({ "_type": "unknown", "xdr": b64 }),
             }
         }
-        Err(_) => json!({ "_xdr": b64 }),
+        Err(_) => json!({ "_type": "unknown", "xdr": b64 }),
     }
 }
 
@@ -176,7 +176,7 @@ impl<'a> Cursor<'a> {
                 }
             }
             SCV_ADDRESS => Value::String(self.read_address()?),
-            _ => json!({ "_xdr_tag": tag }),
+            _ => json!({ "_type": "unknown", "xdr_tag": tag }),
         })
     }
 
@@ -374,9 +374,22 @@ mod tests {
     }
 
     #[test]
-    fn malformed_falls_back_to_raw() {
+    fn malformed_falls_back_to_unknown() {
         let raw = base64::engine::general_purpose::STANDARD.encode([0xff, 0xff]);
-        assert_eq!(b64(&raw), serde_json::json!({ "_xdr": raw }));
+        assert_eq!(b64(&raw), serde_json::json!({ "_type": "unknown", "xdr": raw }));
+    }
+
+    #[test]
+    fn unknown_scval_tag_returns_discriminator() {
+        // Create an XDR with an unknown tag (999) — not one of the SCV_* constants.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&999u32.to_be_bytes());
+        let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = b64(&raw);
+
+        // Should return a structured unknown marker.
+        assert_eq!(result.get("_type").and_then(|v| v.as_str()), Some("unknown"));
+        assert_eq!(result.get("xdr_tag").and_then(|v| v.as_u64()), Some(999));
     }
 
     #[test]

@@ -50,6 +50,14 @@ pub fn build_schema(pool: PgPool) -> AppSchema {
 // ---- Types ----
 
 #[derive(SimpleObject)]
+struct EnrichedParam {
+    name: String,
+    #[graphql(name = "type")]
+    type_: String,
+    value: GqlJson<Value>,
+}
+
+#[derive(SimpleObject)]
 struct ContractStat {
     contract_id: String,
     event_count: i64,
@@ -68,7 +76,6 @@ impl From<Contract> for ContractStat {
     }
 }
 
-#[derive(SimpleObject)]
 struct Event {
     event_id: String,
     contract_id: String,
@@ -76,11 +83,8 @@ struct Event {
     ledger_closed_at: DateTime<Utc>,
     event_type: String,
     event_name: Option<String>,
-    /// Decoded topics as JSON.
     decoded_topics: GqlJson<Value>,
-    /// Decoded event body as JSON.
     decoded_value: GqlJson<Value>,
-    /// Named, typed record from the contract spec; null when none matched.
     enriched: Option<GqlJson<Value>>,
     tx_hash: String,
     in_successful_call: bool,
@@ -101,6 +105,85 @@ impl From<EventRow> for Event {
             tx_hash: e.tx_hash,
             in_successful_call: e.in_successful_call,
         }
+    }
+}
+
+#[Object]
+impl Event {
+    async fn event_id(&self) -> &str {
+        &self.event_id
+    }
+
+    async fn contract_id(&self) -> &str {
+        &self.contract_id
+    }
+
+    async fn ledger(&self) -> i64 {
+        self.ledger
+    }
+
+    async fn ledger_closed_at(&self) -> DateTime<Utc> {
+        self.ledger_closed_at
+    }
+
+    async fn event_type(&self) -> &str {
+        &self.event_type
+    }
+
+    async fn event_name(&self) -> &Option<String> {
+        &self.event_name
+    }
+
+    async fn decoded_topics(&self) -> &GqlJson<Value> {
+        &self.decoded_topics
+    }
+
+    async fn decoded_value(&self) -> &GqlJson<Value> {
+        &self.decoded_value
+    }
+
+    async fn enriched(&self) -> &Option<GqlJson<Value>> {
+        &self.enriched
+    }
+
+    async fn params(&self) -> Result<Vec<EnrichedParam>> {
+        match &self.enriched {
+            Some(enriched) => {
+                if let Some(params_obj) = enriched.0.get("params").and_then(|v| v.as_object()) {
+                    let params: Vec<EnrichedParam> = params_obj
+                        .iter()
+                        .map(|(name, value)| {
+                            let type_ = value
+                                .get("type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let param_value = value
+                                .get("value")
+                                .cloned()
+                                .unwrap_or_else(|| Value::Null);
+                            EnrichedParam {
+                                name: name.clone(),
+                                type_,
+                                value: GqlJson(param_value),
+                            }
+                        })
+                        .collect();
+                    Ok(params)
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn tx_hash(&self) -> &str {
+        &self.tx_hash
+    }
+
+    async fn in_successful_call(&self) -> bool {
+        self.in_successful_call
     }
 }
 
