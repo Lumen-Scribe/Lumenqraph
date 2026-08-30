@@ -379,22 +379,45 @@ export class LumenqraphClient {
   /**
    * Async iterator over *all* of a contract's events via GraphQL cursor
    * pagination — transparently fetching page after page.
+   *
+   * Cancellation (#279): pass `signal` to cancel from the caller. Independently,
+   * breaking out of the `for await` loop early runs this generator's `finally`
+   * cleanup, which aborts the signal handed to the page fetches — so an
+   * in-flight `eventsPage` request is cancelled rather than left to run and have
+   * its result discarded.
    */
   async *paginateEvents(
     contractId: string,
     opts: { pageSize?: number; eventName?: string; signal?: AbortSignal } = {},
   ): AsyncGenerator<EventRecord> {
-    let after: string | undefined;
-    for (;;) {
-      const page = await this.eventsPage(contractId, {
-        first: opts.pageSize ?? 100,
-        after,
-        eventName: opts.eventName,
-        signal: opts.signal,
-      });
-      for (const node of page.nodes) yield node;
-      if (!page.hasNextPage || !page.endCursor) return;
-      after = page.endCursor;
+    // An internal controller, chained to the caller's signal, is what the page
+    // fetches actually see. Early termination (a `break` in the consumer's
+    // `for await`, or a thrown error) triggers the `finally` below, which aborts
+    // it and tears down any pending request.
+    const pageAborter = new AbortController();
+    const external = opts.signal;
+    const onExternalAbort = () => pageAborter.abort(external?.reason);
+    if (external) {
+      if (external.aborted) pageAborter.abort(external.reason);
+      else external.addEventListener("abort", onExternalAbort, { once: true });
+    }
+
+    try {
+      let after: string | undefined;
+      for (;;) {
+        const page = await this.eventsPage(contractId, {
+          first: opts.pageSize ?? 100,
+          after,
+          eventName: opts.eventName,
+          signal: pageAborter.signal,
+        });
+        for (const node of page.nodes) yield node;
+        if (!page.hasNextPage || !page.endCursor) return;
+        after = page.endCursor;
+      }
+    } finally {
+      external?.removeEventListener("abort", onExternalAbort);
+      pageAborter.abort();
     }
   }
 
