@@ -92,6 +92,34 @@ This costs one small, indexed query per lookup (`wasm_hash`, `fetched_at`) —
 the section itself (large, and requiring an XDR re-parse) is only re-fetched
 when that comparison actually detects a change.
 
+## contract_summaries trigger
+
+`contract_summaries` is a denormalized table that keeps a running
+`(event_count, first_seen_ledger, last_seen_ledger)` per contract, maintained
+by a Postgres row trigger on `events` (`trg_update_contract_summary`).  It
+exists so `GET /contracts` can be answered with a cheap primary-key scan instead
+of a full `GROUP BY` on the (potentially very large) `events` table.
+
+The trigger handles all three DML operations:
+
+| DML | Behaviour |
+|-----|-----------|
+| `INSERT` | Upserts a row with `event_count = 1`, or increments an existing row by 1 and widens the `first_seen_ledger` / `last_seen_ledger` bounds. |
+| `DELETE` | Decrements `event_count` and re-derives ledger bounds if the deleted row was at an edge (using an indexed `MIN`/`MAX` sub-select, so it is O(log n) not O(n)). When `event_count` reaches zero the summary row is **deleted** — `list_contracts` therefore never exposes contracts that have had all their events pruned. |
+| `UPDATE` | Treated as a logical delete of the old row followed by an insert of the new one; only fires when `contract_id` or `ledger` actually changes, which is rare. |
+
+**Retention interaction.** The retention pruner (`lumenqraph-indexer::retention`)
+deletes from `events` in batches; each delete fires the trigger, so
+`contract_summaries` stays exact across retention runs without any separate
+reconciliation query.  This is covered by the Postgres-backed integration tests
+in `crates/lumenqraph-indexer/src/retention.rs` (see the
+`contract_summaries_*` test group).
+
+**Migration history.**
+- `migrations/0009_contract_summaries.sql` — initial table and `INSERT`-only trigger.
+- `migrations/0021_contract_summaries_delete.sql` — replaces the trigger with the
+  `INSERT | UPDATE | DELETE` variant described above.
+
 ## Idempotency & reorgs
 
 ### Guarantee and limitations

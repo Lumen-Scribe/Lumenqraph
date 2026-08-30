@@ -5,12 +5,23 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distDir = path.join(__dirname, '../dist');
 const jsFile = path.join(distDir, 'explorer.js');
-const outputFile = path.join(__dirname, '../index.html');
+const outputDir = path.join(__dirname, '..');
+const outputHtml = path.join(outputDir, 'index.html');
+const outputJs = path.join(outputDir, 'app.js');
 
 // Read the generated JavaScript
 const js = fs.readFileSync(jsFile, 'utf-8');
 
-// Generate the final HTML file
+// Write app.js as a standalone external file.
+// This is required for a strict Content-Security-Policy that disallows inline
+// scripts (script-src 'self').  The API serves explorer/ with:
+//   Content-Security-Policy: default-src 'self'; script-src 'self'; …
+// An external <script src="app.js"> satisfies 'self'; an inline <script> block
+// would not, and represents a stored-XSS risk through unsanitised contract data.
+fs.writeFileSync(outputJs, js);
+console.log(`Written ${outputJs}`);
+
+// Generate the final HTML file referencing the external script.
 const html = `<!doctype html>
 <html lang="en">
 <head>
@@ -74,11 +85,12 @@ const html = `<!doctype html>
 </div>
 <div class="toast" id="toast"></div>
 
-<script>
-${js}
-</script>
+<!-- External script satisfies Content-Security-Policy: script-src 'self'
+     served by the API.  Do NOT move this back to an inline <script> block. -->
+<script src="app.js"></script>
 </body>
 </html>`;
 
-fs.writeFileSync(outputFile, html);
-console.log(`Generated ${outputFile}`);
+fs.writeFileSync(outputHtml, html);
+console.log(`Generated ${outputHtml}`);
+

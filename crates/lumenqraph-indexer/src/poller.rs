@@ -102,7 +102,21 @@ async fn poll_once(
     config: &Config,
     specs: &SpecCache,
 ) -> anyhow::Result<Option<i64>> {
+    use tracing::Instrument as _;
+
     let latest = rpc.get_latest_ledger().await?;
+
+    // Wrap the rest of the cycle in a span so all log lines — including those
+    // from spawned tasks (spec fetches, state/key snapshots) — carry a shared
+    // `ledger_range` field. Log aggregators can filter on it to reconstruct a
+    // single cycle without interleaved noise from concurrent cycles.
+    let cycle_span = tracing::info_span!(
+        "poll_cycle",
+        from = tracing::field::Empty,
+        to = latest,
+    );
+
+    async move {
 
     let mut start = match cursor::read_last_processed(pool).await? {
         Some(c) => c + 1,
@@ -142,6 +156,10 @@ async fn poll_once(
         );
         start = clamped;
     }
+
+    // Record the ledger range we are about to process in the span, now that
+    // we know both endpoints after clamping.
+    cycle_span.record("from", start);
 
     let (inserted, enrichment) = fetch_and_store(pool, rpc, config, specs, start, latest).await?;
 
@@ -199,6 +217,9 @@ async fn poll_once(
         info!(reorg_updated, "events updated due to shallow reorg detection");
     }
     Ok(Some(latest))
+    }
+    .instrument(cycle_span)
+    .await
 }
 
 /// Enrichment metrics for a cycle.

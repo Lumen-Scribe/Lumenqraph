@@ -112,6 +112,36 @@ jobs:
       - name: Build (release)
         run: cargo build --workspace --release
 
+  # Issue #222: OpenAPI spec drift check.
+  # Generates the spec from utoipa annotations (via --print-openapi) and
+  # compares it against the committed openapi.yaml.  Fails the build if any
+  # path, method, or parameter name differs so that hand-edits to the YAML
+  # can never silently diverge from the actual implementation.
+  openapi-drift:
+    name: OpenAPI Drift Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          key: openapi-drift
+      - name: Build lumenqraph-api
+        run: cargo build -p lumenqraph-api
+      - name: Generate OpenAPI spec from code
+        # --print-openapi dumps the utoipa-derived spec as JSON and exits
+        # without connecting to Postgres or binding a port.
+        run: cargo run -p lumenqraph-api -- --print-openapi > /tmp/generated-openapi.json
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install PyYAML
+        run: pip install pyyaml
+      - name: Check for drift
+        run: |
+          python3 scripts/check_openapi_drift.py openapi.yaml /tmp/generated-openapi.json
+
   # TypeScript SDK: build, typecheck, lint, test, and codegen drift check
   sdk-typescript:
     name: TypeScript SDK

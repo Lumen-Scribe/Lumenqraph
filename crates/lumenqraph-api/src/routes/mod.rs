@@ -217,7 +217,19 @@ pub fn router(state: AppState) -> Router {
             header::HeaderName::from_static("content-security-policy"),
             HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'"),
         );
-        app.fallback_service(csp.layer(revalidate.layer(ServeDir::new(explorer_dir))))
+        // Prevent MIME-type sniffing (guards against polyglot-file attacks).
+        let nosniff = SetResponseHeaderLayer::if_not_present(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        );
+        // Prevent the explorer from being embedded in an iframe (clickjacking).
+        let no_frame = SetResponseHeaderLayer::if_not_present(
+            header::HeaderName::from_static("x-frame-options"),
+            HeaderValue::from_static("DENY"),
+        );
+        app.fallback_service(
+            no_frame.layer(nosniff.layer(csp.layer(revalidate.layer(ServeDir::new(explorer_dir)))))
+        )
     } else {
         app
     }

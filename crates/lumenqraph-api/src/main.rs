@@ -161,6 +161,20 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // --print-openapi: dump the generated OpenAPI 3.1 spec as JSON to stdout
+    // and exit.  Used by the CI drift check to compare against the committed
+    // openapi.yaml without starting the full server or connecting to Postgres.
+    //
+    //   cargo run -p lumenqraph-api -- --print-openapi | \
+    //     python3 scripts/check_openapi_drift.py openapi.yaml -
+    if args.get(1).map(|s| s.as_str()) == Some("--print-openapi") {
+        use utoipa::OpenApi as _;
+        let spec = openapi::ApiDoc::openapi();
+        let json = serde_json::to_string_pretty(&spec)?;
+        println!("{json}");
+        return Ok(());
+    }
+
     let _ = dotenvy::dotenv();
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
