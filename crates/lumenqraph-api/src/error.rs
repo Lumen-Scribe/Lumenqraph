@@ -21,7 +21,8 @@
 //! | `not_found`           | 404         | Requested resource does not exist.                     |
 //! | `rate_limited`        | 429         | Caller exceeded the request-per-minute limit.          |
 //! | `simulation_failed`   | 400         | RPC simulation returned an error (contract trap, etc.).|
-//! | `spec_unavailable`    | 404         | Contract interface not indexed (or Stellar Asset Contract). |
+//! | `spec_unavailable`    | 404         | Contract has not been indexed yet; retry later.        |
+//! | `sac_not_supported`   | 422         | Stellar Asset Contract: no WASM spec; retrying will not help. |
 //! | `internal_error`      | 500         | Unexpected server-side failure (details are logged).   |
 
 use std::fmt;
@@ -44,6 +45,7 @@ pub enum ErrorCode {
     RateLimited,
     SimulationFailed,
     SpecUnavailable,
+    SacNotSupported,
     InternalError,
 }
 
@@ -57,6 +59,7 @@ impl ErrorCode {
             ErrorCode::RateLimited => "rate_limited",
             ErrorCode::SimulationFailed => "simulation_failed",
             ErrorCode::SpecUnavailable => "spec_unavailable",
+            ErrorCode::SacNotSupported => "sac_not_supported",
             ErrorCode::InternalError => "internal_error",
         }
     }
@@ -104,6 +107,16 @@ impl ApiError {
         ApiError::Status(
             StatusCode::NOT_FOUND,
             ErrorCode::SpecUnavailable,
+            msg.into(),
+        )
+    }
+    /// The contract is a Stellar Asset Contract (or otherwise has no on-chain
+    /// WASM spec). Retrying will never help — the caller should use the token
+    /// metadata endpoints instead of `/call` or `/simulate`.
+    pub fn sac_not_supported(msg: impl Into<String>) -> Self {
+        ApiError::Status(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            ErrorCode::SacNotSupported,
             msg.into(),
         )
     }
