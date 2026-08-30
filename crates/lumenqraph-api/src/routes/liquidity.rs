@@ -106,15 +106,17 @@ pub async fn list_liquidity_events(
         (false, events)
     };
 
+    let next_cursor = if has_next_page {
+        result_events
+            .last()
+            .map(|l| pagination::encode_cursor(l.ledger, &l.event_id))
+    } else {
+        None
+    };
+
     Ok(Json(LiquidityResponse {
         data: result_events,
         has_more: has_next_page,
-        next_cursor: if has_next_page {
-            result_events
-                .last()
-                .map(|l| pagination::encode_cursor(l.ledger, &l.event_id))
-        } else {
-            None
-        },
+        next_cursor,
     }))
 }

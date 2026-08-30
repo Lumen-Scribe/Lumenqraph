@@ -217,7 +217,12 @@ mod tests {
                 "get_contract_data",
                 "query_events",
                 "call_contract",
-                "simulate_call"
+                "simulate_call",
+                "query_transfers",
+                "diff_contract_interface",
+                "query_swaps",
+                "query_nft_events",
+                "query_liquidity_events",
             ]
         );
         for t in defs.as_array().unwrap() {
@@ -311,7 +316,7 @@ mod tests {
         let resp = handle(&state, msg).await.unwrap();
         assert_eq!(resp["id"], 2);
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 8, "all eight tools must be declared");
+        assert_eq!(tools.len(), 13, "all thirteen tools must be declared");
         for tool in tools {
             // Every tool must have a non-empty name, description, and an object schema.
             assert!(!tool["name"].as_str().unwrap_or("").is_empty());

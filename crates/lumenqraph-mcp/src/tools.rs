@@ -2,7 +2,7 @@
 //! Postgres the API reads and the same read-layer encoder the API calls, so an
 //! agent gets typed, self-describing access to every indexed Soroban contract.
 
-use lumenqraph_core::{read, Contract, ContractSpec, EventRow, SpecDiff, TokenTransfer};
+use lumenqraph_core::{read, AmmSwap, Contract, ContractSpec, EventRow, LiquidityEvent, NftEvent, SpecDiff, TokenTransfer};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -134,6 +134,51 @@ pub fn definitions() -> Value {
                 },
                 "required": ["contract_id", "from", "to"], "additionalProperties": false
             }
+        },
+        {
+            "name": "query_swaps",
+            "description": "Query materialized AMM swap events for a contract, newest first. Each record includes sender, sell/buy token addresses, and sell/buy amounts. Optionally filter by sender, sell token, or buy token.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "contract_id": { "type": "string", "description": "Contract id (C...)" },
+                    "sender": { "type": "string", "description": "Optional sender address filter" },
+                    "sell_token": { "type": "string", "description": "Optional sell token address filter" },
+                    "buy_token": { "type": "string", "description": "Optional buy token address filter" },
+                    "limit": { "type": "integer", "description": "Max swaps (1-200, default 20)" }
+                },
+                "required": ["contract_id"], "additionalProperties": false
+            }
+        },
+        {
+            "name": "query_nft_events",
+            "description": "Query materialized NFT events (mint/transfer/burn) for a contract, newest first. Optionally filter by event kind, from/to address, or token id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "contract_id": { "type": "string", "description": "Contract id (C...)" },
+                    "kind": { "type": "string", "description": "Optional kind filter: mint | transfer | burn" },
+                    "from": { "type": "string", "description": "Optional sender address filter" },
+                    "to": { "type": "string", "description": "Optional recipient address filter" },
+                    "token_id": { "type": "string", "description": "Optional token id filter" },
+                    "limit": { "type": "integer", "description": "Max events (1-200, default 20)" }
+                },
+                "required": ["contract_id"], "additionalProperties": false
+            }
+        },
+        {
+            "name": "query_liquidity_events",
+            "description": "Query materialized liquidity events (add/remove) for a contract, newest first. Optionally filter by event kind or provider address.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "contract_id": { "type": "string", "description": "Contract id (C...)" },
+                    "kind": { "type": "string", "description": "Optional kind filter: add | remove" },
+                    "provider": { "type": "string", "description": "Optional liquidity provider address filter" },
+                    "limit": { "type": "integer", "description": "Max events (1-200, default 20)" }
+                },
+                "required": ["contract_id"], "additionalProperties": false
+            }
         }
     ])
 }
@@ -216,6 +261,39 @@ pub async fn call(state: &State, name: &str, args: &Value) -> anyhow::Result<Val
                 str_arg(args, "contract_id")?,
                 args.get("from").and_then(Value::as_i64),
                 args.get("to").and_then(Value::as_i64),
+            )
+            .await
+        }
+        "query_swaps" => {
+            query_swaps(
+                state,
+                str_arg(args, "contract_id")?,
+                args.get("sender").and_then(Value::as_str),
+                args.get("sell_token").and_then(Value::as_str),
+                args.get("buy_token").and_then(Value::as_str),
+                args.get("limit").and_then(Value::as_i64),
+            )
+            .await
+        }
+        "query_nft_events" => {
+            query_nft_events(
+                state,
+                str_arg(args, "contract_id")?,
+                args.get("kind").and_then(Value::as_str),
+                args.get("from").and_then(Value::as_str),
+                args.get("to").and_then(Value::as_str),
+                args.get("token_id").and_then(Value::as_str),
+                args.get("limit").and_then(Value::as_i64),
+            )
+            .await
+        }
+        "query_liquidity_events" => {
+            query_liquidity_events(
+                state,
+                str_arg(args, "contract_id")?,
+                args.get("kind").and_then(Value::as_str),
+                args.get("provider").and_then(Value::as_str),
+                args.get("limit").and_then(Value::as_i64),
             )
             .await
         }
@@ -457,6 +535,121 @@ async fn query_transfers(
         "contract_id": contract_id,
         "count": transfers.len(),
         "transfers": transfers,
+    }))
+}
+
+async fn query_swaps(
+    state: &State,
+    contract_id: &str,
+    sender: Option<&str>,
+    sell_token: Option<&str>,
+    buy_token: Option<&str>,
+    limit: Option<i64>,
+) -> anyhow::Result<Value> {
+    validate_contract_id(contract_id)?;
+    let limit = limit.unwrap_or(20).clamp(1, 200);
+    let swaps: Vec<lumenqraph_core::AmmSwap> = sqlx::query_as(
+        "SELECT event_id, contract_id, sender, sell_token, buy_token,
+                sell_amount, buy_amount, raw_event_name, ledger, ledger_closed_at
+         FROM amm_swaps
+         WHERE contract_id = $1
+           AND ($2::text IS NULL OR sender = $2)
+           AND ($3::text IS NULL OR sell_token = $3)
+           AND ($4::text IS NULL OR buy_token = $4)
+         ORDER BY ledger DESC, event_id DESC
+         LIMIT $5",
+    )
+    .bind(contract_id)
+    .bind(sender)
+    .bind(sell_token)
+    .bind(buy_token)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(json!({
+        "contract_id": contract_id,
+        "count": swaps.len(),
+        "swaps": swaps,
+    }))
+}
+
+async fn query_nft_events(
+    state: &State,
+    contract_id: &str,
+    kind: Option<&str>,
+    from: Option<&str>,
+    to: Option<&str>,
+    token_id: Option<&str>,
+    limit: Option<i64>,
+) -> anyhow::Result<Value> {
+    validate_contract_id(contract_id)?;
+    if let Some(k) = kind {
+        if !matches!(k, "mint" | "transfer" | "burn") {
+            anyhow::bail!("kind must be one of: mint, transfer, burn");
+        }
+    }
+    let limit = limit.unwrap_or(20).clamp(1, 200);
+    let events: Vec<lumenqraph_core::NftEvent> = sqlx::query_as(
+        "SELECT event_id, contract_id, event_kind, from_addr, to_addr,
+                token_id, ledger, ledger_closed_at
+         FROM nft_events
+         WHERE contract_id = $1
+           AND ($2::text IS NULL OR event_kind = $2)
+           AND ($3::text IS NULL OR from_addr = $3)
+           AND ($4::text IS NULL OR to_addr = $4)
+           AND ($5::text IS NULL OR token_id = $5)
+         ORDER BY ledger DESC, event_id DESC
+         LIMIT $6",
+    )
+    .bind(contract_id)
+    .bind(kind)
+    .bind(from)
+    .bind(to)
+    .bind(token_id)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(json!({
+        "contract_id": contract_id,
+        "count": events.len(),
+        "nft_events": events,
+    }))
+}
+
+async fn query_liquidity_events(
+    state: &State,
+    contract_id: &str,
+    kind: Option<&str>,
+    provider: Option<&str>,
+    limit: Option<i64>,
+) -> anyhow::Result<Value> {
+    validate_contract_id(contract_id)?;
+    if let Some(k) = kind {
+        if !matches!(k, "add" | "remove") {
+            anyhow::bail!("kind must be one of: add, remove");
+        }
+    }
+    let limit = limit.unwrap_or(20).clamp(1, 200);
+    let events: Vec<lumenqraph_core::LiquidityEvent> = sqlx::query_as(
+        "SELECT event_id, contract_id, event_kind, provider, amount_a, amount_b,
+                shares, raw_event_name, extra_amounts, ledger, ledger_closed_at
+         FROM liquidity_events
+         WHERE contract_id = $1
+           AND ($2::text IS NULL OR event_kind = $2)
+           AND ($3::text IS NULL OR provider = $3)
+         ORDER BY ledger DESC, event_id DESC
+         LIMIT $4",
+    )
+    .bind(contract_id)
+    .bind(kind)
+    .bind(provider)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(json!({
+        "contract_id": contract_id,
+        "count": events.len(),
+        "liquidity_events": events,
     }))
 }
 

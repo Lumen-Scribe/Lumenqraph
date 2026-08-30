@@ -118,15 +118,17 @@ pub async fn list_nft_events(
         (false, events)
     };
 
+    let next_cursor = if has_next_page {
+        result_events
+            .last()
+            .map(|n| pagination::encode_cursor(n.ledger, &n.event_id))
+    } else {
+        None
+    };
+
     Ok(Json(NftsResponse {
         data: result_events,
         has_more: has_next_page,
-        next_cursor: if has_next_page {
-            result_events
-                .last()
-                .map(|n| pagination::encode_cursor(n.ledger, &n.event_id))
-        } else {
-            None
-        },
+        next_cursor,
     }))
 }

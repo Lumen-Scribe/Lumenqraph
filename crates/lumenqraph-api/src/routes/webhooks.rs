@@ -294,9 +294,24 @@ type DeliveryRow = (
     chrono::DateTime<chrono::Utc>,         // created_at
 );
 
+#[derive(Deserialize)]
+pub struct DeliveriesQuery {
+    /// Maximum number of deliveries to return (default 50, max 500).
+    #[serde(default = "default_deliveries_limit")]
+    limit: i64,
+    /// Number of rows to skip for offset pagination (default 0).
+    #[serde(default)]
+    offset: i64,
+}
+
+fn default_deliveries_limit() -> i64 {
+    50
+}
+
 pub async fn list_webhook_deliveries(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(q): Query<DeliveriesQuery>,
 ) -> ApiResult<Json<Value>> {
     // Verify subscription exists
     let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id = $1)")
@@ -308,15 +323,28 @@ pub async fn list_webhook_deliveries(
         return Err(ApiError::not_found("subscription not found"));
     }
 
-    // Fetch recent deliveries with pagination (default limit 50, max 500)
+    let limit = q.limit.clamp(1, 500);
+    let offset = q.offset.max(0);
+
+    // Fetch total count first for pagination metadata.
+    let total_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM webhook_deliveries WHERE subscription_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&state.pool)
+    .await?;
+
+    // Fetch the requested page of deliveries.
     let deliveries: Vec<DeliveryRow> = sqlx::query_as(
         "SELECT id, status, attempts, last_error, delivered_at, created_at
          FROM webhook_deliveries
          WHERE subscription_id = $1
          ORDER BY created_at DESC
-         LIMIT 50",
+         LIMIT $2 OFFSET $3",
     )
     .bind(id)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(&state.pool)
     .await?;
 
@@ -332,6 +360,8 @@ pub async fn list_webhook_deliveries(
     .bind(id)
     .fetch_one(&state.pool)
     .await?;
+
+    let has_more = offset + limit < total_count;
 
     let delivery_list = deliveries
         .into_iter()
@@ -349,6 +379,10 @@ pub async fn list_webhook_deliveries(
 
     Ok(Json(json!({
         "deliveries": delivery_list,
+        "total_count": total_count,
+        "limit": limit,
+        "offset": offset,
+        "has_more": has_more,
         "summary": {
             "delivered": counts.0,
             "failed": counts.1,

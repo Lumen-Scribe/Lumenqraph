@@ -181,7 +181,7 @@ All configuration is via environment variables (see [`.env.example`](.env.exampl
 | --- | --- | --- |
 | `DATABASE_URL` | `postgres://lumenqraph:lumenqraph@localhost:5432/lumenqraph` | Postgres connection string. |
 | `RPC_URL` | `https://soroban-testnet.stellar.org` | Soroban RPC endpoint. Used by the indexer (polling) and the API (read-layer simulation). |
-| `CONTRACT_IDS` | *(empty)* | Comma-separated contract IDs to index. Empty = **all** contract events. |
+| `CONTRACT_IDS` | *(empty)* | Comma-separated contract IDs to index. Empty = **all** contract events. The Soroban RPC `getEvents` method supports at most **25 contract IDs** (5 filters × 5 IDs per filter); providing more causes the indexer to exit at startup with an actionable error. To index more than 25 contracts, run multiple indexer instances each covering a different subset. |
 | `POLL_INTERVAL_SECS` | `5` | How often the indexer polls for new events. |
 | `PAGE_SIZE` | `1000` | Events requested per `getEvents` page (1–10000). |
 | `START_LEDGER` | `0` | Ledger to start a fresh index from. `0` = near the tip. Clamped to RPC retention. |
@@ -232,6 +232,9 @@ Base URL defaults to `http://localhost:8080`. Full reference: [docs/API.md](docs
 | `GET` | `/events/:event_id` | Fetch a single event by its unique id. `404` if not found. |
 | `GET` | `/transactions/:tx_hash/events` | All indexed events emitted by a transaction, in emission order. Query: `limit`. |
 | `GET` | `/contracts/:id/transfers` | Materialized token transfers. Query: `limit`, `offset`, `from`, `to`. |
+| `GET` | `/contracts/:id/swaps` | Materialized AMM swap events. Query: `limit`, `offset`, `after`, `sender`, `sell_token`, `buy_token`. |
+| `GET` | `/contracts/:id/nfts` | Materialized NFT events (mint/transfer/burn). Query: `limit`, `offset`, `after`, `kind`, `from`, `to`, `token_id`. |
+| `GET` | `/contracts/:id/liquidity` | Materialized liquidity events (add/remove). Query: `limit`, `offset`, `after`, `kind`, `provider`. |
 | `POST`/`GET` | `/graphql` | GraphQL endpoint (POST queries; GET serves the GraphiQL IDE). See [GraphQL](#graphql). |
 | `POST` | `/webhooks` | Create a subscription. |
 | `GET` | `/webhooks` | List subscriptions (secrets omitted). |
