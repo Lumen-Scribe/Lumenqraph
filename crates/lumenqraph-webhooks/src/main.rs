@@ -66,14 +66,15 @@ async fn main() -> anyhow::Result<()> {
         .with(fmt::layer())
         .init();
 
-    // Validate webhook encryption key is set for production security
-    if std::env::var("WEBHOOK_ENCRYPTION_KEY").is_err() {
-        anyhow::bail!(
-            "WEBHOOK_ENCRYPTION_KEY must be set (generate with: openssl rand -hex 32). \
-             The default test key provides no security and must not be used in production."
-        );
-    }
+    // Validate CONTRACT_IDS at startup so a misconfigured address is caught
+    // immediately rather than silently ignored.
+    lumenqraph_core::parse_contract_ids(
+        &std::env::var("CONTRACT_IDS").unwrap_or_default(),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    // Config::from_env() validates and reads WEBHOOK_ENCRYPTION_KEY, failing
+    // fast if it is absent or empty — no separate check needed here.
     let config = Config::from_env()?;
     let max_connect_retries = env_parse_u32("DATABASE_CONNECT_RETRIES", 30);
     let pool = connect_with_retry(&config.database_url, max_connect_retries).await?;

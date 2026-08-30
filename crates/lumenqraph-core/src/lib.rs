@@ -36,3 +36,4 @@ pub use models::{
 };
 pub use spec::ContractSpec;
 pub use xdr::is_valid_contract_id;
+pub use xdr::parse_contract_ids;

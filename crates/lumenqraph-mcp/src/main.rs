@@ -23,7 +23,7 @@ use anyhow::Context;
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -55,6 +55,13 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(30);
 
+    // Validate CONTRACT_IDS at startup so a misconfigured address is caught
+    // immediately rather than silently ignored.
+    lumenqraph_core::parse_contract_ids(
+        &std::env::var("CONTRACT_IDS").unwrap_or_default(),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&database_url)
@@ -71,8 +78,18 @@ async fn main() -> anyhow::Result<()> {
 
 /// The stdio JSON-RPC loop: read a message per line, dispatch, write responses.
 async fn serve(state: State) -> anyhow::Result<()> {
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
+    serve_io(state, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+/// Protocol loop over any `AsyncRead` / `AsyncWrite` pair (stdin/stdout in
+/// production, in-memory duplex streams in tests).
+pub(crate) async fn serve_io<R, W>(state: State, reader: R, writer: W) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut lines = BufReader::new(reader).lines();
+    let mut out = writer;
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
@@ -81,21 +98,25 @@ async fn serve(state: State) -> anyhow::Result<()> {
             Ok(v) => v,
             Err(e) => {
                 let err = error_response(Value::Null, -32700, &format!("parse error: {e}"));
-                write(&mut stdout, &err).await?;
+                write_to(&mut out, &err).await?;
                 continue;
             }
         };
         if let Some(response) = handle(&state, msg).await {
-            write(&mut stdout, &response).await?;
+            write_to(&mut out, &response).await?;
         }
     }
     Ok(())
 }
 
-async fn write(stdout: &mut tokio::io::Stdout, value: &Value) -> anyhow::Result<()> {
-    stdout.write_all(value.to_string().as_bytes()).await?;
-    stdout.write_all(b"\n").await?;
-    stdout.flush().await?;
+async fn write_to<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    value: &Value,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    writer.write_all(value.to_string().as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
     Ok(())
 }
 
@@ -516,5 +537,239 @@ mod tests {
             err.to_string().contains("CNOPE"),
             "error should mention the contract id: {err}"
         );
+    }
+}
+
+/// Integration tests for the JSON-RPC protocol layer (`serve_io`).
+///
+/// These tests drive the MCP server through the full stdio round-trip using an
+/// in-process `tokio::io::duplex` stream pair, covering:
+///  - The initialize → tools/list → tools/call handshake
+///  - Malformed JSON input (parse error -32700)
+///  - Unknown method (method-not-found error -32601)
+///  - Notifications (no response expected)
+///  - Missing required tool argument (isError result)
+///
+/// No real database or RPC server is required; the pool is created with
+/// `connect_lazy` so no network calls are made before the tests exercise
+/// validation paths.
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    /// Build a `State` that does not need a live database.
+    fn lazy_state() -> State {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://test:test@localhost/test")
+            .expect("connect_lazy");
+        State {
+            pool,
+            rpc: RpcClient::new("http://127.0.0.1:0", 30),
+        }
+    }
+
+    /// Feed `input` (newline-delimited JSON-RPC messages) through `serve_io`
+    /// and return all response lines as parsed `serde_json::Value`s.
+    ///
+    /// Uses a simplex stream: we write all input into one half of a duplex,
+    /// close the write end (signalling EOF), run serve_io against it, then
+    /// collect all output from the output half of a second duplex.
+    async fn run_rpc(input: &str) -> Vec<Value> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let state = lazy_state();
+
+        // Build the input side: a DuplexStream where we write the test messages
+        // then drop the write half to signal EOF.
+        let (mut write_half, read_half) = tokio::io::duplex(64 * 1024);
+        write_half.write_all(input.as_bytes()).await.expect("write input");
+        drop(write_half); // EOF for the server reader
+
+        // The output side: a DuplexStream where the server writes responses.
+        let (out_write_half, mut out_read_half) = tokio::io::duplex(64 * 1024);
+
+        // Run serve_io to completion; it will exit when the reader hits EOF.
+        serve_io(state, read_half, out_write_half)
+            .await
+            .expect("serve_io should not fail");
+
+        // Read all bytes written by serve_io.
+        let mut buf = Vec::new();
+        out_read_half.read_to_end(&mut buf).await.expect("read output");
+        let output = String::from_utf8(buf).expect("utf8 output");
+
+        output
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| {
+                panic!("server produced invalid JSON: {e}\nline: {l}")
+            }))
+            .collect()
+    }
+
+    // ── initialize handshake ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn initialize_round_trip() {
+        let msgs = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}
+"#;
+        let responses = run_rpc(msgs).await;
+        assert_eq!(responses.len(), 1, "exactly one response to initialize");
+        let r = &responses[0];
+        assert_eq!(r["id"], 1);
+        assert_eq!(r["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(r["result"]["serverInfo"]["name"], "lumenqraph-mcp");
+        assert!(r["result"]["capabilities"]["tools"].is_object());
+    }
+
+    // ── tools/list ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tools_list_round_trip() {
+        let msgs = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+"#;
+        let responses = run_rpc(msgs).await;
+        assert_eq!(responses.len(), 1);
+        let r = &responses[0];
+        assert_eq!(r["id"], 2);
+        let tools = r["result"]["tools"].as_array().expect("tools array");
+        assert!(!tools.is_empty(), "at least one tool must be declared");
+        for tool in tools {
+            assert!(!tool["name"].as_str().unwrap_or("").is_empty());
+            assert_eq!(tool["inputSchema"]["type"], "object");
+        }
+    }
+
+    // ── full initialize → tools/list → tools/call round-trip ─────────────
+
+    #[tokio::test]
+    async fn full_handshake_round_trip() {
+        // Three messages: initialize, tools/list, and a tools/call that will
+        // fail with isError (no DB) but still produce a well-formed response.
+        let msgs = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_contracts","arguments":{}}}"#, "\n",
+        );
+        let responses = run_rpc(msgs).await;
+        assert_eq!(responses.len(), 3, "one response per request");
+
+        assert_eq!(responses[0]["id"], 1, "init id");
+        assert!(responses[0]["result"]["protocolVersion"].is_string());
+
+        assert_eq!(responses[1]["id"], 2, "tools/list id");
+        assert!(responses[1]["result"]["tools"].is_array());
+
+        assert_eq!(responses[2]["id"], 3, "tools/call id");
+        // Either a real result or an isError — both are valid without a DB.
+        let result = &responses[2]["result"];
+        assert!(result.is_object(), "tools/call always produces a result object");
+    }
+
+    // ── error cases ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn malformed_json_returns_parse_error() {
+        let msgs = "not valid json at all\n";
+        let responses = run_rpc(msgs).await;
+        assert_eq!(responses.len(), 1);
+        let r = &responses[0];
+        // id must be null/absent for a parse error (we can't know the request id).
+        assert_eq!(r["error"]["code"], -32700);
+        assert!(
+            r["error"]["message"].as_str().unwrap_or("").contains("parse error"),
+            "message should say parse error: {:?}", r["error"]["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_method_returns_method_not_found() {
+        let msgs = r#"{"jsonrpc":"2.0","id":9,"method":"no/such/method"}
+"#;
+        let responses = run_rpc(msgs).await;
+        assert_eq!(responses.len(), 1);
+        let r = &responses[0];
+        assert_eq!(r["id"], 9);
+        assert_eq!(r["error"]["code"], -32601);
+        assert!(
+            r["error"]["message"].as_str().unwrap_or("").contains("no/such/method"),
+            "error should mention the method: {:?}", r["error"]["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_produces_no_response() {
+        // Notifications have no `id`; the server must not reply.
+        let msgs = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}
+"#;
+        let responses = run_rpc(msgs).await;
+        assert_eq!(responses.len(), 0, "notifications must not produce a response");
+    }
+
+    #[tokio::test]
+    async fn empty_lines_are_ignored() {
+        let msgs = "\n\n   \n";
+        let responses = run_rpc(msgs).await;
+        assert_eq!(responses.len(), 0, "blank lines produce no output");
+    }
+
+    #[tokio::test]
+    async fn ping_returns_empty_result() {
+        let msgs = r#"{"jsonrpc":"2.0","id":42,"method":"ping"}
+"#;
+        let responses = run_rpc(msgs).await;
+        assert_eq!(responses.len(), 1);
+        let r = &responses[0];
+        assert_eq!(r["id"], 42);
+        assert!(r["result"].is_object());
+        assert!(r.get("error").is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_required_arg_returns_is_error() {
+        // get_contract_interface requires contract_id; omitting it must produce
+        // isError: true (MCP convention — tool errors are results, not protocol errors).
+        let msgs = r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"get_contract_interface","arguments":{}}}
+"#;
+        let responses = run_rpc(msgs).await;
+        assert_eq!(responses.len(), 1);
+        let r = &responses[0];
+        assert_eq!(r["id"], 5);
+        let result = &r["result"];
+        assert_eq!(result["isError"], true, "missing arg must set isError");
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("contract_id"),
+            "error text should mention 'contract_id': {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_name_returns_is_error_via_protocol() {
+        let msgs = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"does_not_exist","arguments":{}}}
+"#;
+        let responses = run_rpc(msgs).await;
+        assert_eq!(responses.len(), 1);
+        let r = &responses[0];
+        assert_eq!(r["id"], 7);
+        assert_eq!(r["result"]["isError"], true);
+        let text = r["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("does_not_exist"),
+            "error should mention the unknown tool: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_messages_get_independent_responses() {
+        // Two well-formed requests: both must produce a response, in order.
+        let msgs = concat!(
+            r#"{"jsonrpc":"2.0","id":10,"method":"ping"}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":11,"method":"ping"}"#, "\n",
+        );
+        let responses = run_rpc(msgs).await;
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["id"], 10);
+        assert_eq!(responses[1]["id"], 11);
     }
 }

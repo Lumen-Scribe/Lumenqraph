@@ -183,14 +183,13 @@ async fn main() -> anyhow::Result<()> {
 
     let database_url = std::env::var("DATABASE_URL").context("missing DATABASE_URL")?;
     
-    // Validate webhook encryption key is set for production security
-    if std::env::var("WEBHOOK_ENCRYPTION_KEY").is_err() {
-        anyhow::bail!(
-            "WEBHOOK_ENCRYPTION_KEY must be set (generate with: openssl rand -hex 32). \
-             The default test key provides no security and must not be used in production."
-        );
-    }
-    
+    // Validate CONTRACT_IDS at startup so a misconfigured address is caught
+    // immediately rather than silently ignored or causing runtime errors.
+    lumenqraph_core::parse_contract_ids(
+        &std::env::var("CONTRACT_IDS").unwrap_or_default(),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
     let bind_addr = std::env::var("API_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let rpc_url = std::env::var("RPC_URL")
         .unwrap_or_else(|_| "https://soroban-testnet.stellar.org".to_string());

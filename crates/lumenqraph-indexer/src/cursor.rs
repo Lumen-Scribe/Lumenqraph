@@ -111,3 +111,20 @@ pub async fn track_rpc_call(
     .await?;
     Ok(())
 }
+
+/// Set the current consecutive-error count for the circuit-breaker Prometheus
+/// gauge (`lumenqraph_consecutive_errors`). Called on every failure increment
+/// and reset to 0 on the first successful cycle after a run of failures.
+pub async fn set_consecutive_errors(pool: &PgPool, count: u32) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO indexer_cursor (id, last_processed_ledger, consecutive_errors, updated_at)
+         VALUES (1, 0, $1, now())
+         ON CONFLICT (id) DO UPDATE SET
+            consecutive_errors = $1,
+            updated_at         = now()",
+    )
+    .bind(count as i64)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
