@@ -5,7 +5,22 @@ use serde::Deserialize;
 
 use crate::keys::{parse_durability, KeyTemplate};
 
-#[derive(Debug, Clone)]
+pub fn redact_database_url(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let after_scheme = &url[scheme_end + 3..];
+        if let Some(at_idx) = after_scheme.find('@') {
+            let user_pass = &after_scheme[..at_idx];
+            if let Some(colon_idx) = user_pass.find(':') {
+                let user = &user_pass[..colon_idx];
+                let rest = &after_scheme[at_idx..];
+                return format!("{}://{}:[REDACTED]{}", &url[..scheme_end], user, rest);
+            }
+        }
+    }
+    url.to_string()
+}
+
+#[derive(Clone)]
 pub struct Config {
     pub database_url: String,
     pub rpc_url: String,
@@ -13,80 +28,46 @@ pub struct Config {
     pub contract_ids: Vec<String>,
     pub poll_interval_secs: u64,
     pub page_size: u32,
-    /// Ledger to start from on a fresh index. 0 => start near the current tip.
-    /// Clamped to the RPC retention window (~7 days, 120k ledgers for SDF public RPC).
     pub start_ledger: i64,
-    /// Max ledgers behind the tip we'll fetch in a single live polling cycle.
-    /// This is a conservative safety limit, NOT the RPC retention window.
-    /// The RPC retention window is ~7 days (120k ledgers on SDF public RPC),
-    /// but we catch up more conservatively in live polling to avoid performance
-    /// issues or RPC processing limits. Public Soroban RPCs reject `getEvents`
-    /// whose `startLedger` is too far behind (`-32001` "processing limit").
-    /// If the cursor falls further behind (e.g. after downtime) we skip ahead to
-    /// this window and log the unrecoverable gap rather than stalling forever.
-    /// Raise it with a retaining/paid RPC. Default 4000 (~5–6h) is conservative
-    /// for the SDF public endpoints.
     pub max_catchup_ledgers: i64,
-    /// When true, snapshot each active contract's instance storage into
-    /// `contract_state` (versioned). Off by default — it costs one extra RPC
-    /// call per active contract per cycle. Best paired with `CONTRACT_IDS`.
     pub state_indexing: bool,
-    /// When true, snapshot *per-holder* balances into `contract_data`: for each
-    /// holder named in a token's events this cycle, fetch its `Balance(Address)`
-    /// entry. Off by default — it costs one RPC call per newly-active holder per
-    /// cycle, so it should be paired with `CONTRACT_IDS`.
     pub key_indexing: bool,
-    /// The symbol naming the balance storage-key variant (`DataKey::Balance` in
-    /// the soroban token reference). Configurable for tokens that differ.
     pub balance_key_symbol: String,
-    /// Durability of the balance storage entry: "persistent" (default) or
-    /// "temporary".
     pub balance_key_durability: String,
-    /// Configurable key templates for per-key state indexing (JSON array).
-    /// Format: [{"symbol":"Balance","events":["transfer","mint"],"params":[1,2],"durability":"persistent","label":"balance"}]
-    /// Each template defines: symbol (storage key variant), events (triggering event names),
-    /// params (topic indices to extract), durability (persistent/temporary), label (optional grouping tag).
     pub key_templates: Vec<KeyTemplate>,
-    /// Keep only the last N ledgers of history, pruning older rows as the tip
-    /// advances. 0 (default) => keep everything. Set this when the database has
-    /// a hard size cap (e.g. a 500MB free tier) that an unbounded index would
-    /// hit; see `retention`.
     pub retention_ledgers: i64,
-    /// Keep only the last N versions of each contract's spec in `contract_spec_versions`,
-    /// pruning older versions once they fall outside the retention window. 0 (default)
-    /// => keep everything. Newest N versions per contract are always preserved even if
-    /// outside the window. When `RETENTION_LEDGERS` is set, specs outside the window
-    /// are pruned unless they're among the newest N for their contract.
     pub spec_version_retention: i64,
-    /// When true, check whether a tracked contract's executable has changed and,
-    /// if so, re-read its interface and append a `contract_spec_versions` row
-    /// with the diff (see `specs`). Costs one RPC call per tracked contract per
-    /// cycle, so it defaults to on only when `CONTRACT_IDS` bounds that set;
-    /// in index-all mode it must be enabled explicitly, and then only covers
-    /// contracts active in the cycle. `STATE_INDEXING` already reads each
-    /// instance and detects upgrades for free, so this adds no calls alongside it.
     pub upgrade_watch: bool,
-    /// Number of ledgers to re-scan each cycle to handle shallow reorgs where
-    /// the RPC returns different events for recently-passed ledgers. Each cycle,
-    /// we re-fetch the last N ledgers and upsert events with updated content.
-    /// 0 (default) means no trailing re-scan. Small values (10-100) provide shallow
-    /// reorg protection with minimal overhead. Requires careful tuning based on
-    /// the RPC's reorg exposure.
     pub reorg_overlap_ledgers: i64,
-    /// Request timeout for every outbound RPC HTTP call, in seconds.
-    /// Without a timeout, a hung RPC connection blocks the poll loop
-    /// indefinitely. Default 30 matches the previous hardcoded value.
-    /// Raise for slow/paid endpoints; lower for tight liveness requirements.
     pub rpc_timeout_secs: u64,
-    /// Warn if the not-enriched fraction (not_enriched / total) exceeds this
-    /// threshold in a single cycle. 0.5 = warn if >50% of events fail enrichment.
-    /// 0.0 = never warn; 1.0+ = warn only if 100%+ fail (never). Default 0.5.
     pub enrichment_warn_threshold: f64,
-    /// Maximum number of entries in the in-memory spec cache before evicting
-    /// least-recently-used entries. Prevents unbounded memory growth when
-    /// indexing all contracts. Evicted entries are re-fetched from the database
-    /// on next miss. Default: 2000.
     pub spec_cache_max_entries: usize,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("database_url", &redact_database_url(&self.database_url))
+            .field("rpc_url", &self.rpc_url)
+            .field("contract_ids", &self.contract_ids)
+            .field("poll_interval_secs", &self.poll_interval_secs)
+            .field("page_size", &self.page_size)
+            .field("start_ledger", &self.start_ledger)
+            .field("max_catchup_ledgers", &self.max_catchup_ledgers)
+            .field("state_indexing", &self.state_indexing)
+            .field("key_indexing", &self.key_indexing)
+            .field("balance_key_symbol", &self.balance_key_symbol)
+            .field("balance_key_durability", &self.balance_key_durability)
+            .field("key_templates", &self.key_templates)
+            .field("retention_ledgers", &self.retention_ledgers)
+            .field("spec_version_retention", &self.spec_version_retention)
+            .field("upgrade_watch", &self.upgrade_watch)
+            .field("reorg_overlap_ledgers", &self.reorg_overlap_ledgers)
+            .field("rpc_timeout_secs", &self.rpc_timeout_secs)
+            .field("enrichment_warn_threshold", &self.enrichment_warn_threshold)
+            .field("spec_cache_max_entries", &self.spec_cache_max_entries)
+            .finish()
+    }
 }
 
 impl Config {
