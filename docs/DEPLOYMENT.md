@@ -273,6 +273,23 @@ The indexer's position relative to the chain tip is exported as two metrics:
 - `lumenqraph_rpc_errors_32001_total` — RPC quota-limit hits (indicates sustained
   load pressure; may need higher RPC plan or longer `POLL_INTERVAL_SECS`).
 
+### Webhook metrics
+
+The webhook service exposes its own `/metrics` endpoint (default
+`127.0.0.1:9091`, set by `WEBHOOKS_METRICS_BIND_ADDR`):
+
+- `lumenqraph_webhooks_pending_deliveries` (gauge) — deliveries in the `pending`
+  state, refreshed once per dispatcher tick. This is the queue-depth signal: a
+  sustained climb means the dispatcher is falling behind, almost always because
+  a subscriber endpoint is slow, failing, or unreachable and its retries are
+  starving the queue. Alert when it stays above ~500 for 5 minutes (warning) and
+  ~5000 for 5 minutes (critical).
+- `lumenqraph_webhook_oldest_pending_age_seconds` (gauge) — age of the oldest
+  pending delivery; pairs with the backlog gauge to tell a transient spike from
+  a genuine stall.
+- `lumenqraph_webhook_delivered_total` / `lumenqraph_webhook_failed_total`
+  (counters) — lifetime delivery outcomes.
+
 ### Monitoring Setup
 
 Ship-ready Prometheus alert rules and Grafana dashboards are included in the
@@ -322,6 +339,7 @@ Ship-ready Prometheus alert rules and Grafana dashboards are included in the
 | `lumenqraph_indexer_errors_total` | Counter | Total poll-cycle errors |
 | `lumenqraph_api_requests_total` | Counter | Total API requests served |
 | `lumenqraph_events_total` | Gauge | Total events in database |
+| `lumenqraph_webhooks_pending_deliveries` | Gauge | Webhook deliveries pending (queue depth), refreshed each dispatcher tick |
 
 #### Alert Rules
 
@@ -334,6 +352,8 @@ Ship-ready Prometheus alert rules and Grafana dashboards are included in the
 | LargeLagGrowth | lag growth > 1000 ledgers/hour | 5 min | warning |
 | IngestRateLow | < 1 event/sec | 10 min | warning |
 | APINoRequests | No requests | 5 min | warning |
+| WebhookBacklogHigh | pending deliveries > 500 | 5 min | warning |
+| WebhookBacklogCritical | pending deliveries > 5000 | 5 min | critical |
 
 Tune thresholds in `monitoring/prometheus_alerts.yml` to fit your SLA.
 
@@ -348,3 +368,104 @@ unrecoverable gap** rather than stalling forever on an impossible range. Deep
 or gapless historical backfill requires a retaining/paid RPC or a
 Galexie/captive-core data-lake source (not yet implemented); with one, raise
 `MAX_CATCHUP_LEDGERS`.
+
+## Disaster Recovery
+
+Lumenqraph's database is a **derived index**: every event in it originally came
+from the chain. That makes recovery from a total database loss possible in
+principle — but only the on-chain data is reconstructible. Anything Lumenqraph
+stores that is *not* on-chain (API keys, webhook subscriptions, the webhook
+delivery queue and its watermarks) is gone unless it was in a backup.
+
+**Take Postgres backups anyway.** Rebuilding from the chain is slow, bounded by
+RPC retention (below), and loses the non-derived tables. A nightly `pg_dump` (or
+your managed provider's PITR) turns a multi-hour rebuild into a minutes-long
+restore. This is the recommended primary recovery path.
+
+### Option A — restore from a Postgres backup (preferred)
+
+1. Stop all three services (or scale them to zero) so nothing writes during the
+   restore.
+2. Restore the dump into a fresh database:
+   ```bash
+   pg_restore --clean --if-exists -d "$DATABASE_URL" backup.dump
+   # or, for a plain SQL dump:
+   psql "$DATABASE_URL" < backup.sql
+   ```
+3. Start the **indexer** first. It applies any pending migrations, reads
+   `indexer_cursor.last_processed_ledger`, and catches up from there. If the
+   backup is older than `MAX_CATCHUP_LEDGERS` ledgers, the indexer skips the gap
+   and logs it (see [Limits](#limits)) — run a [`backfill`](#option-b--rebuild-the-index-from-scratch-no-backup)
+   for that window if you need it gapless.
+4. Start the API and webhooks. Webhook subscriptions, `starting_seq` values, and
+   `webhook_state` watermarks are all in the dump, so delivery resumes where it
+   left off — subscribers may see a burst of deliveries for events indexed
+   between the backup and now, which is expected (delivery is idempotent per
+   `(subscription, event)` only within a single database lineage; see the note
+   in Option B).
+
+### Option B — rebuild the index from scratch (no backup)
+
+1. Create an empty database and set `DATABASE_URL`.
+2. Decide how far back you need history:
+   - **Last ~7 days only:** start the indexer with `START_LEDGER=0` (the
+     default). It applies migrations on startup and begins indexing from the
+     start of the RPC retention window (~120k ledgers / ~7 days on SDF public
+     RPC). This is the whole of a from-scratch rebuild for most deployments.
+   - **A specific recent ledger:** set `START_LEDGER=<ledger>` (first run only;
+     ignored once `indexer_cursor` exists) and optionally run a one-shot
+     `lumenqraph-indexer backfill <ledger>` to fill the window up to the tip
+     before the live poller takes over.
+   - **Older than the retention window:** the public RPC cannot serve it. You
+     need a retaining/paid RPC, or a Galexie / captive-core data-lake export fed
+     through `lumenqraph-indexer deep-backfill` (see
+     [docs/DEEP_BACKFILL.md](DEEP_BACKFILL.md)). Without one of those, events
+     older than ~7 days before the rebuild are **permanently lost**.
+3. Let the indexer run until lag is near zero (`lumenqraph_indexer_lag_seconds`).
+4. Re-create the non-derived tables — see the next two sections.
+
+> **Idempotency caveat.** `ON CONFLICT (event_id) DO NOTHING` de-dupes writes
+> *within one database*. A rebuilt database is a new lineage: `events.seq`
+> restarts from 1, so `webhook_state` watermarks from an old backup do **not**
+> line up with it. Never mix an old `webhook_state` (or old `webhook_deliveries`)
+> with a freshly rebuilt `events` table.
+
+### What is permanently lost
+
+| Data | Recoverable? | Notes |
+|------|--------------|-------|
+| Events within the RPC retention window (~7 days) | Yes | Re-indexed automatically from `START_LEDGER=0`. |
+| Events older than the retention window | Only via a data-lake `deep-backfill` | Otherwise gone. |
+| Enrichment (`enriched` field) for contracts not yet seen post-rebuild | Rebuilds lazily | The poller re-fetches specs on next encounter; run it a cycle before a deep-backfill to warm the cache. |
+| `api_keys` | No | Re-issue keys; distribute the new values to clients. |
+| `webhook_subscriptions` | No | Re-register (below). |
+| `webhook_deliveries` queue + `webhook_state` watermarks | No | Recreated empty; delivery starts fresh from the current `events.seq`. |
+| `audit_log` | No | History only; no operational impact. |
+
+### Re-registering webhook subscriptions after a rebuild
+
+Subscriptions live only in Postgres, so after Option B you must re-insert them.
+Keep an out-of-band copy of your subscription list (URL, `kind`, filters,
+secret) precisely for this.
+
+```sql
+INSERT INTO webhook_subscriptions (url, kind, contract_id, event_name, secret)
+VALUES ('https://your-app.example.com/webhooks/lumenqraph', 'event', 'C...', NULL, 'your-secret');
+```
+
+Watermark behaviour on a rebuilt database:
+
+- A new subscription defaults to `starting_seq = 0`. Because `webhook_state`
+  also starts at 0, the dispatcher will enqueue a delivery for **every event
+  already indexed** at the moment the subscription becomes active — a large
+  backlog if the backfill has been running for a while.
+- To avoid that flood, either **register subscriptions before starting the
+  indexer**, or set `starting_seq` to the current max when you register:
+  ```sql
+  INSERT INTO webhook_subscriptions (url, kind, secret, starting_seq)
+  VALUES ('https://...', 'event', 'your-secret',
+          (SELECT COALESCE(max(seq), 0) FROM events));
+  ```
+- Subscribers must treat redelivered events as duplicates regardless — HMAC
+  signature verification plus idempotent handling on their side is the contract
+  (see [docs/WEBHOOKS.md](WEBHOOKS.md)).
