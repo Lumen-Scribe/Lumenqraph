@@ -287,3 +287,80 @@ async fn shutdown_signal() {
     }
     info!("shutdown signal received; stopping api");
 }
+
+#[cfg(test)]
+mod tests {
+    /// #219 — CONTRACT_IDS startup validation in lumenqraph-api.
+    ///
+    /// The API calls `lumenqraph_core::parse_contract_ids` at startup and
+    /// propagates the error, refusing to proceed. These tests exercise the same
+    /// validation logic directly, without needing a live Postgres or bind
+    /// address, to ensure the guard never silently regresses.
+    mod contract_ids_startup_validation {
+        #[test]
+        fn rejects_g_strkey_account_address() {
+            // A G… strkey is a Stellar account, not a Soroban contract.
+            let raw = "GAIH3ULLFQ4DGSECF2AR555KZ4KNDGEKN4AFI4SU2M7B43MGK3BEJD4";
+            let err = lumenqraph_core::parse_contract_ids(raw).unwrap_err();
+            assert!(
+                err.contains("invalid CONTRACT_ID"),
+                "error should mention invalid CONTRACT_ID: {err}"
+            );
+            assert!(
+                err.contains("GAIH3ULLFQ4DGSECF2AR555KZ4KNDGEKN4AFI4SU2M7B43MGK3BEJD4"),
+                "error should quote the bad id: {err}"
+            );
+        }
+
+        #[test]
+        fn rejects_garbage_string() {
+            let raw = "not-a-contract-id";
+            let err = lumenqraph_core::parse_contract_ids(raw).unwrap_err();
+            assert!(
+                err.contains("invalid CONTRACT_ID"),
+                "garbage string should be rejected: {err}"
+            );
+        }
+
+        #[test]
+        fn rejects_too_many_contract_ids() {
+            // getEvents supports at most 25 IDs; the parser enforces this.
+            // Build 26 syntactically valid-looking (but fake) C-strkey placeholders
+            // by using the same test id repeated — the count check fires before
+            // strkey validation so any 26 non-empty tokens trigger it.
+            // Use a real C-strkey so each individual ID passes strkey validation.
+            let single = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+            let raw = std::iter::repeat(single).take(26).collect::<Vec<_>>().join(",");
+            let err = lumenqraph_core::parse_contract_ids(&raw).unwrap_err();
+            assert!(
+                err.contains("26"),
+                "error should mention the count 26: {err}"
+            );
+        }
+
+        #[test]
+        fn accepts_empty_string() {
+            // Empty CONTRACT_IDS means "index all" — must not be an error.
+            let ids = lumenqraph_core::parse_contract_ids("").unwrap();
+            assert!(ids.is_empty(), "empty string should yield zero IDs");
+        }
+
+        #[test]
+        fn accepts_valid_c_strkey() {
+            let raw = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+            let ids = lumenqraph_core::parse_contract_ids(raw).unwrap();
+            assert_eq!(ids.len(), 1);
+            assert_eq!(ids[0], raw);
+        }
+
+        #[test]
+        fn mixed_valid_and_invalid_is_rejected() {
+            let raw = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC,GAIH3ULLFQ4DGSECF2AR555KZ4KNDGEKN4AFI4SU2M7B43MGK3BEJD4";
+            let err = lumenqraph_core::parse_contract_ids(raw).unwrap_err();
+            assert!(
+                err.contains("invalid CONTRACT_ID"),
+                "a G-strkey mixed with a valid C-strkey should be rejected: {err}"
+            );
+        }
+    }
+}
