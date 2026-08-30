@@ -26,6 +26,7 @@ use url::Url;
 
 use crate::config::Config;
 use futures::stream::{self, StreamExt};
+use lumenqraph_core::url_validation::validate_webhook_url_at_delivery;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -316,6 +317,12 @@ fn extract_host(url: &str) -> String {
 }
 
 async fn send(http: &reqwest::Client, d: &DueDelivery, config: &Config) -> anyhow::Result<()> {
+    // Re-validate URL at delivery time to prevent DNS rebinding attacks.
+    // This ensures the hostname still resolves to a public address even if the
+    // DNS record changed since registration.
+    validate_webhook_url_at_delivery(&d.url).await
+        .map_err(|e| anyhow::anyhow!("URL validation failed at delivery: {}", e))?;
+
     let body = serde_json::to_vec(&d.payload.0)?;
     let timestamp = Utc::now().to_rfc3339();
 

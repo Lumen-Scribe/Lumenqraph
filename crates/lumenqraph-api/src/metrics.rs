@@ -38,6 +38,11 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
     let lag_time_secs = lag * 5; // Approximate ~5 seconds per ledger
     let requests = state.http_requests.load(Ordering::Relaxed);
 
+    let cache_hits = state.call_cache.hits();
+    let cache_misses = state.call_cache.misses();
+    let cache_evictions = state.call_cache.evictions();
+    let cache_size = state.call_cache.size();
+
     let mut body = format!(
         "# HELP lumenqraph_indexer_last_processed_ledger Last ledger the indexer processed\n\
          # TYPE lumenqraph_indexer_last_processed_ledger gauge\n\
@@ -80,7 +85,19 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
          lumenqraph_rpc_errors_32001_total {rpc_errors_32001}\n\
          # HELP lumenqraph_api_requests_total API requests served\n\
          # TYPE lumenqraph_api_requests_total counter\n\
-         lumenqraph_api_requests_total {requests}\n",
+         lumenqraph_api_requests_total {requests}\n\
+         # HELP lumenqraph_call_cache_hits_total Total cache hits for /call results\n\
+         # TYPE lumenqraph_call_cache_hits_total counter\n\
+         lumenqraph_call_cache_hits_total {cache_hits}\n\
+         # HELP lumenqraph_call_cache_misses_total Total cache misses for /call results\n\
+         # TYPE lumenqraph_call_cache_misses_total counter\n\
+         lumenqraph_call_cache_misses_total {cache_misses}\n\
+         # HELP lumenqraph_call_cache_evictions_total Total entries evicted from /call cache\n\
+         # TYPE lumenqraph_call_cache_evictions_total counter\n\
+         lumenqraph_call_cache_evictions_total {cache_evictions}\n\
+         # HELP lumenqraph_call_cache_size Current number of entries in /call cache\n\
+         # TYPE lumenqraph_call_cache_size gauge\n\
+         lumenqraph_call_cache_size {cache_size}\n",
         last = last,
         tip = tip,
         lag = lag,
@@ -95,6 +112,10 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
         rpc_errors = rpc_errors,
         rpc_errors_32001 = rpc_errors_32001,
         requests = requests,
+        cache_hits = cache_hits,
+        cache_misses = cache_misses,
+        cache_evictions = cache_evictions,
+        cache_size = cache_size,
     );
 
     body.push_str("# HELP lumenqraph_http_request_duration_ms Per-route HTTP request latency\n");

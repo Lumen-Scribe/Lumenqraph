@@ -1,7 +1,9 @@
 //! The single-row indexer status (id = 1): ledger cursor plus health counters
-//! that `/health` and `/metrics` read back.
+//! that `/health` and `/metrics` read back. Uses optimistic locking (version column)
+//! to detect and reject concurrent writer instances.
 
 use sqlx::PgPool;
+use tracing::warn;
 
 /// Last fully-processed ledger, if the index has started.
 pub async fn read_last_processed(pool: &PgPool) -> anyhow::Result<Option<i64>> {
@@ -12,29 +14,56 @@ pub async fn read_last_processed(pool: &PgPool) -> anyhow::Result<Option<i64>> {
     Ok(row.map(|r| r.0))
 }
 
+/// Read the current version for optimistic locking.
+async fn read_version(pool: &PgPool) -> anyhow::Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COALESCE(version, 0) FROM indexer_cursor WHERE id = 1"
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
 /// Advance the cursor and record the observed chain tip + how many events were
-/// newly ingested this cycle.
+/// newly ingested this cycle. Uses optimistic locking to detect concurrent writers.
 pub async fn write_progress(
     pool: &PgPool,
     last_processed: i64,
     chain_tip: i64,
     ingested_delta: u64,
 ) -> anyhow::Result<()> {
-    sqlx::query(
-        "INSERT INTO indexer_cursor
-            (id, last_processed_ledger, chain_tip_ledger, events_ingested_total, updated_at)
-         VALUES (1, $1, $2, $3, now())
-         ON CONFLICT (id) DO UPDATE SET
-            last_processed_ledger = EXCLUDED.last_processed_ledger,
-            chain_tip_ledger      = EXCLUDED.chain_tip_ledger,
-            events_ingested_total = indexer_cursor.events_ingested_total + $3,
-            updated_at            = now()",
+    // Read current version for optimistic locking
+    let current_version = read_version(pool).await?;
+
+    // Attempt update with version check; increment version on success
+    let rows_affected = sqlx::query(
+        "UPDATE indexer_cursor
+         SET last_processed_ledger = $1,
+             chain_tip_ledger      = $2,
+             events_ingested_total = events_ingested_total + $3,
+             version               = $4,
+             updated_at            = now()
+         WHERE id = 1 AND version = $5",
     )
     .bind(last_processed)
     .bind(chain_tip)
     .bind(ingested_delta as i64)
+    .bind(current_version + 1)
+    .bind(current_version)
     .execute(pool)
-    .await?;
+    .await?
+    .rows_affected();
+
+    if rows_affected == 0 {
+        warn!(
+            "cursor update failed: version mismatch (expected {}, cursor may have been updated by another instance)",
+            current_version
+        );
+        return Err(anyhow::anyhow!(
+            "concurrent writer detected: version mismatch on cursor update"
+        ));
+    }
+
     Ok(())
 }
 
