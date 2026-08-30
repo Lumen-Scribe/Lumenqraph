@@ -67,6 +67,7 @@ stellar-xdr = { version = "23", default-features = false, features = [
     "base64",
 ] }
 lru = "0.12"
+criterion = { version = "0.5", features = ["async_tokio"] }
 
 [profile.release]
 opt-level = 3

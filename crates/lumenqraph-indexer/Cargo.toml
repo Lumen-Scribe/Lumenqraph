@@ -32,3 +32,9 @@ axum.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
+criterion.workspace = true
+tokio.workspace = true
+
+[[bench]]
+name = "bench_indexer"
+harness = false
