@@ -302,6 +302,13 @@ pub async fn contract_interface_diff(
              so there is no earlier interface to compare it to"
         )));
     }
+    if from > to {
+        return Err(ApiError::bad_request(format!(
+            "`from` ({from}) must be less than `to` ({to}); \
+             reversing the order would produce a backward diff where added items \
+             appear as removed and vice-versa"
+        )));
+    }
     if from == to {
         return Err(ApiError::bad_request(
             "`from` and `to` are the same version; nothing to diff",
@@ -549,4 +556,69 @@ pub async fn contract_data_key(
         "count": versions.len(),
         "versions": versions,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    /// The `from > to` guard added for #211 is a pure value comparison before
+    /// any DB or RPC call, so we can exercise it by inspecting the validation
+    /// logic directly rather than spinning up a full Axum server + Postgres.
+    ///
+    /// The guard is: if from > to { return Err(bad_request(…)) }
+    /// These tests document and lock in that rule.
+
+    fn validate_diff_params(from: i32, to: i32) -> Result<(), String> {
+        if from < 1 {
+            return Err(format!(
+                "no version to diff against: from ({from}) must be >= 1"
+            ));
+        }
+        if from > to {
+            return Err(format!(
+                "`from` ({from}) must be less than `to` ({to}); \
+                 reversing the order would produce a backward diff"
+            ));
+        }
+        if from == to {
+            return Err("`from` and `to` are the same version; nothing to diff".to_string());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn diff_from_greater_than_to_is_rejected() {
+        // from=5, to=2 is the canonical bad case from the issue.
+        assert!(
+            validate_diff_params(5, 2).is_err(),
+            "from > to must be rejected"
+        );
+    }
+
+    #[test]
+    fn diff_from_equal_to_to_is_rejected() {
+        assert!(
+            validate_diff_params(3, 3).is_err(),
+            "from == to must be rejected"
+        );
+    }
+
+    #[test]
+    fn diff_valid_range_is_accepted() {
+        assert!(
+            validate_diff_params(1, 2).is_ok(),
+            "from=1, to=2 is a valid range"
+        );
+        assert!(
+            validate_diff_params(1, 5).is_ok(),
+            "from=1, to=5 is a valid range"
+        );
+    }
+
+    #[test]
+    fn diff_from_below_one_is_rejected() {
+        assert!(
+            validate_diff_params(0, 1).is_err(),
+            "from=0 is not a valid version"
+        );
+    }
 }

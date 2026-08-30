@@ -240,10 +240,16 @@ async fn main() -> anyhow::Result<()> {
         readyz_max_age_secs: env_parse("READYZ_MAX_AGE_SECS", 120i64),
         health_max_lag_ledgers: env_parse("HEALTH_MAX_LAG_LEDGERS", 100i64),
         health_max_stale_secs: env_parse("HEALTH_MAX_STALE_SECS", 120i64),
+        metrics_require_auth: env_bool("METRICS_REQUIRE_API_KEY", false),
     };
 
     let cors_layer = build_cors_layer();
-    let max_body_bytes = env_parse::<u32>("API_MAX_BODY_BYTES", 256 * 1024);
+    // MAX_REQUEST_BODY_BYTES is the canonical name (#212).
+    // API_MAX_BODY_BYTES is kept as a fallback alias for backward compatibility.
+    let max_body_bytes = std::env::var("MAX_REQUEST_BODY_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or_else(|| env_parse::<u64>("API_MAX_BODY_BYTES", 65536));
     info!(max_body_bytes, "enforcing request body size limit");
     info!(request_timeout_secs, "enforcing request timeout");
 
