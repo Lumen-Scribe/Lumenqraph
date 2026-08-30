@@ -17,10 +17,45 @@ use crate::state::AppState;
 
 #[derive(Deserialize)]
 pub struct SdkQuery {
-    /// Target language; only TypeScript (`ts`) so far.
+    /// Target language: `ts` (default), `python`, or `rust`.
     lang: Option<String>,
     /// Generate from a historical interface version instead of the current one.
     version: Option<i32>,
+}
+
+/// The supported codegen languages, together with their content-type and file
+/// extension.
+enum Lang {
+    TypeScript,
+    Python,
+    Rust,
+}
+
+impl Lang {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "ts" | "typescript" => Some(Self::TypeScript),
+            "python" | "py" => Some(Self::Python),
+            "rust" | "rs" => Some(Self::Rust),
+            _ => None,
+        }
+    }
+
+    fn content_type(&self) -> &'static str {
+        match self {
+            Self::TypeScript => "text/typescript; charset=utf-8",
+            Self::Python => "text/x-python; charset=utf-8",
+            Self::Rust => "text/x-rust; charset=utf-8",
+        }
+    }
+
+    fn extension(&self) -> &'static str {
+        match self {
+            Self::TypeScript => "ts",
+            Self::Python => "py",
+            Self::Rust => "rs",
+        }
+    }
 }
 
 pub async fn contract_sdk(
@@ -28,14 +63,12 @@ pub async fn contract_sdk(
     Path(contract_id): Path<String>,
     Query(q): Query<SdkQuery>,
 ) -> ApiResult<Response> {
-    match q.lang.as_deref().unwrap_or("ts") {
-        "ts" | "typescript" => {}
-        other => {
-            return Err(ApiError::bad_request(format!(
-                "unsupported lang {other:?}; supported: ts"
-            )))
-        }
-    }
+    let lang_str = q.lang.as_deref().unwrap_or("ts");
+    let lang = Lang::from_str(lang_str).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "unsupported lang {lang_str:?}; supported: ts, python, rust"
+        ))
+    })?;
 
     let spec = match q.version {
         Some(v) => state.specs.at_version(&state.pool, &contract_id, v).await?,
@@ -48,16 +81,22 @@ pub async fn contract_sdk(
         )));
     };
 
-    let code = codegen::typescript_client(&contract_id, parsed);
+    let code = match lang {
+        Lang::TypeScript => codegen::typescript_client(&contract_id, parsed),
+        Lang::Python => codegen::python_client(&contract_id, parsed),
+        Lang::Rust => codegen::rust_client(&contract_id, parsed),
+    };
+
+    let ext = lang.extension();
     let filename = match q.version {
-        Some(v) => format!("{contract_id}.v{v}.ts"),
-        None => format!("{contract_id}.ts"),
+        Some(v) => format!("{contract_id}.v{v}.{ext}"),
+        None => format!("{contract_id}.{ext}"),
     };
     Ok((
         [
             (
                 header::CONTENT_TYPE,
-                "text/typescript; charset=utf-8".to_string(),
+                lang.content_type().to_string(),
             ),
             (
                 header::CONTENT_DISPOSITION,

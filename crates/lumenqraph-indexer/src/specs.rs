@@ -17,6 +17,7 @@
 //! upgraded in place, its interface is a time series, and this is how we record
 //! what changed and when.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -57,6 +58,9 @@ const FETCH_ERROR_TTL: Duration = Duration::from_secs(60);
 
 pub struct SpecCache {
     inner: Mutex<LruCache<String, Cached>>,
+    /// Current number of entries in the cache; updated on every insert/evict.
+    /// Exposed as the `lumenqraph_spec_cache_size` Prometheus gauge.
+    cache_size: AtomicUsize,
 }
 
 impl SpecCache {
@@ -65,7 +69,14 @@ impl SpecCache {
             inner: Mutex::new(LruCache::new(
                 std::num::NonZeroUsize::new(max_entries).expect("max_entries must be > 0"),
             )),
+            cache_size: AtomicUsize::new(0),
         }
+    }
+
+    /// Return the current number of entries in the spec cache. Used by the
+    /// `/metrics` endpoint to expose the `lumenqraph_spec_cache_size` gauge.
+    pub fn cache_size(&self) -> usize {
+        self.cache_size.load(Ordering::Relaxed)
     }
 
     /// Return the spec for a contract if it is already in the in-memory cache,
@@ -115,13 +126,19 @@ impl SpecCache {
                 }
             }
         };
-        self.inner.lock().unwrap().insert(
-            contract_id.to_string(),
-            Cached {
-                spec: cached_spec.clone(),
-                wasm_hash,
-            },
-        );
+        {
+            let mut map = self.inner.lock().unwrap();
+            map.put(
+                contract_id.to_string(),
+                Cached {
+                    spec: cached_spec.clone(),
+                    wasm_hash,
+                },
+            );
+            // LruCache::len() is O(1) and accounts for any eviction this insert
+            // may have triggered (when the cache was at capacity).
+            self.cache_size.store(map.len(), Ordering::Relaxed);
+        }
         match cached_spec {
             CachedSpec::Spec(s) => Some(s),
             _ => None,
@@ -151,7 +168,8 @@ impl SpecCache {
             let mut map = self.inner.lock().unwrap();
             match map.get(contract_id) {
                 Some(cached) if cached.wasm_hash.as_deref() != Some(current_hash) => {
-                    map.remove(contract_id);
+                    map.pop(contract_id);
+                    self.cache_size.store(map.len(), Ordering::Relaxed);
                     true
                 }
                 _ => false,
@@ -180,7 +198,7 @@ pub async fn check_for_upgrade(
     rpc: &RpcClient,
     specs: &SpecCache,
     contract_id: &str,
-    ledger: i64,
+    _ledger: i64,
 ) {
     match rpc.get_contract_instance(contract_id).await {
         Ok(Some(instance)) => {
@@ -464,7 +482,7 @@ mod tests {
         // Every restart and every cache miss re-reads the spec; only a genuine
         // change may append to the history.
         for _ in 0..3 {
-            record_version(&pool, "C1", "hash1", &section, &spec)
+            record_version(&pool, "C1", "hash1", &section, &spec, 100)
                 .await
                 .unwrap();
         }
@@ -476,13 +494,13 @@ mod tests {
     async fn an_upgrade_appends_a_version_with_its_diff() {
         let pool = fixture().await;
         let (s1, spec1) = spec_with(&["balance", "withdraw"]);
-        record_version(&pool, "C1", "hash1", &s1, &spec1)
+        record_version(&pool, "C1", "hash1", &s1, &spec1, 100)
             .await
             .unwrap();
 
         // v2 drops withdraw and adds pause: a breaking change.
         let (s2, spec2) = spec_with(&["balance", "pause"]);
-        record_version(&pool, "C1", "hash2", &s2, &spec2)
+        record_version(&pool, "C1", "hash2", &s2, &spec2, 101)
             .await
             .unwrap();
 
@@ -517,7 +535,7 @@ mod tests {
             .unwrap();
         // New code, identical interface — e.g. a bug fix. Still an upgrade worth
         // recording, but nothing an integration needs to react to.
-        record_version(&pool, "C1", "hash2", &section, &spec)
+        record_version(&pool, "C1", "hash2", &section, &spec, 101)
             .await
             .unwrap();
 
@@ -553,7 +571,7 @@ mod tests {
         .unwrap();
 
         let (s2, spec2) = spec_with(&["balance"]);
-        record_version(&pool, "C1", "hash2", &s2, &spec2)
+        record_version(&pool, "C1", "hash2", &s2, &spec2, 101)
             .await
             .unwrap();
 

@@ -3,6 +3,7 @@
 //! retried with exponential backoff so a flaky RPC never kills the process.
 //! Responds to Ctrl-C / SIGTERM for a clean shutdown.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lumenqraph_core::NewEvent;
@@ -31,12 +32,9 @@ pub fn max_lookback() -> i64 {
     MAX_LOOKBACK_LEDGERS
 }
 
-pub async fn run(pool: PgPool, rpc: RpcClient, config: Config) -> anyhow::Result<()> {
+pub async fn run(pool: PgPool, rpc: RpcClient, config: Config, specs: Arc<SpecCache>) -> anyhow::Result<()> {
     let base_interval = Duration::from_secs(config.poll_interval_secs.max(1));
     let mut backoff = base_interval;
-    // One spec cache for the process lifetime: each contract's interface is
-    // fetched and parsed once, then reused to enrich every event.
-    let specs = SpecCache::new(config.spec_cache_max_entries);
     // None => prune on the first cycle that reaches the tip, so a deployment
     // that switches retention on starts reclaiming immediately.
     let mut last_prune: Option<Instant> = None;
@@ -116,6 +114,7 @@ async fn poll_once(
         to = latest,
     );
 
+    let cycle_span_for_record = cycle_span.clone();
     async move {
 
     let mut start = match cursor::read_last_processed(pool).await? {
@@ -159,7 +158,7 @@ async fn poll_once(
 
     // Record the ledger range we are about to process in the span, now that
     // we know both endpoints after clamping.
-    cycle_span.record("from", start);
+    cycle_span_for_record.record("from", start);
 
     let (inserted, enrichment) = fetch_and_store(pool, rpc, config, specs, start, latest).await?;
 

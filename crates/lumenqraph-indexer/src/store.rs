@@ -129,8 +129,8 @@ pub async fn insert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result
                 transfers.iter().map(|t| t.to_addr.clone()).collect();
             let t_amounts: Vec<String> = transfers.iter().map(|t| t.amount.clone()).collect();
             let t_kinds: Vec<String> = transfers.iter().map(|t| t.kind.clone()).collect();
-            let t_amounts_numeric: Vec<Option<sqlx::types::Decimal>> = transfers.iter().map(|t| {
-                t.amount.parse::<sqlx::types::Decimal>().ok()
+            let t_amounts_numeric: Vec<Option<String>> = transfers.iter().map(|t| {
+                Some(t.amount.clone())
             }).collect();
             let t_ledgers: Vec<i64> = transfers.iter().map(|t| t.ledger).collect();
             let t_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
@@ -295,8 +295,8 @@ pub async fn upsert_events(
                 transfers.iter().map(|t| t.to_addr.clone()).collect();
             let t_amounts: Vec<String> = transfers.iter().map(|t| t.amount.clone()).collect();
             let t_kinds: Vec<String> = transfers.iter().map(|t| t.kind.clone()).collect();
-            let t_amounts_numeric: Vec<Option<sqlx::types::Decimal>> = transfers.iter().map(|t| {
-                t.amount.parse::<sqlx::types::Decimal>().ok()
+            let t_amounts_numeric: Vec<Option<String>> = transfers.iter().map(|t| {
+                Some(t.amount.clone())
             }).collect();
             let t_ledgers: Vec<i64> = transfers.iter().map(|t| t.ledger).collect();
             let t_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =

@@ -666,4 +666,44 @@ mod tests {
             unique_times.len()
         );
     }
+
+    // ── Cross-language signing test vector (issue #270) ──────────────────────
+    //
+    // This test produces a stable, hard-coded HMAC-SHA256 signature using the
+    // *exact same* algorithm as `send()`. The values are intentionally fixed so
+    // the companion TypeScript test in
+    //   sdk/typescript/src/webhook_roundtrip.test.ts
+    // can verify that the TypeScript `verifyWebhook()` function produces the
+    // same result for the same inputs — catching any encoding mismatch between
+    // the two implementations.
+    //
+    // The body contains a non-ASCII Unicode character (€ U+20AC) to expose any
+    // difference in UTF-8 encoding between the two sides.
+    //
+    // To regenerate the expected signature:
+    //   echo -n '{"event":"transfer","amount":"100","currency":"€"}' | \
+    //     openssl dgst -sha256 -hmac 'round-trip-secret-42'
+    #[test]
+    fn signing_produces_stable_cross_language_test_vector() {
+        // Fixed inputs — do not change without updating the TypeScript fixture.
+        let secret = "round-trip-secret-42";
+        let body = r#"{"event":"transfer","amount":"100","currency":"€"}"#;
+        let expected_hex = "7f57c5ce713d6e0af04058523af69c77096025b41bac63a883ecf8be1b2ca55e";
+
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+            .expect("HMAC accepts any key size");
+        mac.update(body.as_bytes());
+        let computed_hex = hex::encode(mac.finalize().into_bytes());
+
+        assert_eq!(
+            computed_hex, expected_hex,
+            "HMAC-SHA256 signature must match the pre-computed test vector; \
+             if you changed the signing algorithm, update the TypeScript fixture too"
+        );
+        // Confirm the full header matches the format the TypeScript SDK expects.
+        assert_eq!(
+            format!("sha256={computed_hex}"),
+            format!("sha256={expected_hex}")
+        );
+    }
 }

@@ -10,6 +10,7 @@ db-test = []
 
 [dev-dependencies]
 proptest = "1"
+tokio = { version = "1", features = ["rt", "macros"] }
 
 [dependencies]
 serde.workspace = true

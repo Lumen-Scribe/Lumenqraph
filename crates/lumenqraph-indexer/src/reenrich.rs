@@ -5,12 +5,10 @@
 //! This is a one-shot backfill pass that can be run manually or automatically
 //! when a spec is first successfully fetched for a contract with stored events.
 
-use lumenqraph_core::NewEvent;
 use sqlx::{PgPool, Row};
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
-use crate::convert::to_new_event;
 use crate::rpc_client::RpcClient;
 use crate::specs::SpecCache;
 
@@ -71,7 +69,7 @@ pub async fn run_reenrich(pool: PgPool, rpc: RpcClient, config: Config) -> anyho
             };
 
             // Fetch the spec for this contract (cached after first fetch).
-            let spec = specs.get(&pool, &rpc, &contract_id).await;
+            let spec = specs.get(&pool, &rpc, &contract_id, 0).await;
 
             // Try to enrich against the spec.
             let enriched = if let Some(spec_ref) = spec.as_deref() {

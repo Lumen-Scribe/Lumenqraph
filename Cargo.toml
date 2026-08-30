@@ -37,7 +37,6 @@ sqlx = { version = "0.8", default-features = false, features = [
     "json",
     "migrate",
     "uuid",
-    "offline",
 ] }
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.8"
