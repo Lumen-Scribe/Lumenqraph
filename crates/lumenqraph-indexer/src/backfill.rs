@@ -184,7 +184,7 @@ mod tests {
 
         let rpc = RpcClient::new(&rpc_url, 30);
         let config = test_config(&rpc_url, 2);
-        let specs = SpecCache::new(2000);
+        let specs = SpecCache::new(2000, 4);
 
         let (inserted, _) = fetch_and_store(&pool, &rpc, &config, &specs, 500, 1000)
             .await
@@ -233,7 +233,7 @@ mod tests {
         let config = test_config(&rpc_url, 2);
 
         // First run: all three events are new.
-        let specs = SpecCache::new(2000);
+        let specs = SpecCache::new(2000, 4);
         let (first, _) = fetch_and_store(&pool, &rpc, &config, &specs, 500, 1000)
             .await
             .expect("first run");
@@ -279,7 +279,7 @@ mod tests {
 
         let rpc = RpcClient::new(&rpc_url, 30);
         let config = test_config(&rpc_url, 2);
-        let specs = SpecCache::new(2000);
+        let specs = SpecCache::new(2000, 4);
 
         let (inserted, _) = fetch_and_store(&pool, &rpc, &config, &specs, 500, 1000)
             .await
@@ -344,7 +344,7 @@ pub async fn run(
     }
     info!(from = start, to = tip, "starting backfill");
 
-    let specs = SpecCache::new(config.spec_cache_max_entries);
+    let specs = SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
     let (inserted, _) = fetch_and_store(&pool, &rpc, &config, &specs, start, tip).await?;
     cursor::write_progress(&pool, tip, tip, inserted).await?;
     info!(inserted, up_to_ledger = tip, "backfill complete");

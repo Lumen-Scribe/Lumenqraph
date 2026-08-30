@@ -36,7 +36,7 @@ pub async fn run(pool: PgPool, rpc: RpcClient, config: Config) -> anyhow::Result
     let mut backoff = base_interval;
     // One spec cache for the process lifetime: each contract's interface is
     // fetched and parsed once, then reused to enrich every event.
-    let specs = SpecCache::new(config.spec_cache_max_entries);
+    let specs = SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
     // None => prune on the first cycle that reaches the tip, so a deployment
     // that switches retention on starts reclaiming immediately.
     let mut last_prune: Option<Instant> = None;
