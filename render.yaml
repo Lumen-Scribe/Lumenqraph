@@ -68,6 +68,25 @@ services:
       - key: KEY_INDEXING
         value: "true"
 
+      # ---- Security --------------------------------------------------------
+      # Encryption key used to sign and verify webhook payloads (HMAC-SHA256).
+      # Generate before deploying: openssl rand -hex 32
+      # Leave the value blank here — Render will prompt you to set it as a
+      # secret. Never commit a real value to source control.
+      - key: WEBHOOK_ENCRYPTION_KEY
+        sync: false
+
+      # ---- Database connection pool ----------------------------------------
+      # Supabase free tier allows 60 simultaneous connections. The all-in-one
+      # container runs indexer + api in the same process group, so their pools
+      # share that cap. These defaults leave headroom for migrations and the
+      # Supabase internal pooler.
+      #   indexer  — single writer, low concurrency → 3 connections
+      #   api      — concurrent reads                → 8 connections
+      # Raise these values only after monitoring actual Supabase connection use.
+      - key: DATABASE_MAX_CONNECTIONS
+        value: "10"
+
       # ---- Optional second network in the same container --------------------
       # Setting TESTNET_DATABASE_URL makes run-all-in-one.sh start a second
       # indexer+api pair against Soroban testnet, reverse-proxied by the public

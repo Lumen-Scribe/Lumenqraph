@@ -140,7 +140,22 @@ Render's free tier has several limits that shape how we deploy:
 2. Create a new project.
 3. Go to **Project Settings → Database → Connection string** and copy the URI. Remember to append `?sslmode=require`.
 
-#### 2. Deploy Blueprint on Render
+#### 2. Generate Required Secrets Before Deploying
+
+Before running the Blueprint, generate the webhook encryption key locally and keep it ready to paste into the Render prompt:
+
+```bash
+# Generates a 256-bit hex secret — store it somewhere safe (e.g. a password manager)
+openssl rand -hex 32
+```
+
+> [!IMPORTANT]
+> Never commit this value to source control. The `WEBHOOK_ENCRYPTION_KEY` entry in
+> `render.yaml` intentionally has no default. Render will prompt you to set it during
+> Blueprint setup. Deployments that skip this step fall back to the hardcoded
+> `"default-key-for-testing"` value, which is insecure.
+
+#### 3. Deploy Blueprint on Render
 1. Fork the Lumenqraph repository on GitHub.
 2. Go to your [Render Dashboard](https://dashboard.render.com).
 3. Click **New → Blueprint**.
@@ -148,14 +163,15 @@ Render's free tier has several limits that shape how we deploy:
 5. Render will automatically parse [`render.yaml`](../render.yaml). You will be prompted to input:
    - `DATABASE_URL`: The Supabase connection string.
    - `CONTRACT_IDS`: **Must** be a focused allowlist of contracts. **Do not** leave this empty or include high-frequency contracts (like the Stellar Asset Contract `CAS3J7GY...` which generates millions of events daily and will fill the 500MB cap in hours).
+   - `WEBHOOK_ENCRYPTION_KEY`: Paste the 64-character hex string you generated above.
 
-#### 3. Prevent Inactivity Spin-Down (Keep-Alive Cron)
+#### 4. Prevent Inactivity Spin-Down (Keep-Alive Cron)
 Since Render will sleep the container if no HTTP requests are received, you must ping the health check endpoint.
 1. Create a free account at an external cron provider (e.g., [cron-job.org](https://cron-job.org)).
 2. Configure a cron job targeting `https://<your-render-subdomain>.onrender.com/health`.
 3. Set the schedule to run **every 10 minutes**. This keeps the container awake and indexing continuously.
 
-#### 4. Configure Testnet & Mainnet Dual-Indexing
+#### 5. Configure Testnet & Mainnet Dual-Indexing
 You can index both Stellar Mainnet and Testnet using a single Render container:
 1. In your Supabase SQL Editor, create a second database:
    ```sql
@@ -166,7 +182,7 @@ You can index both Stellar Mainnet and Testnet using a single Render container:
    - `TESTNET_CONTRACT_IDS`: A focused contract allowlist for testnet.
 3. `scripts/run-all-in-one.sh` detects `TESTNET_DATABASE_URL` and starts a testnet API/indexer pair internally, proxying it via `INSTANCE_MOUNTS` under `/testnet`. The explorer UI will automatically detect the sibling network mount via `/health` and display a network switcher.
 
-#### 5. Moving to a Paid Production Plan
+#### 6. Moving to a Paid Production Plan
 When ready to move to separate, robust services:
 1. Delete or disable the Render Blueprint setup on the free plan.
 2. Provision a Render Web Service for the API, a Background Worker for the Indexer, and a Background Worker for Webhooks.
@@ -176,6 +192,7 @@ When ready to move to separate, robust services:
 ## Production Checklist
 
 - [ ] `DATABASE_URL` → managed Postgres with TLS (`sslmode=require`).
+- [ ] `WEBHOOK_ENCRYPTION_KEY` → 256-bit random hex secret (`openssl rand -hex 32`). **Never** use the default testing key in production.
 - [ ] `RPC_URL` set (paid/retaining RPC if you need backfill or higher limits).
 - [ ] `CONTRACT_IDS` = your allowlist, or intentionally empty to index all.
 - [ ] `REQUIRE_API_KEY=true` to require `x-api-key` on data routes (`/health` +
@@ -210,6 +227,15 @@ DATABASE_MAX_CONNECTIONS=3   # indexer — writes only, low concurrency
 DATABASE_MAX_CONNECTIONS=8   # api     — concurrent reads; scale up with API replicas
 DATABASE_MAX_CONNECTIONS=2   # webhooks — delivery is serialised per subscription
 ```
+
+**Render + Supabase free tier**
+
+The all-in-one container runs the indexer and API in the same process group.
+`render.yaml` sets `DATABASE_MAX_CONNECTIONS=10` as a combined ceiling (indexer
++ API share one pool). This stays well within Supabase's 60-connection free
+limit while leaving headroom for migrations and the Supabase internal pooler.
+Raise this value only after confirming headroom in the Supabase dashboard
+(**Project Settings → Database → Connection Pooling**).
 
 On paid plans (Neon Standard 100 conn, Supabase Pro 60 direct / PgBouncer
 unlimited): raise the API pool first; the indexer and webhooks are single-writer
