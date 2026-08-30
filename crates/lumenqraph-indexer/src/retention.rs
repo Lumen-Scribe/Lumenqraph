@@ -496,4 +496,119 @@ mod tests {
         assert_eq!(prune(&pool, 100, 500).await.unwrap(), 0);
         assert_eq!(count(&pool, "SELECT count(*) FROM events").await, 1);
     }
+
+    // -------------------------------------------------------------------------
+    // Issue #225: contract_summaries trigger DELETE handling
+    // -------------------------------------------------------------------------
+
+    async fn summary_event_count(pool: &PgPool, contract_id: &str) -> Option<i64> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT event_count FROM contract_summaries WHERE contract_id = $1")
+                .bind(contract_id)
+                .fetch_optional(pool)
+                .await
+                .expect("query contract_summaries");
+        row.map(|(c,)| c)
+    }
+
+    /// Retention pruning must decrement `contract_summaries.event_count` for every
+    /// deleted event, and remove the row entirely when the count reaches zero.
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn contract_summaries_decrements_on_event_delete() {
+        let pool = fixture().await;
+
+        // Insert three events for the same contract.
+        insert_event(&pool, "e1", 100).await;
+        insert_event(&pool, "e2", 200).await;
+        insert_event(&pool, "e3", 300).await;
+
+        // Sanity check: the trigger should have maintained the count during inserts.
+        let before = summary_event_count(&pool, "C1")
+            .await
+            .expect("summary row should exist after inserts");
+        assert_eq!(before, 3, "insert trigger must have counted all three events");
+
+        // Prune events older than ledger 250 (tip=1000, retention=750 → cutoff=250).
+        // Events e1 (ledger=100) and e2 (ledger=200) are below the cutoff; e3 survives.
+        let deleted = prune(&pool, 1000, 750).await.expect("prune");
+        assert_eq!(deleted, 2, "two events should be pruned");
+
+        let after = summary_event_count(&pool, "C1")
+            .await
+            .expect("summary row should still exist because one event survives");
+        assert_eq!(after, 1, "event_count must reflect the one surviving event");
+
+        // Prune the last event (cutoff=350 > ledger=300).
+        let deleted2 = prune(&pool, 1000, 650).await.expect("prune again");
+        assert_eq!(deleted2, 1, "the final event should be pruned");
+
+        let final_row = summary_event_count(&pool, "C1").await;
+        assert!(
+            final_row.is_none(),
+            "summary row must be removed when event_count would reach zero; \
+             list_contracts must never expose contracts with zero events"
+        );
+    }
+
+    /// first_seen_ledger and last_seen_ledger must stay accurate after pruning.
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn contract_summaries_ledger_bounds_after_prune() {
+        let pool = fixture().await;
+
+        // Three events spanning a wide ledger range.
+        insert_event(&pool, "b1", 50).await;
+        insert_event(&pool, "b2", 500).await;
+        insert_event(&pool, "b3", 900).await;
+
+        // Prune events before ledger 200 (cutoff=200 → only b1 deleted).
+        prune(&pool, 1000, 800).await.expect("prune");
+
+        let row: (i64, i64, i64) = sqlx::query_as(
+            "SELECT event_count, first_seen_ledger, last_seen_ledger
+               FROM contract_summaries WHERE contract_id = 'C1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("summary row");
+
+        let (count_val, first, last) = row;
+        assert_eq!(count_val, 2, "two events survive");
+        assert_eq!(
+            first, 500,
+            "first_seen_ledger must advance to the next surviving event"
+        );
+        assert_eq!(last, 900, "last_seen_ledger must remain at the newest event");
+    }
+
+    /// A contract that was never pruned must not be affected by pruning another
+    /// contract's events.
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn contract_summaries_isolation_across_contracts() {
+        let pool = fixture().await;
+
+        // Two events for C1 and one for a second contract C2.
+        insert_event(&pool, "c1e1", 100).await;
+        insert_event(&pool, "c1e2", 800).await;
+        // Insert a C2 event manually (insert_event always uses contract_id='C1').
+        sqlx::query(
+            "INSERT INTO events
+                 (event_id, contract_id, ledger, ledger_closed_at, event_type,
+                  topics, event_name, value, tx_hash, in_successful_call, paging_token)
+             VALUES ('c2e1','C2',600,now(),'contract','[]','mint','v','tx',true,'c2e1')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert C2 event");
+
+        // Prune events before ledger 200 (removes c1e1 only).
+        prune(&pool, 1000, 800).await.expect("prune");
+
+        let c1 = summary_event_count(&pool, "C1").await.expect("C1 row");
+        let c2 = summary_event_count(&pool, "C2").await.expect("C2 row");
+        assert_eq!(c1, 1, "C1 should have one surviving event");
+        assert_eq!(c2, 1, "C2 should be unaffected by C1's prune");
+    }
 }
