@@ -44,6 +44,7 @@ pub enum ErrorCode {
     RateLimited,
     SimulationFailed,
     SpecUnavailable,
+    FeatureDisabled,
     InternalError,
 }
 
@@ -57,6 +58,7 @@ impl ErrorCode {
             ErrorCode::RateLimited => "rate_limited",
             ErrorCode::SimulationFailed => "simulation_failed",
             ErrorCode::SpecUnavailable => "spec_unavailable",
+            ErrorCode::FeatureDisabled => "feature_disabled",
             ErrorCode::InternalError => "internal_error",
         }
     }
@@ -112,6 +114,13 @@ impl ApiError {
         ApiError::Status(
             StatusCode::NOT_FOUND,
             ErrorCode::SpecUnavailable,
+            msg.into(),
+        )
+    }
+    pub fn feature_disabled(msg: impl Into<String>) -> Self {
+        ApiError::Status(
+            StatusCode::NOT_IMPLEMENTED,
+            ErrorCode::FeatureDisabled,
             msg.into(),
         )
     }
