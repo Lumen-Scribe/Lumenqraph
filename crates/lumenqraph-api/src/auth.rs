@@ -280,12 +280,98 @@ pub async fn rpc_auth_and_rate_limit(
         }
     };
 
-    if !state.rpc_limiter.check(&identity, limit).allowed {
+    let rl_status = state.rpc_limiter.check(&identity, limit);
+    if !rl_status.allowed {
         if is_authenticated {
             let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
             log_audit_event(&state.pool, hash_prefix, &route, &method, 429).await;
         }
-        return Err(ApiError::too_many_requests());
+        return Err(ApiError::too_many_requests(rl_status.retry_after_secs));
+    }
+
+    let response = next.run(req).await;
+    let status = response.status().as_u16();
+
+    if is_authenticated {
+        let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
+        log_audit_event(&state.pool, hash_prefix, &route, &method, status).await;
+    }
+
+    Ok(response)
+}
+
+/// Middleware for webhook subscription creation (POST /webhooks).
+/// Uses a separate rate limiter with a lower limit for anonymous callers
+/// to prevent unbounded subscription creation.
+pub async fn webhook_auth_and_rate_limit(
+    State(state): State<AppState>,
+    ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    req: Request,
+    next: Next,
+) -> ApiResult<Response> {
+    state.http_requests.fetch_add(1, Ordering::Relaxed);
+
+    let method = req.method().to_string();
+    let uri = req.uri().to_string();
+    let route = uri.split('?').next().unwrap_or("").to_string();
+
+    let (identity, limit, is_authenticated) = match extract_key(&headers) {
+        Some(key) => {
+            let hash = hash_key(&key);
+            let row: Option<(bool, i32)> = sqlx::query_as(
+                "SELECT revoked, rate_limit_per_min FROM api_keys WHERE key_hash = $1",
+            )
+            .bind(&hash)
+            .fetch_optional(&state.pool)
+            .await?;
+            match row {
+                Some((false, limit)) => (format!("key:{hash}"), limit, true),
+                Some((true, _)) => {
+                    log_audit_event(&state.pool, &hash, &route, &method, 401).await;
+                    return Err(ApiError::unauthorized("API key revoked"))
+                },
+                None => {
+                    log_audit_event(&state.pool, &hash, &route, &method, 401).await;
+                    return Err(ApiError::unauthorized("invalid API key"))
+                },
+            }
+        }
+        None => {
+            if state.require_auth {
+                return Err(ApiError::unauthorized("missing API key"));
+            }
+            let client_ip = extract_client_ip(&headers, Some(socket_addr));
+            (format!("anon:{client_ip}"), state.webhook_anon_rate_limit, false)
+        }
+    };
+
+    let rl_status = state.webhook_limiter.check(&identity, limit);
+    if !rl_status.allowed {
+        let mut response = (StatusCode::TOO_MANY_REQUESTS, crate::error::rate_limit_error()).into_response();
+
+        // Add rate limit headers
+        if let Some(retry_after) = rl_status.retry_after_secs {
+            response.headers_mut().insert(
+                "Retry-After",
+                retry_after.to_string().parse().unwrap_or_else(|_| "60".parse().unwrap()),
+            );
+        }
+        response.headers_mut().insert(
+            "X-RateLimit-Limit",
+            limit.to_string().parse().unwrap_or_else(|_| "0".parse().unwrap()),
+        );
+        response.headers_mut().insert(
+            "X-RateLimit-Remaining",
+            rl_status.tokens_remaining.to_string().parse().unwrap_or_else(|_| "0".parse().unwrap()),
+        );
+
+        if is_authenticated {
+            let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
+            log_audit_event(&state.pool, hash_prefix, &route, &method, 429).await;
+        }
+
+        return Ok(response);
     }
 
     let response = next.run(req).await;
@@ -412,6 +498,13 @@ mod integration_tests {
             concurrency_limiter: Arc::new(ConcurrencyLimiter::new()),
             max_concurrent_per_ip: 100,
             read_cost_limit_config: ReadCostLimitConfig::default(),
+            readyz_lag_threshold: 100,
+            readyz_max_age_secs: 120,
+            health_max_lag_ledgers: 100,
+            health_max_stale_secs: 120,
+            webhook_limiter: Arc::new(RateLimiter::new()),
+            webhook_anon_rate_limit: 10,
+            webhook_max_subscriptions: 100,
         }
     }
 
@@ -599,5 +692,31 @@ mod integration_tests {
         assert_eq!(res.status(), 429);
         let body: serde_json::Value = res.json().await.unwrap();
         assert!(body.get("error").is_some(), "429 must have error envelope");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn rate_limit_response_has_retry_after_header() {
+        let pool = db_pool().await;
+        let base = spawn_server(make_state(pool, false, 1)).await;
+        let client = reqwest::Client::new();
+        // Exhaust the single token.
+        client.get(format!("{base}/contracts")).send().await.unwrap();
+        let res = client
+            .get(format!("{base}/contracts"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 429);
+        let retry_after = res
+            .headers()
+            .get("retry-after")
+            .expect("429 responses must carry a Retry-After header")
+            .to_str()
+            .unwrap();
+        assert!(
+            retry_after.parse::<u64>().is_ok(),
+            "Retry-After must be an integer number of seconds, got {retry_after:?}"
+        );
     }
 }

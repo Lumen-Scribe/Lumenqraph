@@ -11,6 +11,7 @@
 //!   `CALL_CACHE_MAX_ENTRIES`  — LRU capacity (default 1000).
 
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,9 @@ struct Key {
 pub struct CallCache {
     inner: Mutex<LruCache<Key, (Value, Instant)>>,
     ttl: Duration,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
 }
 
 impl CallCache {
@@ -38,6 +42,9 @@ impl CallCache {
         Self {
             inner: Mutex::new(LruCache::new(capacity)),
             ttl: Duration::from_secs(ttl_secs),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
         }
     }
 
@@ -50,14 +57,19 @@ impl CallCache {
         let mut cache = self.inner.lock().unwrap();
         match cache.get(&key) {
             Some((value, inserted_at)) if inserted_at.elapsed() < self.ttl => {
+                self.hits.fetch_add(1, Ordering::Relaxed);
                 Some(value.clone())
             }
             Some(_) => {
                 // Expired: evict now so the LRU capacity reflects live entries.
                 cache.pop(&key);
+                self.misses.fetch_add(1, Ordering::Relaxed);
                 None
             }
-            None => None,
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
         }
     }
 
@@ -67,10 +79,33 @@ impl CallCache {
             return;
         }
         let key = self.make_key(contract_id, function, args);
-        self.inner
+        let evicted = self.inner
             .lock()
             .unwrap()
             .put(key, (result, Instant::now()));
+        if evicted.is_some() {
+            self.evictions.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Get cache hit count (for Prometheus metrics).
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    /// Get cache miss count (for Prometheus metrics).
+    pub fn misses(&self) -> u64 {
+        self.misses.load(Ordering::Relaxed)
+    }
+
+    /// Get cache eviction count (for Prometheus metrics).
+    pub fn evictions(&self) -> u64 {
+        self.evictions.load(Ordering::Relaxed)
+    }
+
+    /// Get current cache size (number of entries, for Prometheus metrics).
+    pub fn size(&self) -> usize {
+        self.inner.lock().unwrap().len()
     }
 
     fn make_key(&self, contract_id: &str, function: &str, args: &Value) -> Key {

@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use lru::LruCache;
 use lumenqraph_core::{ContractSpec, SpecDiff};
 use sqlx::PgPool;
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::rpc_client::RpcClient;
@@ -57,14 +58,16 @@ const FETCH_ERROR_TTL: Duration = Duration::from_secs(60);
 
 pub struct SpecCache {
     inner: Mutex<LruCache<String, Cached>>,
+    fetch_semaphore: Arc<Semaphore>,
 }
 
 impl SpecCache {
-    pub fn new(max_entries: usize) -> Self {
+    pub fn new(max_entries: usize, concurrency: usize) -> Self {
         Self {
             inner: Mutex::new(LruCache::new(
                 std::num::NonZeroUsize::new(max_entries).expect("max_entries must be > 0"),
             )),
+            fetch_semaphore: Arc::new(Semaphore::new(concurrency)),
         }
     }
 
@@ -84,6 +87,7 @@ impl SpecCache {
 
     /// The spec for a contract, fetching+parsing+persisting on first use.
     /// Distinguishes transient failures (retryable) from permanent failures (SAC).
+    /// Concurrent fetches are bounded by the semaphore; already-cached lookups bypass it.
     pub async fn get(
         &self,
         pool: &PgPool,
@@ -104,6 +108,8 @@ impl SpecCache {
                 }
             }
         }
+        // Acquire semaphore permit before fetching — this limits concurrent fetches.
+        let _permit = self.fetch_semaphore.acquire().await.expect("semaphore acquire failed");
         let (spec, wasm_hash, is_permanent) = load(pool, rpc, contract_id, ledger).await;
         let cached_spec = match spec {
             Some(s) => CachedSpec::Spec(s.clone()),

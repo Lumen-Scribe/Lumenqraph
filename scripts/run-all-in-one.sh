@@ -24,6 +24,30 @@ if [[ -n "${PORT:-}" && -z "${API_BIND_ADDR:-}" ]]; then
   export API_BIND_ADDR="0.0.0.0:${PORT}"
 fi
 
+# ---- Run migrations FIRST ---------------------------------------------------
+# The indexer would eventually run migrations itself, but the API and webhook
+# services start concurrently and may attempt database connections before the
+# schema exists on a fresh database.  Running `sqlx migrate run` here makes
+# migrations an explicit prerequisite: if this step fails the whole container
+# exits immediately rather than starting a partially-configured stack.
+echo "run-all-in-one: running database migrations…" >&2
+if ! sqlx migrate run --database-url "${DATABASE_URL}"; then
+  echo "run-all-in-one: migrations FAILED — aborting startup" >&2
+  exit 1
+fi
+echo "run-all-in-one: migrations complete" >&2
+
+# Run migrations for the optional testnet database as well, before any of its
+# services start.
+if [[ -n "${TESTNET_DATABASE_URL:-}" ]]; then
+  echo "run-all-in-one: running testnet database migrations…" >&2
+  if ! sqlx migrate run --database-url "${TESTNET_DATABASE_URL}"; then
+    echo "run-all-in-one: testnet migrations FAILED — aborting startup" >&2
+    exit 1
+  fi
+  echo "run-all-in-one: testnet migrations complete" >&2
+fi
+
 pids=()
 
 # ---- Optional testnet pair (must start before the public API so it can be
@@ -54,7 +78,9 @@ if [[ -n "${TESTNET_DATABASE_URL:-}" ]]; then
 fi
 
 # ---- Primary pair ------------------------------------------------------------
-lumenqraph-indexer &
+# Migrations have already been applied above; pass SKIP_MIGRATIONS=true so the
+# indexer does not attempt to run them a second time.
+SKIP_MIGRATIONS=true lumenqraph-indexer &
 pids+=($!)
 lumenqraph-api &
 pids+=($!)
