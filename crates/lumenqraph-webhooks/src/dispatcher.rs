@@ -19,6 +19,7 @@ use sha2::Sha256;
 use sqlx::types::Json;
 use sqlx::PgPool;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
@@ -26,6 +27,7 @@ use url::Url;
 
 use crate::config::Config;
 use futures::stream::{self, StreamExt};
+use lumenqraph_core::url_validation::validate_webhook_url_at_delivery;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -33,6 +35,27 @@ type HmacSha256 = Hmac<Sha256>;
 /// off `User-Agent` for debugging, so delivery logs can be traced back to the
 /// version that sent them.
 const USER_AGENT: &str = concat!("lumenqraph-webhooks/", env!("CARGO_PKG_VERSION"));
+
+/// Last observed count of `pending` rows in `webhook_deliveries`, refreshed once
+/// per dispatcher tick by [`refresh_pending_gauge`] and read by the `/metrics`
+/// endpoint (`lumenqraph_webhooks_pending_deliveries`).
+///
+/// Enqueue and deliver counts only describe what moved *this* tick; they go
+/// quiet when the dispatcher is starved by a slow or unresponsive subscriber
+/// even though the backlog is growing. This gauge makes that backlog the one
+/// number an operator can alert on.
+pub static PENDING_DELIVERIES: AtomicI64 = AtomicI64::new(0);
+
+/// Refresh [`PENDING_DELIVERIES`] from the database. Called once per tick by the
+/// service loop; returns the value it stored so the caller can log it.
+pub async fn refresh_pending_gauge(pool: &PgPool) -> anyhow::Result<i64> {
+    let pending: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'pending'")
+            .fetch_one(pool)
+            .await?;
+    PENDING_DELIVERIES.store(pending, Ordering::Relaxed);
+    Ok(pending)
+}
 
 /// Enqueue deliveries for everything new in both streams. Returns how many
 /// delivery rows were created.
@@ -175,10 +198,7 @@ struct DueDelivery {
 /// keep their long-standing shape (the bare event row); upgrade payloads are
 /// tagged, since they're a new shape and a consumer receiving one should be able
 /// to tell what it is.
-async fn fetch_due(pool: &PgPool, batch: i64) -> anyhow::Result<Vec<DueDelivery>> {
-    let encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY")
-        .unwrap_or_else(|_| "default-key-for-testing".to_string());
-
+async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::Result<Vec<DueDelivery>> {
     let rows: Vec<(i64, String, i32, String, String, Json<serde_json::Value>)> = sqlx::query_as(
         "SELECT d.id, s.id, d.attempts, s.url,
                 pgp_sym_decrypt(s.encrypted_secret, $1),
@@ -226,7 +246,7 @@ pub async fn deliver(
     http: &reqwest::Client,
     config: &Config,
 ) -> anyhow::Result<(u64, u64)> {
-    let deliveries = fetch_due(pool, config.batch_size).await?;
+    let deliveries = fetch_due(pool, config.batch_size, &config.encryption_key).await?;
     if deliveries.is_empty() {
         return Ok((0, 0));
     }
@@ -316,6 +336,12 @@ fn extract_host(url: &str) -> String {
 }
 
 async fn send(http: &reqwest::Client, d: &DueDelivery, config: &Config) -> anyhow::Result<()> {
+    // Re-validate URL at delivery time to prevent DNS rebinding attacks.
+    // This ensures the hostname still resolves to a public address even if the
+    // DNS record changed since registration.
+    validate_webhook_url_at_delivery(&d.url).await
+        .map_err(|e| anyhow::anyhow!("URL validation failed at delivery: {}", e))?;
+
     let body = serde_json::to_vec(&d.payload.0)?;
     let timestamp = Utc::now().to_rfc3339();
 
@@ -565,7 +591,7 @@ mod tests {
             "only the upgrade (v2) enqueues; v1 is a baseline, not a change"
         );
 
-        let due = fetch_due(&pool, 100).await.unwrap();
+        let due = fetch_due(&pool, 100, "test-key").await.unwrap();
         assert_eq!(due.len(), 1);
         let payload = &due[0].payload.0;
         assert_eq!(payload["type"], "contract.upgraded");
@@ -622,7 +648,7 @@ mod tests {
         assert_eq!(enqueue(&pool, 100).await.unwrap(), 1);
         // The watermark has advanced, so a second pass finds nothing new.
         assert_eq!(enqueue(&pool, 100).await.unwrap(), 0);
-        assert_eq!(fetch_due(&pool, 100).await.unwrap().len(), 1);
+        assert_eq!(fetch_due(&pool, 100, "test-key").await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -638,7 +664,7 @@ mod tests {
         assert_eq!(enqueue(&pool, 100).await.unwrap(), 5);
 
         // Simulate failures for all 5 deliveries.
-        let due = fetch_due(&pool, 100).await.unwrap();
+        let due = fetch_due(&pool, 100, "test-key").await.unwrap();
         assert_eq!(due.len(), 5);
 
         for d in due {

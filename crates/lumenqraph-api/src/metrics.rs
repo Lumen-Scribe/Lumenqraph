@@ -19,10 +19,10 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 }
 
 pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
-    let status: Option<(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
+    let status: Option<(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
         "SELECT last_processed_ledger, chain_tip_ledger, events_ingested_total, errors_total,
                 events_enriched_total, events_not_enriched_total, spec_fetch_failures_total,
-                rpc_calls_total, rpc_errors_total, rpc_errors_32001_total
+                rpc_calls_total, rpc_errors_total, rpc_errors_32001_total, consecutive_errors
          FROM indexer_cursor WHERE id = 1",
     )
     .fetch_optional(&state.pool)
@@ -33,10 +33,15 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
         .await?;
 
     let (last, tip, ingested, errors, enriched, not_enriched, spec_fetch_failures,
-         rpc_calls, rpc_errors, rpc_errors_32001) = status.unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+         rpc_calls, rpc_errors, rpc_errors_32001, consecutive_errors) = status.unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
     let lag = (tip - last).max(0);
     let lag_time_secs = lag * 5; // Approximate ~5 seconds per ledger
     let requests = state.http_requests.load(Ordering::Relaxed);
+
+    let cache_hits = state.call_cache.hits();
+    let cache_misses = state.call_cache.misses();
+    let cache_evictions = state.call_cache.evictions();
+    let cache_size = state.call_cache.size();
 
     let mut body = format!(
         "# HELP lumenqraph_indexer_last_processed_ledger Last ledger the indexer processed\n\
@@ -60,6 +65,9 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
          # HELP lumenqraph_indexer_errors_total Indexer poll-cycle errors\n\
          # TYPE lumenqraph_indexer_errors_total counter\n\
          lumenqraph_indexer_errors_total {errors}\n\
+         # HELP lumenqraph_consecutive_errors Current number of consecutive poll-cycle failures (circuit breaker gauge; resets to 0 on success)\n\
+         # TYPE lumenqraph_consecutive_errors gauge\n\
+         lumenqraph_consecutive_errors {consecutive_errors}\n\
          # HELP lumenqraph_events_enriched_total Events successfully enriched with spec data\n\
          # TYPE lumenqraph_events_enriched_total counter\n\
          lumenqraph_events_enriched_total {enriched}\n\
@@ -80,7 +88,19 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
          lumenqraph_rpc_errors_32001_total {rpc_errors_32001}\n\
          # HELP lumenqraph_api_requests_total API requests served\n\
          # TYPE lumenqraph_api_requests_total counter\n\
-         lumenqraph_api_requests_total {requests}\n",
+         lumenqraph_api_requests_total {requests}\n\
+         # HELP lumenqraph_call_cache_hits_total Total cache hits for /call results\n\
+         # TYPE lumenqraph_call_cache_hits_total counter\n\
+         lumenqraph_call_cache_hits_total {cache_hits}\n\
+         # HELP lumenqraph_call_cache_misses_total Total cache misses for /call results\n\
+         # TYPE lumenqraph_call_cache_misses_total counter\n\
+         lumenqraph_call_cache_misses_total {cache_misses}\n\
+         # HELP lumenqraph_call_cache_evictions_total Total entries evicted from /call cache\n\
+         # TYPE lumenqraph_call_cache_evictions_total counter\n\
+         lumenqraph_call_cache_evictions_total {cache_evictions}\n\
+         # HELP lumenqraph_call_cache_size Current number of entries in /call cache\n\
+         # TYPE lumenqraph_call_cache_size gauge\n\
+         lumenqraph_call_cache_size {cache_size}\n",
         last = last,
         tip = tip,
         lag = lag,
@@ -88,6 +108,7 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
         events = total_events.0,
         ingested = ingested,
         errors = errors,
+        consecutive_errors = consecutive_errors,
         enriched = enriched,
         not_enriched = not_enriched,
         spec_fetch_failures = spec_fetch_failures,
@@ -95,6 +116,10 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
         rpc_errors = rpc_errors,
         rpc_errors_32001 = rpc_errors_32001,
         requests = requests,
+        cache_hits = cache_hits,
+        cache_misses = cache_misses,
+        cache_evictions = cache_evictions,
+        cache_size = cache_size,
     );
 
     body.push_str("# HELP lumenqraph_http_request_duration_ms Per-route HTTP request latency\n");

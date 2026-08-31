@@ -152,6 +152,31 @@ describe("URL construction", () => {
     const url = new URL(f.mock.calls[0]?.[0] as string);
     expect(url.searchParams.has("limit")).toBe(false);
   });
+
+  it("getInterfaceHistory hits /contracts/:id/interface/history with limit", async () => {
+    const f = mockFetch([{ status: 200, body: [] }]);
+    await client(f).getInterfaceHistory("C1", { limit: 5 });
+    const url = new URL(f.mock.calls[0]?.[0] as string);
+    expect(url.pathname).toBe("/contracts/C1/interface/history");
+    expect(url.searchParams.get("limit")).toBe("5");
+  });
+
+  it("getInterfaceDiff hits /contracts/:id/interface/diff with from and to params", async () => {
+    const f = mockFetch([{ status: 200, body: {} }]);
+    await client(f).getInterfaceDiff("C1", { from: 1, to: 2 });
+    const url = new URL(f.mock.calls[0]?.[0] as string);
+    expect(url.pathname).toBe("/contracts/C1/interface/diff");
+    expect(url.searchParams.get("from")).toBe("1");
+    expect(url.searchParams.get("to")).toBe("2");
+  });
+
+  it("getInterfaceAtVersion hits /contracts/:id/interface with version param", async () => {
+    const f = mockFetch([{ status: 200, body: {} }]);
+    await client(f).getInterfaceAtVersion("C1", 3);
+    const url = new URL(f.mock.calls[0]?.[0] as string);
+    expect(url.pathname).toBe("/contracts/C1/interface");
+    expect(url.searchParams.get("version")).toBe("3");
+  });
 });
 
 // ---- Auth header injection ----
@@ -316,5 +341,55 @@ describe("paginateEvents", () => {
       (f.mock.calls[0]?.[1] as RequestInit).body as string,
     ) as { variables: { first: number } };
     expect(body.variables.first).toBe(25);
+  });
+
+  it("aborts the in-flight page request when the consumer breaks early (#279)", async () => {
+    // Every page reports hasNextPage:true, so the only way iteration ends is the
+    // consumer bailing out — which must not leave a page fetch running.
+    const f = mockFetch([
+      { status: 200, body: gqlPage(["e1", "e2"], true, "cur-1") },
+      { status: 200, body: gqlPage(["e3", "e4"], true, "cur-2") },
+    ]);
+    const c = client(f);
+    const spy = vi.spyOn(c, "eventsPage");
+
+    for await (const _ev of c.paginateEvents("C1")) {
+      break; // stop after the very first event
+    }
+
+    // The generator's finally cleanup aborts the signal it handed to eventsPage.
+    const passedSignal = (spy.mock.calls[0]?.[1] as { signal?: AbortSignal })
+      .signal;
+    expect(passedSignal).toBeInstanceOf(AbortSignal);
+    expect(passedSignal?.aborted).toBe(true);
+    // And no further page was requested after the early break.
+    expect(f).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops pagination when the caller's AbortSignal fires (#279)", async () => {
+    const ac = new AbortController();
+    const f = mockFetch([
+      { status: 200, body: gqlPage(["e1"], true, "cur-1") },
+      { status: 200, body: gqlPage(["e2"], true, "cur-2") },
+    ]);
+    const gen = client(f).paginateEvents("C1", { signal: ac.signal });
+
+    const first = await gen.next();
+    expect(first.done).toBe(false);
+
+    ac.abort();
+    await expect(gen.next()).rejects.toThrow(/abort/i);
+    expect(f).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not start any request when given an already-aborted signal (#279)", async () => {
+    const f = mockFetch([
+      { status: 200, body: gqlPage(["e1"], true, "cur-1") },
+    ]);
+    const gen = client(f).paginateEvents("C1", {
+      signal: AbortSignal.abort(),
+    });
+    await expect(gen.next()).rejects.toThrow(/abort/i);
+    expect(f).not.toHaveBeenCalled();
   });
 });

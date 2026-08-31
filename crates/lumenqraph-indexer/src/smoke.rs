@@ -9,9 +9,15 @@
 //!                creates pending deliveries; a local HTTP sink receives and
 //!                validates the signed POST.
 //!
-//! Run with:
+//! This module is gated behind the `smoke-tests` cargo feature *and*
+//! `#[ignore]`, so a plain `cargo test` never compiles or runs it (offline CI
+//! stays offline). Run it explicitly with:
+//!
 //!   TEST_DATABASE_URL=postgres://…/lumenqraph \
-//!     cargo test -p lumenqraph-indexer smoke -- --ignored --test-threads=1
+//!     cargo test -p lumenqraph-indexer --features smoke-tests smoke \
+//!       -- --ignored --test-threads=1
+//!
+//! or `make test-smoke`. See CONTRIBUTING.md → "Smoke tests".
 
 #[cfg(test)]
 mod tests {
@@ -215,7 +221,7 @@ mod tests {
 
         let rpc = RpcClient::new(&rpc_url, 30);
         let config = test_config(&rpc_url, 2);
-        let specs = SpecCache::new(config.spec_cache_max_entries);
+        let specs = SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
 
         let (inserted, _) = poller::fetch_and_store(&pool, &rpc, &config, &specs, 500, 1000)
             .await

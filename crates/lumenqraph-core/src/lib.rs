@@ -18,6 +18,7 @@ pub mod models;
 pub mod read;
 pub mod sanitize;
 pub mod spec;
+pub mod url_validation;
 pub mod xdr;
 
 pub use diff::SpecDiff;
@@ -36,3 +37,4 @@ pub use models::{
 };
 pub use spec::ContractSpec;
 pub use xdr::is_valid_contract_id;
+pub use xdr::parse_contract_ids;

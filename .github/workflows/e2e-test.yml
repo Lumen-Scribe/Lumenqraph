@@ -1,0 +1,73 @@
+name: End-to-End Test
+
+on:
+  schedule:
+    # Run nightly at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-test:
+    name: Full Stack E2E Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@885d1462b5b1c5ae1b325e8c8ce65d60825e4ee8 # v3
+
+      - name: Generate webhook encryption key
+        run: |
+          echo "WEBHOOK_ENCRYPTION_KEY=$(openssl rand -hex 32)" >> $GITHUB_ENV
+
+      - name: Start full stack with docker-compose
+        run: |
+          docker compose -f docker-compose.full.yml up --build -d
+        env:
+          WEBHOOK_ENCRYPTION_KEY: ${{ env.WEBHOOK_ENCRYPTION_KEY }}
+          RPC_URL: https://soroban-testnet.stellar.org
+          RUST_LOG: info
+
+      - name: Wait for services to be ready
+        run: |
+          # Give services time to start and healthchecks to stabilize
+          sleep 10
+
+      - name: Check service status
+        run: |
+          docker compose -f docker-compose.full.yml ps
+          docker compose -f docker-compose.full.yml logs --tail=50 api || true
+
+      - name: Run smoke test
+        run: bash scripts/e2e_smoke_test.sh
+        env:
+          API_URL: http://localhost:8080
+
+      - name: Query API for data
+        run: |
+          echo "Testing GraphQL endpoint..."
+          curl -sf http://localhost:8080/graphql -X POST \
+            -H "content-type: application/json" \
+            -d '{"query": "{ events(contractId: \"\") { edges { node { eventId } } } }"}' \
+            | jq . || echo "GraphQL query failed (may be expected if no data indexed yet)"
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          echo "=== API logs ==="
+          docker compose -f docker-compose.full.yml logs api || true
+          echo "=== Indexer logs ==="
+          docker compose -f docker-compose.full.yml logs indexer || true
+          echo "=== Webhooks logs ==="
+          docker compose -f docker-compose.full.yml logs webhooks || true
+
+      - name: Clean up
+        if: always()
+        run: docker compose -f docker-compose.full.yml down -v

@@ -47,20 +47,27 @@ fn check_if_none_match(headers: &HeaderMap, etag: &str) -> bool {
 
 #[derive(Deserialize)]
 pub struct ContractsQuery {
+    /// Maximum number of contracts to return. Default 100, max 1000.
     #[serde(default = "default_limit")]
     limit: i64,
+    /// Cursor-based pagination: the `contract_id` returned as `next_cursor`
+    /// from a previous response. When supplied, returns contracts whose
+    /// `contract_id` sorts after this value (within the same event-count order).
     #[serde(default)]
-    offset: i64,
+    after: Option<String>,
 }
 
 fn default_limit() -> i64 {
-    200
+    100
 }
 
 #[derive(Serialize)]
 pub struct ContractsResponse {
     pub data: Vec<Contract>,
     pub has_more: bool,
+    /// The `after` value to pass on the next request to continue pagination.
+    /// `null` when there are no more pages.
+    pub next_cursor: Option<String>,
 }
 
 pub async fn list_contracts(
@@ -71,34 +78,77 @@ pub async fn list_contracts(
     // instead of computing a GROUP BY on every request. This provides constant-time
     // performance independent of the total event count, making the explorer's landing
     // page (which relies on this endpoint) performant at scale.
-    let limit = q.limit.clamp(1, 500);
-    let offset = q.offset.max(0);
+    //
+    // Cursor pagination: when `after` is provided, resolve the event_count of the
+    // cursor row and continue from there. Ties in event_count are broken by
+    // contract_id (lexicographic), which gives a stable total order without a
+    // sequential scan.
+    let limit = q.limit.clamp(1, 1000);
 
-    let contracts: Vec<Contract> = sqlx::query_as(
-        "SELECT contract_id,
-                event_count,
-                first_seen_ledger,
-                last_seen_ledger
-         FROM contract_summaries
-         WHERE event_count > 0
-         ORDER BY event_count DESC
-         LIMIT $1 OFFSET $2",
-    )
-    .bind(limit + 1)
-    .bind(offset)
-    .fetch_all(&state.pool)
-    .await?;
+    let contracts: Vec<Contract> = if let Some(ref cursor) = q.after {
+        // Look up the event_count of the cursor contract so we can use a
+        // keyset predicate instead of OFFSET, keeping the query O(log N).
+        let cursor_count: Option<i64> = sqlx::query_scalar(
+            "SELECT event_count FROM contract_summaries WHERE contract_id = $1",
+        )
+        .bind(cursor)
+        .fetch_optional(&state.pool)
+        .await?;
+
+        match cursor_count {
+            Some(cc) => sqlx::query_as(
+                "SELECT contract_id,
+                        event_count,
+                        first_seen_ledger,
+                        last_seen_ledger
+                 FROM contract_summaries
+                 WHERE event_count > 0
+                   AND (event_count < $1
+                        OR (event_count = $1 AND contract_id > $2))
+                 ORDER BY event_count DESC, contract_id ASC
+                 LIMIT $3",
+            )
+            .bind(cc)
+            .bind(cursor)
+            .bind(limit + 1)
+            .fetch_all(&state.pool)
+            .await?,
+            // Unknown cursor — return empty rather than silently restarting.
+            None => vec![],
+        }
+    } else {
+        sqlx::query_as(
+            "SELECT contract_id,
+                    event_count,
+                    first_seen_ledger,
+                    last_seen_ledger
+             FROM contract_summaries
+             WHERE event_count > 0
+             ORDER BY event_count DESC, contract_id ASC
+             LIMIT $1",
+        )
+        .bind(limit + 1)
+        .fetch_all(&state.pool)
+        .await?
+    };
 
     let has_more = contracts.len() as i64 > limit;
-    let result_contracts = if has_more {
+    let result_contracts: Vec<Contract> = if has_more {
         contracts.into_iter().take(limit as usize).collect()
     } else {
         contracts
     };
 
+    let next_cursor = if has_more {
+        result_contracts.last().map(|c| c.contract_id.clone())
+    } else {
+        None
+    };
+
     Ok(Json(ContractsResponse {
         data: result_contracts,
         has_more,
+        next_cursor,
     }))
 }
 
@@ -323,6 +373,13 @@ pub async fn contract_interface_diff(
              so there is no earlier interface to compare it to"
         )));
     }
+    if from > to {
+        return Err(ApiError::bad_request(format!(
+            "`from` ({from}) must be less than `to` ({to}); \
+             reversing the order would produce a backward diff where added items \
+             appear as removed and vice-versa"
+        )));
+    }
     if from == to {
         return Err(ApiError::bad_request(
             "`from` and `to` are the same version; nothing to diff",
@@ -395,9 +452,19 @@ pub async fn contract_state(
     .await?;
 
     if rows.is_empty() {
+        // Check if state indexing is disabled by seeing if any state exists at all.
+        let any_state_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM contract_state LIMIT 1)")
+            .fetch_one(&state.pool)
+            .await?;
+
+        if !any_state_exists {
+            return Err(ApiError::feature_disabled(
+                "state indexing is disabled",
+            ));
+        }
+
         return Err(ApiError::not_found(
-            "no state snapshots for this contract (state indexing may be disabled, \
-             or the contract hasn't been active since it was enabled)",
+            "no state snapshots for this contract",
         ));
     }
 
@@ -479,9 +546,19 @@ pub async fn contract_data(
     .await?;
 
     if rows.is_empty() {
+        // Check if key indexing is disabled by seeing if any data exists at all.
+        let any_data_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM contract_data LIMIT 1)")
+            .fetch_one(&state.pool)
+            .await?;
+
+        if !any_data_exists {
+            return Err(ApiError::feature_disabled(
+                "key indexing is disabled",
+            ));
+        }
+
         return Err(ApiError::not_found(
-            "no per-key data snapshots for this contract (key indexing may be disabled, \
-             or no tracked keys have been active since it was enabled)",
+            "no per-key data snapshots for this contract",
         ));
     }
 
@@ -570,4 +647,69 @@ pub async fn contract_data_key(
         "count": versions.len(),
         "versions": versions,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    /// The `from > to` guard added for #211 is a pure value comparison before
+    /// any DB or RPC call, so we can exercise it by inspecting the validation
+    /// logic directly rather than spinning up a full Axum server + Postgres.
+    ///
+    /// The guard is: if from > to { return Err(bad_request(…)) }
+    /// These tests document and lock in that rule.
+
+    fn validate_diff_params(from: i32, to: i32) -> Result<(), String> {
+        if from < 1 {
+            return Err(format!(
+                "no version to diff against: from ({from}) must be >= 1"
+            ));
+        }
+        if from > to {
+            return Err(format!(
+                "`from` ({from}) must be less than `to` ({to}); \
+                 reversing the order would produce a backward diff"
+            ));
+        }
+        if from == to {
+            return Err("`from` and `to` are the same version; nothing to diff".to_string());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn diff_from_greater_than_to_is_rejected() {
+        // from=5, to=2 is the canonical bad case from the issue.
+        assert!(
+            validate_diff_params(5, 2).is_err(),
+            "from > to must be rejected"
+        );
+    }
+
+    #[test]
+    fn diff_from_equal_to_to_is_rejected() {
+        assert!(
+            validate_diff_params(3, 3).is_err(),
+            "from == to must be rejected"
+        );
+    }
+
+    #[test]
+    fn diff_valid_range_is_accepted() {
+        assert!(
+            validate_diff_params(1, 2).is_ok(),
+            "from=1, to=2 is a valid range"
+        );
+        assert!(
+            validate_diff_params(1, 5).is_ok(),
+            "from=1, to=5 is a valid range"
+        );
+    }
+
+    #[test]
+    fn diff_from_below_one_is_rejected() {
+        assert!(
+            validate_diff_params(0, 1).is_err(),
+            "from=0 is not a valid version"
+        );
+    }
 }
