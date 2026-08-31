@@ -96,6 +96,9 @@ jobs:
               && 'type=cacheonly'
               || format('type=image,name={0}/{1},push-by-digest=true,name-canonical=true,push=true', env.REGISTRY, env.IMAGE_NAME)
             }}
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ github.event.repository.updated_at }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
