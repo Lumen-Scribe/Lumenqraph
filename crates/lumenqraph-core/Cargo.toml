@@ -23,3 +23,5 @@ stellar-xdr.workspace = true
 hex.workspace = true
 subtle.workspace = true
 base64 = "0.22"
+url.workspace = true
+tokio = { version = "1", features = ["net"] }
