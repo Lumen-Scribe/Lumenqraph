@@ -1,7 +1,7 @@
 # Multi-stage build producing one image with all four service binaries.
 # Uses rustls throughout (no OpenSSL), so the runtime only needs CA certs.
 
-FROM rust:1-slim AS builder
+FROM rust:1-slim@sha256:17d1ba895198f9934c6314ec5346a0d5115372f3243390c3d731e242f35c2f27 AS builder
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config \
     && rm -rf /var/lib/apt/lists/*
@@ -10,7 +10,7 @@ COPY crates ./crates
 COPY migrations ./migrations
 RUN cargo build --release --workspace
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*

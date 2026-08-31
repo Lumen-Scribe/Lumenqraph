@@ -58,6 +58,39 @@ updates:
       - dependencies
       - typescript
 
+  # ── Python SDK (pip) ────────────────────────────────────────────────────────
+  - package-ecosystem: pip
+    directory: /sdk/python
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: UTC
+    groups:
+      pip-dependencies:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - python
+
+  # ── Docker base images ──────────────────────────────────────────────────────
+  # Keeps the digest pins in the Dockerfile up-to-date so reproducible builds
+  # also pick up security patches on a schedule rather than requiring manual
+  # digest refreshes.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: UTC
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - docker
+
   # ── GitHub Actions ──────────────────────────────────────────────────────────
   - package-ecosystem: github-actions
     directory: /
