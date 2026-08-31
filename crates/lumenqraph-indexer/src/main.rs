@@ -28,7 +28,10 @@ mod rpc_client;
 mod specs;
 mod state;
 mod store;
-#[cfg(test)]
+// The end-to-end smoke test is gated behind the `smoke-tests` feature (as well
+// as `#[ignore]`) so it is never compiled or run by a plain `cargo test`,
+// including in offline CI. See CONTRIBUTING.md → "Smoke tests".
+#[cfg(all(test, feature = "smoke-tests"))]
 mod smoke;
 
 use std::time::Duration;

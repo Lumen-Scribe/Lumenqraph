@@ -60,6 +60,8 @@ pub struct AppState {
     pub health_max_lag_ledgers: i64,
     /// Max age of cursor update for /health to show "ok" status, in seconds.
     pub health_max_stale_secs: i64,
+    /// When true, GET /metrics requires a valid API key (#213).
+    pub metrics_require_auth: bool,
 }
 
 pub struct BuildInfo {

@@ -555,6 +555,94 @@
       ],
       "title": "Total API Requests",
       "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "description": "Webhook deliveries in the 'pending' state, refreshed once per dispatcher tick. A sustained climb means the dispatcher is falling behind a slow or unresponsive subscriber.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 500
+              },
+              {
+                "color": "red",
+                "value": 5000
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "id": 10,
+      "options": {
+        "legend": {
+          "calcs": ["min", "max", "mean"],
+          "displayMode": "table",
+          "placement": "right"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "pluginVersion": "8.0.0",
+      "targets": [
+        {
+          "expr": "lumenqraph_webhooks_pending_deliveries",
+          "legendFormat": "Pending Deliveries",
+          "refId": "A"
+        }
+      ],
+      "title": "Webhook Delivery Backlog (Queue Depth)",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",
@@ -572,5 +660,5 @@
   "timezone": "",
   "title": "Lumenqraph Indexer & API Monitoring",
   "uid": "lumenqraph-monitoring",
-  "version": 1
+  "version": 2
 }

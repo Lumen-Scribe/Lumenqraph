@@ -1,4 +1,4 @@
-.PHONY: help db db-down seed build test test-db fmt lint indexer api webhooks backfill up down
+.PHONY: help db db-down seed build test test-db test-smoke fmt lint indexer api webhooks backfill up down
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -30,6 +30,12 @@ test-db: db ## Run Postgres-backed tests (requires TEST_DATABASE_URL or a runnin
 	cargo test -p lumenqraph-webhooks -- --ignored --test-threads=1; \
 	cargo test -p lumenqraph-api      -- --ignored --test-threads=1; \
 	cargo test -p lumenqraph-mcp      -- --ignored --test-threads=1
+
+test-smoke: db ## Run the gated end-to-end smoke test (requires TEST_DATABASE_URL or a running local Postgres)
+	@if [ -z "$$TEST_DATABASE_URL" ]; then \
+	  export TEST_DATABASE_URL=postgres://lumenqraph:lumenqraph@localhost:5432/lumenqraph; \
+	fi; \
+	cargo test -p lumenqraph-indexer --features smoke-tests smoke -- --ignored --test-threads=1
 
 fmt: ## Format
 	cargo fmt --all

@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Opt-in gate for the heavy end-to-end smoke test in `src/smoke.rs`. It is
+# also `#[ignore]`d, but the feature keeps the module out of a normal
+# `cargo test` build entirely so it can never run in offline CI by accident.
+# Run with: cargo test -p lumenqraph-indexer --features smoke-tests -- --ignored --test-threads=1
+smoke-tests = []
+
 [[bin]]
 name = "lumenqraph-indexer"
 path = "src/main.rs"

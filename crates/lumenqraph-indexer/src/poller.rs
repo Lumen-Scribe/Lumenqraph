@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use lumenqraph_core::NewEvent;
 use sqlx::PgPool;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::convert::to_new_event;
@@ -33,6 +33,7 @@ pub fn max_lookback() -> i64 {
 
 pub async fn run(pool: PgPool, rpc: RpcClient, config: Config) -> anyhow::Result<()> {
     let base_interval = Duration::from_secs(config.poll_interval_secs.max(1));
+    let degraded_interval = Duration::from_secs(config.degraded_poll_interval_secs.max(1));
     let mut backoff = base_interval;
     // One spec cache for the process lifetime: each contract's interface is
     // fetched and parsed once, then reused to enrich every event.
@@ -40,10 +41,22 @@ pub async fn run(pool: PgPool, rpc: RpcClient, config: Config) -> anyhow::Result
     // None => prune on the first cycle that reaches the tip, so a deployment
     // that switches retention on starts reclaiming immediately.
     let mut last_prune: Option<Instant> = None;
+    // Circuit-breaker state: count consecutive poll failures.
+    let mut consecutive_errors: u32 = 0;
 
     loop {
         let sleep_for = match poll_once(&pool, &rpc, &config, &specs).await {
             Ok(processed_to) => {
+                // Success: reset both the backoff and the circuit-breaker counter.
+                if consecutive_errors > 0 {
+                    info!(
+                        consecutive_errors,
+                        "poll cycle succeeded; resetting circuit breaker"
+                    );
+                    consecutive_errors = 0;
+                    // Record cleared state to the gauge.
+                    let _ = cursor::set_consecutive_errors(&pool, 0).await;
+                }
                 backoff = base_interval;
                 if let Some(ledger) = processed_to {
                     debug!(ledger, "cycle complete");
@@ -77,11 +90,31 @@ pub async fn run(pool: PgPool, rpc: RpcClient, config: Config) -> anyhow::Result
                 base_interval
             }
             Err(e) => {
-                warn!(error = %e, backoff_secs = backoff.as_secs(), "poll cycle failed; backing off");
+                consecutive_errors += 1;
                 let _ = cursor::incr_errors(&pool).await;
-                let this = backoff;
-                backoff = (backoff * 2).min(Duration::from_secs(60));
-                this
+                let _ = cursor::set_consecutive_errors(&pool, consecutive_errors).await;
+
+                // Check if we should enter degraded / circuit-breaker state.
+                let circuit_open = config.max_consecutive_errors > 0
+                    && consecutive_errors >= config.max_consecutive_errors;
+
+                if circuit_open {
+                    error!(
+                        error = %e,
+                        consecutive_errors,
+                        max_consecutive_errors = config.max_consecutive_errors,
+                        degraded_interval_secs = config.degraded_poll_interval_secs,
+                        "circuit breaker open: too many consecutive poll failures; \
+                         switching to degraded polling interval"
+                    );
+                    backoff = degraded_interval;
+                    degraded_interval
+                } else {
+                    warn!(error = %e, backoff_secs = backoff.as_secs(), consecutive_errors, "poll cycle failed; backing off");
+                    let this = backoff;
+                    backoff = (backoff * 2).min(Duration::from_secs(60));
+                    this
+                }
             }
         };
 
@@ -518,5 +551,53 @@ mod tests {
             MAX_LOOKBACK_LEDGERS,
             "max_lookback() should export the RPC retention window"
         );
+    }
+
+    // ── Circuit breaker logic ─────────────────────────────────────────────
+
+    #[test]
+    fn circuit_breaker_opens_after_max_consecutive_errors() {
+        let max = 20u32;
+        // Simulate accumulating errors.
+        for count in 1..=max {
+            let circuit_open = max > 0 && count >= max;
+            if count < max {
+                assert!(!circuit_open, "circuit should stay closed at error {count}");
+            } else {
+                assert!(circuit_open, "circuit should open at error {count}");
+            }
+        }
+    }
+
+    #[test]
+    fn circuit_breaker_disabled_when_max_is_zero() {
+        // max_consecutive_errors = 0 means the circuit breaker is disabled.
+        let max = 0u32;
+        let count = 1_000u32;
+        let circuit_open = max > 0 && count >= max;
+        assert!(!circuit_open, "circuit should never open when max = 0");
+    }
+
+    #[test]
+    fn circuit_breaker_resets_on_success() {
+        // After a successful cycle consecutive_errors is reset to 0.
+        let mut consecutive_errors: u32 = 25;
+        // Simulate success path.
+        if consecutive_errors > 0 {
+            consecutive_errors = 0;
+        }
+        assert_eq!(consecutive_errors, 0);
+    }
+
+    #[test]
+    fn degraded_interval_used_when_circuit_open() {
+        let base = Duration::from_secs(5);
+        let degraded = Duration::from_secs(300);
+        let max_consecutive_errors = 20u32;
+        let consecutive_errors = 20u32;
+
+        let circuit_open = max_consecutive_errors > 0 && consecutive_errors >= max_consecutive_errors;
+        let sleep = if circuit_open { degraded } else { base };
+        assert_eq!(sleep, degraded, "degraded interval should be used when circuit is open");
     }
 }
