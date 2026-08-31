@@ -195,6 +195,8 @@ All configuration is via environment variables (see [`.env.example`](.env.exampl
 | `API_BIND_ADDR` | `0.0.0.0:8080` | API listen address. |
 | `CORS_ALLOWED_ORIGINS` | *(unset)* | Comma-separated list of allowed origins for CORS requests (e.g. `https://example.com`), `*` to allow all origins, or unset for same-origin only (no CORS headers added, default behavior). |
 | `REQUIRE_API_KEY` | `false` | Require a valid API key on data routes. |
+| `METRICS_REQUIRE_API_KEY` | `false` | Require a valid API key on `GET /metrics`. When `false` (default) the endpoint is public. Set to `true` in production when the API is internet-accessible to avoid leaking operational telemetry. |
+| `MAX_REQUEST_BODY_BYTES` | `65536` | Maximum request body size in bytes (64 KB). Axum returns `413` for larger bodies. Protects `POST /call`, `POST /simulate`, and `POST /graphql` from large-payload denial-of-service. Replaces the old `API_MAX_BODY_BYTES` variable (kept as a fallback alias). |
 | `ANON_RATE_LIMIT_PER_MIN` | `60` | Requests/min for unauthenticated callers. |
 | `WEBHOOK_TICK_SECS` | `3` | Webhook dispatcher poll interval. |
 | `WEBHOOK_BATCH_SIZE` | `100` | Deliveries processed per tick. |
@@ -209,7 +211,7 @@ All configuration is via environment variables (see [`.env.example`](.env.exampl
 
 Base URL defaults to `http://localhost:8080`. Full reference: [docs/API.md](docs/API.md).
 
-**Authentication.** Data routes accept an API key via `Authorization: Bearer <key>` or `x-api-key: <key>`. When `REQUIRE_API_KEY=false` (default), unauthenticated callers are allowed up to `ANON_RATE_LIMIT_PER_MIN`. `/health` and `/metrics` are always public. Rate-limit breaches return `429`; invalid or revoked keys return `401`.
+**Authentication.** Data routes accept an API key via `Authorization: Bearer <key>` or `x-api-key: <key>`. When `REQUIRE_API_KEY=false` (default), unauthenticated callers are allowed up to `ANON_RATE_LIMIT_PER_MIN`. `/health`, `/livez`, and `/readyz` are always public. `/metrics` is public by default and can be restricted with `METRICS_REQUIRE_API_KEY=true`. Rate-limit breaches return `429`; invalid or revoked keys return `401`.
 
 | Method | Path | Description |
 | --- | --- | --- |
