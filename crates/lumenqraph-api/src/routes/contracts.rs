@@ -24,6 +24,27 @@ use crate::error::{ApiError, ApiResult};
 use crate::specs::CachedSpec;
 use crate::state::AppState;
 
+/// Build a weak ETag value from an arbitrary string (e.g. wasm hash or version
+/// composite). Returns a string like `W/"<hex>"`.
+fn generate_etag(source: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hasher);
+    let h = hasher.finish();
+    format!("W/\"{h:016x}\"")
+}
+
+/// Return `true` when the client's `If-None-Match` header matches the etag,
+/// meaning the cached copy is still valid and we can respond 304.
+fn check_if_none_match(headers: &HeaderMap, etag: &str) -> bool {
+    if let Some(inm) = headers.get(header::IF_NONE_MATCH) {
+        if let Ok(s) = inm.to_str() {
+            return s == etag || s == "*";
+        }
+    }
+    false
+}
+
 #[derive(Deserialize)]
 pub struct ContractsQuery {
     /// Maximum number of contracts to return. Default 100, max 1000.
@@ -142,7 +163,7 @@ pub async fn contract_interface(
     Path(contract_id): Path<String>,
     Query(q): Query<InterfaceQuery>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     if !lumenqraph_core::is_valid_contract_id(&contract_id) {
         return Err(ApiError::bad_request("invalid contract id"));
     }
@@ -187,7 +208,7 @@ async fn contract_interface_at_version(
     contract_id: &str,
     version: i32,
     headers: &HeaderMap,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     let row: Option<(SqlxJson<Value>, String, DateTime<Utc>)> = sqlx::query_as(
         "SELECT interface, wasm_hash, observed_at FROM contract_spec_versions
          WHERE contract_id = $1 AND version = $2",
@@ -239,7 +260,7 @@ pub async fn contract_interface_history(
     Path(contract_id): Path<String>,
     Query(q): Query<HistoryQuery>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     if !lumenqraph_core::is_valid_contract_id(&contract_id) {
         return Err(ApiError::bad_request("invalid contract id"));
     }
@@ -415,7 +436,7 @@ pub async fn contract_state(
     Path(contract_id): Path<String>,
     Query(q): Query<StateQuery>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     if !lumenqraph_core::is_valid_contract_id(&contract_id) {
         return Err(ApiError::bad_request("invalid contract id"));
     }

@@ -1472,7 +1472,7 @@ mod tests {
                         doc: "".try_into().unwrap(),
                         name: "r".try_into().unwrap(),
                         type_: ScSpecTypeDef::Result(Box::new(
-                            stellar_xdr::curr::ScSpecUdtResultV0 {
+                            stellar_xdr::curr::ScSpecTypeResult {
                                 ok_type: Box::new(ScSpecTypeDef::U32),
                                 error_type: Box::new(ScSpecTypeDef::U32),
                             },

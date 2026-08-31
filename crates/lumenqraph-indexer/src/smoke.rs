@@ -180,6 +180,7 @@ mod tests {
             balance_key_symbol: "Balance".into(),
             balance_key_durability: "persistent".into(),
             retention_ledgers: 0,
+            spec_version_retention: 0,
             upgrade_watch: false,
             reorg_overlap_ledgers: 0,
             rpc_timeout_secs: 30,

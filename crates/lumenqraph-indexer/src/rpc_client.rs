@@ -598,6 +598,7 @@ impl RpcClient {
 
 /// A contract's instance entry: executable hash, instance storage, and the
 /// ledger it last changed at.
+#[derive(Clone)]
 pub struct InstanceEntry {
     pub wasm_hash: Option<String>,
     pub storage: ScVal,

@@ -103,15 +103,17 @@ pub async fn list_transfers(
         (false, transfers)
     };
 
+    let next_cursor = if has_next_page {
+        result_transfers
+            .last()
+            .map(|t| pagination::encode_cursor(t.ledger, &t.event_id))
+    } else {
+        None
+    };
+
     Ok(Json(TransfersResponse {
         data: result_transfers,
         has_more: has_next_page,
-        next_cursor: if has_next_page {
-            result_transfers
-                .last()
-                .map(|t| pagination::encode_cursor(t.ledger, &t.event_id))
-        } else {
-            None
-        },
+        next_cursor,
     }))
 }

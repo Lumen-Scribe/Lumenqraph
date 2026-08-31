@@ -263,12 +263,30 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("failed to bind {bind_addr}"))?;
     info!(addr = %bind_addr, "lumenqraph api listening");
-    axum::serve(
+
+    let shutdown_timeout_secs: u64 = env_parse("API_SHUTDOWN_TIMEOUT_SECS", 30u64);
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    .with_graceful_shutdown(shutdown_signal());
+
+    // Wrap the graceful shutdown in a hard timeout so a slow or stuck client
+    // cannot keep the process alive indefinitely during a rolling restart.
+    match tokio::time::timeout(
+        Duration::from_secs(shutdown_timeout_secs),
+        server,
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            info!(
+                timeout_secs = shutdown_timeout_secs,
+                "shutdown timeout reached; forcing exit"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -291,7 +309,11 @@ async fn shutdown_signal() {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
-    info!("shutdown signal received; stopping api");
+    info!("shutdown signal received; draining in-flight requests (up to {}s)",
+          std::env::var("API_SHUTDOWN_TIMEOUT_SECS")
+              .ok()
+              .and_then(|v| v.parse::<u64>().ok())
+              .unwrap_or(30));
 }
 
 #[cfg(test)]

@@ -200,6 +200,7 @@ fn spec_sep41_transfer_function_and_event() {
     use stellar_xdr::curr::ScSpecEventParamV0;
     let transfer_event = ScSpecEntry::EventV0(ScSpecEventV0 {
         doc: "".try_into().unwrap(),
+        lib: "".try_into().unwrap(),
         name: sym("transfer"),
         prefix_topics: vec![sym("transfer")].try_into().unwrap(),
         params: vec![
@@ -432,6 +433,7 @@ fn sep41_spec() -> ContractSpec {
 
     let transfer_event = ScSpecEntry::EventV0(ScSpecEventV0 {
         doc: "".try_into().unwrap(),
+        lib: "".try_into().unwrap(),
         name: sym("transfer"),
         prefix_topics: vec![sym("transfer")].try_into().unwrap(),
         params: vec![

@@ -180,10 +180,20 @@ async fn main() -> anyhow::Result<()> {
     // Start health/metrics HTTP server if configured
     if let Ok(health_addr) = std::env::var("INDEXER_HEALTH_ADDR") {
         let pool_arc = std::sync::Arc::new(pool.clone());
-        http::start_http_server(pool_arc, &health_addr).await?;
+        let spec_cache_arc = std::sync::Arc::new(specs::SpecCache::new(config.spec_cache_max_entries));
+        let spec_cache_for_poller = spec_cache_arc.clone();
+        http::start_http_server(pool_arc, spec_cache_arc, &health_addr).await?;
+        let result = poller::run(pool.clone(), rpc, config, spec_cache_for_poller).await;
+        info!("releasing indexer leader lock");
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(INDEXER_LOCK_ID)
+            .execute(&pool)
+            .await;
+        return result;
     }
 
-    let result = poller::run(pool.clone(), rpc, config).await;
+    let spec_cache = std::sync::Arc::new(specs::SpecCache::new(config.spec_cache_max_entries));
+    let result = poller::run(pool.clone(), rpc, config, spec_cache).await;
 
     // Release the advisory lock on shutdown.
     info!("releasing indexer leader lock");

@@ -33,9 +33,10 @@ hex.workspace = true
 sha2.workspace = true
 uuid.workspace = true
 lru.workspace = true
+axum.workspace = true
+tower-http.workspace = true
 
 [dev-dependencies]
-axum.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 reqwest.workspace = true

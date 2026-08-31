@@ -12,13 +12,21 @@ use std::sync::Arc;
 use serde_json::json;
 use tracing::{error, info};
 
+use crate::specs::SpecCache;
+
 #[derive(Clone)]
 pub struct HttpState {
     pub pool: Arc<PgPool>,
+    /// Reference to the live spec cache so its size can be reported in metrics.
+    pub spec_cache: Arc<SpecCache>,
 }
 
-pub async fn start_http_server(pool: Arc<PgPool>, bind_addr: &str) -> anyhow::Result<()> {
-    let state = HttpState { pool };
+pub async fn start_http_server(
+    pool: Arc<PgPool>,
+    spec_cache: Arc<SpecCache>,
+    bind_addr: &str,
+) -> anyhow::Result<()> {
+    let state = HttpState { pool, spec_cache };
 
     let app = Router::new()
         .route("/health", get(health))
@@ -109,6 +117,12 @@ async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
             body.push_str("# HELP lumenqraph_enrichment_rate Fraction of events successfully enriched (0.0 to 1.0)\n");
             body.push_str("# TYPE lumenqraph_enrichment_rate gauge\n");
             body.push_str(&format!("lumenqraph_enrichment_rate {}\n", metrics.enrichment_rate));
+
+            // Spec cache size gauge (issue #268).
+            let cache_size = state.spec_cache.cache_size();
+            body.push_str("# HELP lumenqraph_spec_cache_size Current number of entries in the in-memory spec cache\n");
+            body.push_str("# TYPE lumenqraph_spec_cache_size gauge\n");
+            body.push_str(&format!("lumenqraph_spec_cache_size {cache_size}\n"));
         }
         Err(e) => {
             error!(error = %e, "failed to gather indexer metrics");

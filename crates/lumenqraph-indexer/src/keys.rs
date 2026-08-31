@@ -60,7 +60,7 @@ impl KeyTemplate {
             
             // Cartesian product for multi-param keys
             let mut next_params = Vec::new();
-            for mut base in params {
+            for base in params {
                 for addr in &addresses {
                     let mut combo = base.clone();
                     combo.push(addr.clone());
