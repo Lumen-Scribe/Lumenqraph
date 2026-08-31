@@ -14,6 +14,9 @@ pub enum Error {
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
 
+    #[error("hex decode error: {0}")]
+    Hex(#[from] hex::FromHexError),
+
     #[error("{0}")]
     Other(String),
 }

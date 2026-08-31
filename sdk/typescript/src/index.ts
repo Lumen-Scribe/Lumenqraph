@@ -318,6 +318,21 @@ export class LumenqraphClient {
     }, opts.signal);
   }
 
+  /** Fetch a single event by its unique ID. */
+  getEvent(eventId: string, opts: RequestOptions = {}): Promise<EventRecord> {
+    return this.get(`/events/${enc(eventId)}`, {}, opts.signal);
+  }
+
+  /** All indexed events emitted by a transaction, in emission order. */
+  getTransactionEvents(
+    txHash: string,
+    opts: { limit?: number; signal?: AbortSignal } = {},
+  ): Promise<{ tx_hash: string; count: number; data: EventRecord[] }> {
+    return this.get(`/transactions/${enc(txHash)}/events`, {
+      limit: opts.limit,
+    }, opts.signal);
+  }
+
   /** Materialized SEP-41 transfers, newest first (limit/offset). */
   listTransfers(
     contractId?: string,
@@ -448,22 +463,45 @@ export class LumenqraphClient {
   /**
    * Async iterator over *all* of a contract's events via GraphQL cursor
    * pagination — transparently fetching page after page.
+   *
+   * Cancellation (#279): pass `signal` to cancel from the caller. Independently,
+   * breaking out of the `for await` loop early runs this generator's `finally`
+   * cleanup, which aborts the signal handed to the page fetches — so an
+   * in-flight `eventsPage` request is cancelled rather than left to run and have
+   * its result discarded.
    */
   async *paginateEvents(
     contractId: string,
     opts: { pageSize?: number; eventName?: string; signal?: AbortSignal } = {},
   ): AsyncGenerator<EventRecord> {
-    let after: string | undefined;
-    for (;;) {
-      const page = await this.eventsPage(contractId, {
-        first: opts.pageSize ?? 100,
-        after,
-        eventName: opts.eventName,
-        signal: opts.signal,
-      });
-      for (const node of page.nodes) yield node;
-      if (!page.hasNextPage || !page.endCursor) return;
-      after = page.endCursor;
+    // An internal controller, chained to the caller's signal, is what the page
+    // fetches actually see. Early termination (a `break` in the consumer's
+    // `for await`, or a thrown error) triggers the `finally` below, which aborts
+    // it and tears down any pending request.
+    const pageAborter = new AbortController();
+    const external = opts.signal;
+    const onExternalAbort = () => pageAborter.abort(external?.reason);
+    if (external) {
+      if (external.aborted) pageAborter.abort(external.reason);
+      else external.addEventListener("abort", onExternalAbort, { once: true });
+    }
+
+    try {
+      let after: string | undefined;
+      for (;;) {
+        const page = await this.eventsPage(contractId, {
+          first: opts.pageSize ?? 100,
+          after,
+          eventName: opts.eventName,
+          signal: pageAborter.signal,
+        });
+        for (const node of page.nodes) yield node;
+        if (!page.hasNextPage || !page.endCursor) return;
+        after = page.endCursor;
+      }
+    } finally {
+      external?.removeEventListener("abort", onExternalAbort);
+      pageAborter.abort();
     }
   }
 
@@ -678,7 +716,7 @@ export async function verifyWebhook(
   const bodyBytes: ArrayBuffer =
     typeof rawBody === "string"
       ? (enc.encode(rawBody).buffer as ArrayBuffer)
-      : (rawBody.buffer as ArrayBuffer);
+      : (rawBody.buffer.slice(rawBody.byteOffset, rawBody.byteOffset + rawBody.byteLength) as ArrayBuffer);
 
   // Import the secret as an HMAC-SHA-256 key via Web Crypto (Node 18+, browsers).
   const cryptoKey = await crypto.subtle.importKey(

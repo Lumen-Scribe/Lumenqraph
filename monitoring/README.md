@@ -103,12 +103,26 @@ scrape_configs:
 
 - **`lumenqraph_events_total`** - Total events stored in database
 
+### Webhook Metrics
+
+Exposed by the `lumenqraph-webhooks` service on its own `/metrics` endpoint
+(default `127.0.0.1:9091`, `WEBHOOKS_METRICS_BIND_ADDR`):
+
+- **`lumenqraph_webhooks_pending_deliveries`** - Deliveries in the `pending`
+  state (queue depth), refreshed once per dispatcher tick. A sustained rise
+  means the dispatcher is falling behind a slow or unresponsive subscriber.
+- **`lumenqraph_webhook_oldest_pending_age_seconds`** - Age of the oldest
+  pending delivery.
+- **`lumenqraph_webhook_delivered_total`** / **`lumenqraph_webhook_failed_total`**
+  - Lifetime delivery outcomes.
+
 ## Alert Rules
 
 ### Critical Alerts
 
 - **IndexerStalled** - No events ingested in 5+ minutes but lag exists
 - **IndexerLagCritical** - Lag > 500 ledgers for 2+ minutes
+- **LumenqraphWebhookBacklogCritical** - Pending webhook deliveries > 5000 for 5+ minutes
 
 ### Warning Alerts
 
@@ -117,6 +131,7 @@ scrape_configs:
 - **LargeLagGrowth** - Lag grew > 1000 ledgers/hour
 - **IngestRateLow** - Processing < 1 event/sec for 10+ minutes
 - **APINoRequests** - No API requests for 5+ minutes
+- **LumenqraphWebhookBacklogHigh** - Pending webhook deliveries > 500 for 5+ minutes
 
 ## Customization
 

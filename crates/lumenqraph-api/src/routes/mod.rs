@@ -70,8 +70,20 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health::health))
         .route("/livez", get(health::livez))
         .route("/readyz", get(health::readyz))
-        .route("/metrics", get(metrics::metrics))
         .merge(openapi::router());
+
+    // /metrics: public by default, but can be restricted to authenticated
+    // callers via METRICS_REQUIRE_API_KEY=true (#213).
+    let metrics_router = if state.metrics_require_auth {
+        Router::new()
+            .route("/metrics", get(metrics::metrics))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_and_rate_limit,
+            ))
+    } else {
+        Router::new().route("/metrics", get(metrics::metrics))
+    };
 
     // RPC-backed routes with separate, tighter rate limiting (they hit upstream RPC).
     let rpc_routes = Router::new()
@@ -161,6 +173,7 @@ pub fn router(state: AppState) -> Router {
 
     let metrics_collector = state.metrics.clone();
     let mut app = public
+        .merge(metrics_router)
         .merge(protected)
         .merge(rpc_routes)
         .with_state(state.clone())

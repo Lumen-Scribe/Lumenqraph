@@ -21,23 +21,7 @@ use crate::specs::SpecCache;
 /// AND event_name IS NOT NULL, re-enrich them against the (now-cached) spec,
 /// and update the database.
 pub async fn run_reenrich(pool: PgPool, rpc: RpcClient, config: Config) -> anyhow::Result<()> {
-    let specs = SpecCache::new(config.spec_cache_max_entries);
-
-    // Count total events to enrich for progress estimation
-    let total_result: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM events WHERE enriched IS NULL AND event_name IS NOT NULL",
-    )
-    .fetch_one(&pool)
-    .await?;
-    let total_events = total_result.0 as u64;
-
-    if total_events == 0 {
-        info!("no events to re-enrich");
-        return Ok(());
-    }
-
-    info!(total_events, "starting re-enrichment pass");
-
+    let specs = SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
     let mut processed = 0u64;
     let mut updated = 0u64;
 

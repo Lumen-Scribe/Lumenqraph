@@ -238,11 +238,17 @@ impl QueryRoot {
         Ok(build_event_connection(rows, limit))
     }
 
-    /// Cursor-paginated token transfers, newest first. Filter by contract.
+    /// Cursor-paginated token transfers, newest first. Optional filters by
+    /// contract and by the `from` / `to` address — mirroring the REST
+    /// `GET /contracts/:id/transfers` `?from=`/`?to=` query parameters.
     async fn transfers(
         &self,
         ctx: &Context<'_>,
         contract_id: Option<String>,
+        #[graphql(desc = "Only transfers sent from this address (G… / C… strkey)")]
+        from: Option<String>,
+        #[graphql(desc = "Only transfers received by this address (G… / C… strkey)")]
+        to: Option<String>,
         #[graphql(desc = "Page size (1-200, default 20)")] first: Option<i32>,
         after: Option<String>,
     ) -> Result<TransferConnection> {
@@ -258,11 +264,15 @@ impl QueryRoot {
             "SELECT event_id, contract_id, from_addr, to_addr, amount, ledger, ledger_closed_at
              FROM token_transfers
              WHERE ($1::text IS NULL OR contract_id = $1)
-               AND ($2::bigint IS NULL OR ledger < $2 OR (ledger = $2 AND event_id < $3))
+               AND ($2::text IS NULL OR from_addr = $2)
+               AND ($3::text IS NULL OR to_addr = $3)
+               AND ($4::bigint IS NULL OR ledger < $4 OR (ledger = $4 AND event_id < $5))
              ORDER BY ledger DESC, event_id DESC
-             LIMIT $4",
+             LIMIT $6",
         )
         .bind(&contract_id)
+        .bind(&from)
+        .bind(&to)
         .bind(after_ledger)
         .bind(after_id)
         .bind(limit + 1)
@@ -440,6 +450,12 @@ mod tests {
             "type EventConnection",
             "type PageInfo",
             "hasNextPage",
+            // The GraphQL `transfers` field must expose the same address filters
+            // as the REST endpoint (#285): `from` and `to`, both optional. The
+            // `Transfer` type's own fields are `fromAddr` / `toAddr`, so these
+            // substrings are unambiguous argument signatures.
+            "from: String",
+            "to: String",
         ] {
             assert!(sdl.contains(expected), "SDL missing {expected:?}");
         }
