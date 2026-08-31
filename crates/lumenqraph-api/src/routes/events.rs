@@ -138,6 +138,11 @@ pub async fn list_events(
                AND ($4::bigint IS NULL OR ledger <= $4)
                AND ($5::timestamp IS NULL OR ledger_closed_at >= $5)
                AND ($6::timestamp IS NULL OR ledger_closed_at <= $6)
+               -- Topic filtering: decoded_topics is a JSONB array. To filter by position,
+               -- we use JSONB containment (@>) with null padding. For example, to match
+               -- decoded_topics[1], we build an array [null, value] and check containment.
+               -- This works because JSONB containment checks if the right side is a subset
+               -- of the left side, preserving position for array elements.
                AND ($7::text IS NULL OR decoded_topics @> jsonb_build_array($7::jsonb))
                AND ($8::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, $8::jsonb))
                AND ($9::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, $9::jsonb))
@@ -179,6 +184,11 @@ pub async fn list_events(
                AND ($4::bigint IS NULL OR ledger <= $4)
                AND ($5::timestamp IS NULL OR ledger_closed_at >= $5)
                AND ($6::timestamp IS NULL OR ledger_closed_at <= $6)
+               -- Topic filtering: decoded_topics is a JSONB array. To filter by position,
+               -- we use JSONB containment (@>) with null padding. For example, to match
+               -- decoded_topics[1], we build an array [null, value] and check containment.
+               -- This works because JSONB containment checks if the right side is a subset
+               -- of the left side, preserving position for array elements.
                AND ($7::text IS NULL OR decoded_topics @> jsonb_build_array($7::jsonb))
                AND ($8::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, $8::jsonb))
                AND ($9::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, $9::jsonb))
