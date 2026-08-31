@@ -45,10 +45,10 @@ pub fn decode_scval_base64(b64: &str) -> Value {
             let mut cur = Cursor::new(&bytes);
             match cur.read_scval() {
                 Some(v) => v,
-                None => json!({ "_xdr": b64 }),
+                None => json!({ "_type": "unknown", "xdr": b64 }),
             }
         }
-        Err(_) => json!({ "_xdr": b64 }),
+        Err(_) => json!({ "_type": "unknown", "xdr": b64 }),
     }
 }
 
@@ -176,7 +176,7 @@ impl<'a> Cursor<'a> {
                 }
             }
             SCV_ADDRESS => Value::String(self.read_address()?),
-            _ => json!({ "_xdr_tag": tag }),
+            _ => json!({ "_type": "unknown", "xdr_tag": tag }),
         })
     }
 
@@ -317,6 +317,47 @@ fn base32_encode(data: &[u8]) -> String {
     out
 }
 
+/// Parse and validate the `CONTRACT_IDS` environment variable string.
+///
+/// Accepts a comma-separated list of C-strkey contract addresses (or an empty
+/// string / unset for "index everything"). Returns an error if:
+/// * any entry is not a valid C-strkey,
+/// * the number of entries exceeds the `getEvents` RPC limit of 25 (5 filters ×
+///   5 IDs).
+///
+/// This function is shared by all services that need to read `CONTRACT_IDS` so
+/// that validation never drifts between the indexer, API, webhooks, and MCP.
+pub fn parse_contract_ids(raw: &str) -> Result<Vec<String>, String> {
+    let ids: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    for id in &ids {
+        if !is_valid_contract_id(id) {
+            return Err(format!(
+                "invalid CONTRACT_ID {id:?}: expected a C\u{2026} strkey (Soroban contract address)"
+            ));
+        }
+    }
+
+    const MAX_CONTRACT_IDS: usize = 25; // 5 filters × 5 IDs per filter
+    if ids.len() > MAX_CONTRACT_IDS {
+        return Err(format!(
+            "CONTRACT_IDS contains {} entries, but getEvents supports at most {} \
+             contract IDs (5 filters × 5 IDs per filter). \
+             Remove {} contract IDs, or run multiple instances each covering a \
+             different subset.",
+            ids.len(),
+            MAX_CONTRACT_IDS,
+            ids.len() - MAX_CONTRACT_IDS,
+        ));
+    }
+
+    Ok(ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,9 +415,22 @@ mod tests {
     }
 
     #[test]
-    fn malformed_falls_back_to_raw() {
+    fn malformed_falls_back_to_unknown() {
         let raw = base64::engine::general_purpose::STANDARD.encode([0xff, 0xff]);
-        assert_eq!(b64(&raw), serde_json::json!({ "_xdr": raw }));
+        assert_eq!(b64(&raw), serde_json::json!({ "_type": "unknown", "xdr": raw }));
+    }
+
+    #[test]
+    fn unknown_scval_tag_returns_discriminator() {
+        // Create an XDR with an unknown tag (999) — not one of the SCV_* constants.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&999u32.to_be_bytes());
+        let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = b64(&raw);
+
+        // Should return a structured unknown marker.
+        assert_eq!(result.get("_type").and_then(|v| v.as_str()), Some("unknown"));
+        assert_eq!(result.get("xdr_tag").and_then(|v| v.as_u64()), Some(999));
     }
 
     #[test]
@@ -499,6 +553,73 @@ mod tests {
         let mut invalid4 = valid;
         invalid4.replace_range(25..26, "!"); // '!' not in base32 alphabet
         assert!(!is_valid_contract_id(&invalid4), "invalid char '!'");
+    }
+
+    // ── parse_contract_ids ────────────────────────────────────────────────
+
+    fn valid_c_strkey() -> String {
+        strkey(VERSION_CONTRACT, &[0u8; 32])
+    }
+
+    #[test]
+    fn parse_contract_ids_empty_string_is_ok() {
+        assert_eq!(parse_contract_ids("").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_contract_ids_whitespace_only_is_ok() {
+        assert_eq!(parse_contract_ids("  ,  , ").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_contract_ids_single_valid_id() {
+        let id = valid_c_strkey();
+        assert_eq!(parse_contract_ids(&id).unwrap(), vec![id]);
+    }
+
+    #[test]
+    fn parse_contract_ids_multiple_valid_ids() {
+        let id1 = strkey(VERSION_CONTRACT, &[0u8; 32]);
+        let id2 = strkey(VERSION_CONTRACT, &[1u8; 32]);
+        let raw = format!("{id1},{id2}");
+        assert_eq!(parse_contract_ids(&raw).unwrap(), vec![id1, id2]);
+    }
+
+    #[test]
+    fn parse_contract_ids_trims_whitespace_around_entries() {
+        let id = valid_c_strkey();
+        let raw = format!("  {id}  ");
+        assert_eq!(parse_contract_ids(&raw).unwrap(), vec![id]);
+    }
+
+    #[test]
+    fn parse_contract_ids_rejects_invalid_id() {
+        let err = parse_contract_ids("NOT_A_VALID_ID").unwrap_err();
+        assert!(err.contains("NOT_A_VALID_ID"), "error mentions bad id: {err}");
+    }
+
+    #[test]
+    fn parse_contract_ids_rejects_g_strkey() {
+        let g_key = strkey(VERSION_ACCOUNT, &[0u8; 32]);
+        let err = parse_contract_ids(&g_key).unwrap_err();
+        assert!(err.contains("C\u{2026} strkey"), "error mentions expected format: {err}");
+    }
+
+    #[test]
+    fn parse_contract_ids_rejects_too_many_ids() {
+        // Build 26 valid contract IDs (one over the limit of 25).
+        let mut ids: Vec<String> = (0u8..26)
+            .map(|i| strkey(VERSION_CONTRACT, &[i; 32]))
+            .collect();
+        // Make each one unique by varying its payload byte.
+        let raw = ids.join(",");
+        let err = parse_contract_ids(&raw).unwrap_err();
+        assert!(err.contains("26"), "error mentions count: {err}");
+        assert!(err.contains("25"), "error mentions limit: {err}");
+        // 25 IDs (at the limit) should be accepted.
+        ids.truncate(25);
+        let raw25 = ids.join(",");
+        assert_eq!(parse_contract_ids(&raw25).unwrap().len(), 25);
     }
 }
 

@@ -87,47 +87,23 @@ pub struct Config {
     /// indexing all contracts. Evicted entries are re-fetched from the database
     /// on next miss. Default: 2000.
     pub spec_cache_max_entries: usize,
+    /// After this many consecutive poll failures the poller enters a degraded
+    /// state: it sleeps for `degraded_poll_interval_secs` instead of the
+    /// normal backoff and emits an ERROR-level log. The counter resets on the
+    /// first successful cycle. 0 = never enter degraded state (disabled).
+    /// Default: 20.
+    pub max_consecutive_errors: u32,
+    /// Sleep interval (seconds) used while the circuit breaker is open (i.e.
+    /// the poller is in degraded state). Default: 300 (5 minutes).
+    pub degraded_poll_interval_secs: u64,
 }
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        let contract_ids: Vec<String> = std::env::var("CONTRACT_IDS")
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        // Validate CONTRACT_IDS as C-strkeys (Soroban contract addresses).
-        for id in &contract_ids {
-            if !lumenqraph_core::is_valid_contract_id(id) {
-                return Err(anyhow::anyhow!(
-                    "invalid CONTRACT_ID {}: expected a C… strkey (Soroban contract address)",
-                    id
-                ));
-            }
-        }
-
-        // Validate the CONTRACT_IDS count against the getEvents RPC protocol limit:
-        // at most 5 filters × 5 IDs per filter = 25 IDs total. Checking this at
-        // startup produces a clear, actionable error message instead of a cryptic
-        // runtime failure on the first poll cycle.
-        const MAX_IDS_PER_FILTER: usize = 5;
-        const MAX_FILTERS: usize = 5;
-        const MAX_CONTRACT_IDS: usize = MAX_IDS_PER_FILTER * MAX_FILTERS;
-        if contract_ids.len() > MAX_CONTRACT_IDS {
-            return Err(anyhow::anyhow!(
-                "CONTRACT_IDS contains {} entries, but getEvents supports at most {} \
-                 contract IDs ({} filters × {} IDs per filter). \
-                 Remove {} contract IDs, or run multiple indexer instances each \
-                 covering a different subset.",
-                contract_ids.len(),
-                MAX_CONTRACT_IDS,
-                MAX_FILTERS,
-                MAX_IDS_PER_FILTER,
-                contract_ids.len() - MAX_CONTRACT_IDS,
-            ));
-        }
+        let contract_ids: Vec<String> = lumenqraph_core::parse_contract_ids(
+            &std::env::var("CONTRACT_IDS").unwrap_or_default(),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // Parse numeric config with validation.
         let poll_interval_secs = env_parse("POLL_INTERVAL_SECS", 5)?;
@@ -138,6 +114,9 @@ impl Config {
         let reorg_overlap_ledgers = env_parse("REORG_OVERLAP_LEDGERS", 0)?;
         let rpc_timeout_secs = env_parse("RPC_TIMEOUT_SECS", 30u64)?;
         let spec_cache_max_entries = env_parse("SPEC_CACHE_MAX_ENTRIES", 2000usize)?;
+        let spec_fetch_concurrency = env_parse("SPEC_FETCH_CONCURRENCY", 4usize)?;
+        let database_max_connections = env_parse("DATABASE_MAX_CONNECTIONS", 10u32)?;
+        let database_min_connections = env_parse("DATABASE_MIN_CONNECTIONS", 0u32)?;
 
         // Validate and clamp PAGE_SIZE to RPC documented bounds (1–10000).
         let page_size = clamp_with_warning("PAGE_SIZE", page_size, 1, 10000);
@@ -189,6 +168,23 @@ impl Config {
 
         // Validate SPEC_CACHE_MAX_ENTRIES minimum (must be at least 1).
         let spec_cache_max_entries = clamp_with_warning("SPEC_CACHE_MAX_ENTRIES", spec_cache_max_entries, 1, usize::MAX);
+
+        // Validate SPEC_FETCH_CONCURRENCY minimum (must be at least 1).
+        let spec_fetch_concurrency = clamp_with_warning("SPEC_FETCH_CONCURRENCY", spec_fetch_concurrency, 1, usize::MAX);
+
+        // Validate DATABASE_MAX_CONNECTIONS minimum (must be at least 1).
+        let database_max_connections = clamp_with_warning("DATABASE_MAX_CONNECTIONS", database_max_connections, 1, u32::MAX);
+
+        // Validate DATABASE_MIN_CONNECTIONS (must be <= max).
+        if database_min_connections > database_max_connections {
+            tracing::warn!(
+                requested_min = database_min_connections,
+                max = database_max_connections,
+                clamped_min = database_max_connections,
+                "DATABASE_MIN_CONNECTIONS cannot exceed DATABASE_MAX_CONNECTIONS; clamping to max"
+            );
+        }
+        let database_min_connections = database_min_connections.min(database_max_connections);
 
         // Parse ENRICHMENT_WARN_THRESHOLD (0.0-1.0, default 0.5).
         let enrichment_warn_threshold: f64 = env_parse("ENRICHMENT_WARN_THRESHOLD", 0.5)?;
@@ -254,6 +250,9 @@ impl Config {
             .transpose()?
             .unwrap_or_default();
 
+        let max_consecutive_errors = env_parse("MAX_CONSECUTIVE_ERRORS", 20u32)?;
+        let degraded_poll_interval_secs = env_parse("DEGRADED_POLL_INTERVAL_SECS", 300u64)?;
+
         Ok(Self {
             database_url: env("DATABASE_URL")?,
             rpc_url: env("RPC_URL")?,
@@ -277,6 +276,8 @@ impl Config {
             enrichment_warn_threshold,
             key_templates,
             spec_cache_max_entries,
+            max_consecutive_errors,
+            degraded_poll_interval_secs,
         })
     }
 }

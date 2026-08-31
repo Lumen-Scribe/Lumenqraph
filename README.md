@@ -43,6 +43,7 @@ Indexing Stellar **mainnet** right now. Below: the [Aquarius AMM](https://aqua.n
 - [TypeScript SDK](#typescript-sdk)
 - [AI-agent access — the MCP server](#ai-agent-access--the-mcp-server)
 - [Webhooks](#webhooks)
+- [Multi-network deployments](#multi-network-deployments)
 - [Running in production](#running-in-production)
 - [Project structure](#project-structure)
 - [Development](#development)
@@ -51,6 +52,7 @@ Indexing Stellar **mainnet** right now. Below: the [Aquarius AMM](https://aqua.n
 - [Troubleshooting & FAQ](docs/TROUBLESHOOTING.md)
 - [Explorer UI & Configuration](docs/EXPLORER.md)
 - [Migration Rollback Strategy](docs/MIGRATIONS.md)
+- [Upgrading Between Versions](docs/UPGRADING.md)
 - [Security](SECURITY.md)
 - [Contributing](#contributing)
 - [License](#license)
@@ -193,8 +195,11 @@ All configuration is via environment variables (see [`.env.example`](.env.exampl
 | `SPEC_CACHE_MAX_ENTRIES` | `2000` | Maximum number of contract specs held in memory before evicting least-recently-used entries. Prevents unbounded memory growth in index-all mode. Evicted specs are re-fetched from the database on next miss. Increase for better cache hit rates with many contracts; decrease to reduce memory usage. |
 | `ENRICHMENT_WARN_THRESHOLD` | `0.5` | Warn (emit a warn-level log) if the not-enriched fraction (events failing spec decode or fetch) exceeds this threshold in a single poll cycle. Range: 0.0–1.0. Default 0.5 = warn if >50% fail. Set to 0.0 to disable warnings; 1.0+ to warn only at 100%. |
 | `API_BIND_ADDR` | `0.0.0.0:8080` | API listen address. |
+| `INSTANCE_MOUNTS` | *(unset)* | Comma-separated list of sibling instances to reverse-proxy under path prefixes (e.g. `testnet=http://127.0.0.1:8081`). Enables serving multiple networks from one deployment. See [Multi-network deployments](#multi-network-deployments). |
 | `CORS_ALLOWED_ORIGINS` | *(unset)* | Comma-separated list of allowed origins for CORS requests (e.g. `https://example.com`), `*` to allow all origins, or unset for same-origin only (no CORS headers added, default behavior). |
 | `REQUIRE_API_KEY` | `false` | Require a valid API key on data routes. |
+| `METRICS_REQUIRE_API_KEY` | `false` | Require a valid API key on `GET /metrics`. When `false` (default) the endpoint is public. Set to `true` in production when the API is internet-accessible to avoid leaking operational telemetry. |
+| `MAX_REQUEST_BODY_BYTES` | `65536` | Maximum request body size in bytes (64 KB). Axum returns `413` for larger bodies. Protects `POST /call`, `POST /simulate`, and `POST /graphql` from large-payload denial-of-service. Replaces the old `API_MAX_BODY_BYTES` variable (kept as a fallback alias). |
 | `ANON_RATE_LIMIT_PER_MIN` | `60` | Requests/min for unauthenticated callers. |
 | `WEBHOOK_TICK_SECS` | `3` | Webhook dispatcher poll interval. |
 | `WEBHOOK_BATCH_SIZE` | `100` | Deliveries processed per tick. |
@@ -209,7 +214,7 @@ All configuration is via environment variables (see [`.env.example`](.env.exampl
 
 Base URL defaults to `http://localhost:8080`. Full reference: [docs/API.md](docs/API.md).
 
-**Authentication.** Data routes accept an API key via `Authorization: Bearer <key>` or `x-api-key: <key>`. When `REQUIRE_API_KEY=false` (default), unauthenticated callers are allowed up to `ANON_RATE_LIMIT_PER_MIN`. `/health` and `/metrics` are always public. Rate-limit breaches return `429`; invalid or revoked keys return `401`.
+**Authentication.** Data routes accept an API key via `Authorization: Bearer <key>` or `x-api-key: <key>`. When `REQUIRE_API_KEY=false` (default), unauthenticated callers are allowed up to `ANON_RATE_LIMIT_PER_MIN`. `/health`, `/livez`, and `/readyz` are always public. `/metrics` is public by default and can be restricted with `METRICS_REQUIRE_API_KEY=true`. Rate-limit breaches return `429`; invalid or revoked keys return `401`.
 
 | Method | Path | Description |
 | --- | --- | --- |
@@ -239,6 +244,8 @@ Base URL defaults to `http://localhost:8080`. Full reference: [docs/API.md](docs
 | `POST` | `/webhooks` | Create a subscription. |
 | `GET` | `/webhooks` | List subscriptions (secrets omitted). |
 | `DELETE` | `/webhooks/:id` | Delete a subscription. |
+
+**Multi-network paths:** When `INSTANCE_MOUNTS` is configured (see [Multi-network deployments](#multi-network-deployments)), all routes above are also available under `/<mount-name>/` prefixes. Example: `GET /<mount-name>/contracts` queries the mounted instance.
 
 <details>
 <summary><b>Example: a decoded transfer event</b></summary>
@@ -628,6 +635,35 @@ function verify(rawBody, signatureHeader, secret) {
 
 Deliveries retry with exponential backoff up to `WEBHOOK_MAX_ATTEMPTS`.
 
+## Multi-network deployments
+
+Lumenqraph can serve multiple Stellar networks (mainnet, testnet, futurenet) from a single logical deployment using **instance mounts**. One Lumenqraph API reverse-proxies to sibling instances running on the same host, allowing clients to query different networks under a unified origin.
+
+**Recommended pattern:** One instance per network + federation at the edge. This provides clean separation, independent scaling, and simple operations.
+
+Example:
+```bash
+# Primary instance (mainnet)
+RPC_URL=https://mainnet.sorobanrpc.com
+INSTANCE_MOUNTS=testnet=http://127.0.0.1:8081
+
+# GET /contracts → queries mainnet
+# GET /testnet/contracts → proxied to testnet instance at :8081
+```
+
+The primary instance's `/health` endpoint advertises available networks so clients (like the explorer) can discover them automatically and switch networks with one click:
+
+```json
+{
+  "network": "mainnet",
+  "mounts": {
+    "testnet": "/testnet"
+  }
+}
+```
+
+See [docs/MULTI_NETWORK.md](docs/MULTI_NETWORK.md) for detailed configuration, deployment patterns (free tier, separate services, fully isolated), security considerations, and monitoring.
+
 ## Running in production
 
 Run three long-lived processes against one Postgres. Only the indexer applies migrations.
@@ -639,6 +675,8 @@ Run three long-lived processes against one Postgres. Only the indexer applies mi
 | `lumenqraph-webhooks` | A single instance suffices; delivery is idempotent per (subscription, event). |
 
 Scrape `GET /metrics` and alert on `lumenqraph_indexer_lag_ledgers` climbing. For managed Postgres, point `DATABASE_URL` at Neon or Supabase. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for scaling notes (RPC providers, Redis-backed rate limiting, caching).
+
+When upgrading a running deployment, always consult [docs/UPGRADING.md](docs/UPGRADING.md) for breaking changes, required env var additions, and the database migration log for each release.
 
 ## Project structure
 
@@ -705,7 +743,7 @@ Contributions toward any of these are very welcome — see [Contributing](#contr
 
 Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for the dev setup and conventions, and review our [Code of Conduct](CODE_OF_CONDUCT.md). Good first issues are labelled in the [issue tracker](https://github.com/Lumen-Scribe/Lumenqraph/issues).
 
-See [CHANGELOG.md](CHANGELOG.md) for release history and versioning policy.
+See [CHANGELOG.md](CHANGELOG.md) for release history, versioning policy, and per-release migration notes. See [docs/UPGRADING.md](docs/UPGRADING.md) for step-by-step upgrade instructions.
 
 ## License
 

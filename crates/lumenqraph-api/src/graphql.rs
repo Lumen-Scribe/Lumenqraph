@@ -50,6 +50,14 @@ pub fn build_schema(pool: PgPool) -> AppSchema {
 // ---- Types ----
 
 #[derive(SimpleObject)]
+struct EnrichedParam {
+    name: String,
+    #[graphql(name = "type")]
+    type_: String,
+    value: GqlJson<Value>,
+}
+
+#[derive(SimpleObject)]
 struct ContractStat {
     contract_id: String,
     event_count: i64,
@@ -68,7 +76,6 @@ impl From<Contract> for ContractStat {
     }
 }
 
-#[derive(SimpleObject)]
 struct Event {
     event_id: String,
     contract_id: String,
@@ -76,11 +83,8 @@ struct Event {
     ledger_closed_at: DateTime<Utc>,
     event_type: String,
     event_name: Option<String>,
-    /// Decoded topics as JSON.
     decoded_topics: GqlJson<Value>,
-    /// Decoded event body as JSON.
     decoded_value: GqlJson<Value>,
-    /// Named, typed record from the contract spec; null when none matched.
     enriched: Option<GqlJson<Value>>,
     tx_hash: String,
     in_successful_call: bool,
@@ -101,6 +105,85 @@ impl From<EventRow> for Event {
             tx_hash: e.tx_hash,
             in_successful_call: e.in_successful_call,
         }
+    }
+}
+
+#[Object]
+impl Event {
+    async fn event_id(&self) -> &str {
+        &self.event_id
+    }
+
+    async fn contract_id(&self) -> &str {
+        &self.contract_id
+    }
+
+    async fn ledger(&self) -> i64 {
+        self.ledger
+    }
+
+    async fn ledger_closed_at(&self) -> DateTime<Utc> {
+        self.ledger_closed_at
+    }
+
+    async fn event_type(&self) -> &str {
+        &self.event_type
+    }
+
+    async fn event_name(&self) -> &Option<String> {
+        &self.event_name
+    }
+
+    async fn decoded_topics(&self) -> &GqlJson<Value> {
+        &self.decoded_topics
+    }
+
+    async fn decoded_value(&self) -> &GqlJson<Value> {
+        &self.decoded_value
+    }
+
+    async fn enriched(&self) -> &Option<GqlJson<Value>> {
+        &self.enriched
+    }
+
+    async fn params(&self) -> Result<Vec<EnrichedParam>> {
+        match &self.enriched {
+            Some(enriched) => {
+                if let Some(params_obj) = enriched.0.get("params").and_then(|v| v.as_object()) {
+                    let params: Vec<EnrichedParam> = params_obj
+                        .iter()
+                        .map(|(name, value)| {
+                            let type_ = value
+                                .get("type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let param_value = value
+                                .get("value")
+                                .cloned()
+                                .unwrap_or_else(|| Value::Null);
+                            EnrichedParam {
+                                name: name.clone(),
+                                type_,
+                                value: GqlJson(param_value),
+                            }
+                        })
+                        .collect();
+                    Ok(params)
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn tx_hash(&self) -> &str {
+        &self.tx_hash
+    }
+
+    async fn in_successful_call(&self) -> bool {
+        self.in_successful_call
     }
 }
 
@@ -238,11 +321,17 @@ impl QueryRoot {
         Ok(build_event_connection(rows, limit))
     }
 
-    /// Cursor-paginated token transfers, newest first. Filter by contract.
+    /// Cursor-paginated token transfers, newest first. Optional filters by
+    /// contract and by the `from` / `to` address — mirroring the REST
+    /// `GET /contracts/:id/transfers` `?from=`/`?to=` query parameters.
     async fn transfers(
         &self,
         ctx: &Context<'_>,
         contract_id: Option<String>,
+        #[graphql(desc = "Only transfers sent from this address (G… / C… strkey)")]
+        from: Option<String>,
+        #[graphql(desc = "Only transfers received by this address (G… / C… strkey)")]
+        to: Option<String>,
         #[graphql(desc = "Page size (1-200, default 20)")] first: Option<i32>,
         after: Option<String>,
     ) -> Result<TransferConnection> {
@@ -258,11 +347,15 @@ impl QueryRoot {
             "SELECT event_id, contract_id, from_addr, to_addr, amount, ledger, ledger_closed_at
              FROM token_transfers
              WHERE ($1::text IS NULL OR contract_id = $1)
-               AND ($2::bigint IS NULL OR ledger < $2 OR (ledger = $2 AND event_id < $3))
+               AND ($2::text IS NULL OR from_addr = $2)
+               AND ($3::text IS NULL OR to_addr = $3)
+               AND ($4::bigint IS NULL OR ledger < $4 OR (ledger = $4 AND event_id < $5))
              ORDER BY ledger DESC, event_id DESC
-             LIMIT $4",
+             LIMIT $6",
         )
         .bind(&contract_id)
+        .bind(&from)
+        .bind(&to)
         .bind(after_ledger)
         .bind(after_id)
         .bind(limit + 1)
@@ -440,6 +533,12 @@ mod tests {
             "type EventConnection",
             "type PageInfo",
             "hasNextPage",
+            // The GraphQL `transfers` field must expose the same address filters
+            // as the REST endpoint (#285): `from` and `to`, both optional. The
+            // `Transfer` type's own fields are `fromAddr` / `toAddr`, so these
+            // substrings are unambiguous argument signatures.
+            "from: String",
+            "to: String",
         ] {
             assert!(sdl.contains(expected), "SDL missing {expected:?}");
         }

@@ -99,3 +99,32 @@ groups:
             API endpoint has received no HTTP requests.
             API may be unreachable or load balancer misconfigured.
             Check API health and connectivity.
+
+      # Webhook delivery backlog alerts
+      - alert: LumenqraphWebhookBacklogHigh
+        expr: lumenqraph_webhooks_pending_deliveries > 500
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Lumenqraph webhook delivery backlog is {{ $value }}"
+          description: |
+            {{ $value }} webhook deliveries have been pending for more than 5
+            minutes (threshold: 500). The dispatcher is falling behind — usually
+            one or more subscriber endpoints are slow, failing, or unreachable
+            and their retries are starving the queue.
+            Check the webhook service logs and lumenqraph_webhook_oldest_pending_age_seconds.
+
+      - alert: LumenqraphWebhookBacklogCritical
+        expr: lumenqraph_webhooks_pending_deliveries > 5000
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Lumenqraph webhook backlog critical: {{ $value }} pending"
+          description: |
+            {{ $value }} webhook deliveries are pending (critical threshold: 5000).
+            The backlog is large enough that delivery latency is now measured in
+            hours. Check whether the webhook process is running, whether the
+            database is reachable, and whether a high-volume subscriber needs to
+            be auto-disabled.

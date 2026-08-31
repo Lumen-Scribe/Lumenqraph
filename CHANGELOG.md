@@ -15,7 +15,49 @@ Lumenqraph follows [Semantic Versioning 2.0.0](https://semver.org/):
 
 Breaking changes will be documented in the changelog with migration guidance where applicable.
 
+> **Upgrading a running deployment?**
+> See [docs/UPGRADING.md](docs/UPGRADING.md) for step-by-step migration
+> instructions, required env var changes, and the full database migration log
+> for every release.
+
 ## [Unreleased]
+
+### Migration notes
+
+> Full step-by-step instructions: [docs/UPGRADING.md — Unreleased](docs/UPGRADING.md#unreleased--next-release)
+
+**Breaking changes requiring action before deploy:**
+
+- **`WEBHOOK_ENCRYPTION_KEY` is now required** for the webhooks service.
+  Webhook secrets are encrypted at rest using `pgcrypto`. Generate the key
+  with `openssl rand -hex 32` and set it before deploying — migration
+  `0020` backfills existing subscriptions using this key. Deployments
+  without it fall back to the insecure hardcoded default.
+  See [docs/UPGRADING.md](docs/UPGRADING.md#1-webhook-secrets-are-now-encrypted-at-rest--webhook_encryption_key-required).
+
+- **`token_transfers.kind` column added** (`transfer` | `mint` | `burn` |
+  `clawback`). Clients reading transfer payloads by positional index must
+  update. Migration `0015` backfills existing rows as `"transfer"`.
+
+- **CORS is now same-origin only by default.** Set `CORS_ALLOWED_ORIGINS`
+  if your frontend is on a different origin.
+
+- **GraphQL introspection and GraphiQL are off by default.** Set
+  `GRAPHQL_INTROSPECTION_ENABLED=true` in non-production environments if needed.
+
+**Database migrations applied:** `0010` through `0021` (run automatically by
+the indexer on startup). Stop the webhooks service before deploying to avoid
+a write conflict on `webhook_deliveries` during migration `0008`.
+
+**New environment variables:** `WEBHOOK_ENCRYPTION_KEY`, `CORS_ALLOWED_ORIGINS`,
+`GRAPHQL_MAX_DEPTH`, `GRAPHQL_MAX_COMPLEXITY`, `GRAPHQL_INTROSPECTION_ENABLED`,
+`RATE_LIMIT_TRUST_XFF`, `RATE_LIMIT_BACKEND`, `REDIS_URL`,
+`RPC_ROUTE_RATE_LIMIT_PER_MIN`, `RPC_REQUIRE_API_KEY`, `RPC_TIMEOUT_SECS`,
+`READYZ_LAG_THRESHOLD`, `READYZ_MAX_AGE_SECS`, `HEALTH_MAX_LAG_LEDGERS`,
+`HEALTH_MAX_STALE_SECS`, `ENRICHMENT_WARN_THRESHOLD`, `SPEC_CACHE_MAX_ENTRIES`,
+`SPEC_VERSION_RETENTION`, `KEY_TEMPLATES`, `BALANCE_KEY_SYMBOL`,
+`BALANCE_KEY_DURABILITY`, `DATABASE_MAX_CONNECTIONS`, `DATABASE_MIN_CONNECTIONS`,
+`DATABASE_ACQUIRE_TIMEOUT_SECS`, `DATABASE_IDLE_TIMEOUT_SECS`.
 
 ### Added
 - Keyset cursor pagination for REST `/events` and `/transfers` endpoints
@@ -42,6 +84,16 @@ Breaking changes will be documented in the changelog with migration guidance whe
 - Documentation clarified `MAX_LOOKBACK_LEDGERS` vs `MAX_CATCHUP_LEDGERS`
 
 ## [0.1.0] - Initial Release
+
+### Migration notes
+
+> Full step-by-step instructions: [docs/UPGRADING.md — Fresh install / v0.1.0](docs/UPGRADING.md#fresh-install--v010-initial-release)
+
+**Fresh install** — no prior version to migrate from. The indexer applies
+migrations `0001` through `0009` automatically on first startup.
+
+**Required environment variables:** `DATABASE_URL`, `RPC_URL`.
+All other variables have safe defaults. See [Configuration](README.md#configuration).
 
 ### Added
 - **Core indexing**: Poll Soroban RPC `getEvents`, decode XDR to JSON, store in Postgres

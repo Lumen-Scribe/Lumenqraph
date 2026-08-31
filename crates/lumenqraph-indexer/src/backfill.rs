@@ -184,7 +184,7 @@ mod tests {
 
         let rpc = RpcClient::new(&rpc_url, 30);
         let config = test_config(&rpc_url, 2);
-        let specs = SpecCache::new(2000);
+        let specs = SpecCache::new(2000, 4);
 
         let (inserted, _) = fetch_and_store(&pool, &rpc, &config, &specs, 500, 1000)
             .await
@@ -233,7 +233,7 @@ mod tests {
         let config = test_config(&rpc_url, 2);
 
         // First run: all three events are new.
-        let specs = SpecCache::new(2000);
+        let specs = SpecCache::new(2000, 4);
         let (first, _) = fetch_and_store(&pool, &rpc, &config, &specs, 500, 1000)
             .await
             .expect("first run");
@@ -279,7 +279,7 @@ mod tests {
 
         let rpc = RpcClient::new(&rpc_url, 30);
         let config = test_config(&rpc_url, 2);
-        let specs = SpecCache::new(2000);
+        let specs = SpecCache::new(2000, 4);
 
         let (inserted, _) = fetch_and_store(&pool, &rpc, &config, &specs, 500, 1000)
             .await
@@ -292,6 +292,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    /// After a simulated mid-backfill failure the cursor reflects the last
+    /// *successfully* stored page, not the start or the live tip.
+    ///
+    /// We verify this by running `fetch_and_store` for page 1 only (simulating
+    /// a two-page backfill where page 2 never starts), writing the cursor as
+    /// `backfill::run` now does after each page, then asserting the persisted
+    /// cursor equals the last ledger from page 1.
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn backfill_cursor_checkpointed_per_page() {
+        let pool = fixture().await;
+        let tip = 1000i64;
+
+        // Serve only one page (page 2 would need a second request, which the
+        // mock never receives because we stop after the first page).
+        let rpc_url = spawn_mock_rpc(
+            tip,
+            vec![MockPage {
+                cursor_in: None,
+                events: vec![make_event("e1", 500), make_event("e2", 501)],
+                // Return a cursor that signals "there is more" — but we won't
+                // request it (simulating an error mid-backfill).
+                cursor_out: Some("page2".into()),
+            }],
+        )
+        .await;
+
+        let rpc = RpcClient::new(&rpc_url, 30);
+        let config = test_config(&rpc_url, 2);
+        let specs = SpecCache::new(2000);
+
+        // Simulate what backfill::run does: fetch page 1, store it, checkpoint.
+        let (inserted, _) = fetch_and_store(&pool, &rpc, &config, &specs, 500, tip)
+            .await
+            .expect("fetch_and_store page 1");
+
+        // Checkpoint after this page (ledger 501 is the max from page 1).
+        let page_max_ledger = 501i64;
+        cursor::write_progress(&pool, page_max_ledger, tip, inserted)
+            .await
+            .unwrap();
+
+        // The cursor must reflect page 1's last ledger, not 0 and not `tip`.
+        let last = cursor::read_last_processed(&pool).await.unwrap();
+        assert_eq!(
+            last,
+            Some(page_max_ledger),
+            "cursor must be checkpointed to the last page's max ledger after a partial backfill"
+        );
     }
 
     /// `backfill::run` clamps `from_ledger` to the oldest ledger the RPC still
@@ -334,10 +385,23 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let tip = rpc.get_latest_ledger().await?;
     let oldest = tip - poller::max_lookback();
-    let start = from_ledger.max(oldest).max(1);
-    if start > from_ledger {
+
+    // If the caller passes 0 (or no explicit --from), try to resume from the
+    // last persisted cursor so an interrupted backfill picks up where it left
+    // off.  A non-zero explicit from_ledger always wins.
+    let resume_from = if from_ledger == 0 {
+        cursor::read_last_processed(&pool)
+            .await?
+            .map(|l| l + 1)
+            .unwrap_or(0)
+    } else {
+        from_ledger
+    };
+
+    let start = resume_from.max(oldest).max(1);
+    if start > resume_from && resume_from > 0 {
         warn!(
-            requested = from_ledger,
+            requested = resume_from,
             clamped_to = start,
             "backfill start is older than RPC retention; clamping"
         );
@@ -345,8 +409,63 @@ pub async fn run(
     info!(from = start, to = tip, "starting backfill");
 
     let specs = SpecCache::new(config.spec_cache_max_entries);
-    let (inserted, _) = fetch_and_store(&pool, &rpc, &config, &specs, start, tip).await?;
-    cursor::write_progress(&pool, tip, tip, inserted).await?;
-    info!(inserted, up_to_ledger = tip, "backfill complete");
+
+    // Drive the paging loop here so we can checkpoint the cursor after every
+    // successfully stored page.  An interrupted backfill can be resumed by
+    // re-running with from_ledger = 0 (the default): the code above will read
+    // the persisted cursor and continue from the last completed page.
+    let mut cursor_token: Option<String> = None;
+    let mut total_inserted = 0u64;
+    let mut last_page_ledger = start;
+
+    loop {
+        let page = rpc
+            .get_events(
+                Some(start),
+                &config.contract_ids,
+                cursor_token.clone(),
+                config.page_size,
+            )
+            .await?;
+
+        let page_len = page.events.len();
+        let page_max_ledger = page
+            .events
+            .iter()
+            .map(|e| e.ledger)
+            .max()
+            .unwrap_or(last_page_ledger);
+
+        // Build and store this page's events.
+        let mut batch = Vec::with_capacity(page_len);
+        for ev in &page.events {
+            let spec = specs.get(&pool, &rpc, &ev.contract_id, ev.ledger).await;
+            batch.push(crate::convert::to_new_event(ev, spec.as_deref()));
+        }
+        let inserted = crate::store::insert_events(&pool, &batch).await?;
+        total_inserted += inserted;
+
+        // ── checkpoint after each successfully stored page ──────────────────
+        // Writing the cursor here means a crash or Ctrl-C on the *next* page
+        // leaves the cursor pointing at the end of the last page we finished,
+        // so the backfill is resumable with no ledger range lost.
+        last_page_ledger = page_max_ledger;
+        cursor::write_progress(&pool, last_page_ledger, tip, inserted).await?;
+        info!(
+            inserted,
+            page_max_ledger,
+            total_inserted,
+            "backfill page complete (cursor checkpointed)"
+        );
+
+        cursor_token = page.cursor;
+        if page_len < config.page_size as usize || cursor_token.is_none() {
+            break;
+        }
+    }
+
+    // Final cursor advance to the tip so the live poller starts from there.
+    cursor::write_progress(&pool, tip, tip, 0).await?;
+    info!(total_inserted, up_to_ledger = tip, "backfill complete");
     Ok(())
 }

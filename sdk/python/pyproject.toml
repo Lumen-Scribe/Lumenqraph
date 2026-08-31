@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "lumenqraph"
+version = "0.1.0"
+description = "Lumenqraph Python SDK — a typed client over the Lumenqraph REST + GraphQL API"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Lumen Scribe", email = "dev@lumenscribe.com" }]
+requires-python = ">=3.8"
+keywords = ["stellar", "soroban", "blockchain", "dapp", "lumenqraph"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Internet",
+]
+# Zero runtime dependencies — stdlib only (urllib, asyncio, hmac, hashlib).
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+    "mypy>=1.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/Lumen-Scribe/Lumenqraph"
+Documentation = "https://github.com/Lumen-Scribe/Lumenqraph#python-sdk"
+"Source Code" = "https://github.com/Lumen-Scribe/Lumenqraph/tree/main/sdk/python"
+"Bug Reports" = "https://github.com/Lumen-Scribe/Lumenqraph/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lumenqraph*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.8"
+strict = true
+files = ["lumenqraph"]
