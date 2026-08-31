@@ -94,6 +94,28 @@ export TEST_DATABASE_URL=postgres://user:password@host:port/dbname
 cargo test -p lumenqraph-indexer --features smoke-tests smoke -- --ignored --test-threads=1
 ```
 
+## Database changes
+
+When modifying the schema or adding new tables/functions:
+
+```bash
+# 1. Create a new migration file
+sqlx migrate add -r <description>
+
+# 2. Edit the generated migrations/NNNN_<description>.sql and .down.sql
+#    (Never edit an already-applied migration.)
+
+# 3. Apply it to your local database
+cargo run -p lumenqraph-indexer
+
+# 4. Regenerate .sqlx offline metadata after the migration succeeds
+cargo sqlx prepare --database-url "$DATABASE_URL"
+```
+
+After running migrations, you must commit `.sqlx/` metadata alongside your code changes. CI verifies this metadata is up-to-date; stale metadata fails the build.
+
+To update schema objects like triggers (`contract_summaries`), edit the relevant migration and include the `CREATE TRIGGER` or `ALTER FUNCTION` statement. Test the change against a live database before committing.
+
 ## Conventions
 
 - Shared types and decoding live in `lumenqraph-core`; don't duplicate models.

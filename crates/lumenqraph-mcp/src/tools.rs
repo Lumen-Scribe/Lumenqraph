@@ -96,7 +96,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "simulate_call",
-            "description": "Dry-run ANY contract call (including state-changing ones like transfer/deposit) WITHOUT submitting it, and preview the typed result, the events it would emit, and its resource cost. Nothing is signed or broadcast. Use this to answer 'what would happen if I called X?'. This relies on the Soroban RPC's simulateTransaction endpoint returning without submitting to the network; the safety guarantee ultimately depends on the RPC endpoint's simulation semantics.",
+            "description": "Dry-run ANY contract call (including state-changing ones like transfer/deposit) WITHOUT submitting it, and preview the typed result, the events it would emit, and its resource cost. Nothing is signed or broadcast to the network by Lumenqraph. Use this to answer 'what would happen if I called X?'. TRUST BOUNDARY: This relies on the Soroban RPC's simulateTransaction endpoint to return without submitting to the network. Lumenqraph does not sign or broadcast anything, but the safety guarantee ultimately depends on the RPC endpoint's simulation semantics.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

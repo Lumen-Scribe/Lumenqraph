@@ -324,10 +324,13 @@ muxed account (`M…` strkey) for sub-account routing.
 ### `POST /contracts/:id/simulate`
 Dry-run **any** call, including state-changing ones, and get the typed result,
 the events it would emit (decoded + enriched), and its estimated resource fee.
-Same body as `/call`. This endpoint relies on the Soroban RPC's simulateTransaction
-endpoint returning without submitting to the network; the safety guarantee
-ultimately depends on the RPC endpoint's simulation semantics. Lumenqraph itself
-does not sign or broadcast anything.
+Same body as `/call`.
+
+**Trust boundary:** This endpoint relies on the Soroban RPC's simulateTransaction
+endpoint to return without submitting to the network. Lumenqraph does not sign or
+broadcast anything itself, but the safety guarantee ultimately depends on the RPC
+endpoint's simulation semantics. If the RPC endpoint's behavior changes (e.g., a
+future Soroban upgrade), state-changing simulation calls could have unintended effects.
 ```json
 { "contract_id": "CB...", "function": "transfer", "result": null,
   "events": [
