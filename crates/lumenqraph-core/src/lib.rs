@@ -18,6 +18,7 @@ pub mod models;
 pub mod read;
 pub mod sanitize;
 pub mod spec;
+pub mod url_validation;
 pub mod xdr;
 
 pub use diff::SpecDiff;
