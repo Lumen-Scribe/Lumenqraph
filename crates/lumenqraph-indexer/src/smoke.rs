@@ -220,7 +220,7 @@ mod tests {
 
         let rpc = RpcClient::new(&rpc_url, 30);
         let config = test_config(&rpc_url, 2);
-        let specs = SpecCache::new(config.spec_cache_max_entries);
+        let specs = SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
 
         let (inserted, _) = poller::fetch_and_store(&pool, &rpc, &config, &specs, 500, 1000)
             .await

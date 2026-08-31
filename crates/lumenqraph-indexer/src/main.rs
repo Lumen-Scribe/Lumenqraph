@@ -76,8 +76,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let pool = PgPoolOptions::new()
-        .max_connections(env_parse_u32("DATABASE_MAX_CONNECTIONS", 5))
-        .min_connections(env_parse_u32("DATABASE_MIN_CONNECTIONS", 1))
+        .max_connections(config.database_max_connections)
+        .min_connections(config.database_min_connections)
         .acquire_timeout(Duration::from_secs(env_parse_u64(
             "DATABASE_ACQUIRE_TIMEOUT_SECS",
             30,

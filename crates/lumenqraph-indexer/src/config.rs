@@ -114,6 +114,9 @@ impl Config {
         let reorg_overlap_ledgers = env_parse("REORG_OVERLAP_LEDGERS", 0)?;
         let rpc_timeout_secs = env_parse("RPC_TIMEOUT_SECS", 30u64)?;
         let spec_cache_max_entries = env_parse("SPEC_CACHE_MAX_ENTRIES", 2000usize)?;
+        let spec_fetch_concurrency = env_parse("SPEC_FETCH_CONCURRENCY", 4usize)?;
+        let database_max_connections = env_parse("DATABASE_MAX_CONNECTIONS", 10u32)?;
+        let database_min_connections = env_parse("DATABASE_MIN_CONNECTIONS", 0u32)?;
 
         // Validate and clamp PAGE_SIZE to RPC documented bounds (1–10000).
         let page_size = clamp_with_warning("PAGE_SIZE", page_size, 1, 10000);
@@ -165,6 +168,23 @@ impl Config {
 
         // Validate SPEC_CACHE_MAX_ENTRIES minimum (must be at least 1).
         let spec_cache_max_entries = clamp_with_warning("SPEC_CACHE_MAX_ENTRIES", spec_cache_max_entries, 1, usize::MAX);
+
+        // Validate SPEC_FETCH_CONCURRENCY minimum (must be at least 1).
+        let spec_fetch_concurrency = clamp_with_warning("SPEC_FETCH_CONCURRENCY", spec_fetch_concurrency, 1, usize::MAX);
+
+        // Validate DATABASE_MAX_CONNECTIONS minimum (must be at least 1).
+        let database_max_connections = clamp_with_warning("DATABASE_MAX_CONNECTIONS", database_max_connections, 1, u32::MAX);
+
+        // Validate DATABASE_MIN_CONNECTIONS (must be <= max).
+        if database_min_connections > database_max_connections {
+            tracing::warn!(
+                requested_min = database_min_connections,
+                max = database_max_connections,
+                clamped_min = database_max_connections,
+                "DATABASE_MIN_CONNECTIONS cannot exceed DATABASE_MAX_CONNECTIONS; clamping to max"
+            );
+        }
+        let database_min_connections = database_min_connections.min(database_max_connections);
 
         // Parse ENRICHMENT_WARN_THRESHOLD (0.0-1.0, default 0.5).
         let enrichment_warn_threshold: f64 = env_parse("ENRICHMENT_WARN_THRESHOLD", 0.5)?;

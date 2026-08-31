@@ -286,6 +286,21 @@ export class LumenqraphClient {
     }, opts.signal);
   }
 
+  /** Fetch a single event by its unique ID. */
+  getEvent(eventId: string, opts: RequestOptions = {}): Promise<EventRecord> {
+    return this.get(`/events/${enc(eventId)}`, {}, opts.signal);
+  }
+
+  /** All indexed events emitted by a transaction, in emission order. */
+  getTransactionEvents(
+    txHash: string,
+    opts: { limit?: number; signal?: AbortSignal } = {},
+  ): Promise<{ tx_hash: string; count: number; data: EventRecord[] }> {
+    return this.get(`/transactions/${enc(txHash)}/events`, {
+      limit: opts.limit,
+    }, opts.signal);
+  }
+
   /** Materialized SEP-41 transfers, newest first (limit/offset). */
   listTransfers(
     contractId?: string,

@@ -18,7 +18,7 @@ use crate::specs::SpecCache;
 /// AND event_name IS NOT NULL, re-enrich them against the (now-cached) spec,
 /// and update the database.
 pub async fn run_reenrich(pool: PgPool, rpc: RpcClient, config: Config) -> anyhow::Result<()> {
-    let specs = SpecCache::new(config.spec_cache_max_entries);
+    let specs = SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
     let mut processed = 0u64;
     let mut updated = 0u64;
 

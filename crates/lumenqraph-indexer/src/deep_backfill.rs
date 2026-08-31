@@ -402,7 +402,7 @@ pub async fn run(
     to_ledger: Option<i64>,
 ) -> anyhow::Result<()> {
     let to = to_ledger.unwrap_or(i64::MAX);
-    let specs = SpecCache::new(config.spec_cache_max_entries);
+    let specs = SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
 
     info!(
         from = from_ledger,
