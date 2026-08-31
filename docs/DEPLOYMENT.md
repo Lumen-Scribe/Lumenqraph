@@ -22,6 +22,51 @@ assets (the Docker image ships them at `/app/explorer`).
 docker compose -f docker-compose.full.yml up --build -d
 ```
 One image holds all three binaries; each service overrides `command:`.
+
+### Postgres data volume
+
+`docker-compose.full.yml` persists the database to a named volume, `pgdata`,
+mounted at `/var/lib/postgresql/data`. Indexed data therefore survives
+`docker compose -f docker-compose.full.yml down` and image rebuilds — only
+`docker compose ... down -v` (or an explicit `docker volume rm`) deletes it.
+
+The volume is created in the compose project's namespace, so its full name is
+`<project>_pgdata` (the project defaults to the repo directory name, e.g.
+`lumenqraph_pgdata`). List and inspect it with:
+
+```bash
+docker volume ls | grep pgdata
+docker volume inspect lumenqraph_pgdata
+```
+
+**Back up** (logical dump, portable across major versions):
+
+```bash
+docker compose -f docker-compose.full.yml exec -T postgres \
+  pg_dump -U lumenqraph -Fc lumenqraph > lumenqraph-$(date +%F).dump
+```
+
+**Restore** into a fresh volume:
+
+```bash
+docker compose -f docker-compose.full.yml up -d postgres
+docker compose -f docker-compose.full.yml exec -T postgres \
+  pg_restore -U lumenqraph -d lumenqraph --clean --if-exists < lumenqraph-2025-01-01.dump
+```
+
+For a raw, version-locked copy of the volume instead, archive the mount point
+while Postgres is stopped:
+
+```bash
+docker compose -f docker-compose.full.yml stop postgres
+docker run --rm -v lumenqraph_pgdata:/data -v "$PWD":/backup alpine \
+  tar czf /backup/pgdata.tar.gz -C /data .
+```
+
+Managed-Postgres deploys (Fly.io, Neon, Supabase — see below) handle
+persistence and backups on the provider side; this section applies only to the
+self-hosted Docker stack.
+
 ## Managed Deploy (Fly.io)
 
 Fly.io is the recommended hosting platform for running Lumenqraph in production. The repository ships with a pre-configured [`fly.toml`](../fly.toml) that defines three distinct process groups:

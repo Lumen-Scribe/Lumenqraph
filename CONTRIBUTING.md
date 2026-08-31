@@ -68,6 +68,32 @@ cargo test -p lumenqraph-mcp      -- --ignored --test-threads=1
 
 CI runs all of the above against a Postgres service.
 
+### Smoke tests
+
+`crates/lumenqraph-indexer/src/smoke.rs` is a single heavy end-to-end test that
+drives the whole pipeline (indexer → Postgres → API-shaped queries → webhook
+enqueue → signed delivery). It uses an in-process mock Soroban RPC and a local
+HTTP sink — **no live network** — but it is expensive and needs a database, so
+it is kept out of the normal test run by two independent gates:
+
+- `#[ignore]` — skipped by `cargo test` unless `--ignored` is passed.
+- `#[cfg(feature = "smoke-tests")]` — the module is not even compiled without
+  the `smoke-tests` cargo feature, so it can never run in an offline CI job that
+  forgets to set `TEST_DATABASE_URL`.
+
+Run it with:
+
+```bash
+make test-smoke
+```
+
+or manually:
+
+```bash
+export TEST_DATABASE_URL=postgres://user:password@host:port/dbname
+cargo test -p lumenqraph-indexer --features smoke-tests smoke -- --ignored --test-threads=1
+```
+
 ## Conventions
 
 - Shared types and decoding live in `lumenqraph-core`; don't duplicate models.
