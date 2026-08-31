@@ -130,6 +130,29 @@ fly scale vm shared-cpu-1x --memory 1024 --process-group indexer
 fly scale vm shared-cpu-1x --memory 512 --process-group api
 ```
 
+#### 5b. Memory and Resource Configuration
+
+Lumenqraph has distinct memory requirements per process:
+- **Indexer**: Higher memory due to WASM spec parsing and event decoding. Requires at least **512 MB**, recommended **1024 MB** or higher.
+- **API**: Stateless request handler. **256 MB** minimum; **512 MB** recommended for multiple concurrent requests.
+- **Webhooks**: Delivery worker. **256 MB** minimum; **512 MB** recommended.
+
+**Recommended Instance Size**: Fly.io Standard or Premium tier (`shared-cpu-1x` with ≥2GB total available memory).
+
+**Memory Pressure & WASM Parsing Spikes**: The indexer's most memory-intensive operation is parsing contract WASM binaries during spec extraction. On memory-constrained deployments (< 512 MB), this can trigger OOM kills:
+
+1. **Increase available memory** for the indexer (scale up the Fly machine or use a larger instance).
+2. **Reduce spec cache size** if memory is severely constrained:
+   ```bash
+   fly secrets set SPEC_CACHE_MAX_ENTRIES=500
+   ```
+   The default is 2000 entries. Reducing this evicts old specs more aggressively but may increase RPC calls to re-fetch specs. A good starting point for tight memory is 256–500 entries.
+
+3. **Monitor for OOM** in logs:
+   ```bash
+   fly logs | grep -i "oom\|killed\|memory"
+   ```
+
 #### 6. Deploy
 Deploy the configuration:
 ```bash
@@ -245,6 +268,8 @@ When ready to move to separate, robust services:
       only if the read-only chain data is meant to be public.
 - [ ] `ANON_RATE_LIMIT_PER_MIN` tuned (default 60/min/IP; per-instance — see below).
 - [ ] Indexer pinned 24/7 (`auto_stop_machines=false`, `min_machines_running=1`).
+- [ ] Memory limits configured per process in `fly.toml` (indexer: ≥512 MB, api/webhooks: ≥256 MB).
+- [ ] `SPEC_CACHE_MAX_ENTRIES` tuned if deploying to memory-constrained instances (default 2000).
 - [ ] Scrape `/metrics`; alert on lag (`lumenqraph_indexer_lag_seconds` > 600s for warning,
       > 3600s for critical) and error rates. See the **Observability** section above
       for recommended thresholds and key metrics.

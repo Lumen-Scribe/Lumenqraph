@@ -53,7 +53,15 @@ primary_region = "iad"
     method = "GET"
     path = "/health"
 
-# The indexer does more work (decode + snapshots) than the readers.
+# Resource allocation: the indexer does more work (WASM parsing, event decode,
+# state snapshots) than the stateless api and webhooks. Memory limits prevent
+# one process group from triggering OOM kills in others.
+#
+# Recommended: Fly.io Standard or Premium tier (shared-cpu-1x with 2GB+ available).
+# Adjust these if using smaller instances (see DEPLOYMENT.md for tuning guidance).
+#
+# Memory spikes occur during WASM spec parsing; if the indexer OOM kills on startup,
+# reduce SPEC_CACHE_MAX_ENTRIES (default 2000) or increase available memory.
 [[vm]]
   size = "shared-cpu-1x"
   memory = "1024mb"
