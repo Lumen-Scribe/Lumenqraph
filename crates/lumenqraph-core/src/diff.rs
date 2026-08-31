@@ -44,6 +44,10 @@ pub struct SectionDiff {
     pub removed: Vec<String>,
     /// Items whose name persisted but whose signature moved.
     pub changed: Vec<ChangedItem>,
+    /// Items whose name persisted and whose parameter set is identical but
+    /// whose parameter *order* changed. Soroban encoding is positional, so a
+    /// reorder breaks every caller that passes arguments by position.
+    pub reordered: Vec<ReorderedItem>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -53,14 +57,31 @@ pub struct ChangedItem {
     pub to: String,
 }
 
+/// A function whose parameter set is identical but whose parameter *order*
+/// changed. Because Soroban encoding is positional, reordering parameters is
+/// a breaking change: a caller that passes `(from, to, amount)` positionally
+/// will send `from` where `amount` is now expected.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ReorderedItem {
+    pub name: String,
+    /// The parameter list as it appeared in the old interface (ordered).
+    pub from: String,
+    /// The parameter list as it appears in the new interface (ordered).
+    pub to: String,
+}
+
 impl SectionDiff {
     fn is_empty(&self) -> bool {
-        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+        self.added.is_empty()
+            && self.removed.is_empty()
+            && self.changed.is_empty()
+            && self.reordered.is_empty()
     }
 
-    /// Additions can't break an existing caller; removals and changes can.
+    /// Additions can't break an existing caller; removals, changes, and
+    /// reorderings can (Soroban encoding is positional).
     fn has_breaking(&self) -> bool {
-        !self.removed.is_empty() || !self.changed.is_empty()
+        !self.removed.is_empty() || !self.changed.is_empty() || !self.reordered.is_empty()
     }
 }
 
@@ -68,7 +89,10 @@ impl SpecDiff {
     /// Diff `old` against `new`. The result reads in the direction of the
     /// upgrade: `added` means "new interface has it, old one didn't".
     pub fn between(old: &ContractSpec, new: &ContractSpec) -> Self {
-        let functions = diff_section(&function_sigs(old), &function_sigs(new));
+        let (old_fsigs, old_fparams) = function_sigs(old);
+        let (new_fsigs, new_fparams) = function_sigs(new);
+        let functions =
+            diff_section_with_params(&old_fsigs, &new_fsigs, &old_fparams, &new_fparams);
         let events = diff_section(&event_sigs(old), &event_sigs(new));
         let types = diff_section(&type_sigs(old), &type_sigs(new));
 
@@ -106,6 +130,12 @@ impl SpecDiff {
                     item.name, item.from, item.to
                 ));
             }
+            for item in &section.reordered {
+                out.push(format!(
+                    "reordered {kind} {}: {} became {}",
+                    item.name, item.from, item.to
+                ));
+            }
             for sig in &section.added {
                 out.push(format!("added {kind} {sig}"));
             }
@@ -121,17 +151,52 @@ impl SpecDiff {
 
 /// Compare two name-to-signature maps. Names are the identity: a name in both
 /// with a different signature is a *change*, not an add plus a remove.
+///
+/// When both old and new have an entry with the same name but different
+/// signatures, we additionally check whether the difference is purely a
+/// parameter reorder (same set of `"name: type"` tokens, different order).
+/// Reorders are separated into `reordered` rather than `changed` so the
+/// summary can label them precisely — but they are still breaking because
+/// Soroban encoding is positional.
 fn diff_section(old: &BTreeMap<String, String>, new: &BTreeMap<String, String>) -> SectionDiff {
+    diff_section_with_params(old, new, &BTreeMap::new(), &BTreeMap::new())
+}
+
+/// Like `diff_section` but accepts optional ordered parameter lists per name so
+/// that a pure reorder can be distinguished from a type/name change.
+/// `old_params` and `new_params` map function name → ordered `["name: type", …]`.
+fn diff_section_with_params(
+    old: &BTreeMap<String, String>,
+    new: &BTreeMap<String, String>,
+    old_params: &BTreeMap<String, Vec<String>>,
+    new_params: &BTreeMap<String, Vec<String>>,
+) -> SectionDiff {
     let names: BTreeSet<&String> = old.keys().chain(new.keys()).collect();
     let mut diff = SectionDiff::default();
 
     for name in names {
         match (old.get(name), new.get(name)) {
-            (Some(before), Some(after)) if before != after => diff.changed.push(ChangedItem {
-                name: name.clone(),
-                from: before.clone(),
-                to: after.clone(),
-            }),
+            (Some(before), Some(after)) if before != after => {
+                // Check if this is a pure parameter reorder: same set of
+                // "name: type" tokens, different order.
+                let old_ps = old_params.get(name);
+                let new_ps = new_params.get(name);
+                if let (Some(op), Some(np)) = (old_ps, new_ps) {
+                    if is_param_reorder(op, np) {
+                        diff.reordered.push(ReorderedItem {
+                            name: name.clone(),
+                            from: before.clone(),
+                            to: after.clone(),
+                        });
+                        continue;
+                    }
+                }
+                diff.changed.push(ChangedItem {
+                    name: name.clone(),
+                    from: before.clone(),
+                    to: after.clone(),
+                });
+            }
             (Some(_), Some(_)) => {}
             (Some(before), None) => diff.removed.push(before.clone()),
             (None, Some(after)) => diff.added.push(after.clone()),
@@ -141,26 +206,44 @@ fn diff_section(old: &BTreeMap<String, String>, new: &BTreeMap<String, String>) 
     diff
 }
 
-fn function_sigs(spec: &ContractSpec) -> BTreeMap<String, String> {
-    spec.functions
-        .iter()
-        .map(|f| {
-            let inputs: Vec<String> = f
-                .inputs
-                .iter()
-                .map(|i| format!("{}: {}", i.name, i.type_name))
-                .collect();
-            let output = match f.outputs.as_slice() {
-                [] => "void".to_string(),
-                [one] => one.clone(),
-                many => format!("({})", many.join(", ")),
-            };
-            (
-                f.name.clone(),
-                format!("{}({}) -> {}", f.name, inputs.join(", "), output),
-            )
-        })
-        .collect()
+/// Returns `true` when `old` and `new` contain the same `"name: type"` tokens
+/// but in a different order. Both must be non-empty and must differ in order.
+fn is_param_reorder(old: &[String], new: &[String]) -> bool {
+    if old.len() != new.len() || old == new {
+        return false;
+    }
+    let mut old_sorted = old.to_vec();
+    let mut new_sorted = new.to_vec();
+    old_sorted.sort();
+    new_sorted.sort();
+    old_sorted == new_sorted
+}
+
+/// Returns a map of function name → rendered signature, plus a companion map
+/// of function name → ordered `["param: type", …]` tokens. The second map is
+/// used by `diff_section_with_params` to distinguish a pure parameter reorder
+/// from a deeper signature change (renamed parameter, changed type, etc.).
+fn function_sigs(spec: &ContractSpec) -> (BTreeMap<String, String>, BTreeMap<String, Vec<String>>) {
+    let mut sigs = BTreeMap::new();
+    let mut params = BTreeMap::new();
+    for f in &spec.functions {
+        let inputs: Vec<String> = f
+            .inputs
+            .iter()
+            .map(|i| format!("{}: {}", i.name, i.type_name))
+            .collect();
+        let output = match f.outputs.as_slice() {
+            [] => "void".to_string(),
+            [one] => one.clone(),
+            many => format!("({})", many.join(", ")),
+        };
+        sigs.insert(
+            f.name.clone(),
+            format!("{}({}) -> {}", f.name, inputs.join(", "), output),
+        );
+        params.insert(f.name.clone(), inputs);
+    }
+    (sigs, params)
 }
 
 /// Event signatures carry each param's location and the body's data format:
@@ -705,6 +788,91 @@ mod tests {
         assert_eq!(d.functions.added.len(), 1);
         assert_eq!(d.functions.removed.len(), 1);
         assert!(d.functions.changed.is_empty());
+    }
+
+    /// Reordering parameters is a breaking change because Soroban encoding is
+    /// positional: a caller that passes `(from, to, amount)` by position will
+    /// send `from` where `amount` is now expected. The diff must flag this
+    /// explicitly as a `reordered` item rather than a generic `changed` item,
+    /// and the `breaking` flag must be set.
+    #[test]
+    fn reordered_parameters_are_breaking_and_flagged_as_reordered() {
+        let old = spec_of(&[func(
+            "transfer",
+            &[
+                ("from", ScSpecTypeDef::Address),
+                ("to", ScSpecTypeDef::Address),
+                ("amount", ScSpecTypeDef::I128),
+            ],
+            None,
+        )]);
+        let new = spec_of(&[func(
+            "transfer",
+            &[
+                ("amount", ScSpecTypeDef::I128),
+                ("from", ScSpecTypeDef::Address),
+                ("to", ScSpecTypeDef::Address),
+            ],
+            None,
+        )]);
+        let d = SpecDiff::between(&old, &new);
+        assert!(d.breaking, "parameter reorder must be breaking");
+        assert!(
+            d.functions.changed.is_empty(),
+            "a pure reorder must not appear in 'changed'"
+        );
+        assert_eq!(
+            d.functions.reordered.len(),
+            1,
+            "a pure reorder must appear in 'reordered'"
+        );
+        let item = &d.functions.reordered[0];
+        assert_eq!(item.name, "transfer");
+        assert!(
+            item.from.contains("from: Address"),
+            "from-signature should reference old order"
+        );
+        assert!(
+            item.to.contains("amount: i128"),
+            "to-signature should reference new order"
+        );
+        // The summary line should say "reordered function …"
+        assert_eq!(d.summary.len(), 1);
+        assert!(
+            d.summary[0].starts_with("reordered function transfer"),
+            "summary line should start with 'reordered function transfer', got: {}",
+            d.summary[0]
+        );
+    }
+
+    /// A change that renames or retypes a parameter is NOT a pure reorder —
+    /// it must still appear in `changed`, not `reordered`.
+    #[test]
+    fn renamed_parameter_is_changed_not_reordered() {
+        // Same types, different names — not a reorder.
+        let old = spec_of(&[func(
+            "transfer",
+            &[
+                ("from", ScSpecTypeDef::Address),
+                ("to", ScSpecTypeDef::Address),
+            ],
+            None,
+        )]);
+        let new = spec_of(&[func(
+            "transfer",
+            &[
+                ("sender", ScSpecTypeDef::Address),
+                ("recipient", ScSpecTypeDef::Address),
+            ],
+            None,
+        )]);
+        let d = SpecDiff::between(&old, &new);
+        assert!(d.breaking);
+        assert_eq!(d.functions.changed.len(), 1, "renamed params → changed");
+        assert!(
+            d.functions.reordered.is_empty(),
+            "renamed params → not reordered"
+        );
     }
 
     #[test]
