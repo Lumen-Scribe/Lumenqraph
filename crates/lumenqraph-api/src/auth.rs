@@ -280,12 +280,13 @@ pub async fn rpc_auth_and_rate_limit(
         }
     };
 
-    if !state.rpc_limiter.check(&identity, limit).allowed {
+    let rl_status = state.rpc_limiter.check(&identity, limit);
+    if !rl_status.allowed {
         if is_authenticated {
             let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
             log_audit_event(&state.pool, hash_prefix, &route, &method, 429).await;
         }
-        return Err(ApiError::too_many_requests());
+        return Err(ApiError::too_many_requests(rl_status.retry_after_secs));
     }
 
     let response = next.run(req).await;
@@ -691,5 +692,31 @@ mod integration_tests {
         assert_eq!(res.status(), 429);
         let body: serde_json::Value = res.json().await.unwrap();
         assert!(body.get("error").is_some(), "429 must have error envelope");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn rate_limit_response_has_retry_after_header() {
+        let pool = db_pool().await;
+        let base = spawn_server(make_state(pool, false, 1)).await;
+        let client = reqwest::Client::new();
+        // Exhaust the single token.
+        client.get(format!("{base}/contracts")).send().await.unwrap();
+        let res = client
+            .get(format!("{base}/contracts"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 429);
+        let retry_after = res
+            .headers()
+            .get("retry-after")
+            .expect("429 responses must carry a Retry-After header")
+            .to_str()
+            .unwrap();
+        assert!(
+            retry_after.parse::<u64>().is_ok(),
+            "Retry-After must be an integer number of seconds, got {retry_after:?}"
+        );
     }
 }

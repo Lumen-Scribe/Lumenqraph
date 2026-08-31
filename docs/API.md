@@ -27,7 +27,8 @@ stable and will not be renamed or removed.
 | `not_found`         | 404         | The requested resource does not exist.                                |
 | `rate_limited`      | 429         | Caller exceeded the requests-per-minute limit.                        |
 | `simulation_failed` | 400         | RPC simulation returned an error (contract trap, bad call, etc.).    |
-| `spec_unavailable`  | 404         | The contract's interface is not indexed yet, or is a Stellar Asset Contract (no callable spec). |
+| `spec_unavailable`  | 404         | Contract has not been indexed yet. The indexer fetches the interface on first sighting — retry after the contract has been seen. |
+| `sac_not_supported` | 422         | The contract is a Stellar Asset Contract (or has no WASM spec). Retrying will never help; use the token metadata endpoints instead of `/call` or `/simulate`. |
 | `internal_error`    | 500         | Unexpected server-side failure. Details are logged, not exposed.     |
 
 ## Public
@@ -298,6 +299,8 @@ probably safe via `/call`; when in doubt, or when `is_view` is `false`, prefer
 Invoke a **view** function read-only and return a typed result.
 Body: `{ "function": "balance", "args": { "id": "G..." }, "source_account": null }`
 — `args` takes an object keyed by parameter name, or a positional array.
+`source_account` accepts both a plain Ed25519 public key (`G…` strkey) and a
+muxed account (`M…` strkey) for sub-account routing.
 ```json
 { "contract_id": "CB...", "function": "balance",
   "result": "500", "simulated_at_ledger": 3550886 }
@@ -487,6 +490,24 @@ detecting whether another page exists.
 
 ### `DELETE /webhooks/:id`
 Removes a subscription (and cascades its deliveries).
+
+### `POST /webhooks/:id/rotate-secret`
+Rotates the HMAC signing secret for a subscription. Returns the new secret
+**once only** — store it immediately. The previous secret remains valid for a
+configurable grace period (default 5 minutes, set via `WEBHOOK_SECRET_GRACE_SECS`)
+so consumers can roll out the new secret without a verification gap.
+
+```json
+{
+  "id": "...",
+  "secret": "<new-hex-secret>",
+  "previous_secret_valid_until": "2025-01-24T12:05:00Z",
+  "message": "Store this secret immediately — it will not be shown again."
+}
+```
+
+Delivery history and the subscription watermark are fully preserved — no
+deliveries are replayed and no events are missed.
 
 ### Verifying a delivery
 `HMAC-SHA256(secret, raw_request_body)` hex must equal the value after

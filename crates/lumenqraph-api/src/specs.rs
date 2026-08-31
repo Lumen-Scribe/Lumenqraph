@@ -106,10 +106,11 @@ impl SpecCache {
                 .fetch_optional(pool)
                 .await?;
                 if has_events.is_some() {
-                    return Err(ApiError::not_found(
+                    return Err(ApiError::sac_not_supported(
                         "Stellar Asset Contract: no on-chain WASM interface. \
                          SACs publish only standard SEP-41 token conventions; \
-                         use token metadata endpoints instead of /call."
+                         use token metadata endpoints instead of /call or /simulate. \
+                         Retrying will not help."
                     ));
                 }
                 return Err(not_indexed());
@@ -135,7 +136,11 @@ impl SpecCache {
         let hex_section = section
             .map(|r| r.0)
             .filter(|s| !s.is_empty())
-            .ok_or_else(not_indexed)?;
+            .ok_or_else(|| ApiError::sac_not_supported(
+                "contract has no callable on-chain WASM interface (Stellar Asset Contract or \
+                 equivalent). Retrying will not help; use token metadata endpoints instead of \
+                 /call or /simulate."
+            ))?;
         let entry = Arc::new(parse(&hex_section)?);
 
         let mut map = self.current.write().unwrap();
@@ -203,8 +208,8 @@ fn parse(hex_section: &str) -> ApiResult<CachedSpec> {
 
 fn not_indexed() -> ApiError {
     ApiError::spec_unavailable(
-        "no interface indexed for this contract yet (the indexer fetches it \
-         on first sighting; Stellar Asset Contracts have no callable spec)",
+        "no interface indexed for this contract yet; the indexer fetches it \
+         on first sighting — retry after the indexer has seen this contract",
     )
 }
 

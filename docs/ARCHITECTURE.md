@@ -92,6 +92,21 @@ This costs one small, indexed query per lookup (`wasm_hash`, `fetched_at`) —
 the section itself (large, and requiring an XDR re-parse) is only re-fetched
 when that comparison actually detects a change.
 
+## Database Invariants
+
+A handful of schema constructs carry load-bearing invariants that are not
+obvious from the column definitions alone. A migration that changes any of them
+without preserving the property described here will break a service at runtime,
+usually silently. They are collected here so a schema change can be checked
+against the list.
+
+| Construct | Invariant | Why it exists | What breaks if violated |
+|-----------|-----------|---------------|-------------------------|
+| **`trg_update_contract_summary`** trigger on `events` | Every `INSERT` / `UPDATE` / `DELETE` on `events` adjusts the matching `contract_summaries` row in the same statement, so `contract_summaries` is always an exact aggregate of `events` — never a cache that can drift. | `GET /contracts` reads `contract_summaries` by primary key instead of running a `GROUP BY` over the whole `events` table (see the next section). | Disabling or narrowing the trigger, or bulk-loading `events` with the trigger off, makes `contract_summaries` diverge: `/contracts` then reports wrong `event_count` / ledger bounds, or lists contracts whose events were all pruned. Bulk loads must re-run the reconciliation in `migrations/0021_contract_summaries_delete.sql` or `DELETE FROM contract_summaries` and let it rebuild. |
+| **`events.seq`** (`BIGSERIAL`, unique) | Assigned strictly increasing in insert order and never reused or reordered. It is *not* the ordering key of anything the indexer does — it exists purely so a downstream reader can stream new rows with a single high-water mark. `event_id` (the RPC id) is the dedupe key but is **not** monotonic, so it cannot be used for this. | The webhook enqueuer streams new events by `WHERE seq > last_seen` (see `webhook_state` below). One integer comparison replaces "diff the set of event ids I've seen". | Making `seq` nullable, resetting the sequence, backfilling rows with `seq` values below the current webhook watermark, or copying `events` without preserving `seq` all cause the webhook enqueuer to **skip** those rows permanently — subscribers silently miss deliveries. Reordering `seq` vs. insert order can also skip rows if the enqueuer reads a gap that later fills in. |
+| **`webhook_state`** (single row, `CHECK (id = 1)`) | Exactly one row, holding `last_seq` (events stream watermark) and `last_upgrade_id` (contract-upgrade stream watermark). Each watermark only ever moves forward, and it is advanced **in the same transaction** that inserts the matching `webhook_deliveries` rows — so a crash between "enqueue" and "advance watermark" is impossible; the pair commit together or not at all. The two watermarks are independent: a quiet period in one stream cannot stall the other. | Gives at-least-once delivery with a bounded, crash-safe replay window, without a per-subscription cursor. The `ON CONFLICT (subscription_id, ...) DO NOTHING` dedupe on `webhook_deliveries` covers the "at-least" overlap. | Allowing a second row, resetting a watermark to 0 (re-enqueues and re-delivers the entire history), or advancing a watermark outside the enqueue transaction (a crash then skips deliveries). Manually editing `last_seq` forward to "skip a backlog" drops those deliveries for good. |
+| **`indexer_cursor`** (single row, `CHECK (id = 1)`) | Exactly one row, id `1`. Holds `last_processed_ledger` plus denormalized status/counter columns (`chain_tip_ledger`, `events_ingested_total`, RPC/enrichment counters) that `/health` and `/metrics` read directly. The indexer resumes ingestion from `last_processed_ledger` on every startup. | A single well-known row is a cheap, race-free resume point for the one writer, and doubles as the status snapshot the API serves without querying the indexer process. | A second row, or `id <> 1`, makes the resume query ambiguous — the indexer can re-scan or skip ledgers. Deleting the row loses the resume point (it restarts from `START_LEDGER`). Two indexer processes writing this row concurrently is unsupported: run exactly one indexer. |
+
 ## contract_summaries trigger
 
 `contract_summaries` is a denormalized table that keeps a running

@@ -2,6 +2,10 @@ version: 2
 
 updates:
   # ── Rust / Cargo ────────────────────────────────────────────────────────────
+  # Covers the whole workspace: `directory: /` points at the root Cargo.toml,
+  # and Dependabot walks every member crate's manifest from there, so
+  # workspace-pinned crates (stellar-xdr, reqwest, axum, sqlx, …) and each
+  # crate's own dependencies are all monitored.
   - package-ecosystem: cargo
     directory: /
     schedule:
@@ -9,11 +13,29 @@ updates:
       day: monday
       time: "06:00"
       timezone: UTC
-    # Group all non-breaking bumps into one PR to keep noise low.
     groups:
-      cargo-dependencies:
+      # Security patches ship on their own, unbatched, so a vulnerable transitive
+      # dependency is never held back waiting on an unrelated version bump.
+      cargo-security:
+        applies-to: security-updates
         patterns:
           - "*"
+      # Stellar stack (stellar-xdr, stellar-strkey, …) grouped by itself: these
+      # move together and a bump here can touch the XDR/strkey decode path, so
+      # it deserves a focused PR rather than being buried in a bulk update.
+      stellar:
+        applies-to: version-updates
+        patterns:
+          - "stellar-*"
+          - "soroban-*"
+      # Everything else: one batched PR per week to keep review noise low.
+      cargo-dependencies:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "stellar-*"
+          - "soroban-*"
     open-pull-requests-limit: 5
     labels:
       - dependencies
@@ -35,6 +57,39 @@ updates:
     labels:
       - dependencies
       - typescript
+
+  # ── Python SDK (pip) ────────────────────────────────────────────────────────
+  - package-ecosystem: pip
+    directory: /sdk/python
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: UTC
+    groups:
+      pip-dependencies:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - python
+
+  # ── Docker base images ──────────────────────────────────────────────────────
+  # Keeps the digest pins in the Dockerfile up-to-date so reproducible builds
+  # also pick up security patches on a schedule rather than requiring manual
+  # digest refreshes.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: UTC
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - docker
 
   # ── GitHub Actions ──────────────────────────────────────────────────────────
   - package-ecosystem: github-actions

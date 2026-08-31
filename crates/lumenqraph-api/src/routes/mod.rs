@@ -37,6 +37,7 @@ use crate::auth::{
 };
 use crate::graphql::{self, AppSchema};
 use crate::metrics;
+use crate::request_id;
 use crate::state::AppState;
 
 /// Execute a GraphQL query against the shared schema.
@@ -72,8 +73,20 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health::health))
         .route("/livez", get(health::livez))
         .route("/readyz", get(health::readyz))
-        .route("/metrics", get(metrics::metrics))
         .merge(openapi::router());
+
+    // /metrics: public by default, but can be restricted to authenticated
+    // callers via METRICS_REQUIRE_API_KEY=true (#213).
+    let metrics_router = if state.metrics_require_auth {
+        Router::new()
+            .route("/metrics", get(metrics::metrics))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_and_rate_limit,
+            ))
+    } else {
+        Router::new().route("/metrics", get(metrics::metrics))
+    };
 
     // RPC-backed routes with separate, tighter rate limiting (they hit upstream RPC).
     let rpc_routes = Router::new()
@@ -152,6 +165,7 @@ pub fn router(state: AppState) -> Router {
         .route("/webhooks/:id/deliveries", get(webhooks::list_webhook_deliveries))
         .route("/webhooks/:id/redrive", post(webhooks::redrive_webhook))
         .route("/webhooks/:id/reenable", post(webhooks::reenable_webhook))
+        .route("/webhooks/:id/rotate-secret", post(webhooks::rotate_webhook_secret))
         // GraphQL: POST executes queries, GET serves the GraphiQL IDE. Behind
         // the same auth + rate-limit middleware as the REST data routes.
         .route("/graphql", post(graphql_handler).get(graphiql))
@@ -171,6 +185,7 @@ pub fn router(state: AppState) -> Router {
 
     let metrics_collector = state.metrics.clone();
     let mut app = public
+        .merge(metrics_router)
         .merge(protected)
         .merge(rpc_routes)
         .merge(webhook_create_routes)
@@ -182,7 +197,8 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn(move |req: Request, next: Next| {
             let collector = metrics_collector.clone();
             collector.middleware(req, next)
-        }));
+        }))
+        .layer(middleware::from_fn(request_id::request_id_middleware));
 
     // Sibling instances under a path prefix (see `proxy`). Registered outside
     // the auth middleware: each upstream enforces its own policy.
