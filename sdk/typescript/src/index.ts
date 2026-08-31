@@ -641,7 +641,7 @@ export async function verifyWebhook(
   const bodyBytes: ArrayBuffer =
     typeof rawBody === "string"
       ? (enc.encode(rawBody).buffer as ArrayBuffer)
-      : (rawBody.buffer as ArrayBuffer);
+      : (rawBody.buffer.slice(rawBody.byteOffset, rawBody.byteOffset + rawBody.byteLength) as ArrayBuffer);
 
   // Import the secret as an HMAC-SHA-256 key via Web Crypto (Node 18+, browsers).
   const cryptoKey = await crypto.subtle.importKey(
