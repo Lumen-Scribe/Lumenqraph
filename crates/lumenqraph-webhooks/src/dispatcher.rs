@@ -197,10 +197,7 @@ struct DueDelivery {
 /// keep their long-standing shape (the bare event row); upgrade payloads are
 /// tagged, since they're a new shape and a consumer receiving one should be able
 /// to tell what it is.
-async fn fetch_due(pool: &PgPool, batch: i64) -> anyhow::Result<Vec<DueDelivery>> {
-    let encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY")
-        .unwrap_or_else(|_| "default-key-for-testing".to_string());
-
+async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::Result<Vec<DueDelivery>> {
     let rows: Vec<(i64, String, i32, String, String, Json<serde_json::Value>)> = sqlx::query_as(
         "SELECT d.id, s.id, d.attempts, s.url,
                 pgp_sym_decrypt(s.encrypted_secret, $1),
@@ -248,7 +245,7 @@ pub async fn deliver(
     http: &reqwest::Client,
     config: &Config,
 ) -> anyhow::Result<(u64, u64)> {
-    let deliveries = fetch_due(pool, config.batch_size).await?;
+    let deliveries = fetch_due(pool, config.batch_size, &config.encryption_key).await?;
     if deliveries.is_empty() {
         return Ok((0, 0));
     }
@@ -587,7 +584,7 @@ mod tests {
             "only the upgrade (v2) enqueues; v1 is a baseline, not a change"
         );
 
-        let due = fetch_due(&pool, 100).await.unwrap();
+        let due = fetch_due(&pool, 100, "test-key").await.unwrap();
         assert_eq!(due.len(), 1);
         let payload = &due[0].payload.0;
         assert_eq!(payload["type"], "contract.upgraded");
@@ -644,7 +641,7 @@ mod tests {
         assert_eq!(enqueue(&pool, 100).await.unwrap(), 1);
         // The watermark has advanced, so a second pass finds nothing new.
         assert_eq!(enqueue(&pool, 100).await.unwrap(), 0);
-        assert_eq!(fetch_due(&pool, 100).await.unwrap().len(), 1);
+        assert_eq!(fetch_due(&pool, 100, "test-key").await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -660,7 +657,7 @@ mod tests {
         assert_eq!(enqueue(&pool, 100).await.unwrap(), 5);
 
         // Simulate failures for all 5 deliveries.
-        let due = fetch_due(&pool, 100).await.unwrap();
+        let due = fetch_due(&pool, 100, "test-key").await.unwrap();
         assert_eq!(due.len(), 5);
 
         for d in due {
