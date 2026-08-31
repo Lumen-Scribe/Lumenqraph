@@ -8,6 +8,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends pkg-config \
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY migrations ./migrations
+# Build-time metadata baked into the binary via option_env!() macros.
+# Pass these with --build-arg GIT_COMMIT=$(git rev-parse --short HEAD)
+# and --build-arg BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ) at image
+# build time so the /health endpoint reports real values instead of "unknown".
+ARG GIT_COMMIT=""
+ARG BUILD_TIME=""
+ENV LUMENQRAPH_GIT_SHA=${GIT_COMMIT}
+ENV LUMENQRAPH_BUILD_TIME=${BUILD_TIME}
 RUN cargo build --release --workspace
 
 FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime

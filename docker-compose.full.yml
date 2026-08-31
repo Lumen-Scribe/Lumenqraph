@@ -4,6 +4,10 @@
 # IMPORTANT: Set WEBHOOK_ENCRYPTION_KEY in your environment before starting:
 #   export WEBHOOK_ENCRYPTION_KEY=$(openssl rand -hex 32)
 #   docker compose -f docker-compose.full.yml up --build
+#
+# Optional: set GIT_COMMIT and BUILD_TIME for accurate /health build info:
+#   export GIT_COMMIT=$(git rev-parse --short HEAD)
+#   export BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 services:
   postgres:
@@ -24,7 +28,11 @@ services:
       start_period: 10s
 
   indexer:
-    build: .
+    build:
+      context: .
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-}
+        BUILD_TIME: ${BUILD_TIME:-}
     command: ["lumenqraph-indexer"]
     restart: unless-stopped
     depends_on:
@@ -38,7 +46,11 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
 
   api:
-    build: .
+    build:
+      context: .
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-}
+        BUILD_TIME: ${BUILD_TIME:-}
     command: ["lumenqraph-api"]
     restart: unless-stopped
     depends_on:
@@ -61,7 +73,11 @@ services:
       start_period: 10s
 
   webhooks:
-    build: .
+    build:
+      context: .
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-}
+        BUILD_TIME: ${BUILD_TIME:-}
     command: ["lumenqraph-webhooks"]
     restart: unless-stopped
     depends_on:
