@@ -51,6 +51,7 @@ Indexing Stellar **mainnet** right now. Below: the [Aquarius AMM](https://aqua.n
 - [Troubleshooting & FAQ](docs/TROUBLESHOOTING.md)
 - [Explorer UI & Configuration](docs/EXPLORER.md)
 - [Migration Rollback Strategy](docs/MIGRATIONS.md)
+- [Upgrading Between Versions](docs/UPGRADING.md)
 - [Security](SECURITY.md)
 - [Contributing](#contributing)
 - [License](#license)
@@ -642,6 +643,8 @@ Run three long-lived processes against one Postgres. Only the indexer applies mi
 
 Scrape `GET /metrics` and alert on `lumenqraph_indexer_lag_ledgers` climbing. For managed Postgres, point `DATABASE_URL` at Neon or Supabase. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for scaling notes (RPC providers, Redis-backed rate limiting, caching).
 
+When upgrading a running deployment, always consult [docs/UPGRADING.md](docs/UPGRADING.md) for breaking changes, required env var additions, and the database migration log for each release.
+
 ## Project structure
 
 ```
@@ -707,7 +710,7 @@ Contributions toward any of these are very welcome — see [Contributing](#contr
 
 Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for the dev setup and conventions, and review our [Code of Conduct](CODE_OF_CONDUCT.md). Good first issues are labelled in the [issue tracker](https://github.com/Lumen-Scribe/Lumenqraph/issues).
 
-See [CHANGELOG.md](CHANGELOG.md) for release history and versioning policy.
+See [CHANGELOG.md](CHANGELOG.md) for release history, versioning policy, and per-release migration notes. See [docs/UPGRADING.md](docs/UPGRADING.md) for step-by-step upgrade instructions.
 
 ## License
 
