@@ -185,6 +185,13 @@ impl SpecCache {
         Ok(entry)
     }
 
+    /// Evict a contract's current interface from the in-memory cache, forcing
+    /// subsequent lookups to re-read and re-parse.
+    pub fn invalidate(&self, contract_id: &str) {
+        let mut map = self.current.write().unwrap();
+        map.remove(contract_id);
+    }
+
     /// Seed a pre-built spec directly into the cache, bypassing the database.
     /// Used only in handler tests where a real Postgres connection is not needed.
     #[cfg(test)]

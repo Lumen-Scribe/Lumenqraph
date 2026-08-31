@@ -236,6 +236,21 @@ baseline version, or if `from` == `to`; `404` for an unknown version.
 `breaking` is true when anything was removed or changed — an integration built
 against the old interface may no longer work. Additions alone are not breaking.
 
+### `POST /contracts/:id/refresh`
+Trigger an immediate manual re-fetch of a contract's on-chain interface from
+Soroban RPC, clearing the cached spec and updating the contract's stored
+interface and version history.
+
+Useful when an initial spec fetch failed (e.g. due to a transient RPC error) or
+when an operator needs to force a spec refresh for a specific contract without
+restarting the indexer. Returns the refreshed interface on success or a
+structured error on failure.
+```json
+{ "contract_id": "CB...", "has_events": true,
+  "interface": { "functions": [...], "events": [...], "structs": [], "unions": [], "enums": [] },
+  "fetched_at": "2026-07-15T..." }
+```
+
 ### `GET /contracts/:id/state`
 Versioned snapshots of the contract's **instance storage** (admin, config,
 counters…), newest first. Query: `limit` (1–200, default 1 = current state).
@@ -381,6 +396,12 @@ baseline version, or if `from` == `to`; `404` for an unknown version.
 
 `breaking` is true when anything was removed or changed — an integration built
 against the old interface may no longer work. Additions alone are not breaking.
+
+### `POST /contracts/:id/refresh`
+Trigger an immediate manual re-fetch of a contract's on-chain interface from
+Soroban RPC, clearing the cached spec and updating the contract's stored
+interface and version history. Useful when an initial spec fetch failed due to a
+transient RPC error or to force a spec refresh without restarting the indexer.
 
 ## Generated typed clients
 
