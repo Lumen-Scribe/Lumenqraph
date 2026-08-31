@@ -54,10 +54,17 @@ url = "2"
 axum = "0.7"
 tower = "0.5"
 tower-http = { version = "0.5", features = ["trace", "cors", "fs", "set-header", "compression-gzip", "compression-br", "timeout"] }
-# Pinned to the 7.0.x line that targets axum 0.7 (7.0.11+ moved to axum 0.8,
-# which would clash with the rest of the stack).
-async-graphql = { version = "=7.0.7", features = ["chrono"] }
-async-graphql-axum = "=7.0.7"
+# Constrained to the async-graphql 7.0.x releases that still target axum 0.7:
+# 7.0.11 switched to axum 0.8, which would clash with the rest of the stack
+# (`axum = "0.7"`, `tower-http = "0.5"`, and the utoipa axum integrations).
+#
+# A `>=` / `<` range rather than an exact `=` pin so patch-level fixes in the
+# 7.0.7..7.0.10 window (bug/security) are still picked up automatically, while
+# the axum-0.8 bump stays gated. Lifting the `<7.0.11` ceiling is the
+# async-graphql side of migrating the whole workspace to axum 0.8 and should be
+# done together with it (tracked separately).
+async-graphql = { version = ">=7.0.7, <7.0.11", features = ["chrono"] }
+async-graphql-axum = ">=7.0.7, <7.0.11"
 # Canonical Stellar XDR types. Used ONLY on the cold, once-per-contract spec /
 # ledger-entry path (parsing a contract's on-chain interface). The hot event
 # decode path stays dependency-free in `lumenqraph-core::xdr`.
@@ -67,6 +74,7 @@ stellar-xdr = { version = "23", default-features = false, features = [
     "base64",
 ] }
 lru = "0.12"
+criterion = { version = "0.5", features = ["async_tokio"] }
 
 [profile.release]
 opt-level = 3

@@ -11,6 +11,35 @@ ledgers) of event history, and `START_LEDGER` is clamped to that window.
 Analytics, audits, and "since inception" dashboards need history older than
 7 days — that requires an alternate ingest source.
 
+## Archive RPC timeouts
+
+If you are backfilling recent history (inside the ~7-day RPC window) with the
+RPC-based `backfill` subcommand — usually via `scripts/backfill.sh` — against a
+slow archive or paid RPC endpoint, raise the RPC timeout.
+
+`RPC_TIMEOUT_SECS` defaults to `30`, which suits the public SDF RPC. Archive
+endpoints answering deep `getEvents` queries are frequently slower than that. A
+timeout aborts the entire batch, and the automatic retry reuses the same
+timeout, so a consistently slow RPC turns into a permanent failure until the
+value is raised. **120 seconds** is a good starting point for archive RPCs;
+increase further if you still see timeouts.
+
+Set it any of these ways (highest precedence first):
+
+```bash
+# 1. Per-run flag on the backfill script:
+./scripts/backfill.sh --rpc-timeout 120 <start_ledger>
+
+# 2. Exported in the environment:
+RPC_TIMEOUT_SECS=120 ./scripts/backfill.sh <start_ledger>
+
+# 3. Persisted in .env (picked up by the indexer, not overridden if already set):
+echo 'RPC_TIMEOUT_SECS=120' >> .env
+```
+
+The data-lake `deep-backfill` path below does not talk to an RPC, so
+`RPC_TIMEOUT_SECS` has no effect there.
+
 ## Architecture
 
 ```

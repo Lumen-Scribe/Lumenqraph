@@ -98,6 +98,13 @@ export interface DataKeyHistory {
   versions: { ledger: number; value: Json; captured_at: string }[];
 }
 
+export interface ContractsResponse {
+  data: Contract[];
+  has_more: boolean;
+  /** Pass as `after` on the next call to fetch the next page. `null` when no more pages. */
+  next_cursor: string | null;
+}
+
 export interface EventsResponse {
   data: EventRecord[];
   has_more: boolean;
@@ -121,6 +128,38 @@ export interface CallOptions {
   args?: Json;
   /** Optional `G…` source account for the simulation. */
   sourceAccount?: string;
+}
+
+export interface Webhook {
+  id: string;
+  url: string;
+  subscriptions: string[];
+  active: boolean;
+  secret: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WebhookDelivery {
+  id: string;
+  webhook_id: string;
+  status: "pending" | "success" | "failed";
+  status_code?: number;
+  error?: string;
+  attempts: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateWebhookOptions {
+  url: string;
+  subscriptions?: string[];
+}
+
+export interface UpdateWebhookOptions {
+  url?: string;
+  subscriptions?: string[];
+  active?: boolean;
 }
 
 /** A Relay-style page returned by the GraphQL cursor connections. */
@@ -237,9 +276,15 @@ export class LumenqraphClient {
     return this.get("/health", {}, opts.signal);
   }
 
-  /** Contracts the indexer has seen, with per-contract event counts. */
-  listContracts(opts: RequestOptions = {}): Promise<Contract[]> {
-    return this.get("/contracts", {}, opts.signal);
+  /**
+   * Contracts the indexer has seen, with per-contract event counts.
+   * Supports cursor-based pagination: pass the `next_cursor` from a previous
+   * response as `after` to fetch the next page.
+   */
+  listContracts(
+    opts: { limit?: number; after?: string; signal?: AbortSignal } = {},
+  ): Promise<ContractsResponse> {
+    return this.get("/contracts", { limit: opts.limit, after: opts.after }, opts.signal);
   }
 
   /** A contract's decoded on-chain interface (functions, events, types). */
@@ -318,6 +363,21 @@ export class LumenqraphClient {
     }, opts.signal);
   }
 
+  /** Fetch a single event by its unique ID. */
+  getEvent(eventId: string, opts: RequestOptions = {}): Promise<EventRecord> {
+    return this.get(`/events/${enc(eventId)}`, {}, opts.signal);
+  }
+
+  /** All indexed events emitted by a transaction, in emission order. */
+  getTransactionEvents(
+    txHash: string,
+    opts: { limit?: number; signal?: AbortSignal } = {},
+  ): Promise<{ tx_hash: string; count: number; data: EventRecord[] }> {
+    return this.get(`/transactions/${enc(txHash)}/events`, {
+      limit: opts.limit,
+    }, opts.signal);
+  }
+
   /** Materialized SEP-41 transfers, newest first (limit/offset). */
   listTransfers(
     contractId?: string,
@@ -349,6 +409,43 @@ export class LumenqraphClient {
       function: opts.function,
       args: opts.args ?? null,
       source_account: opts.sourceAccount,
+    }, opts.signal);
+  }
+
+  // ---- Webhooks ----
+
+  /** Create a new webhook subscription. Returns the webhook with its secret. */
+  createWebhook(opts: CreateWebhookOptions & RequestOptions): Promise<Webhook> {
+    return this.post("/webhooks", {
+      url: opts.url,
+      subscriptions: opts.subscriptions ?? [],
+    }, opts.signal);
+  }
+
+  /** List all webhooks for this instance. */
+  listWebhooks(opts: RequestOptions = {}): Promise<Webhook[]> {
+    return this.get("/webhooks", {}, opts.signal);
+  }
+
+  /** Delete a webhook by ID. */
+  deleteWebhook(id: string, opts: RequestOptions = {}): Promise<void> {
+    return this.delete(`/webhooks/${enc(id)}`, opts.signal);
+  }
+
+  /** Update a webhook's URL, subscriptions, or active status. */
+  updateWebhook(id: string, opts: UpdateWebhookOptions & RequestOptions): Promise<Webhook> {
+    return this.post(`/webhooks/${enc(id)}`, {
+      url: opts.url,
+      subscriptions: opts.subscriptions,
+      active: opts.active,
+    }, opts.signal);
+  }
+
+  /** List delivery attempts for a webhook. */
+  listDeliveries(id: string, opts: { limit?: number; offset?: number; signal?: AbortSignal } = {}): Promise<WebhookDelivery[]> {
+    return this.get(`/webhooks/${enc(id)}/deliveries`, {
+      limit: opts.limit,
+      offset: opts.offset,
     }, opts.signal);
   }
 
@@ -411,22 +508,45 @@ export class LumenqraphClient {
   /**
    * Async iterator over *all* of a contract's events via GraphQL cursor
    * pagination — transparently fetching page after page.
+   *
+   * Cancellation (#279): pass `signal` to cancel from the caller. Independently,
+   * breaking out of the `for await` loop early runs this generator's `finally`
+   * cleanup, which aborts the signal handed to the page fetches — so an
+   * in-flight `eventsPage` request is cancelled rather than left to run and have
+   * its result discarded.
    */
   async *paginateEvents(
     contractId: string,
     opts: { pageSize?: number; eventName?: string; signal?: AbortSignal } = {},
   ): AsyncGenerator<EventRecord> {
-    let after: string | undefined;
-    for (;;) {
-      const page = await this.eventsPage(contractId, {
-        first: opts.pageSize ?? 100,
-        after,
-        eventName: opts.eventName,
-        signal: opts.signal,
-      });
-      for (const node of page.nodes) yield node;
-      if (!page.hasNextPage || !page.endCursor) return;
-      after = page.endCursor;
+    // An internal controller, chained to the caller's signal, is what the page
+    // fetches actually see. Early termination (a `break` in the consumer's
+    // `for await`, or a thrown error) triggers the `finally` below, which aborts
+    // it and tears down any pending request.
+    const pageAborter = new AbortController();
+    const external = opts.signal;
+    const onExternalAbort = () => pageAborter.abort(external?.reason);
+    if (external) {
+      if (external.aborted) pageAborter.abort(external.reason);
+      else external.addEventListener("abort", onExternalAbort, { once: true });
+    }
+
+    try {
+      let after: string | undefined;
+      for (;;) {
+        const page = await this.eventsPage(contractId, {
+          first: opts.pageSize ?? 100,
+          after,
+          eventName: opts.eventName,
+          signal: pageAborter.signal,
+        });
+        for (const node of page.nodes) yield node;
+        if (!page.hasNextPage || !page.endCursor) return;
+        after = page.endCursor;
+      }
+    } finally {
+      external?.removeEventListener("abort", onExternalAbort);
+      pageAborter.abort();
     }
   }
 
@@ -497,6 +617,12 @@ export class LumenqraphClient {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
+    }, signal);
+  }
+
+  private async delete<T = Json>(path: string, signal?: AbortSignal): Promise<T> {
+    return this.request<T>(this.baseUrl + path, {
+      method: "DELETE",
     }, signal);
   }
 
@@ -635,7 +761,7 @@ export async function verifyWebhook(
   const bodyBytes: ArrayBuffer =
     typeof rawBody === "string"
       ? (enc.encode(rawBody).buffer as ArrayBuffer)
-      : (rawBody.buffer as ArrayBuffer);
+      : (rawBody.buffer.slice(rawBody.byteOffset, rawBody.byteOffset + rawBody.byteLength) as ArrayBuffer);
 
   // Import the secret as an HMAC-SHA-256 key via Web Crypto (Node 18+, browsers).
   const cryptoKey = await crypto.subtle.importKey(

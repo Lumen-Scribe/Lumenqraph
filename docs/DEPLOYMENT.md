@@ -22,6 +22,51 @@ assets (the Docker image ships them at `/app/explorer`).
 docker compose -f docker-compose.full.yml up --build -d
 ```
 One image holds all three binaries; each service overrides `command:`.
+
+### Postgres data volume
+
+`docker-compose.full.yml` persists the database to a named volume, `pgdata`,
+mounted at `/var/lib/postgresql/data`. Indexed data therefore survives
+`docker compose -f docker-compose.full.yml down` and image rebuilds — only
+`docker compose ... down -v` (or an explicit `docker volume rm`) deletes it.
+
+The volume is created in the compose project's namespace, so its full name is
+`<project>_pgdata` (the project defaults to the repo directory name, e.g.
+`lumenqraph_pgdata`). List and inspect it with:
+
+```bash
+docker volume ls | grep pgdata
+docker volume inspect lumenqraph_pgdata
+```
+
+**Back up** (logical dump, portable across major versions):
+
+```bash
+docker compose -f docker-compose.full.yml exec -T postgres \
+  pg_dump -U lumenqraph -Fc lumenqraph > lumenqraph-$(date +%F).dump
+```
+
+**Restore** into a fresh volume:
+
+```bash
+docker compose -f docker-compose.full.yml up -d postgres
+docker compose -f docker-compose.full.yml exec -T postgres \
+  pg_restore -U lumenqraph -d lumenqraph --clean --if-exists < lumenqraph-2025-01-01.dump
+```
+
+For a raw, version-locked copy of the volume instead, archive the mount point
+while Postgres is stopped:
+
+```bash
+docker compose -f docker-compose.full.yml stop postgres
+docker run --rm -v lumenqraph_pgdata:/data -v "$PWD":/backup alpine \
+  tar czf /backup/pgdata.tar.gz -C /data .
+```
+
+Managed-Postgres deploys (Fly.io, Neon, Supabase — see below) handle
+persistence and backups on the provider side; this section applies only to the
+self-hosted Docker stack.
+
 ## Managed Deploy (Fly.io)
 
 Fly.io is the recommended hosting platform for running Lumenqraph in production. The repository ships with a pre-configured [`fly.toml`](../fly.toml) that defines three distinct process groups:
@@ -140,7 +185,22 @@ Render's free tier has several limits that shape how we deploy:
 2. Create a new project.
 3. Go to **Project Settings → Database → Connection string** and copy the URI. Remember to append `?sslmode=require`.
 
-#### 2. Deploy Blueprint on Render
+#### 2. Generate Required Secrets Before Deploying
+
+Before running the Blueprint, generate the webhook encryption key locally and keep it ready to paste into the Render prompt:
+
+```bash
+# Generates a 256-bit hex secret — store it somewhere safe (e.g. a password manager)
+openssl rand -hex 32
+```
+
+> [!IMPORTANT]
+> Never commit this value to source control. The `WEBHOOK_ENCRYPTION_KEY` entry in
+> `render.yaml` intentionally has no default. Render will prompt you to set it during
+> Blueprint setup. Deployments that skip this step fall back to the hardcoded
+> `"default-key-for-testing"` value, which is insecure.
+
+#### 3. Deploy Blueprint on Render
 1. Fork the Lumenqraph repository on GitHub.
 2. Go to your [Render Dashboard](https://dashboard.render.com).
 3. Click **New → Blueprint**.
@@ -148,14 +208,15 @@ Render's free tier has several limits that shape how we deploy:
 5. Render will automatically parse [`render.yaml`](../render.yaml). You will be prompted to input:
    - `DATABASE_URL`: The Supabase connection string.
    - `CONTRACT_IDS`: **Must** be a focused allowlist of contracts. **Do not** leave this empty or include high-frequency contracts (like the Stellar Asset Contract `CAS3J7GY...` which generates millions of events daily and will fill the 500MB cap in hours).
+   - `WEBHOOK_ENCRYPTION_KEY`: Paste the 64-character hex string you generated above.
 
-#### 3. Prevent Inactivity Spin-Down (Keep-Alive Cron)
+#### 4. Prevent Inactivity Spin-Down (Keep-Alive Cron)
 Since Render will sleep the container if no HTTP requests are received, you must ping the health check endpoint.
 1. Create a free account at an external cron provider (e.g., [cron-job.org](https://cron-job.org)).
 2. Configure a cron job targeting `https://<your-render-subdomain>.onrender.com/health`.
 3. Set the schedule to run **every 10 minutes**. This keeps the container awake and indexing continuously.
 
-#### 4. Configure Testnet & Mainnet Dual-Indexing
+#### 5. Configure Testnet & Mainnet Dual-Indexing
 You can index both Stellar Mainnet and Testnet using a single Render container:
 1. In your Supabase SQL Editor, create a second database:
    ```sql
@@ -166,7 +227,7 @@ You can index both Stellar Mainnet and Testnet using a single Render container:
    - `TESTNET_CONTRACT_IDS`: A focused contract allowlist for testnet.
 3. `scripts/run-all-in-one.sh` detects `TESTNET_DATABASE_URL` and starts a testnet API/indexer pair internally, proxying it via `INSTANCE_MOUNTS` under `/testnet`. The explorer UI will automatically detect the sibling network mount via `/health` and display a network switcher.
 
-#### 5. Moving to a Paid Production Plan
+#### 6. Moving to a Paid Production Plan
 When ready to move to separate, robust services:
 1. Delete or disable the Render Blueprint setup on the free plan.
 2. Provision a Render Web Service for the API, a Background Worker for the Indexer, and a Background Worker for Webhooks.
@@ -176,6 +237,7 @@ When ready to move to separate, robust services:
 ## Production Checklist
 
 - [ ] `DATABASE_URL` → managed Postgres with TLS (`sslmode=require`).
+- [ ] `WEBHOOK_ENCRYPTION_KEY` → 256-bit random hex secret (`openssl rand -hex 32`). **Never** use the default testing key in production.
 - [ ] `RPC_URL` set (paid/retaining RPC if you need backfill or higher limits).
 - [ ] `CONTRACT_IDS` = your allowlist, or intentionally empty to index all.
 - [ ] `REQUIRE_API_KEY=true` to require `x-api-key` on data routes (`/health` +
@@ -210,6 +272,15 @@ DATABASE_MAX_CONNECTIONS=3   # indexer — writes only, low concurrency
 DATABASE_MAX_CONNECTIONS=8   # api     — concurrent reads; scale up with API replicas
 DATABASE_MAX_CONNECTIONS=2   # webhooks — delivery is serialised per subscription
 ```
+
+**Render + Supabase free tier**
+
+The all-in-one container runs the indexer and API in the same process group.
+`render.yaml` sets `DATABASE_MAX_CONNECTIONS=10` as a combined ceiling (indexer
++ API share one pool). This stays well within Supabase's 60-connection free
+limit while leaving headroom for migrations and the Supabase internal pooler.
+Raise this value only after confirming headroom in the Supabase dashboard
+(**Project Settings → Database → Connection Pooling**).
 
 On paid plans (Neon Standard 100 conn, Supabase Pro 60 direct / PgBouncer
 unlimited): raise the API pool first; the indexer and webhooks are single-writer
@@ -273,6 +344,23 @@ The indexer's position relative to the chain tip is exported as two metrics:
 - `lumenqraph_rpc_errors_32001_total` — RPC quota-limit hits (indicates sustained
   load pressure; may need higher RPC plan or longer `POLL_INTERVAL_SECS`).
 
+### Webhook metrics
+
+The webhook service exposes its own `/metrics` endpoint (default
+`127.0.0.1:9091`, set by `WEBHOOKS_METRICS_BIND_ADDR`):
+
+- `lumenqraph_webhooks_pending_deliveries` (gauge) — deliveries in the `pending`
+  state, refreshed once per dispatcher tick. This is the queue-depth signal: a
+  sustained climb means the dispatcher is falling behind, almost always because
+  a subscriber endpoint is slow, failing, or unreachable and its retries are
+  starving the queue. Alert when it stays above ~500 for 5 minutes (warning) and
+  ~5000 for 5 minutes (critical).
+- `lumenqraph_webhook_oldest_pending_age_seconds` (gauge) — age of the oldest
+  pending delivery; pairs with the backlog gauge to tell a transient spike from
+  a genuine stall.
+- `lumenqraph_webhook_delivered_total` / `lumenqraph_webhook_failed_total`
+  (counters) — lifetime delivery outcomes.
+
 ### Monitoring Setup
 
 Ship-ready Prometheus alert rules and Grafana dashboards are included in the
@@ -322,6 +410,7 @@ Ship-ready Prometheus alert rules and Grafana dashboards are included in the
 | `lumenqraph_indexer_errors_total` | Counter | Total poll-cycle errors |
 | `lumenqraph_api_requests_total` | Counter | Total API requests served |
 | `lumenqraph_events_total` | Gauge | Total events in database |
+| `lumenqraph_webhooks_pending_deliveries` | Gauge | Webhook deliveries pending (queue depth), refreshed each dispatcher tick |
 
 #### Alert Rules
 
@@ -334,6 +423,8 @@ Ship-ready Prometheus alert rules and Grafana dashboards are included in the
 | LargeLagGrowth | lag growth > 1000 ledgers/hour | 5 min | warning |
 | IngestRateLow | < 1 event/sec | 10 min | warning |
 | APINoRequests | No requests | 5 min | warning |
+| WebhookBacklogHigh | pending deliveries > 500 | 5 min | warning |
+| WebhookBacklogCritical | pending deliveries > 5000 | 5 min | critical |
 
 Tune thresholds in `monitoring/prometheus_alerts.yml` to fit your SLA.
 
@@ -348,3 +439,104 @@ unrecoverable gap** rather than stalling forever on an impossible range. Deep
 or gapless historical backfill requires a retaining/paid RPC or a
 Galexie/captive-core data-lake source (not yet implemented); with one, raise
 `MAX_CATCHUP_LEDGERS`.
+
+## Disaster Recovery
+
+Lumenqraph's database is a **derived index**: every event in it originally came
+from the chain. That makes recovery from a total database loss possible in
+principle — but only the on-chain data is reconstructible. Anything Lumenqraph
+stores that is *not* on-chain (API keys, webhook subscriptions, the webhook
+delivery queue and its watermarks) is gone unless it was in a backup.
+
+**Take Postgres backups anyway.** Rebuilding from the chain is slow, bounded by
+RPC retention (below), and loses the non-derived tables. A nightly `pg_dump` (or
+your managed provider's PITR) turns a multi-hour rebuild into a minutes-long
+restore. This is the recommended primary recovery path.
+
+### Option A — restore from a Postgres backup (preferred)
+
+1. Stop all three services (or scale them to zero) so nothing writes during the
+   restore.
+2. Restore the dump into a fresh database:
+   ```bash
+   pg_restore --clean --if-exists -d "$DATABASE_URL" backup.dump
+   # or, for a plain SQL dump:
+   psql "$DATABASE_URL" < backup.sql
+   ```
+3. Start the **indexer** first. It applies any pending migrations, reads
+   `indexer_cursor.last_processed_ledger`, and catches up from there. If the
+   backup is older than `MAX_CATCHUP_LEDGERS` ledgers, the indexer skips the gap
+   and logs it (see [Limits](#limits)) — run a [`backfill`](#option-b--rebuild-the-index-from-scratch-no-backup)
+   for that window if you need it gapless.
+4. Start the API and webhooks. Webhook subscriptions, `starting_seq` values, and
+   `webhook_state` watermarks are all in the dump, so delivery resumes where it
+   left off — subscribers may see a burst of deliveries for events indexed
+   between the backup and now, which is expected (delivery is idempotent per
+   `(subscription, event)` only within a single database lineage; see the note
+   in Option B).
+
+### Option B — rebuild the index from scratch (no backup)
+
+1. Create an empty database and set `DATABASE_URL`.
+2. Decide how far back you need history:
+   - **Last ~7 days only:** start the indexer with `START_LEDGER=0` (the
+     default). It applies migrations on startup and begins indexing from the
+     start of the RPC retention window (~120k ledgers / ~7 days on SDF public
+     RPC). This is the whole of a from-scratch rebuild for most deployments.
+   - **A specific recent ledger:** set `START_LEDGER=<ledger>` (first run only;
+     ignored once `indexer_cursor` exists) and optionally run a one-shot
+     `lumenqraph-indexer backfill <ledger>` to fill the window up to the tip
+     before the live poller takes over.
+   - **Older than the retention window:** the public RPC cannot serve it. You
+     need a retaining/paid RPC, or a Galexie / captive-core data-lake export fed
+     through `lumenqraph-indexer deep-backfill` (see
+     [docs/DEEP_BACKFILL.md](DEEP_BACKFILL.md)). Without one of those, events
+     older than ~7 days before the rebuild are **permanently lost**.
+3. Let the indexer run until lag is near zero (`lumenqraph_indexer_lag_seconds`).
+4. Re-create the non-derived tables — see the next two sections.
+
+> **Idempotency caveat.** `ON CONFLICT (event_id) DO NOTHING` de-dupes writes
+> *within one database*. A rebuilt database is a new lineage: `events.seq`
+> restarts from 1, so `webhook_state` watermarks from an old backup do **not**
+> line up with it. Never mix an old `webhook_state` (or old `webhook_deliveries`)
+> with a freshly rebuilt `events` table.
+
+### What is permanently lost
+
+| Data | Recoverable? | Notes |
+|------|--------------|-------|
+| Events within the RPC retention window (~7 days) | Yes | Re-indexed automatically from `START_LEDGER=0`. |
+| Events older than the retention window | Only via a data-lake `deep-backfill` | Otherwise gone. |
+| Enrichment (`enriched` field) for contracts not yet seen post-rebuild | Rebuilds lazily | The poller re-fetches specs on next encounter; run it a cycle before a deep-backfill to warm the cache. |
+| `api_keys` | No | Re-issue keys; distribute the new values to clients. |
+| `webhook_subscriptions` | No | Re-register (below). |
+| `webhook_deliveries` queue + `webhook_state` watermarks | No | Recreated empty; delivery starts fresh from the current `events.seq`. |
+| `audit_log` | No | History only; no operational impact. |
+
+### Re-registering webhook subscriptions after a rebuild
+
+Subscriptions live only in Postgres, so after Option B you must re-insert them.
+Keep an out-of-band copy of your subscription list (URL, `kind`, filters,
+secret) precisely for this.
+
+```sql
+INSERT INTO webhook_subscriptions (url, kind, contract_id, event_name, secret)
+VALUES ('https://your-app.example.com/webhooks/lumenqraph', 'event', 'C...', NULL, 'your-secret');
+```
+
+Watermark behaviour on a rebuilt database:
+
+- A new subscription defaults to `starting_seq = 0`. Because `webhook_state`
+  also starts at 0, the dispatcher will enqueue a delivery for **every event
+  already indexed** at the moment the subscription becomes active — a large
+  backlog if the backfill has been running for a while.
+- To avoid that flood, either **register subscriptions before starting the
+  indexer**, or set `starting_seq` to the current max when you register:
+  ```sql
+  INSERT INTO webhook_subscriptions (url, kind, secret, starting_seq)
+  VALUES ('https://...', 'event', 'your-secret',
+          (SELECT COALESCE(max(seq), 0) FROM events));
+  ```
+- Subscribers must treat redelivered events as duplicates regardless — HMAC
+  signature verification plus idempotent handling on their side is the contract
+  (see [docs/WEBHOOKS.md](WEBHOOKS.md)).
