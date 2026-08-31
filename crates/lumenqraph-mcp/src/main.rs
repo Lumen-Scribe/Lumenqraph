@@ -36,6 +36,7 @@ const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 pub struct State {
     pub pool: PgPool,
     pub rpc: RpcClient,
+    pub auth_token: Option<String>,
 }
 
 #[tokio::main]
@@ -70,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
     let state = State {
         pool,
         rpc: RpcClient::new(rpc_url, rpc_timeout_secs),
+        auth_token,
     };
 
     info!("lumenqraph MCP server ready (stdio)");
@@ -120,8 +122,30 @@ async fn write_to<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Dispatch one JSON-RPC message. Returns `None` for notifications (no id).
-async fn handle(state: &State, msg: Value) -> Option<Value> {
+fn check_auth(msg: &Value, expected: &str) -> bool {
+    let candidate = msg
+        .get("authorization")
+        .or_else(|| msg.get("Authorization"))
+        .or_else(|| {
+            msg.get("params").and_then(|p| {
+                p.get("authorization")
+                    .or_else(|| p.get("Authorization"))
+                    .or_else(|| p.get("authToken"))
+                    .or_else(|| p.get("auth_token"))
+            })
+        })
+        .and_then(Value::as_str);
+
+    if let Some(token) = candidate {
+        let clean = token.strip_prefix("Bearer ").unwrap_or(token).trim();
+        clean == expected
+    } else {
+        false
+    }
+}
+
+/// Dispatch one JSON-RPC message. Returns `(response, newly_authenticated)` where response is `None` for notifications (no id).
+async fn handle(state: &State, msg: Value, authenticated: bool) -> Option<(Value, bool)> {
     let id = msg.get("id").cloned();
     let method = msg
         .get("method")
@@ -129,23 +153,57 @@ async fn handle(state: &State, msg: Value) -> Option<Value> {
         .unwrap_or_default();
     let is_request = id.is_some();
 
-    match method {
-        "initialize" => Some(result_response(id, initialize_result(&msg))),
+    if method == "initialize" {
+        if let Some(expected_token) = &state.auth_token {
+            if !check_auth(&msg, expected_token) {
+                return Some((
+                    error_response(
+                        id.unwrap_or(Value::Null),
+                        -32001,
+                        "Unauthorized: invalid or missing MCP_AUTH_TOKEN in Authorization field",
+                    ),
+                    false,
+                ));
+            }
+        }
+        return Some((result_response(id, initialize_result(&msg)), true));
+    }
+
+    if method.starts_with("notifications/") {
+        return None;
+    }
+
+    if !authenticated {
+        return if is_request {
+            Some((
+                error_response(
+                    id.unwrap_or(Value::Null),
+                    -32001,
+                    "Unauthorized: authentication required",
+                ),
+                false,
+            ))
+        } else {
+            None
+        };
+    }
+
+    let response = match method {
         "ping" => Some(result_response(id, json!({}))),
         "tools/list" => Some(result_response(
             id,
             json!({ "tools": tools::definitions() }),
         )),
         "tools/call" => Some(handle_tools_call(state, id, &msg).await),
-        // Notifications (initialized, cancelled, …) get no response.
-        _ if method.starts_with("notifications/") => None,
         _ if is_request => Some(error_response(
             id.unwrap_or(Value::Null),
             -32601,
             &format!("method not found: {method}"),
         )),
         _ => None,
-    }
+    };
+
+    response.map(|resp| (resp, false))
 }
 
 fn initialize_result(msg: &Value) -> Value {
@@ -287,8 +345,9 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            auth_token: None,
         };
-        let resp = handle(&state, msg).await;
+        let resp = handle(&state, msg, true).await;
         assert!(resp.is_none(), "notifications should not produce a response");
     }
 
@@ -300,9 +359,10 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            auth_token: None,
         };
         let msg = json!({ "jsonrpc": "2.0", "id": 1, "method": "unknown/method" });
-        let resp = handle(&state, msg).await.unwrap();
+        let (resp, _) = handle(&state, msg, true).await.unwrap();
         assert_eq!(resp["error"]["code"], -32601);
         assert!(resp["error"]["message"].as_str().unwrap().contains("unknown/method"));
     }
@@ -315,11 +375,53 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            auth_token: None,
         };
         let msg = json!({ "jsonrpc": "2.0", "id": 42, "method": "ping" });
-        let resp = handle(&state, msg).await.unwrap();
+        let (resp, _) = handle(&state, msg, true).await.unwrap();
         assert_eq!(resp["id"], 42);
         assert!(resp["result"].is_object());
+    }
+
+    // ── authentication checks ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn initialize_rejects_unauthenticated_request_when_token_is_configured() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://test:test@localhost/test")
+            .unwrap();
+        let state = State {
+            pool,
+            rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            auth_token: Some("secret123".to_string()),
+        };
+        let msg = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} });
+        let (resp, is_auth) = handle(&state, msg, false).await.unwrap();
+        assert!(!is_auth);
+        assert_eq!(resp["error"]["code"], -32001);
+
+        let ping_msg = json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" });
+        let (ping_resp, _) = handle(&state, ping_msg, false).await.unwrap();
+        assert_eq!(ping_resp["error"]["code"], -32001);
+    }
+
+    #[tokio::test]
+    async fn initialize_accepts_valid_authorization_token() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://test:test@localhost/test")
+            .unwrap();
+        let state = State {
+            pool,
+            rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            auth_token: Some("secret123".to_string()),
+        };
+        let msg = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "authorization": "Bearer secret123" }
+        });
+        let (resp, is_auth) = handle(&state, msg, false).await.unwrap();
+        assert!(is_auth);
+        assert!(resp["result"]["capabilities"]["tools"].is_object());
     }
 
     // ── tools/list shape ──────────────────────────────────────────────────
@@ -332,9 +434,10 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            auth_token: None,
         };
         let msg = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
-        let resp = handle(&state, msg).await.unwrap();
+        let (resp, _) = handle(&state, msg, true).await.unwrap();
         assert_eq!(resp["id"], 2);
         let tools = resp["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 13, "all thirteen tools must be declared");
@@ -362,13 +465,14 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            auth_token: None,
         };
         let msg = json!({
             "jsonrpc": "2.0", "id": 1,
             "method": "tools/call",
             "params": { "name": tool_name, "arguments": args }
         });
-        let resp = handle(&state, msg).await.unwrap();
+        let (resp, _) = handle(&state, msg, true).await.unwrap();
         // The result is always present (MCP errors are results with isError).
         let result = &resp["result"];
         assert_eq!(
@@ -437,13 +541,14 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            auth_token: None,
         };
         let msg = json!({
             "jsonrpc": "2.0", "id": 5,
             "method": "tools/call",
             "params": { "name": "no_such_tool", "arguments": {} }
         });
-        let resp = handle(&state, msg).await.unwrap();
+        let (resp, _) = handle(&state, msg, true).await.unwrap();
         assert_eq!(resp["result"]["isError"], true);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
         assert!(
@@ -485,6 +590,7 @@ mod tests {
         State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            auth_token: None,
         }
     }
 

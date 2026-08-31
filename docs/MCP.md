@@ -53,6 +53,7 @@ The server uses **newline-delimited JSON-RPC 2.0 over stdio**, the standard MCP 
 | `DATABASE_URL` | ✅ | — | Postgres connection string, e.g. `postgres://user:pass@host:5432/db` |
 | `RPC_URL` | ❌ | `https://soroban-testnet.stellar.org` | Stellar RPC endpoint for `call_contract` and `simulate_call` |
 | `RPC_TIMEOUT_SECS` | ❌ | `30` | Timeout for RPC calls in seconds |
+| `MCP_AUTH_TOKEN` | ❌ | — | Optional auth token required in `Authorization` field during `initialize` |
 
 Example `.env` file for local testing:
 
@@ -60,6 +61,7 @@ Example `.env` file for local testing:
 DATABASE_URL=postgres://lumenqraph:lumenqraph@localhost:5432/lumenqraph
 RPC_URL=https://soroban-testnet.stellar.org
 RPC_TIMEOUT_SECS=30
+MCP_AUTH_TOKEN=your-secret-token
 ```
 
 ## Tools

@@ -66,6 +66,8 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Check sensitive logging
+        run: python3 scripts/check_sensitive_logging.py
       - name: Install sqlx-cli
         run: cargo install sqlx-cli --no-default-features --features postgres
       - name: Check sqlx metadata is up-to-date

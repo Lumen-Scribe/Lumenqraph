@@ -152,6 +152,31 @@ describe("URL construction", () => {
     const url = new URL(f.mock.calls[0]?.[0] as string);
     expect(url.searchParams.has("limit")).toBe(false);
   });
+
+  it("getInterfaceHistory hits /contracts/:id/interface/history with limit", async () => {
+    const f = mockFetch([{ status: 200, body: [] }]);
+    await client(f).getInterfaceHistory("C1", { limit: 5 });
+    const url = new URL(f.mock.calls[0]?.[0] as string);
+    expect(url.pathname).toBe("/contracts/C1/interface/history");
+    expect(url.searchParams.get("limit")).toBe("5");
+  });
+
+  it("getInterfaceDiff hits /contracts/:id/interface/diff with from and to params", async () => {
+    const f = mockFetch([{ status: 200, body: {} }]);
+    await client(f).getInterfaceDiff("C1", { from: 1, to: 2 });
+    const url = new URL(f.mock.calls[0]?.[0] as string);
+    expect(url.pathname).toBe("/contracts/C1/interface/diff");
+    expect(url.searchParams.get("from")).toBe("1");
+    expect(url.searchParams.get("to")).toBe("2");
+  });
+
+  it("getInterfaceAtVersion hits /contracts/:id/interface with version param", async () => {
+    const f = mockFetch([{ status: 200, body: {} }]);
+    await client(f).getInterfaceAtVersion("C1", 3);
+    const url = new URL(f.mock.calls[0]?.[0] as string);
+    expect(url.pathname).toBe("/contracts/C1/interface");
+    expect(url.searchParams.get("version")).toBe("3");
+  });
 });
 
 // ---- Auth header injection ----

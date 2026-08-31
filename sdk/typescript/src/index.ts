@@ -292,6 +292,38 @@ export class LumenqraphClient {
     return this.get(`/contracts/${enc(contractId)}/interface`, {}, opts.signal);
   }
 
+  /** The version history of a contract's interface with semantic diffs. */
+  getInterfaceHistory(
+    contractId: string,
+    opts: { limit?: number; signal?: AbortSignal } = {},
+  ): Promise<Json> {
+    return this.get(`/contracts/${enc(contractId)}/interface/history`, {
+      limit: opts.limit,
+    }, opts.signal);
+  }
+
+  /** The semantic diff between any two interface versions of a contract. */
+  getInterfaceDiff(
+    contractId: string,
+    opts: { from?: number; to?: number; signal?: AbortSignal } = {},
+  ): Promise<Json> {
+    return this.get(`/contracts/${enc(contractId)}/interface/diff`, {
+      from: opts.from,
+      to: opts.to,
+    }, opts.signal);
+  }
+
+  /** A historical version of a contract's interface. */
+  getInterfaceAtVersion(
+    contractId: string,
+    version: number,
+    opts: RequestOptions = {},
+  ): Promise<Json> {
+    return this.get(`/contracts/${enc(contractId)}/interface`, {
+      version,
+    }, opts.signal);
+  }
+
   /** Versioned instance-storage snapshots, newest first (`limit=1` = current). */
   getState(contractId: string, opts: { limit?: number; signal?: AbortSignal } = {}): Promise<ContractState> {
     return this.get(`/contracts/${enc(contractId)}/state`, { limit: opts.limit }, opts.signal);
