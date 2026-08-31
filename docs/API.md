@@ -27,7 +27,8 @@ stable and will not be renamed or removed.
 | `not_found`         | 404         | The requested resource does not exist.                                |
 | `rate_limited`      | 429         | Caller exceeded the requests-per-minute limit.                        |
 | `simulation_failed` | 400         | RPC simulation returned an error (contract trap, bad call, etc.).    |
-| `spec_unavailable`  | 404         | The contract's interface is not indexed yet, or is a Stellar Asset Contract (no callable spec). |
+| `spec_unavailable`  | 404         | Contract has not been indexed yet. The indexer fetches the interface on first sighting — retry after the contract has been seen. |
+| `sac_not_supported` | 422         | The contract is a Stellar Asset Contract (or has no WASM spec). Retrying will never help; use the token metadata endpoints instead of `/call` or `/simulate`. |
 | `internal_error`    | 500         | Unexpected server-side failure. Details are logged, not exposed.     |
 
 ## Public

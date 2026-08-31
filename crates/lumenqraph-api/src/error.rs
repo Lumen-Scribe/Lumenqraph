@@ -21,7 +21,8 @@
 //! | `not_found`           | 404         | Requested resource does not exist.                     |
 //! | `rate_limited`        | 429         | Caller exceeded the request-per-minute limit. Carries a `Retry-After` header. |
 //! | `simulation_failed`   | 400         | RPC simulation returned an error (contract trap, etc.).|
-//! | `spec_unavailable`    | 404         | Contract interface not indexed (or Stellar Asset Contract). |
+//! | `spec_unavailable`    | 404         | Contract has not been indexed yet; retry later.        |
+//! | `sac_not_supported`   | 422         | Stellar Asset Contract: no WASM spec; retrying will not help. |
 //! | `internal_error`      | 500         | Unexpected server-side failure (details are logged).   |
 
 use std::fmt;
