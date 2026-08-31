@@ -11,8 +11,11 @@ use chrono::Utc;
 use serde_json::json;
 use sqlx::PgPool;
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{error, info};
+
+use crate::dispatcher::PENDING_DELIVERIES;
 
 #[derive(Clone)]
 pub struct MetricsState {
@@ -80,6 +83,16 @@ async fn health(State(state): State<MetricsState>) -> impl IntoResponse {
 
 async fn metrics(State(state): State<MetricsState>) -> impl IntoResponse {
     let mut body = String::new();
+
+    // Emitted unconditionally, straight from the atomic the dispatcher refreshes
+    // each tick, so queue depth stays visible to Prometheus even when the
+    // scrape-time queries below fail (e.g. the database is briefly unreachable).
+    body.push_str("# HELP lumenqraph_webhooks_pending_deliveries Webhook deliveries in 'pending' state, refreshed each dispatcher tick\n");
+    body.push_str("# TYPE lumenqraph_webhooks_pending_deliveries gauge\n");
+    body.push_str(&format!(
+        "lumenqraph_webhooks_pending_deliveries {}\n",
+        PENDING_DELIVERIES.load(Ordering::Relaxed)
+    ));
 
     match gather_metrics(&state.pool).await {
         Ok(metrics) => {

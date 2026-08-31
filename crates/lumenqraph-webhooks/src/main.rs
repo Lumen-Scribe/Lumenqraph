@@ -99,6 +99,9 @@ async fn main() -> anyhow::Result<()> {
         if let Err(e) = dispatcher::deliver(&pool, &http, &config).await {
             tracing::warn!(error = %e, "deliver failed");
         }
+        if let Err(e) = dispatcher::refresh_pending_gauge(&pool).await {
+            tracing::warn!(error = %e, "pending-deliveries gauge refresh failed");
+        }
 
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}

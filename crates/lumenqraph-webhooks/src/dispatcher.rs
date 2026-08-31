@@ -19,6 +19,7 @@ use sha2::Sha256;
 use sqlx::types::Json;
 use sqlx::PgPool;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
@@ -33,6 +34,27 @@ type HmacSha256 = Hmac<Sha256>;
 /// off `User-Agent` for debugging, so delivery logs can be traced back to the
 /// version that sent them.
 const USER_AGENT: &str = concat!("lumenqraph-webhooks/", env!("CARGO_PKG_VERSION"));
+
+/// Last observed count of `pending` rows in `webhook_deliveries`, refreshed once
+/// per dispatcher tick by [`refresh_pending_gauge`] and read by the `/metrics`
+/// endpoint (`lumenqraph_webhooks_pending_deliveries`).
+///
+/// Enqueue and deliver counts only describe what moved *this* tick; they go
+/// quiet when the dispatcher is starved by a slow or unresponsive subscriber
+/// even though the backlog is growing. This gauge makes that backlog the one
+/// number an operator can alert on.
+pub static PENDING_DELIVERIES: AtomicI64 = AtomicI64::new(0);
+
+/// Refresh [`PENDING_DELIVERIES`] from the database. Called once per tick by the
+/// service loop; returns the value it stored so the caller can log it.
+pub async fn refresh_pending_gauge(pool: &PgPool) -> anyhow::Result<i64> {
+    let pending: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'pending'")
+            .fetch_one(pool)
+            .await?;
+    PENDING_DELIVERIES.store(pending, Ordering::Relaxed);
+    Ok(pending)
+}
 
 /// Enqueue deliveries for everything new in both streams. Returns how many
 /// delivery rows were created.
