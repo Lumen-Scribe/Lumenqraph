@@ -242,19 +242,41 @@ async fn contract_interface_at_version(
 
 #[derive(Deserialize)]
 pub struct HistoryQuery {
-    /// How many versions to return, newest first.
+    /// How many versions to return, newest first. Default 50, max 1000.
     #[serde(default = "default_history_limit")]
     limit: i64,
+    /// Cursor for keyset pagination. Pass the `next_cursor` value from a
+    /// previous response to retrieve the next page. The cursor encodes the
+    /// last version seen as `version:<N>`.
+    #[serde(default)]
+    after: Option<String>,
 }
 
 fn default_history_limit() -> i64 {
     50
 }
 
+/// Parse a history cursor of the form `version:<N>` and return `N`.
+///
+/// Returns `Err` with a human-readable message on any malformed input so the
+/// handler can surface a clean `400` instead of silently restarting at page 1.
+fn parse_history_cursor(cursor: &str) -> Result<i32, ApiError> {
+    let version_str = cursor
+        .strip_prefix("version:")
+        .ok_or_else(|| ApiError::bad_request("invalid cursor: expected format `version:<N>`"))?;
+    version_str.parse::<i32>().map_err(|_| {
+        ApiError::bad_request("invalid cursor: version component is not a valid integer")
+    })
+}
+
 /// `GET /contracts/:id/interface/history` — every interface version we've
 /// observed for this contract, newest first, each with the diff against the one
 /// before it. The full interface of each version is omitted (fetch it with
 /// `/interface?version=N`); the diff is what's interesting here.
+///
+/// Supports keyset cursor pagination via the `after` parameter so callers can
+/// retrieve complete history for contracts with more than one page of versions.
+/// Pass the `next_cursor` from a previous response as `after` to continue.
 pub async fn contract_interface_history(
     State(state): State<AppState>,
     Path(contract_id): Path<String>,
@@ -264,8 +286,18 @@ pub async fn contract_interface_history(
     if !lumenqraph_core::is_valid_contract_id(&contract_id) {
         return Err(ApiError::bad_request("invalid contract id"));
     }
-    let limit = q.limit.clamp(1, 200);
-    // Get the latest version for ETag
+
+    // Parse the cursor before hitting the DB so a malformed value returns 400
+    // immediately rather than after an unnecessary round-trip.
+    let after_version: Option<i32> = q
+        .after
+        .as_deref()
+        .map(parse_history_cursor)
+        .transpose()?;
+
+    let limit = q.limit.clamp(1, 1000);
+
+    // Get the latest version for ETag (independent of cursor / limit).
     let latest_version: Option<i32> = sqlx::query_scalar(
         "SELECT max(version) FROM contract_spec_versions WHERE contract_id = $1",
     )
@@ -279,6 +311,8 @@ pub async fn contract_interface_history(
         ));
     };
 
+    // ETag covers the contract + newest version so it invalidates on every
+    // upgrade regardless of which page is being requested.
     let etag = generate_etag(&format!("{}:{}", contract_id, latest_version));
     if check_if_none_match(&headers, &etag) {
         return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
@@ -293,16 +327,54 @@ pub async fn contract_interface_history(
         bool,
         DateTime<Utc>,
     );
-    let rows: Vec<VersionRow> = sqlx::query_as(
-        "SELECT version, wasm_hash, previous_wasm_hash, diff, breaking, observed_at
-         FROM contract_spec_versions
-         WHERE contract_id = $1
-         ORDER BY version DESC LIMIT $2",
-    )
-    .bind(&contract_id)
-    .bind(limit)
-    .fetch_all(&state.pool)
-    .await?;
+
+    // Fetch limit+1 rows so we can detect whether a next page exists without
+    // a separate COUNT query.
+    let rows: Vec<VersionRow> = if let Some(after_v) = after_version {
+        // Keyset predicate: only versions strictly older (lower number) than
+        // the cursor. The unknown-cursor case returns empty rather than
+        // silently restarting at the newest page.
+        sqlx::query_as(
+            "SELECT version, wasm_hash, previous_wasm_hash, diff, breaking, observed_at
+             FROM contract_spec_versions
+             WHERE contract_id = $1
+               AND version < $2
+             ORDER BY version DESC
+             LIMIT $3",
+        )
+        .bind(&contract_id)
+        .bind(after_v)
+        .bind(limit + 1)
+        .fetch_all(&state.pool)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT version, wasm_hash, previous_wasm_hash, diff, breaking, observed_at
+             FROM contract_spec_versions
+             WHERE contract_id = $1
+             ORDER BY version DESC
+             LIMIT $2",
+        )
+        .bind(&contract_id)
+        .bind(limit + 1)
+        .fetch_all(&state.pool)
+        .await?
+    };
+
+    let has_more = rows.len() as i64 > limit;
+    let rows: Vec<VersionRow> = if has_more {
+        rows.into_iter().take(limit as usize).collect()
+    } else {
+        rows
+    };
+
+    // The next cursor points at the last version in this page; the next call
+    // will return versions with a lower number than that.
+    let next_cursor: Option<String> = if has_more {
+        rows.last().map(|(v, ..)| format!("version:{v}"))
+    } else {
+        None
+    };
 
     let versions: Vec<Value> = rows
         .into_iter()
@@ -325,9 +397,14 @@ pub async fn contract_interface_history(
     let mut response = Json(json!({
         "contract_id": contract_id,
         "count": versions.len(),
+        "has_more": has_more,
+        "next_cursor": next_cursor,
         "versions": versions,
-    })).into_response();
-    response.headers_mut().insert(header::ETAG, etag.parse().unwrap());
+    }))
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::ETAG, etag.parse().unwrap());
     Ok(response)
 }
 
@@ -651,6 +728,60 @@ pub async fn contract_data_key(
 
 #[cfg(test)]
 mod tests {
+    use super::parse_history_cursor;
+
+    // -----------------------------------------------------------------------
+    // History cursor parsing (#253)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn history_cursor_valid() {
+        let v = parse_history_cursor("version:42").expect("should parse");
+        assert_eq!(v, 42);
+    }
+
+    #[test]
+    fn history_cursor_version_one() {
+        let v = parse_history_cursor("version:1").expect("should parse");
+        assert_eq!(v, 1);
+    }
+
+    #[test]
+    fn history_cursor_missing_prefix_rejected() {
+        assert!(
+            parse_history_cursor("42").is_err(),
+            "bare integer without prefix must be rejected"
+        );
+    }
+
+    #[test]
+    fn history_cursor_wrong_prefix_rejected() {
+        assert!(
+            parse_history_cursor("ledger:42").is_err(),
+            "wrong prefix must be rejected"
+        );
+    }
+
+    #[test]
+    fn history_cursor_non_integer_version_rejected() {
+        assert!(
+            parse_history_cursor("version:abc").is_err(),
+            "non-integer version must be rejected"
+        );
+    }
+
+    #[test]
+    fn history_cursor_empty_string_rejected() {
+        assert!(
+            parse_history_cursor("").is_err(),
+            "empty cursor must be rejected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Diff parameter validation (#211)
+    // -----------------------------------------------------------------------
+
     /// The `from > to` guard added for #211 is a pure value comparison before
     /// any DB or RPC call, so we can exercise it by inspecting the validation
     /// logic directly rather than spinning up a full Axum server + Postgres.

@@ -206,10 +206,21 @@ The decoded on-chain interface: `functions`, `events`, `structs`, `unions`,
 ```
 
 ### `GET /contracts/:id/interface/history`
-Every interface version observed, newest first. Query: `limit` (1–200, default 50).
-Requires the indexer's `UPGRADE_WATCH`.
+Every interface version observed, newest first. Query: `limit` (1–1000, default
+50), `after` (cursor for keyset pagination). Requires the indexer's
+`UPGRADE_WATCH`.
+
+**Pagination:** For contracts with many interface upgrades, use the `after`
+parameter to page through the full history. Pass the `next_cursor` value from
+a previous response as `after` to retrieve the next page. When `has_more` is
+`false` and `next_cursor` is `null`, all versions have been returned.
+
+Cursors are encoded as `version:<N>` (e.g. `version:42`) and are stable across
+requests — the history is append-only from the top so pages do not shift.
+
 ```json
-{ "contract_id": "CB...", "count": 2, "versions": [
+{ "contract_id": "CB...", "count": 2, "has_more": false, "next_cursor": null,
+  "versions": [
   { "version": 2, "wasm_hash": "...", "previous_wasm_hash": "...",
     "breaking": true, "observed_at": "2026-07-15T...Z",
     "diff": { "breaking": true, "summary": ["removed function withdraw() -> void"],
@@ -382,17 +393,9 @@ The decoded on-chain interface: `functions`, `events`, `structs`, `unions`,
 `enums`. Query: `version` (a historical version; default is the current one).
 
 ### `GET /contracts/:id/interface/history`
-Every version observed, newest first. Query: `limit` (1–200, default 50).
-```json
-{ "contract_id": "CB...", "count": 2, "versions": [
-  { "version": 2, "wasm_hash": "...", "previous_wasm_hash": "...",
-    "breaking": true, "observed_at": "2026-07-15T...Z",
-    "diff": { "breaking": true, "summary": ["removed function withdraw() -> void"],
-              "functions": { "added": [], "removed": ["withdraw() -> void"], "changed": [] },
-              "events": { "added": [], "removed": [], "changed": [] },
-              "types":  { "added": [], "removed": [], "changed": [] } } },
-  { "version": 1, "previous_wasm_hash": null, "breaking": false, "diff": null }
-] }
+Every version observed, newest first. Query: `limit` (1–1000, default 50),
+`after` (cursor for keyset pagination; pass `next_cursor` from a previous
+response). Response includes `has_more` and `next_cursor` for full traversal.
 ```
 
 ### `GET /contracts/:id/interface/diff`
