@@ -2,168 +2,187 @@
 
 ## Overview
 
-This document describes how to benchmark and measure the Lumenqraph indexer's event ingestion throughput under mainnet-scale conditions. Understanding throughput metrics is critical for:
+This document describes how to benchmark the Lumenqraph indexer's event
+ingestion pipeline.  The benchmarks are designed for **regression detection**:
+they must be stable, reproducible, and comparable across machines and time.
 
-- Sizing infrastructure for production deployments
-- Establishing baseline performance for regression detection
-- Optimizing configuration parameters
-- Assessing PostgreSQL tier requirements
+### The core constraint: eliminate network latency
 
-## Benchmark Methodology
+The original script timed an end-to-end run against a live Soroban RPC
+endpoint.  That approach conflates three very different things:
 
-### Test Scenario
+| Source of time | Typical magnitude | Varies with |
+|----------------|------------------|-------------|
+| XDR decode (CPU) | < 1 µs / event | CPU speed |
+| DB write latency | 1–5 ms / batch | Postgres tier, index count |
+| RPC latency | 10–300 ms / page | Network, RPC load, time of day |
 
-The benchmark simulates mainnet workloads using the indexer's ingestion pipeline:
-- **Ingestion path**: `poller::fetch_and_store` → `store::insert_events`
-- **Data source**: Mock/replayed RPC data with scripted high-volume pages
-- **Typical mainnet conditions**: ~500 events per ledger for active Smart Asset Contracts
+RPC latency dominates the total and varies wildly — two runs 10 minutes apart
+from different networks can differ by 10×.  The benchmarks below strip the
+network out entirely so each phase measures exactly one component.
 
-### Measured Metrics
+---
 
-1. **Sustained throughput** (events/second): The steady-state ingestion rate under sustained load
-2. **Database write rate** (events/sec): Direct INSERT/UPDATE operations to PostgreSQL
-3. **RPC calls per cycle**: Network round-trip overhead
-4. **Memory usage**: Peak and steady-state memory consumption
-5. **Page processing time**: End-to-end latency per paginated RPC response
+## Benchmark structure
 
-### Test Variables
+Three phases are isolated in `crates/lumenqraph-indexer/benches/bench_indexer.rs`
+using [Criterion](https://github.com/bheisler/criterion.rs) for statistical
+rigour (multiple iterations, outlier rejection, confidence intervals):
 
-The benchmark exercises these configurable parameters:
+| Phase | What is measured | Needs DB |
+|-------|-----------------|----------|
+| `xdr_decode` | Base64 XDR → decoded JSON (topics + value) per event | No |
+| `enrichment` | Spec-driven named/typed enrichment per event | No |
+| `db_insert` | UNNEST batch INSERT into Postgres | Yes |
 
-| Parameter | Default | Test Range | Impact |
-|-----------|---------|------------|--------|
-| `PAGE_SIZE` | 100 | 50–1000 | Larger pages reduce RPC overhead but increase batch size |
-| `ENRICHMENT_ENABLED` | true | true/false | Decoded JSON enrichment adds CPU/memory overhead |
-| `INDEXER_BATCH_SIZE` | 100 | 10–1000 | Batch size for database inserts |
-| `INDEXER_POLL_INTERVAL_SECS` | 5 | 1–30 | Poll frequency; faster = more RPC calls |
+The `xdr_decode` and `enrichment` phases are pure-CPU and run anywhere.
+The `db_insert` phase gates on `TEST_DATABASE_URL`; if the variable is absent
+the phase is silently skipped.
 
-## Benchmark Setup
+---
 
-### Environment Requirements
+## Running benchmarks
 
-- **PostgreSQL**: 15+ (same tier as production target)
-- **Stellar RPC**: Access to mainnet or testnet endpoint
-- **Rust**: 1.70+
-- **CPU**: 4+ cores (for parallel event processing)
-- **RAM**: 4GB+ (for buffer pools and indexer state)
+### Prerequisites
 
-### Running the Benchmark
+- Rust stable (1.75+)
+- For the `db_insert` phase: Postgres with migrations applied
 
-#### 1. Prepare Database
-
-```bash
-# Create a fresh benchmark database
-createdb lumenqraph_bench
-sqlx migrate run --database-url postgres://user:pass@localhost/lumenqraph_bench
-```
-
-#### 2. Configuration
-
-Create or update your `.env` file:
-
-```env
-DATABASE_URL=postgres://user:pass@localhost/lumenqraph_bench
-RPC_URL=https://soroban-mainnet.stellar.org
-INDEXER_PAGE_SIZE=100
-INDEXER_BATCH_SIZE=100
-INDEXER_POLL_INTERVAL_SECS=5
-ENRICHMENT_ENABLED=true
-LOG_LEVEL=info
-```
-
-#### 3. Run the Benchmark
+### Run all CPU phases (no Postgres required)
 
 ```bash
-# Start the indexer with timing instrumentation
-cargo build --release -p lumenqraph-indexer
-
-time cargo run --release -p lumenqraph-indexer -- --benchmark
+cargo bench --bench bench_indexer
 ```
 
-The benchmark runs for a fixed duration (default: 60 seconds) or until a target ledger is reached, whichever comes first.
+Criterion writes HTML reports to `target/criterion/`.
 
-#### 4. Collect Metrics
-
-The indexer outputs structured logs with timing and throughput information:
-
-```
-2024-01-15T10:30:15Z INFO lumenqraph_indexer: Benchmark started: ledger_start=12345678
-2024-01-15T10:30:15Z INFO lumenqraph_indexer: Batch processed: ledger=12345679, events=487, insert_ms=145, decode_ms=89
-2024-01-15T10:30:16Z INFO lumenqraph_indexer: Batch processed: ledger=12345680, events=512, insert_ms=158, decode_ms=101
-...
-2024-01-15T10:31:15Z INFO lumenqraph_indexer: Benchmark complete: 
-  Duration: 60.2s
-  Total events: 30847
-  Throughput: 512 events/sec
-  Avg insert latency: 151ms
-  Avg decode latency: 95ms
-```
-
-Parse these logs to extract metrics:
+### Run a single phase
 
 ```bash
-cargo run --release -p lumenqraph-indexer -- --benchmark 2>&1 | tee bench.log
-grep "Benchmark complete" bench.log | awk '{print $NF}'
+cargo bench --bench bench_indexer -- xdr_decode
+cargo bench --bench bench_indexer -- enrichment
 ```
 
-## Expected Results
-
-### Baseline Throughput (Mainnet Conditions)
-
-Tested on a moderately-sized PostgreSQL instance (SSD-backed, 8GB RAM):
-
-| Config | Throughput | DB Write Latency | Notes |
-|--------|-----------|-----------------|-------|
-| Default (PAGE_SIZE=100, enrichment=true) | ~450–550 events/sec | ~150ms | Typical production |
-| PAGE_SIZE=500 | ~550–650 events/sec | ~180ms | Reduced RPC overhead |
-| PAGE_SIZE=50 | ~350–450 events/sec | ~120ms | Frequent RPC calls |
-| Enrichment disabled | ~600–750 events/sec | ~140ms | ~20–25% faster |
-| INDEXER_BATCH_SIZE=500 | ~500–600 events/sec | ~200ms | Better batching |
-
-### Performance Regressions
-
-A regression is indicated if throughput drops by **>10%** against the baseline for the same configuration:
-
-- **No regression**: 450 events/sec → 405+ events/sec (expected variance: ±10%)
-- **Regression alert**: 450 events/sec → <405 events/sec (investigate)
-
-## Optimization Tips
-
-1. **Database tuning**:
-   - Ensure indexes from `migrations/0010_hot_query_indexes.sql` are created
-   - Use `EXPLAIN (ANALYZE, BUFFERS)` to verify index usage
-   - Consider connection pooling (pgBouncer) for high-throughput scenarios
-
-2. **RPC optimization**:
-   - Use a local or faster RPC endpoint
-   - Monitor RPC latency: `time curl https://rpc-url/health`
-   - Batch multiple ledgers in a single request if the RPC supports it
-
-3. **Indexer configuration**:
-   - Tune `INDEXER_BATCH_SIZE` based on available memory and DB capacity
-   - For high-throughput scenarios, increase `PAGE_SIZE` (reduces RPC calls)
-   - Consider disabling enrichment during initial sync, enable later for new events
-
-4. **Infrastructure**:
-   - Use SSD for PostgreSQL data (huge performance gain)
-   - Pin CPU cores if possible (reduces context switching)
-   - Monitor memory usage; OOM kills destroy throughput
-
-## Regression Testing
-
-To detect performance regressions in CI/CD:
+### Run all three phases (including DB)
 
 ```bash
-# Establish baseline (should be run once after major optimization)
-cargo run --release -p lumenqraph-indexer -- --benchmark --duration 120 > baseline.log
-
-# In CI, compare new runs against the baseline
-cargo run --release -p lumenqraph-indexer -- --benchmark --duration 120 > current.log
-python3 scripts/compare_benchmarks.py baseline.log current.log
+TEST_DATABASE_URL=postgres://user:pass@localhost/lumenqraph_bench \
+  cargo bench --bench bench_indexer
 ```
+
+### Use the wrapper script
+
+`scripts/benchmark_indexer.sh` wraps the above with baseline save/compare:
+
+```bash
+# Run all phases and save a baseline
+./scripts/benchmark_indexer.sh --save-baseline benchmarks/baseline.json
+
+# Later: compare against the baseline (fails if any phase regressed > 10%)
+./scripts/benchmark_indexer.sh --baseline benchmarks/baseline.json
+
+# Only run the decode phase
+./scripts/benchmark_indexer.sh --phase xdr_decode
+
+# DB phase only, with an explicit URL
+./scripts/benchmark_indexer.sh \
+    --phase db_insert \
+    --db-url postgres://user:pass@localhost/lumenqraph_bench
+```
+
+---
+
+## Expected results
+
+Reference figures on a commodity developer laptop (M-series, 16 GB RAM, SSD
+Postgres). Actual numbers will differ; what matters is **consistency across
+runs on the same machine**.
+
+### `xdr_decode` (1 000 events per iteration)
+
+| Metric | Value |
+|--------|-------|
+| Mean time | ~2 ms |
+| Throughput | ~500 000 events / s |
+
+### `enrichment` (1 000 events per iteration)
+
+| Metric | Value |
+|--------|-------|
+| Mean time | ~1.5 ms |
+| Throughput | ~650 000 events / s |
+
+### `db_insert` (100 events per batch, local Postgres)
+
+| Metric | Value |
+|--------|-------|
+| Mean time per batch | ~5 ms |
+| Throughput | ~20 000 events / s |
+
+---
+
+## Regression detection
+
+A regression is a **> 10% increase in mean latency** for the same batch size
+compared to a saved baseline.  The wrapper script enforces this automatically
+when `--baseline` is passed.
+
+### Establishing a baseline
+
+Run once on a known-good commit:
+
+```bash
+./scripts/benchmark_indexer.sh --save-baseline benchmarks/baseline.json
+git add benchmarks/baseline.json
+git commit -m "bench: establish baseline"
+```
+
+### Checking a PR
+
+```bash
+./scripts/benchmark_indexer.sh --baseline benchmarks/baseline.json
+```
+
+The script exits with a non-zero status if any phase regressed, making it
+suitable as a CI step (see `.github/workflows/ci.yml`).
+
+---
+
+## Interpreting criterion output
+
+```
+xdr_decode/1000         time:   [1.9841 ms 1.9985 ms 2.0148 ms]
+                        thrpt:  [496.33 Kelem/s 500.38 Kelem/s 503.75 Kelem/s]
+                        change: [-0.5124% +0.1234% +0.7781%] (p = 0.73 > 0.05)
+                        No change in performance detected.
+```
+
+| Column | Meaning |
+|--------|---------|
+| `[lo  mid  hi]` | 95% confidence interval for the mean |
+| `change` | % change vs. previous run of this benchmark |
+| `p =` | p-value from a two-sample t-test; p > 0.05 means "no detected change" |
+
+HTML reports with plots are written to `target/criterion/<phase>/` after each
+run.
+
+---
+
+## Adding new benchmark cases
+
+Add new `bench_with_input` calls inside the relevant `bench_*` function in
+`benches/bench_indexer.rs`.  Keeping the three-phase structure ensures each
+new case measures exactly one component.
+
+To measure a genuinely end-to-end scenario (mock RPC → decode → enrich →
+insert), build on the `backfill` integration tests in
+`crates/lumenqraph-indexer/src/backfill.rs` which already use the in-process
+mock RPC server (`spawn_mock_rpc`).
+
+---
 
 ## References
 
-- **RPC Performance**: Stellar RPC documentation for pagination and rate limits
-- **PostgreSQL Tuning**: [PostgreSQL Performance Wiki](https://wiki.postgresql.org/wiki/Performance_Optimization)
-- **Soroban Events**: [Soroban Documentation](https://developers.stellar.org/docs)
+- Criterion user guide: <https://bheisler.github.io/criterion.rs/book/>
+- PostgreSQL `EXPLAIN ANALYZE`: <https://www.postgresql.org/docs/current/sql-explain.html>
+- Soroban event pagination: <https://developers.stellar.org/network/soroban-rpc/api-reference/methods/getEvents>
