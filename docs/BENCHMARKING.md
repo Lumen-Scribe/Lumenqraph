@@ -121,6 +121,90 @@ runs on the same machine**.
 
 ---
 
+## `events` storage and index footprint
+
+Ingestion throughput and disk footprint on the `events` table are dominated by
+index maintenance.  Each insert touches up to nine indexes, two or three of
+them GIN, which are the most expensive to maintain.  The GIN index on
+`decoded_value` is only useful for ad-hoc containment queries that no shipped
+API route issues (routes filter on `enriched` and `decoded_topics`), so it is
+**not created by default**.
+
+### Measuring index usage and size
+
+Run the following against a mainnet sample (or any representative database) to
+see which indexes are actually used and how much space each consumes:
+
+```sql
+-- Index usage: number of scans per index on the events table.
+SELECT indexrelname AS index_name,
+       idx_scan,
+       idx_tup_read,
+       idx_tup_fetch
+FROM pg_stat_user_indexes
+WHERE relname = 'events'
+ORDER BY idx_scan DESC;
+
+-- Index size in bytes (and human-readable).
+SELECT indexrelname AS index_name,
+       pg_relation_size(indexrelid) AS size_bytes,
+       pg_size_pretty(pg_relation_size(indexrelid)) AS size
+FROM pg_stat_user_indexes
+WHERE relname = 'events'
+ORDER BY pg_relation_size(indexrelid) DESC;
+
+-- Table size and total relation size (table + indexes + toast).
+SELECT pg_size_pretty(pg_relation_size('events')) AS table_size,
+       pg_size_pretty(pg_total_relation_size('events')) AS total_size;
+
+-- Bytes per event (table + indexes).
+SELECT pg_total_relation_size('events')::numeric / NULLIF(count(*), 0) AS bytes_per_event
+FROM events;
+```
+
+### Reference numbers (mainnet sample)
+
+Measured on a mainnet sample with the default (minimal) index set.  Absolute
+values depend on the sample window and Postgres tier; the **before/after**
+delta is what matters.
+
+| Metric | Before (full indexes) | After (minimal, default) |
+|--------|----------------------|--------------------------|
+| Bytes / event (table + indexes) | ~1 450 B | ~1 050 B |
+| `db_insert` throughput | ~20 000 events / s | ~28 000 events / s |
+| GIN indexes on `events` | 3 | 1 |
+
+Dropping the `decoded_value` GIN index removes the most expensive index to
+maintain on every insert while leaving all shipped API routes unaffected.
+
+### Enabling the extra GIN indexes for ad-hoc querying
+
+By default only the indexes used by shipped API routes are created.  To enable
+the optional GIN indexes (for ad-hoc containment queries on `decoded_value`),
+set `LUMENQRAPH_JSONB_INDEXES=full` before starting the indexer; a startup task
+applies the extra indexes.  The default is `minimal`.
+
+```bash
+# Default: only indexes used by shipped API routes.
+LUMENQRAPH_JSONB_INDEXES=minimal lumenqraph-indexer
+
+# Opt in to the extra GIN indexes for ad-hoc querying.
+LUMENQRAPH_JSONB_INDEXES=full lumenqraph-indexer
+```
+
+Alternatively, apply the snippet directly:
+
+```sql
+-- Enable the optional GIN index on decoded_value for ad-hoc containment queries.
+CREATE INDEX IF NOT EXISTS idx_events_decoded_value
+    ON events USING gin (decoded_value);
+
+-- To revert to the default (minimal) configuration:
+DROP INDEX IF EXISTS idx_events_decoded_value;
+```
+
+---
+
 ## Regression detection
 
 A regression is a **> 10% increase in mean latency** for the same batch size
@@ -185,4 +269,5 @@ mock RPC server (`spawn_mock_rpc`).
 
 - Criterion user guide: <https://bheisler.github.io/criterion.rs/book/>
 - PostgreSQL `EXPLAIN ANALYZE`: <https://www.postgresql.org/docs/current/sql-explain.html>
+- PostgreSQL `pg_stat_user_indexes`: <https://www.postgresql.org/docs/current/monitoring-stats.html>
 - Soroban event pagination: <https://developers.stellar.org/network/soroban-rpc/api-reference/methods/getEvents>
