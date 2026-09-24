@@ -12,13 +12,31 @@ CREATE INDEX IF NOT EXISTS idx_events_decoded_value
 
 -- Monotonic sequence so the webhook service can stream new events in order via
 -- a single watermark (event_id is not monotonic).
+--
+-- NOTE: `seq` is allocated at INSERT time, not at COMMIT time. Two concurrent
+-- writers can therefore commit out of order (A takes seq 100, B takes seq 101
+-- and commits first). A watermark that simply advances to `max(seq)` would skip
+-- event 100 forever once A commits. To make the watermark commit-order-safe we
+-- also record the inserting transaction id (`xid8`) and only advance past a seq
+-- once every transaction that could still commit a lower seq has finished
+-- (see `webhook_state.safe_seq` and the dispatcher's `enqueue_events`).
 ALTER TABLE events ADD COLUMN IF NOT EXISTS seq BIGSERIAL;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS xid xid8 NOT NULL DEFAULT pg_current_xact_id();
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_seq ON events (seq);
+CREATE INDEX IF NOT EXISTS idx_events_xid ON events (xid);
 
 -- Webhook enqueue watermark (single row).
+--
+-- `last_seq` is the highest seq already enqueued. `safe_seq` is the highest seq
+-- that is safe to advance to: it is bounded by `pg_snapshot_xmin(pg_current_snapshot())`
+-- so that no in-flight transaction can still commit an event with a lower seq.
+-- `safe_xid` records the xmin the bound was computed against, so the dispatcher
+-- can detect when the bound has moved and re-scan the overlap window.
 CREATE TABLE IF NOT EXISTS webhook_state (
-    id       INTEGER PRIMARY KEY DEFAULT 1,
-    last_seq BIGINT  NOT NULL DEFAULT 0,
+    id        INTEGER PRIMARY KEY DEFAULT 1,
+    last_seq  BIGINT  NOT NULL DEFAULT 0,
+    safe_seq  BIGINT  NOT NULL DEFAULT 0,
+    safe_xid  xid8    NOT NULL DEFAULT '0'::xid8,
     CONSTRAINT single_row_state CHECK (id = 1)
 );
 
