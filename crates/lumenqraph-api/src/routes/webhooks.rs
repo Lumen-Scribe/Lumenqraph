@@ -6,7 +6,7 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use lumenqraph_core::WebhookSubscription;
 use rand::RngCore;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 use sqlx::PgPool;
@@ -137,6 +137,17 @@ pub struct UpdateWebhook {
     event_name: Option<String>,
 }
 
+/// Response returned by `create_webhook`. Carries the one-time plaintext
+/// signing secret alongside the persisted subscription. The secret is never
+/// stored in plaintext and is only exposed here, at creation time.
+#[derive(Serialize)]
+pub struct CreatedWebhook {
+    #[serde(flatten)]
+    subscription: WebhookSubscription,
+    /// One-time HMAC signing secret. Not retrievable after creation.
+    secret: String,
+}
+
 fn default_kind() -> String {
     "event".to_string()
 }
@@ -150,7 +161,7 @@ fn random_secret() -> String {
 pub async fn create_webhook(
     State(state): State<AppState>,
     Json(body): Json<CreateWebhook>,
-) -> ApiResult<Json<WebhookSubscription>> {
+) -> ApiResult<Json<CreatedWebhook>> {
     if state.webhook_max_subscriptions > 0 {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_subscriptions")
             .fetch_one(&state.pool)
@@ -190,9 +201,9 @@ pub async fn create_webhook(
         .unwrap_or_else(|_| "default-key-for-testing".to_string());
 
     let sub: WebhookSubscription = sqlx::query_as(
-        "INSERT INTO webhook_subscriptions (url, kind, contract_id, event_name, secret, encrypted_secret, starting_seq)
-         VALUES ($1, $2, $3, $4, '[encrypted]', pgp_sym_encrypt($5, $6), $7)
-         RETURNING id, url, kind, contract_id, event_name, '[encrypted]' as secret, active, created_at",
+        "INSERT INTO webhook_subscriptions (url, kind, contract_id, event_name, encrypted_secret, starting_seq)
+         VALUES ($1, $2, $3, $4, pgp_sym_encrypt($5, $6), $7)
+         RETURNING id, url, kind, contract_id, event_name, active, created_at",
     )
     .bind(&body.url)
     .bind(&body.kind)
@@ -205,14 +216,12 @@ pub async fn create_webhook(
     .await?;
 
     log_webhook_action(&state.pool, "webhook_create", &sub.id.to_string()).await;
-    
-    // Return the secret in the response (this is the only time it's exposed)
-    let mut response = serde_json::to_value(&sub)?;
-    if let Some(obj) = response.as_object_mut() {
-        obj.insert("secret".to_string(), serde_json::Value::String(secret));
-    }
-    
-    Ok(Json(serde_json::from_value(response)?))
+
+    // Return the secret in the response (this is the only time it's exposed).
+    Ok(Json(CreatedWebhook {
+        subscription: sub,
+        secret,
+    }))
 }
 
 async fn calculate_starting_seq(pool: &sqlx::PgPool, since: &str) -> ApiResult<i64> {
@@ -225,87 +234,4 @@ async fn calculate_starting_seq(pool: &sqlx::PgPool, since: &str) -> ApiResult<i
             .await?;
         Ok((current_max - count).max(0))
     } else if let Ok(ledger) = since.parse::<i64>() {
-        let seq: Option<i64> = sqlx::query_scalar("SELECT min(seq) FROM events WHERE ledger >= $1")
-            .bind(ledger)
-            .fetch_optional(pool)
-            .await?
-            .flatten();
-        Ok(seq.unwrap_or(0))
-    } else {
-        let ts = chrono::DateTime::parse_from_rfc3339(since)
-            .map_err(|_| ApiError::bad_request("invalid timestamp format; expected ISO-8601"))?
-            .with_timezone(&chrono::Utc);
-        let seq: Option<i64> = sqlx::query_scalar("SELECT min(seq) FROM events WHERE ledger_closed_at >= $1")
-            .bind(ts)
-            .fetch_optional(pool)
-            .await?
-            .flatten();
-        Ok(seq.unwrap_or(0))
-    }
-}
-
-/// (id, url, kind, contract_id, event_name, active, created_at, auto_disabled_at, auto_disabled_reason)
-type WebhookListRow = (
-    Uuid,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    bool,
-    chrono::DateTime<chrono::Utc>,
-    Option<chrono::DateTime<chrono::Utc>>,
-    Option<String>,
-);
-
-/// List subscriptions without exposing their secrets.
-pub async fn list_webhooks(State(state): State<AppState>) -> ApiResult<Json<Vec<Value>>> {
-    let rows: Vec<WebhookListRow> = sqlx::query_as(
-        "SELECT id, url, kind, contract_id, event_name, active, created_at, auto_disabled_at, auto_disabled_reason
-             FROM webhook_subscriptions ORDER BY created_at DESC",
-    )
-    .fetch_all(&state.pool)
-    .await?;
-
-    let out = rows
-        .into_iter()
-        .map(
-            |(id, url, kind, contract_id, event_name, active, created_at, auto_disabled_at, auto_disabled_reason)| {
-                json!({
-                    "id": id,
-                    "url": url,
-                    "kind": kind,
-                    "contract_id": contract_id,
-                    "event_name": event_name,
-                    "active": active,
-                    "created_at": created_at,
-                    "auto_disabled_at": auto_disabled_at,
-                    "auto_disabled_reason": auto_disabled_reason,
-                })
-            },
-        )
-        .collect();
-    Ok(Json(out))
-}
-
-pub async fn update_webhook(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Json(body): Json<UpdateWebhook>,
-) -> ApiResult<Json<Value>> {
-    // Check that at least one field is being updated
-    if body.active.is_none() && body.contract_id.is_none() && body.event_name.is_none() {
-        return Err(ApiError::bad_request("no fields to update"));
-    }
-
-    // Validate filters if updating them
-    if let Some(ref contract_id) = body.contract_id {
-        if contract_id.is_empty() {
-            return Err(ApiError::bad_request("contract_id cannot be empty"));
-        }
-    }
-
-    // Get current subscription
-    let current: (String, bool, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT kind, active, contract_id, event_name FROM webhook_subscriptions WHERE
-
-/* … truncated 9961 chars — edit only what you need near the top … */
+        let seq: Option<i
