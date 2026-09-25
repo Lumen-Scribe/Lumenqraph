@@ -208,6 +208,10 @@ pub struct LiquidityEvent {
 }
 
 /// A registered webhook subscription.
+///
+/// The signing secret is stored only in encrypted form (`encrypted_secret`);
+/// it is never carried on this shared model. Creation responses return the
+/// one-time plaintext secret via [`CreatedWebhook`].
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct WebhookSubscription {
     pub id: Uuid,
@@ -220,10 +224,19 @@ pub struct WebhookSubscription {
     /// Filter: only events with this name (None = any). Ignored by `upgrade`
     /// subscriptions, which aren't scoped to an event.
     pub event_name: Option<String>,
-    /// Shared secret used to HMAC-sign delivery payloads.
-    pub secret: String,
     pub active: bool,
     pub created_at: DateTime<Utc>,
+}
+
+/// A newly created webhook subscription, returned only from the creation
+/// endpoint. Carries the one-time plaintext `secret` so the caller can store it
+/// for HMAC verification; it is never persisted in plaintext.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatedWebhook {
+    #[serde(flatten)]
+    pub subscription: WebhookSubscription,
+    /// One-time plaintext signing secret. Shown once, never retrievable again.
+    pub secret: String,
 }
 
 /// An API key record. Only the SHA-256 hash of the key is stored.
