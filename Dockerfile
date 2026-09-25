@@ -7,7 +7,7 @@
 # recompiles the workspace crates. BuildKit cache mounts keep the cargo
 # registry/git caches warm across builds (see cache-from/cache-to in CI).
 
-FROM rust:1-slim@sha256:17d1ba895198f9934c6314ec5346a0d5115372f3243390c3d731e242f35c2f27 AS chef
+FROM rust:1-slim@sha256:f47a8de237dcbb0b0ce1099901e60a89728e3d51f24e664b40e947171538ade7 AS chef
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config \
     && rm -rf /var/lib/apt/lists/*
