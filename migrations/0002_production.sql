@@ -12,13 +12,31 @@ CREATE INDEX IF NOT EXISTS idx_events_decoded_value
 
 -- Monotonic sequence so the webhook service can stream new events in order via
 -- a single watermark (event_id is not monotonic).
+--
+-- NOTE: `seq` is allocated at INSERT time, not at COMMIT time. Two concurrent
+-- writers can therefore commit out of order (A takes seq 100, B takes seq 101
+-- and commits first). A watermark that simply advances to `max(seq)` would skip
+-- event 100 forever once A commits. To make the watermark commit-order-safe we
+-- also record the inserting transaction id (`xid8`) and only advance past a seq
+-- once every transaction that could still commit a lower seq has finished
+-- (see `webhook_state.safe_seq` and the dispatcher's `enqueue_events`).
 ALTER TABLE events ADD COLUMN IF NOT EXISTS seq BIGSERIAL;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS xid xid8 NOT NULL DEFAULT pg_current_xact_id();
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_seq ON events (seq);
+CREATE INDEX IF NOT EXISTS idx_events_xid ON events (xid);
 
 -- Webhook enqueue watermark (single row).
+--
+-- `last_seq` is the highest seq already enqueued. `safe_seq` is the highest seq
+-- that is safe to advance to: it is bounded by `pg_snapshot_xmin(pg_current_snapshot())`
+-- so that no in-flight transaction can still commit an event with a lower seq.
+-- `safe_xid` records the xmin the bound was computed against, so the dispatcher
+-- can detect when the bound has moved and re-scan the overlap window.
 CREATE TABLE IF NOT EXISTS webhook_state (
-    id       INTEGER PRIMARY KEY DEFAULT 1,
-    last_seq BIGINT  NOT NULL DEFAULT 0,
+    id        INTEGER PRIMARY KEY DEFAULT 1,
+    last_seq  BIGINT  NOT NULL DEFAULT 0,
+    safe_seq  BIGINT  NOT NULL DEFAULT 0,
+    safe_xid  xid8    NOT NULL DEFAULT '0'::xid8,
     CONSTRAINT single_row_state CHECK (id = 1)
 );
 
@@ -30,14 +48,27 @@ ALTER TABLE indexer_cursor
     ADD COLUMN IF NOT EXISTS errors_total           BIGINT NOT NULL DEFAULT 0;
 
 -- API keys. Only the SHA-256 hash of the key is stored.
+--
+-- `expires_at` (NULL = never expires) lets leaked keys be time-bounded.
+-- `last_used_at` is refreshed at most once per minute per key (see auth
+-- middleware) to avoid write amplification on hot keys.
+-- `scopes` gates route groups: `read` (data), `rpc` (/call, /simulate),
+-- `webhooks` (webhook management), `admin` (key management).
 CREATE TABLE IF NOT EXISTS api_keys (
     key_hash            TEXT        PRIMARY KEY,
     name                TEXT        NOT NULL,
     tier                TEXT        NOT NULL DEFAULT 'free',
     rate_limit_per_min  INTEGER     NOT NULL DEFAULT 60,
     revoked             BOOLEAN     NOT NULL DEFAULT FALSE,
+    expires_at          TIMESTAMPTZ,
+    last_used_at        TIMESTAMPTZ,
+    scopes              TEXT[]      NOT NULL DEFAULT '{read}',
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Find stale keys for cleanup without scanning the whole table.
+CREATE INDEX IF NOT EXISTS idx_api_keys_last_used_at
+    ON api_keys (last_used_at);
 
 -- Webhook subscriptions: register a URL + optional filters, get pushed events.
 CREATE TABLE IF NOT EXISTS webhook_subscriptions (
