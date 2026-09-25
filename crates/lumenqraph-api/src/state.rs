@@ -4,7 +4,9 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use sqlx::PgPool;
+use tokio::sync::mpsc;
 
+use crate::audit::AuditEvent;
 use crate::call_cache::CallCache;
 use crate::concurrency_limit::ConcurrencyLimiter;
 use crate::metrics_middleware::MetricsCollector;
@@ -62,6 +64,13 @@ pub struct AppState {
     pub health_max_stale_secs: i64,
     /// When true, GET /metrics requires a valid API key (#213).
     pub metrics_require_auth: bool,
+    /// Bounded channel for off-request-path audit writes (#367). Auth
+    /// middleware pushes events here instead of awaiting an INSERT; a
+    /// background task drains and batch-inserts them. `None` disables audit
+    /// logging (e.g. in tests).
+    pub audit_tx: Option<mpsc::Sender<AuditEvent>>,
+    /// Count of audit events dropped because the channel was full (#367).
+    pub audit_dropped: Arc<AtomicU64>,
 }
 
 pub struct BuildInfo {

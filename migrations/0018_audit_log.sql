@@ -31,7 +31,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_action
     ON audit_log (action_type, timestamp DESC)
     WHERE action_type IS NOT NULL;
 
--- Index for finding a key's last-used timestamp
-CREATE INDEX IF NOT EXISTS idx_audit_log_key_recent
-    ON audit_log (key_hash_prefix, timestamp DESC)
-    WHERE status_code < 400;
+-- Drop the redundant idx_audit_log_key_recent index: it overlaps idx_audit_log_key
+-- (same key_hash_prefix, timestamp DESC columns) and only adds write amplification
+-- on every audit insert without serving any distinct query pattern.
+DROP INDEX IF EXISTS idx_audit_log_key_recent;
