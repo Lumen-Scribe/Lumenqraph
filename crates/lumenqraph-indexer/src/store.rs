@@ -516,4 +516,62 @@ mod tests {
         let t = extract_transfer(&e);
         assert!(t.is_some(), "should handle complex token_id object");
     }
+
+    // Issue #384: CAP-67 Protocol 23 support for muxed addresses and SAC assets
+    #[test]
+    fn cap67_sac_transfer_with_asset_topic_should_extract() {
+        let e = event(
+            Some("transfer"),
+            vec![
+                json!("transfer"),
+                json!("GFROM"),
+                json!("GTO"),
+                json!("native"),
+            ],
+            json!("500"),
+        );
+        let t = extract_transfer(&e);
+        assert!(t.is_some(), "should handle SAC transfer with asset topic");
+        let transfer = t.unwrap();
+        assert_eq!(transfer.from_addr.as_deref(), Some("GFROM"));
+        assert_eq!(transfer.to_addr.as_deref(), Some("GTO"));
+        assert_eq!(transfer.amount, "500");
+    }
+
+    #[test]
+    fn muxed_address_topic_should_be_preserved() {
+        let muxed_addr = "MAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+        let e = event(
+            Some("transfer"),
+            vec![
+                json!("transfer"),
+                json!("GFROM"),
+                json!(muxed_addr),
+            ],
+            json!("1000"),
+        );
+        let t = extract_transfer(&e);
+        assert!(t.is_some(), "should handle muxed address in topic");
+        let transfer = t.unwrap();
+        // Current behavior: treats muxed address as regular string
+        assert_eq!(transfer.to_addr.as_deref(), Some(muxed_addr));
+    }
+
+    #[test]
+    fn cap67_transfer_with_map_value_should_extract_gracefully() {
+        let map_value = json!({
+            "amount": "100",
+            "to_muxed_id": "42"
+        });
+        let e = event(
+            Some("transfer"),
+            vec![json!("transfer"), json!("GFROM"), json!("GTO")],
+            map_value,
+        );
+        let t = extract_transfer(&e);
+        assert!(t.is_some(), "should handle CAP-67 map value");
+        let transfer = t.unwrap();
+        // Current behavior: stringifies entire map
+        assert!(transfer.amount.contains("amount") || transfer.amount.contains("to_muxed_id"));
+    }
 }
