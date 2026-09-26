@@ -33,11 +33,12 @@ rigour (multiple iterations, outlier rejection, confidence intervals):
 |-------|-----------------|----------|
 | `xdr_decode` | Base64 XDR → decoded JSON (topics + value) per event | No |
 | `enrichment` | Spec-driven named/typed enrichment per event | No |
+| `enrichment_nested_udt` | Enrichment of an event whose value nests a UDT | No |
 | `db_insert` | UNNEST batch INSERT into Postgres | Yes |
 
-The `xdr_decode` and `enrichment` phases are pure-CPU and run anywhere.
-The `db_insert` phase gates on `TEST_DATABASE_URL`; if the variable is absent
-the phase is silently skipped.
+The `xdr_decode`, `enrichment`, and `enrichment_nested_udt` phases are pure-CPU
+and run anywhere. The `db_insert` phase gates on `TEST_DATABASE_URL`; if the
+variable is absent the phase is silently skipped.
 
 ---
 
@@ -61,6 +62,7 @@ Criterion writes HTML reports to `target/criterion/`.
 ```bash
 cargo bench --bench bench_indexer -- xdr_decode
 cargo bench --bench bench_indexer -- enrichment
+cargo bench --bench bench_indexer -- enrichment_nested_udt
 ```
 
 ### Run all three phases (including DB)
@@ -111,6 +113,27 @@ runs on the same machine**.
 |--------|-------|
 | Mean time | ~1.5 ms |
 | Throughput | ~650 000 events / s |
+
+### `enrichment_nested_udt`
+
+Enriches `PositionChanged { pos: Position }`, where `Position` is a struct whose
+`status` field is itself a `Status` enum, against a spec that declares 100
+unrelated UDTs ahead of them. This is the case that used to pay a linear scan
+over the whole type list — once per nested value, recursively — before UDTs were
+indexed by name in `ContractSpec::reindex`.
+
+Run it against a saved baseline to see the delta:
+
+```bash
+# On the commit before the indexing change:
+cargo bench --bench bench_indexer -- enrichment_nested_udt --save-baseline before
+
+# On the change itself:
+cargo bench --bench bench_indexer -- enrichment_nested_udt --baseline before
+```
+
+Criterion prints the per-batch `change:` line; the improvement grows with the
+number of declared types and with how deeply the event nests them.
 
 ### `db_insert` (100 events per batch, local Postgres)
 
