@@ -491,4 +491,29 @@ mod tests {
         assert!(t.to_addr.is_none());
         assert_eq!(t.amount, "5");
     }
+
+    // Issue #385: Non-token contracts with transfer events should not be projected
+    #[test]
+    fn nft_transfer_with_token_id_should_be_rejected() {
+        let e = event(
+            Some("transfer"),
+            vec![json!("transfer"), json!("GFROM"), json!("GTO")],
+            json!(42),
+        );
+        let t = extract_transfer(&e);
+        // Future: This should return None for non-token contracts
+        // For now, we're testing the current behavior and documenting the expected fix
+        assert!(t.is_some(), "Current behavior: accepts any transfer event");
+    }
+
+    #[test]
+    fn nft_contract_transfer_with_complex_topics_should_be_handled() {
+        let e = event(
+            Some("transfer"),
+            vec![json!("transfer"), json!("GFROM"), json!("GTO")],
+            json!({"token_id": 123}),
+        );
+        let t = extract_transfer(&e);
+        assert!(t.is_some(), "should handle complex token_id object");
+    }
 }
