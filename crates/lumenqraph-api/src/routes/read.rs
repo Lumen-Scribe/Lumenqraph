@@ -29,9 +29,15 @@ pub async fn list_functions(
         return Err(ApiError::bad_request("invalid contract id"));
     }
     let spec = state.specs.current(&state.pool, &contract_id).await?;
+    // List from the cached parse rather than re-reading and re-parsing the
+    // stored section on every request.
+    let functions = match spec.parsed.as_ref() {
+        Some(parsed) => read::functions_of(parsed),
+        None => Vec::new(),
+    };
     Ok(Json(json!({
         "contract_id": contract_id,
-        "functions": read::functions(&spec.section),
+        "functions": functions,
     })))
 }
 
@@ -76,11 +82,18 @@ pub async fn call_function(
         return Ok(Json(cached));
     }
 
-
     let spec = state.specs.current(&state.pool, &contract_id).await?;
 
-    let call = read::encode_call(
-        &spec.section,
+    // Encode against the cached, name-indexed parse: the spec section is never
+    // re-parsed per request, and UDTs resolve in a hash lookup.
+    let Some(parsed) = spec.parsed.as_ref() else {
+        // The stored section has no parseable entries, so no function can exist
+        // in it — the same `FunctionNotFound` the raw-bytes path returned.
+        let err = EncodeError::FunctionNotFound(req.function.clone());
+        return Err(encode_error_to_api(err));
+    };
+    let call = read::encode_call_with_spec(
+        parsed,
         &contract_id,
         &req.function,
         &req.args,
@@ -97,7 +110,7 @@ pub async fn call_function(
             let response = json!({
                 "contract_id": contract_id,
                 "function": req.function,
-                "result": read::decode_result(&result_xdr, &call, spec.parsed.as_ref()),
+                "result": read::decode_result(&result_xdr, &call, Some(parsed)),
                 "simulated_at_ledger": latest_ledger,
             });
             state.call_cache.insert(&contract_id, &req.function, &req.args, response.clone());
@@ -145,8 +158,13 @@ pub async fn simulate_call(
 
     let spec = state.specs.current(&state.pool, &contract_id).await?;
 
-    let call = read::encode_call(
-        &spec.section,
+    // Encode against the cached, name-indexed parse (no per-request re-parse).
+    let Some(parsed) = spec.parsed.as_ref() else {
+        let err = EncodeError::FunctionNotFound(req.function.clone());
+        return Err(encode_error_to_api(err));
+    };
+    let call = read::encode_call_with_spec(
+        parsed,
         &contract_id,
         &req.function,
         &req.args,
@@ -162,11 +180,11 @@ pub async fn simulate_call(
             latest_ledger,
         } => {
             // Enrich emitted events from this contract with its interface.
-            let decoded_events = read::decode_events(&events, &contract_id, spec.parsed.as_ref());
+            let decoded_events = read::decode_events(&events, &contract_id, Some(parsed));
             Ok(Json(json!({
                 "contract_id": contract_id,
                 "function": req.function,
-                "result": read::decode_result(&result_xdr, &call, spec.parsed.as_ref()),
+                "result": read::decode_result(&result_xdr, &call, Some(parsed)),
                 "events": decoded_events,
                 "min_resource_fee": min_resource_fee,
                 "simulated_at_ledger": latest_ledger,

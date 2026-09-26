@@ -17,14 +17,13 @@ use std::str::FromStr;
 use serde_json::Value;
 use stellar_xdr::curr::{
     ContractEventBody, ContractEventType, DiagnosticEvent, HostFunction, Int128Parts, Int256Parts,
-    InvokeContractArgs, InvokeHostFunctionOp, Limited, Limits, Memo, MuxedAccount, Operation,
-    OperationBody, Preconditions, PublicKey, ReadXdr, ScAddress, ScBytes, ScMap, ScMapEntry,
-    ScSpecEntry, ScSpecFunctionV0, ScSpecTypeDef, ScString, ScSymbol, ScVal, ScVec, SequenceNumber,
-    Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope, UInt128Parts,
-    UInt256Parts, Uint256, VecM, WriteXdr,
+    InvokeContractArgs, InvokeHostFunctionOp, Limits, Memo, MuxedAccount, Operation, OperationBody,
+    Preconditions, PublicKey, ReadXdr, ScAddress, ScBytes, ScMap, ScMapEntry, ScSpecTypeDef,
+    ScString, ScSymbol, ScVal, ScVec, SequenceNumber, Transaction, TransactionEnvelope,
+    TransactionExt, TransactionV1Envelope, UInt128Parts, UInt256Parts, Uint256, VecM, WriteXdr,
 };
 
-use crate::spec::type_name;
+use crate::spec::{type_name, FunctionSpec, UdtDef, UdtEnum, UdtStruct, UdtUnion};
 use crate::ContractSpec;
 
 /// The canonical all-zero account, used as the (never-signed, never-charged)
@@ -66,6 +65,10 @@ pub struct EncodedCall {
 /// source (defaults to the zero account, which simulation accepts for read-only
 /// calls). Both plain Ed25519 public keys (`G…`) and muxed accounts (`M…`) are
 /// accepted.
+///
+/// This form re-parses `spec_section` on every call. Callers that already hold a
+/// parsed, name-indexed [`ContractSpec`] — the API's `SpecCache`, for one —
+/// should call [`encode_call_with_spec`] directly so that parse is skipped.
 pub fn encode_call(
     spec_section: &[u8],
     contract_id: &str,
@@ -73,25 +76,41 @@ pub fn encode_call(
     args: &Value,
     source_account: Option<&str>,
 ) -> Result<EncodedCall, EncodeError> {
-    // Parsed once and threaded through encoding: a `Udt` type is just a *name*,
-    // so resolving it to its struct/union/enum definition needs the whole spec.
-    let entries = parse_entries(spec_section);
-    let func = find_function(&entries, function)
+    match ContractSpec::from_spec_xdr(spec_section) {
+        Some(spec) => encode_call_with_spec(&spec, contract_id, function, args, source_account),
+        // No parseable interface at all, so no function can exist in it.
+        None => Err(EncodeError::FunctionNotFound(function.to_string())),
+    }
+}
+
+/// Encode a typed contract read against an already-parsed, name-indexed spec.
+///
+/// The function and every `Udt` it references resolve through the spec's name
+/// index, and the raw section is never touched — so encoding a call costs no
+/// XDR parse and no linear scan over the interface.
+pub fn encode_call_with_spec(
+    spec: &ContractSpec,
+    contract_id: &str,
+    function: &str,
+    args: &Value,
+    source_account: Option<&str>,
+) -> Result<EncodedCall, EncodeError> {
+    let func = spec
+        .function(function)
         .ok_or_else(|| EncodeError::FunctionNotFound(function.to_string()))?;
 
     let mut scvals: Vec<ScVal> = Vec::with_capacity(func.inputs.len());
     for (i, input) in func.inputs.iter().enumerate() {
-        let name = input.name.to_utf8_string_lossy();
         let jv = match args {
-            Value::Object(m) => m.get(&name),
+            Value::Object(m) => m.get(&input.name),
             Value::Array(a) => a.get(i),
             _ => None,
         }
-        .ok_or_else(|| EncodeError::MissingArgument(name.clone()))?;
-        scvals.push(json_to_scval(jv, &input.type_, &name, &entries)?);
+        .ok_or_else(|| EncodeError::MissingArgument(input.name.clone()))?;
+        scvals.push(json_to_scval(jv, &input.ty, &input.name, spec)?);
     }
 
-    let output_ty = func.outputs.first().cloned();
+    let output_ty = func.output_tys.first().cloned();
     let output_type = output_ty
         .as_ref()
         .map(type_name)
@@ -121,9 +140,9 @@ const MUTATING_PREFIXES: &[&str] = &[
 /// no `view` keyword, so this combines two weak signals: a `void` return type
 /// almost always means the function mutates state (a pure read has something
 /// to return), and a name matching a well-known mutating prefix.
-fn is_view_heuristic(f: &ScSpecFunctionV0) -> bool {
+fn is_view_heuristic(f: &FunctionSpec) -> bool {
     let is_void_output = f.outputs.is_empty();
-    let name = f.name.to_utf8_string_lossy().to_lowercase();
+    let name = f.name.to_lowercase();
     let matches_mutating_prefix = MUTATING_PREFIXES.iter().any(|p| name.starts_with(p));
     !is_void_output && !matches_mutating_prefix
 }
@@ -134,47 +153,43 @@ fn is_view_heuristic(f: &ScSpecFunctionV0) -> bool {
 /// Each entry also carries a best-effort `is_view` indicator (see
 /// [`is_view_heuristic`]) — callers wanting to avoid accidental state
 /// mutations should still prefer `/simulate` over `/call` when in doubt.
+///
+/// This form re-parses `spec_section`; prefer [`functions_of`] when the caller
+/// already holds a parsed [`ContractSpec`].
 pub fn functions(spec_section: &[u8]) -> Vec<Value> {
-    parse_entries(spec_section)
-        .into_iter()
-        .filter_map(|e| match e {
-            ScSpecEntry::FunctionV0(f) => Some(serde_json::json!({
-                "name": f.name.to_utf8_string_lossy(),
+    match ContractSpec::from_spec_xdr(spec_section) {
+        Some(spec) => functions_of(&spec),
+        None => Vec::new(),
+    }
+}
+
+/// List the callable functions of an already-parsed spec. See [`functions`].
+pub fn functions_of(spec: &ContractSpec) -> Vec<Value> {
+    spec.functions
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "name": f.name.clone(),
                 "inputs": f.inputs.iter().map(|i| serde_json::json!({
-                    "name": i.name.to_utf8_string_lossy(),
-                    "type": type_name(&i.type_),
+                    "name": i.name.clone(),
+                    "type": i.type_name.clone(),
                 })).collect::<Vec<_>>(),
-                "outputs": f.outputs.iter().map(type_name).collect::<Vec<_>>(),
-                "is_view": is_view_heuristic(&f),
-            })),
-            _ => None,
+                "outputs": f.outputs.clone(),
+                "is_view": is_view_heuristic(f),
+            })
         })
         .collect()
 }
 
-fn parse_entries(spec_section: &[u8]) -> Vec<ScSpecEntry> {
-    let mut limited = Limited::new(spec_section, Limits::none());
-    ScSpecEntry::read_xdr_iter(&mut limited)
-        .filter_map(Result::ok)
-        .collect()
-}
-
-fn find_function(entries: &[ScSpecEntry], function: &str) -> Option<ScSpecFunctionV0> {
-    entries.iter().find_map(|e| match e {
-        ScSpecEntry::FunctionV0(f) if f.name.to_utf8_string_lossy() == function => Some(f.clone()),
-        _ => None,
-    })
-}
-
 /// Convert one JSON argument into an `ScVal` according to its declared type.
 ///
-/// `entries` is the contract's full spec, needed to resolve `Udt` types (which
-/// carry only a name) to their struct/union/enum definitions.
+/// `spec` is the contract's parsed interface, needed to resolve `Udt` types
+/// (which carry only a name) to their struct/union/enum definitions.
 fn json_to_scval(
     v: &Value,
     ty: &ScSpecTypeDef,
     name: &str,
-    entries: &[ScSpecEntry],
+    spec: &ContractSpec,
 ) -> Result<ScVal, EncodeError> {
     use ScSpecTypeDef as T;
     let bad = |msg: &str| EncodeError::BadArgument {
@@ -227,14 +242,14 @@ fn json_to_scval(
             if v.is_null() {
                 ScVal::Void
             } else {
-                json_to_scval(v, &inner.value_type, name, entries)?
+                json_to_scval(v, &inner.value_type, name, spec)?
             }
         }
         T::Vec(inner) => {
             let arr = v.as_array().ok_or_else(|| bad("expected an array"))?;
             let items: Result<Vec<ScVal>, _> = arr
                 .iter()
-                .map(|el| json_to_scval(el, &inner.element_type, name, entries))
+                .map(|el| json_to_scval(el, &inner.element_type, name, spec))
                 .collect();
             ScVal::Vec(Some(ScVec(vecm(items?, name)?)))
         }
@@ -249,7 +264,7 @@ fn json_to_scval(
             let items: Result<Vec<ScVal>, _> = arr
                 .iter()
                 .zip(t.value_types.iter())
-                .map(|(el, et)| json_to_scval(el, et, name, entries))
+                .map(|(el, et)| json_to_scval(el, et, name, spec))
                 .collect();
             ScVal::Vec(Some(ScVec(vecm(items?, name)?)))
         }
@@ -259,8 +274,8 @@ fn json_to_scval(
             let obj = v.as_object().ok_or_else(|| bad("expected an object"))?;
             let mut items = Vec::with_capacity(obj.len());
             for (k, val) in obj {
-                let key = json_to_scval(&Value::String(k.clone()), &m.key_type, name, entries)?;
-                let val = json_to_scval(val, &m.value_type, name, entries)?;
+                let key = json_to_scval(&Value::String(k.clone()), &m.key_type, name, spec)?;
+                let val = json_to_scval(val, &m.value_type, name, spec)?;
                 items.push(ScMapEntry { key, val });
             }
             ScVal::Map(Some(ScMap(vecm(items, name)?)))
@@ -273,7 +288,7 @@ fn json_to_scval(
             }
             ScVal::Void
         }
-        T::Udt(u) => udt_to_scval(v, &u.name.to_utf8_string_lossy(), name, entries)?,
+        T::Udt(u) => udt_to_scval(v, &u.name.to_utf8_string_lossy(), name, spec)?,
         // `Val` is untyped by definition, and Result/Error/MuxedAddress aren't
         // things a view function takes as input in practice. Left as a clear
         // client error rather than a guess.
@@ -299,49 +314,39 @@ fn udt_to_scval(
     v: &Value,
     udt_name: &str,
     arg: &str,
-    entries: &[ScSpecEntry],
+    spec: &ContractSpec,
 ) -> Result<ScVal, EncodeError> {
     let bad = |msg: String| EncodeError::BadArgument {
         name: arg.to_string(),
         msg,
     };
 
-    for entry in entries {
-        match entry {
-            ScSpecEntry::UdtStructV0(s) if s.name.to_utf8_string_lossy() == udt_name => {
-                return struct_to_scval(v, s, arg, entries);
-            }
-            ScSpecEntry::UdtEnumV0(e) if e.name.to_utf8_string_lossy() == udt_name => {
-                return enum_to_scval(v, e, arg);
-            }
-            ScSpecEntry::UdtUnionV0(u) if u.name.to_utf8_string_lossy() == udt_name => {
-                return union_to_scval(v, u, arg, entries);
-            }
-            _ => {}
-        }
+    // Resolve the name through the spec's index rather than scanning every
+    // entry: a large contract declares many types, and this runs per argument.
+    match spec.udt_def(udt_name) {
+        Some(UdtDef::Struct(s)) => struct_to_scval(v, s, arg, spec),
+        Some(UdtDef::Enum(e)) => enum_to_scval(v, e, arg),
+        Some(UdtDef::Union(u)) => union_to_scval(v, u, arg, spec),
+        // The spec referenced a type it doesn't define — a malformed/truncated
+        // spec section rather than a caller mistake, but there's nothing to
+        // encode against.
+        None => Err(bad(format!(
+            "contract spec references unknown type {udt_name:?}"
+        ))),
     }
-    // The spec referenced a type it doesn't define — a malformed/truncated spec
-    // section rather than a caller mistake, but there's nothing to encode against.
-    Err(bad(format!(
-        "contract spec references unknown type {udt_name:?}"
-    )))
 }
 
 fn struct_to_scval(
     v: &Value,
-    s: &stellar_xdr::curr::ScSpecUdtStructV0,
+    s: &UdtStruct,
     arg: &str,
-    entries: &[ScSpecEntry],
+    spec: &ContractSpec,
 ) -> Result<ScVal, EncodeError> {
     let bad = |msg: String| EncodeError::BadArgument {
         name: arg.to_string(),
         msg,
     };
-    let field_names: Vec<String> = s
-        .fields
-        .iter()
-        .map(|f| f.name.to_utf8_string_lossy())
-        .collect();
+    let field_names: Vec<&str> = s.fields.iter().map(|f| f.name.as_str()).collect();
 
     // soroban-sdk names tuple-struct fields "0", "1", … and encodes them
     // positionally; a struct with real field names becomes a map.
@@ -365,7 +370,7 @@ fn struct_to_scval(
         let items: Result<Vec<ScVal>, _> = arr
             .iter()
             .zip(s.fields.iter())
-            .map(|(el, f)| json_to_scval(el, &f.type_, arg, entries))
+            .map(|(el, f)| json_to_scval(el, &f.ty, arg, spec))
             .collect();
         return Ok(ScVal::Vec(Some(ScVec(vecm(items?, arg)?))));
     }
@@ -375,18 +380,18 @@ fn struct_to_scval(
         .ok_or_else(|| bad(format!("expected an object for struct {:?}", s.name)))?;
     let mut items = Vec::with_capacity(s.fields.len());
     for f in s.fields.iter() {
-        let fname = f.name.to_utf8_string_lossy();
+        let fname = f.name.as_str();
         let fv = obj
-            .get(&fname)
+            .get(fname)
             .ok_or_else(|| bad(format!("missing field {fname:?} of struct {:?}", s.name)))?;
         items.push(ScMapEntry {
             key: ScVal::Symbol(ScSymbol(
                 fname
-                    .clone()
+                    .to_string()
                     .try_into()
                     .map_err(|_| bad(format!("field name {fname:?} is not a valid symbol")))?,
             )),
-            val: json_to_scval(fv, &f.type_, arg, entries)?,
+            val: json_to_scval(fv, &f.ty, arg, spec)?,
         });
     }
     // ScMap must be key-sorted; spec field order is declaration order.
@@ -394,11 +399,7 @@ fn struct_to_scval(
     Ok(ScVal::Map(Some(ScMap(vecm(items, arg)?))))
 }
 
-fn enum_to_scval(
-    v: &Value,
-    e: &stellar_xdr::curr::ScSpecUdtEnumV0,
-    arg: &str,
-) -> Result<ScVal, EncodeError> {
+fn enum_to_scval(v: &Value, e: &UdtEnum, arg: &str) -> Result<ScVal, EncodeError> {
     let bad = |msg: String| EncodeError::BadArgument {
         name: arg.to_string(),
         msg,
@@ -406,7 +407,7 @@ fn enum_to_scval(
     let names = || {
         e.cases
             .iter()
-            .map(|c| c.name.to_utf8_string_lossy())
+            .map(|(name, _)| name.clone())
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -417,7 +418,7 @@ fn enum_to_scval(
         let case = e
             .cases
             .iter()
-            .find(|c| c.name.to_utf8_string_lossy() == s)
+            .find(|(name, _)| name.as_str() == s)
             .ok_or_else(|| {
                 bad(format!(
                     "unknown case {s:?} for enum {:?}; expected one of: {}",
@@ -425,12 +426,12 @@ fn enum_to_scval(
                     names()
                 ))
             })?;
-        return Ok(ScVal::U32(case.value));
+        return Ok(ScVal::U32(case.1));
     }
     if let Some(n) = v.as_u64() {
         let value = u32::try_from(n)
             .map_err(|_| bad(format!("{n} is out of range for enum {:?}", e.name)))?;
-        if !e.cases.iter().any(|c| c.value == value) {
+        if !e.cases.iter().any(|(_, declared)| *declared == value) {
             return Err(bad(format!(
                 "{value} is not a declared value of enum {:?}; expected one of: {}",
                 e.name,
@@ -448,21 +449,26 @@ fn enum_to_scval(
 
 fn union_to_scval(
     v: &Value,
-    u: &stellar_xdr::curr::ScSpecUdtUnionV0,
+    u: &UdtUnion,
     arg: &str,
-    entries: &[ScSpecEntry],
+    spec: &ContractSpec,
 ) -> Result<ScVal, EncodeError> {
-    use stellar_xdr::curr::ScSpecUdtUnionCaseV0 as Case;
     let bad = |msg: String| EncodeError::BadArgument {
         name: arg.to_string(),
         msg,
     };
-    let case_name = |c: &Case| match c {
-        Case::VoidV0(x) => x.name.to_utf8_string_lossy(),
-        Case::TupleV0(x) => x.name.to_utf8_string_lossy(),
+    // A void case carries no `tys`; that is the distinction the parsed spec
+    // keeps (soroban-sdk emits `VoidV0` for unit variants and never an empty
+    // tuple case), so an empty `tys` means "selected by bare name".
+    let names = || {
+        u.cases
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-    let names = || u.cases.iter().map(case_name).collect::<Vec<_>>().join(", ");
-    let find = |want: &str| u.cases.iter().find(|c| case_name(c) == want).cloned();
+    // Index rather than a reference so the closures stay lifetime-free.
+    let find = |want: &str| u.cases.iter().position(|c| c.name.as_str() == want);
     let symbol = |s: &str| -> Result<ScVal, EncodeError> {
         Ok(ScVal::Symbol(ScSymbol(s.to_string().try_into().map_err(
             |_| bad(format!("case name {s:?} is not a valid symbol")),
@@ -472,11 +478,13 @@ fn union_to_scval(
     // A bare string selects a void case: "Active".
     if let Some(s) = v.as_str() {
         return match find(s) {
-            Some(Case::VoidV0(_)) => Ok(ScVal::Vec(Some(ScVec(vecm(vec![symbol(s)?], arg)?)))),
-            Some(Case::TupleV0(t)) => Err(bad(format!(
+            Some(i) if u.cases[i].tys.is_empty() => {
+                Ok(ScVal::Vec(Some(ScVec(vecm(vec![symbol(s)?], arg)?))))
+            }
+            Some(i) => Err(bad(format!(
                 "case {s:?} of union {:?} carries {} value(s); pass {{\"{s}\": [..]}}",
                 u.name,
-                t.type_.len()
+                u.cases[i].tys.len()
             ))),
             None => Err(bad(format!(
                 "unknown case {s:?} for union {:?}; expected one of: {}",
@@ -505,7 +513,7 @@ fn union_to_scval(
     #[allow(clippy::expect_used)]
     let (key, val) = obj.iter().next().expect("len checked above");
     match find(key) {
-        Some(Case::VoidV0(_)) => {
+        Some(i) if u.cases[i].tys.is_empty() => {
             if !val.is_null() {
                 return Err(bad(format!(
                     "case {key:?} of union {:?} carries no value",
@@ -514,33 +522,34 @@ fn union_to_scval(
             }
             Ok(ScVal::Vec(Some(ScVec(vecm(vec![symbol(key)?], arg)?))))
         }
-        Some(Case::TupleV0(t)) => {
+        Some(i) => {
+            let tys = &u.cases[i].tys;
             // One-value cases may be written unwrapped: {"Bid": 100}.
             let owned;
             let vals: &[Value] = match val.as_array() {
                 Some(a) => a,
-                None if t.type_.len() == 1 => {
+                None if tys.len() == 1 => {
                     owned = [val.clone()];
                     &owned
                 }
                 None => {
                     return Err(bad(format!(
                         "expected an array of {} values for case {key:?}",
-                        t.type_.len()
+                        tys.len()
                     )))
                 }
             };
-            if vals.len() != t.type_.len() {
+            if vals.len() != tys.len() {
                 return Err(bad(format!(
                     "case {key:?} of union {:?} expects {} value(s), got {}",
                     u.name,
-                    t.type_.len(),
+                    tys.len(),
                     vals.len()
                 )));
             }
             let mut items = vec![symbol(key)?];
-            for (el, et) in vals.iter().zip(t.type_.iter()) {
-                items.push(json_to_scval(el, et, arg, entries)?);
+            for (el, et) in vals.iter().zip(tys.iter()) {
+                items.push(json_to_scval(el, et, arg, spec)?);
             }
             Ok(ScVal::Vec(Some(ScVec(vecm(items, arg)?))))
         }
@@ -869,7 +878,7 @@ fn i256_parts(l: Limbs) -> Int256Parts {
 mod tests {
     use super::*;
     use stellar_xdr::curr::{
-        ScSpecFunctionInputV0, ScSpecFunctionV0, ScSpecTypeDef, ScSymbol, WriteXdr,
+        ScSpecEntry, ScSpecFunctionInputV0, ScSpecFunctionV0, ScSpecTypeDef, ScSymbol, WriteXdr,
     };
 
     // balance(id: Address) -> i128
