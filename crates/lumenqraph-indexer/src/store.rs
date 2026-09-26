@@ -574,4 +574,71 @@ mod tests {
         // Current behavior: stringifies entire map
         assert!(transfer.amount.contains("amount") || transfer.amount.contains("to_muxed_id"));
     }
+
+    // Issue #383: Poison-pill events with non-integer values must not abort ingestion
+    #[test]
+    fn transfer_with_numeric_token_id_should_stringify_not_panic() {
+        let e = event(
+            Some("transfer"),
+            vec![json!("transfer"), json!("GFROM"), json!("GTO")],
+            json!(0xDEADBEEF),
+        );
+        let t = extract_transfer(&e).expect("should handle numeric value");
+        assert_eq!(t.amount, "3735928559");
+    }
+
+    #[test]
+    fn transfer_with_vector_value_should_not_panic() {
+        let vector_value = json!(["item1", "item2", "item3"]);
+        let e = event(
+            Some("transfer"),
+            vec![json!("transfer"), json!("GFROM"), json!("GTO")],
+            vector_value,
+        );
+        let t = extract_transfer(&e);
+        assert!(t.is_some(), "should not panic on vector value");
+    }
+
+    #[test]
+    fn mint_with_struct_value_should_stringify() {
+        let struct_value = json!({
+            "field1": "value1",
+            "field2": 42,
+            "nested": {
+                "amount": "100"
+            }
+        });
+        let e = event(
+            Some("mint"),
+            vec![json!("mint"), json!("GRECIPIENT")],
+            struct_value,
+        );
+        let t = extract_transfer(&e);
+        assert!(t.is_some(), "should handle complex struct value");
+        assert!(t.unwrap().amount.contains("field") || t.unwrap().amount.contains("nested"));
+    }
+
+    #[test]
+    fn burn_with_null_value_should_handle() {
+        let e = event(
+            Some("burn"),
+            vec![json!("burn"), json!("GBURNER")],
+            json!(null),
+        );
+        let t = extract_transfer(&e);
+        assert!(t.is_some(), "should handle null value");
+        assert_eq!(t.unwrap().amount, "null");
+    }
+
+    #[test]
+    fn clawback_with_boolean_value_should_stringify() {
+        let e = event(
+            Some("clawback"),
+            vec![json!("clawback"), json!("GVICTIM")],
+            json!(true),
+        );
+        let t = extract_transfer(&e);
+        assert!(t.is_some(), "should handle boolean value");
+        assert_eq!(t.unwrap().amount, "true");
+    }
 }
