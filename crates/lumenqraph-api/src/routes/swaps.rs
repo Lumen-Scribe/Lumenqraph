@@ -5,12 +5,13 @@
 //! Supports both offset (deprecated for large result sets) and cursor
 //! pagination via `after=` (opaque cursor from a previous response).
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::Json;
 use lumenqraph_core::AmmSwap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ApiResult};
+use crate::extract::ValidContractId;
 use crate::pagination;
 use crate::state::AppState;
 
@@ -42,12 +43,9 @@ pub struct SwapsResponse {
 
 pub async fn list_swaps(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
     Query(q): Query<SwapsQuery>,
 ) -> ApiResult<Json<SwapsResponse>> {
-    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
-        return Err(ApiError::bad_request("invalid contract id"));
-    }
     let limit = q.limit.clamp(1, 1000);
 
     let swaps: Vec<AmmSwap> = if let Some(ref cursor) = q.after {

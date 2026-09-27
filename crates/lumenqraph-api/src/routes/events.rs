@@ -14,6 +14,7 @@ use lumenqraph_core::EventRow;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ApiResult};
+use crate::extract::ValidContractId;
 use crate::pagination;
 use crate::state::AppState;
 
@@ -65,12 +66,9 @@ pub struct EventsResponse {
 
 pub async fn list_events(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
     Query(q): Query<EventsQuery>,
 ) -> ApiResult<Json<EventsResponse>> {
-    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
-        return Err(ApiError::bad_request("invalid contract id"));
-    }
     let limit = q.limit.clamp(1, 1000);
 
     // Enforce maximum offset to prevent performance issues

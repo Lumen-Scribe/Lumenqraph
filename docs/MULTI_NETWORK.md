@@ -87,9 +87,11 @@ Rules:
 
 1. **Path prefix stripping**: `GET /testnet/contracts/:id/events` → proxied as `GET /contracts/:id/events` to the testnet instance
 2. **Header forwarding**: Most headers (auth, accept, user-agent) are forwarded; hop-by-hop headers (connection, keep-alive, host) are dropped
-3. **Auth delegation**: The mounted instance applies its own `REQUIRE_API_KEY` and rate limiting — the primary instance doesn't re-auth
-4. **Body size limits**: Request bodies are capped at 10MB (more than enough for GraphQL queries or webhook subscriptions)
-5. **Error handling**: If the mounted instance is unreachable, returns `502 Bad Gateway`
+3. **Auth delegation**: The mounted instance applies its own `REQUIRE_API_KEY` and per-key rate limiting — the primary instance doesn't re-auth
+4. **Client IP forwarding**: The primary appends the caller's IP to `X-Forwarded-For`. Set `RATE_LIMIT_TRUST_XFF=true` on mounted instances so they trust exactly one hop (the right-most entry) and rate limit per real client instead of per proxy
+5. **Per-IP limits at the primary**: Mounted routes go through the primary's per-IP concurrency cap (`MAX_CONCURRENT_PER_IP`) and rate limit (`PROXY_RATE_LIMIT_PER_MIN`)
+6. **Size limits**: Request bodies are capped at 10MB; upstream responses at `PROXY_MAX_RESPONSE_BYTES` (larger → `502`)
+7. **Error handling**: Unreachable upstream → `502 Bad Gateway`; no response within `PROXY_TIMEOUT_SECS` → `504 Gateway Timeout`
 
 ## Deployment Patterns
 

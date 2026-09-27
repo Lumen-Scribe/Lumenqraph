@@ -16,31 +16,19 @@ use serde_json::Value;
 use sqlx::types::Json as SqlxJson;
 use sqlx::PgPool;
 
+use crate::config::GraphqlConfig;
 use crate::pagination::{self, decode_cursor};
 
 pub type AppSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;
 
 /// Build the schema, injecting the shared connection pool as context data.
-pub fn build_schema(pool: PgPool) -> AppSchema {
-    let max_depth = std::env::var("GRAPHQL_MAX_DEPTH")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(12);
-    let max_complexity = std::env::var("GRAPHQL_MAX_COMPLEXITY")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1000);
-    let introspection_enabled = std::env::var("GRAPHQL_INTROSPECTION_ENABLED")
-        .ok()
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
-
+pub fn build_schema(pool: PgPool, config: &GraphqlConfig) -> AppSchema {
     let mut schema_builder = Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
         .data(pool)
-        .limit_depth(max_depth)
-        .limit_complexity(max_complexity);
+        .limit_depth(config.max_depth)
+        .limit_complexity(config.max_complexity);
 
-    if !introspection_enabled {
+    if !config.introspection_enabled {
         schema_builder = schema_builder.disable_introspection();
     }
 

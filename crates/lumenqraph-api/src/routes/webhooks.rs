@@ -17,27 +17,14 @@ use crate::state::AppState;
 use crate::url_validation;
 
 /// Default retention window (in days) for delivered/failed `webhook_deliveries`
-/// rows. Overridable via `WEBHOOK_DELIVERY_RETENTION_DAYS`; `0` disables pruning.
+/// rows. Overridable via `WEBHOOK_DELIVERY_RETENTION_DAYS` (parsed once into
+/// `ApiConfig`); `0` disables pruning.
 pub const DEFAULT_WEBHOOK_DELIVERY_RETENTION_DAYS: i64 = 14;
 
 /// How often the background pruner runs. Slow on purpose: pruning is a
 /// housekeeping task, not a latency-sensitive path.
 const WEBHOOK_DELIVERY_PRUNE_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(10 * 60);
-
-/// Resolve the configured retention window. Returns `None` when pruning is
-/// disabled (`WEBHOOK_DELIVERY_RETENTION_DAYS=0`).
-fn webhook_delivery_retention_days() -> Option<i64> {
-    let days = std::env::var("WEBHOOK_DELIVERY_RETENTION_DAYS")
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(DEFAULT_WEBHOOK_DELIVERY_RETENTION_DAYS);
-    if days <= 0 {
-        None
-    } else {
-        Some(days)
-    }
-}
 
 /// Delete delivered/failed `webhook_deliveries` rows older than `retention_days`
 /// in batches. `pending` rows are never touched. Returns the number of rows
@@ -74,11 +61,11 @@ pub async fn prune_webhook_deliveries(pool: &PgPool, retention_days: i64) -> Res
 /// Spawn the slow background loop that prunes old webhook deliveries. The
 /// webhooks service owns `webhook_deliveries`, so pruning lives here rather
 /// than in the indexer.
-pub fn spawn_webhook_delivery_pruner(pool: PgPool) {
-    let Some(retention_days) = webhook_delivery_retention_days() else {
+pub fn spawn_webhook_delivery_pruner(pool: PgPool, retention_days: i64) {
+    if retention_days <= 0 {
         tracing::info!("webhook delivery pruning disabled (WEBHOOK_DELIVERY_RETENTION_DAYS=0)");
         return;
-    };
+    }
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(WEBHOOK_DELIVERY_PRUNE_INTERVAL);
         // Skip the immediate first tick so startup isn't blocked on a big delete.
@@ -197,8 +184,13 @@ pub async fn create_webhook(
         0
     };
 
-    let encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY")
-        .unwrap_or_else(|_| "default-key-for-testing".to_string());
+    // Read once at startup (#441); an unset key keeps the legacy test fallback
+    // and is warned about in `main`.
+    let encryption_key = state
+        .config
+        .webhook_encryption_key
+        .as_deref()
+        .unwrap_or("default-key-for-testing");
 
     let sub: WebhookSubscription = sqlx::query_as(
         "INSERT INTO webhook_subscriptions (url, kind, contract_id, event_name, encrypted_secret, starting_seq)
@@ -210,7 +202,7 @@ pub async fn create_webhook(
     .bind(&body.contract_id)
     .bind(&body.event_name)
     .bind(&secret)
-    .bind(&encryption_key)
+    .bind(encryption_key)
     .bind(starting_seq)
     .fetch_one(&state.pool)
     .await?;

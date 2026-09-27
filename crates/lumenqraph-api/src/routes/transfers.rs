@@ -6,12 +6,13 @@
 //! For large result sets, cursor pagination is strongly recommended as it has
 //! constant-time per-page performance, whereas offset pagination degrades linearly.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::Json;
 use lumenqraph_core::TokenTransfer;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ApiResult};
+use crate::extract::ValidContractId;
 use crate::pagination;
 use crate::state::AppState;
 
@@ -43,12 +44,9 @@ pub struct TransfersResponse {
 
 pub async fn list_transfers(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
     Query(q): Query<TransfersQuery>,
 ) -> ApiResult<Json<TransfersResponse>> {
-    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
-        return Err(ApiError::bad_request("invalid contract id"));
-    }
     let limit = q.limit.clamp(1, 1000);
 
     // If cursor is provided, use keyset pagination; otherwise fall back to offset.

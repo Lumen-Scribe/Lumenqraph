@@ -4,7 +4,7 @@
 //! Clients connect to the stream and receive new events via SSE, with cursor-based
 //! resume functionality to tail from a specific event sequence number.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::response::sse::{Event, Sse};
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,8 @@ use std::time::Duration;
 use tokio::time::{interval, sleep};
 use tracing::info;
 
-use crate::error::{ApiError, ApiResult};
+use crate::error::ApiResult;
+use crate::extract::ValidContractId;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -43,7 +44,7 @@ struct StreamEvent {
 
 pub async fn stream_events(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
     Query(q): Query<StreamQuery>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     // Validate poll interval (min 1 second, max 60 seconds)

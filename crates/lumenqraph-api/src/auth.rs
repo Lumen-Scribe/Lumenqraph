@@ -97,22 +97,24 @@ mod tests {
     }
 }
 
-/// Extract the client IP address, respecting X-Forwarded-For headers only when
-/// behind a trusted proxy (controlled by RATE_LIMIT_TRUST_XFF environment variable).
-fn extract_client_ip(headers: &HeaderMap, socket_addr: Option<SocketAddr>) -> String {
-    let trust_xff = std::env::var("RATE_LIMIT_TRUST_XFF")
-        .ok()
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
-
+/// Extract the client IP address. `X-Forwarded-For` / `Forwarded` are honoured
+/// only when `trust_xff` (`RATE_LIMIT_TRUST_XFF`) is set, i.e. behind exactly
+/// one trusted proxy — and then only their right-most entry is used: that is
+/// the address the trusted proxy appended, whereas everything to its left is
+/// client-supplied and freely spoofable (#442).
+pub(crate) fn extract_client_ip(
+    headers: &HeaderMap,
+    socket_addr: Option<SocketAddr>,
+    trust_xff: bool,
+) -> String {
     if trust_xff {
         if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            if let Some(ip) = xff.split(',').next().map(|s| s.trim()) {
+            if let Some(ip) = xff.rsplit(',').next().map(|s| s.trim()).filter(|s| !s.is_empty()) {
                 return ip.to_string();
             }
         }
         if let Some(forwarded) = headers.get("forwarded").and_then(|v| v.to_str().ok()) {
-            if let Some(start) = forwarded.find("for=") {
+            if let Some(start) = forwarded.rfind("for=") {
                 let rest = &forwarded[start + 4..];
                 if let Some(end) = rest.find([';', ',']) {
                     return rest[..end].trim_matches('"').to_string();
@@ -189,7 +191,7 @@ pub async fn auth_and_rate_limit(
             if state.require_auth {
                 return Err(ApiError::unauthorized("missing API key"));
             }
-            let client_ip = extract_client_ip(&headers, Some(socket_addr));
+            let client_ip = extract_client_ip(&headers, Some(socket_addr), state.config.trust_xff);
             (format!("anon:{client_ip}"), state.anon_rate_limit, false)
         }
     };
@@ -341,7 +343,7 @@ pub async fn webhook_auth_and_rate_limit(
             if state.require_auth {
                 return Err(ApiError::unauthorized("missing API key"));
             }
-            let client_ip = extract_client_ip(&headers, Some(socket_addr));
+            let client_ip = extract_client_ip(&headers, Some(socket_addr), state.config.trust_xff);
             (format!("anon:{client_ip}"), state.webhook_anon_rate_limit, false)
         }
     };
@@ -394,7 +396,7 @@ pub async fn concurrency_limit(
     mut req: Request,
     next: Next,
 ) -> Response {
-    let client_ip = extract_client_ip(&headers, Some(socket_addr));
+    let client_ip = extract_client_ip(&headers, Some(socket_addr), state.config.trust_xff);
     let status = state.concurrency_limiter.acquire(&client_ip, state.max_concurrent_per_ip);
 
     if !status.allowed {
@@ -417,6 +419,35 @@ pub async fn concurrency_limit(
     state.concurrency_limiter.release(&client_ip);
 
     response
+}
+
+/// Per-client-IP rate limiting for sibling-instance mounts (#442).
+///
+/// API keys belong to the mounted upstream, not to this instance, so every
+/// caller is limited by IP here; the upstream still applies its own auth and
+/// per-key limits. The resolved IP is handed to the proxy handler, which
+/// appends it to `X-Forwarded-For` so the upstream sees the real client
+/// rather than this proxy's single address.
+pub async fn proxy_rate_limit(
+    State(state): State<AppState>,
+    ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    mut req: Request,
+    next: Next,
+) -> ApiResult<Response> {
+    state.http_requests.fetch_add(1, Ordering::Relaxed);
+
+    let client_ip = extract_client_ip(&headers, Some(socket_addr), state.config.trust_xff);
+    let rl_status = state
+        .proxy_limiter
+        .check(&format!("proxy:{client_ip}"), state.config.proxy.rate_limit_per_min);
+    if !rl_status.allowed {
+        return Err(ApiError::too_many_requests(rl_status.retry_after_secs));
+    }
+
+    req.extensions_mut()
+        .insert(crate::routes::proxy::ClientIp(client_ip));
+    Ok(next.run(req).await)
 }
 
 // ---- HTTP-level integration tests ----------------------------------------
@@ -505,6 +536,8 @@ mod integration_tests {
             webhook_limiter: Arc::new(RateLimiter::new()),
             webhook_anon_rate_limit: 10,
             webhook_max_subscriptions: 100,
+            proxy_limiter: Arc::new(RateLimiter::new()),
+            config: Arc::new(crate::config::ApiConfig::test_default()),
         }
     }
 

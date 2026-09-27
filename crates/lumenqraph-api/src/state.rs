@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use crate::audit::AuditEvent;
 use crate::call_cache::CallCache;
 use crate::concurrency_limit::ConcurrencyLimiter;
+use crate::config::ApiConfig;
 use crate::metrics_middleware::MetricsCollector;
 use crate::rate_limit::RateLimiter;
 use crate::read_cost_limit::ReadCostLimitConfig;
@@ -71,6 +72,11 @@ pub struct AppState {
     pub audit_tx: Option<mpsc::Sender<AuditEvent>>,
     /// Count of audit events dropped because the channel was full (#367).
     pub audit_dropped: Arc<AtomicU64>,
+    /// Per-client-IP rate limiter for sibling-instance mounts (#442).
+    pub proxy_limiter: Arc<RateLimiter>,
+    /// Typed configuration, parsed once at startup (#441). Handlers and
+    /// middleware read settings from here, never from the environment.
+    pub config: Arc<ApiConfig>,
 }
 
 pub struct BuildInfo {

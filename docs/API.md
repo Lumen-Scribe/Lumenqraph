@@ -23,6 +23,7 @@ stable and will not be renamed or removed.
 | Code                | HTTP status | When                                                                  |
 |---------------------|-------------|-----------------------------------------------------------------------|
 | `bad_request`       | 400         | Malformed input, invalid parameter value, or wrong argument type.    |
+| `invalid_contract_id` | 400       | The `:contract_id` path segment is not a valid `C…` contract strkey. |
 | `unauthorized`      | 401         | Missing, invalid, or revoked API key.                                 |
 | `not_found`         | 404         | The requested resource does not exist.                                |
 | `rate_limited`      | 429         | Caller exceeded the requests-per-minute limit.                        |

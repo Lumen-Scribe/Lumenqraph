@@ -4,12 +4,13 @@
 //!
 //! Supports both offset and cursor pagination via `after=`.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::Json;
 use lumenqraph_core::LiquidityEvent;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ApiResult};
+use crate::extract::ValidContractId;
 use crate::pagination;
 use crate::state::AppState;
 
@@ -41,12 +42,9 @@ pub struct LiquidityResponse {
 
 pub async fn list_liquidity_events(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
     Query(q): Query<LiquidityQuery>,
 ) -> ApiResult<Json<LiquidityResponse>> {
-    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
-        return Err(ApiError::bad_request("invalid contract id"));
-    }
     // Validate kind filter early.
     if let Some(ref kind) = q.kind {
         if !matches!(kind.as_str(), "add" | "remove") {

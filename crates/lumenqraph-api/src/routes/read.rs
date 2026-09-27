@@ -9,7 +9,7 @@
 //! Argument encoding is driven by the contract's on-chain spec (captured at
 //! index time), so calls are type-checked before they ever hit the network.
 
-use axum::extract::{Path, State};
+use axum::extract::{State};
 use axum::http::StatusCode;
 use axum::Json;
 use lumenqraph_core::read::{self, EncodeError};
@@ -17,17 +17,15 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::{ApiError, ApiResult};
+use crate::extract::ValidContractId;
 use crate::read_cost_limit::validate_call_request;
 use crate::rpc::SimOutcome;
 use crate::state::AppState;
 
 pub async fn list_functions(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
 ) -> ApiResult<Json<Value>> {
-    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
-        return Err(ApiError::bad_request("invalid contract id"));
-    }
     let spec = state.specs.current(&state.pool, &contract_id).await?;
     // List from the cached parse rather than re-reading and re-parsing the
     // stored section on every request.
@@ -56,12 +54,9 @@ pub struct CallRequest {
 
 pub async fn call_function(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
     Json(req): Json<CallRequest>,
 ) -> ApiResult<Json<Value>> {
-    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
-        return Err(ApiError::bad_request("invalid contract id"));
-    }
 
     // Estimate request body size (function name + args serialization)
     let estimated_body_size = req.function.len() + serde_json::to_string(&req.args)
@@ -135,12 +130,9 @@ pub async fn call_function(
 /// submitted. Soroban's answer to Tenderly's transaction preview.
 pub async fn simulate_call(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
     Json(req): Json<CallRequest>,
 ) -> ApiResult<Json<Value>> {
-    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
-        return Err(ApiError::bad_request("invalid contract id"));
-    }
 
     // Estimate request body size (function name + args serialization)
     let estimated_body_size = req.function.len() + serde_json::to_string(&req.args)
@@ -322,6 +314,8 @@ mod tests {
             readyz_max_age_secs: 120,
             health_max_lag_ledgers: 100,
             health_max_stale_secs: 120,
+            proxy_limiter: Arc::new(RateLimiter::new()),
+            config: Arc::new(crate::config::ApiConfig::test_default()),
         }
     }
 
