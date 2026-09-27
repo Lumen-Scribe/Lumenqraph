@@ -379,6 +379,107 @@ components:
         error:
           type: string
 
+    # ---- pagination (#445) ----
+    PageMeta:
+      type: object
+      required: [has_more, next_cursor]
+      properties:
+        has_more:
+          type: boolean
+          description: Whether more rows are available after this page.
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor to pass as `after` for the next page. Null on the last page.
+
+    EventsPage:
+      allOf:
+        - $ref: "#/components/schemas/PageMeta"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items:
+                $ref: "#/components/schemas/EventRecord"
+
+    TransfersPage:
+      allOf:
+        - $ref: "#/components/schemas/PageMeta"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items:
+                $ref: "#/components/schemas/Transfer"
+
+    MaterializedPage:
+      description: Page of materialized swap, NFT or liquidity rows.
+      allOf:
+        - $ref: "#/components/schemas/PageMeta"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+
+    WebhookDelivery:
+      type: object
+      required: [id, status, attempts, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        status:
+          type: string
+          enum: [pending, delivered, failed]
+        attempts:
+          type: integer
+        last_error:
+          type: string
+          nullable: true
+        delivered_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+    DeliverySummary:
+      type: object
+      required: [total, delivered, failed, pending]
+      properties:
+        total:
+          type: integer
+          format: int64
+        delivered:
+          type: integer
+          format: int64
+        failed:
+          type: integer
+          format: int64
+        pending:
+          type: integer
+          format: int64
+
+    DeliveriesPage:
+      allOf:
+        - $ref: "#/components/schemas/PageMeta"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: array
+              items:
+                $ref: "#/components/schemas/WebhookDelivery"
+            summary:
+              $ref: "#/components/schemas/DeliverySummary"
+
   # ---- reusable parameters ----
   parameters:
     ContractId:
@@ -407,10 +508,22 @@ components:
     Offset:
       name: offset
       in: query
+      deprecated: true
       schema:
         type: integer
         minimum: 0
-      description: Number of results to skip (pagination).
+        maximum: 10000
+      description: |
+        Deprecated: number of results to skip. Capped at 10000 (400 above
+        that). Responses to offset requests carry `Deprecation: true` and
+        `Warning` headers. Ignored when `after` is present. Use `after`.
+
+    After:
+      name: after
+      in: query
+      schema:
+        type: string
+      description: Opaque keyset cursor; the `next_cursor` of the previous page.
 
   # ---- reusable responses ----
   responses:
@@ -430,6 +543,13 @@ components:
 
     TooManyRequests:
       description: Rate limit exceeded.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+    BadRequest:
+      description: Invalid parameter (e.g. malformed cursor or offset above the cap).
       content:
         application/json:
           schema:
@@ -628,6 +748,7 @@ paths:
         - $ref: "#/components/parameters/ContractId"
         - $ref: "#/components/parameters/Limit"
         - $ref: "#/components/parameters/Offset"
+        - $ref: "#/components/parameters/After"
         - name: event_name
           in: query
           schema:
@@ -639,9 +760,9 @@ paths:
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/EventRecord"
+                $ref: "#/components/schemas/EventsPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
 
   /contracts/{contract_id}/transfers:
     get:
@@ -652,15 +773,133 @@ paths:
         - $ref: "#/components/parameters/ContractId"
         - $ref: "#/components/parameters/Limit"
         - $ref: "#/components/parameters/Offset"
+        - $ref: "#/components/parameters/After"
+        - name: from
+          in: query
+          schema:
+            type: string
+          description: Filter by sender address.
+        - name: to
+          in: query
+          schema:
+            type: string
+          description: Filter by recipient address.
       responses:
         "200":
           description: OK
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/Transfer"
+                $ref: "#/components/schemas/TransfersPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /contracts/{contract_id}/swaps:
+    get:
+      operationId: listContractSwaps
+      summary: Materialized AMM swaps, newest first.
+      tags: [transfers]
+      parameters:
+        - $ref: "#/components/parameters/ContractId"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+        - $ref: "#/components/parameters/After"
+        - name: sender
+          in: query
+          schema:
+            type: string
+          description: Filter by sender address.
+        - name: sell_token
+          in: query
+          schema:
+            type: string
+          description: Filter by sold token.
+        - name: buy_token
+          in: query
+          schema:
+            type: string
+          description: Filter by bought token.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MaterializedPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /contracts/{contract_id}/nfts:
+    get:
+      operationId: listContractNftEvents
+      summary: Materialized NFT mint/transfer/burn events, newest first.
+      tags: [transfers]
+      parameters:
+        - $ref: "#/components/parameters/ContractId"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+        - $ref: "#/components/parameters/After"
+        - name: kind
+          in: query
+          schema:
+            type: string
+            enum: [mint, transfer, burn]
+          description: Filter by event kind.
+        - name: from
+          in: query
+          schema:
+            type: string
+          description: Filter by sender address.
+        - name: to
+          in: query
+          schema:
+            type: string
+          description: Filter by recipient address.
+        - name: token_id
+          in: query
+          schema:
+            type: string
+          description: Filter by token id.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MaterializedPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /contracts/{contract_id}/liquidity:
+    get:
+      operationId: listContractLiquidityEvents
+      summary: Materialized liquidity add/remove events, newest first.
+      tags: [transfers]
+      parameters:
+        - $ref: "#/components/parameters/ContractId"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+        - $ref: "#/components/parameters/After"
+        - name: kind
+          in: query
+          schema:
+            type: string
+            enum: [add, remove]
+          description: Filter by event kind.
+        - name: provider
+          in: query
+          schema:
+            type: string
+          description: Filter by liquidity provider.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MaterializedPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
 
   /contracts/{contract_id}/call:
     post:
@@ -763,6 +1002,39 @@ paths:
       responses:
         "204":
           description: Deleted.
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /webhooks/{id}/deliveries:
+    get:
+      operationId: listWebhookDeliveries
+      summary: Delivery attempts for a subscription, newest first (keyset on delivery id).
+      tags: [webhooks]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+        - $ref: "#/components/parameters/After"
+        - name: include_summary
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Include per-status counts (runs an aggregate over all deliveries).
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeliveriesPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
 

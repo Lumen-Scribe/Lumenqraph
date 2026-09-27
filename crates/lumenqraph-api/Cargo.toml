@@ -42,3 +42,8 @@ stellar-xdr.workspace = true
 
 [dev-dependencies]
 tower.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "rate_limit"
+harness = false

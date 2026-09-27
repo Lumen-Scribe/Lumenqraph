@@ -12,14 +12,22 @@
 //! - In-memory (default): per-instance limits, fine for single-replica deploys
 //! - Redis: global limits enforced across all replicas
 
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::hash::BuildHasher;
+use std::num::NonZeroUsize;
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-/// Above this many tracked identities we drop stale entries.
-/// Stale entries can never permit more than the limit anyway, so evicting them
-/// is safe and keeps memory bounded on a long-running instance.
+use lru::LruCache;
+
+/// Upper bound on identities tracked by the in-memory backend. When full, the
+/// least-recently-seen identity is evicted in O(1). An evicted identity just
+/// starts again with a full bucket, which is the state it would have refilled
+/// to anyway once it had been idle for a minute.
 const MAX_TRACKED_IDENTITIES: usize = 100_000;
+
+/// Number of independently locked shards. Requests for different identities
+/// contend only when they hash to the same shard.
+const SHARDS: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct RateLimitStatus {
@@ -31,7 +39,9 @@ pub struct RateLimitStatus {
 #[derive(Debug, Clone)]
 struct TokenBucketState {
     tokens: f64,
-    last_refill_secs: f64,
+    /// Monotonic timestamp of the last refill. `Instant` never goes backwards,
+    /// so NTP steps or VM clock jumps cannot drain or instantly refill a bucket.
+    last_refill: Instant,
 }
 
 /// Trait abstracting rate limit storage backends
@@ -39,15 +49,56 @@ pub trait RateLimitBackend: Send + Sync {
     fn check(&self, identity: &str, limit_per_min: i32) -> RateLimitStatus;
 }
 
-/// In-memory backend: per-instance limits
-#[derive(Default)]
+/// In-memory backend: per-instance limits.
+///
+/// Buckets live in [`SHARDS`] mutex-protected LRU maps selected by a randomly
+/// seeded hash of the identity, so there is no global lock and a flood of
+/// unique identities costs O(1) per request (one LRU eviction) instead of a
+/// full sweep of the map.
 pub struct MemoryBackend {
-    buckets: Mutex<HashMap<String, TokenBucketState>>,
+    shards: Box<[Mutex<LruCache<String, TokenBucketState>>]>,
+    hasher: std::collections::hash_map::RandomState,
+}
+
+impl Default for MemoryBackend {
+    fn default() -> Self {
+        Self::with_capacity(MAX_TRACKED_IDENTITIES)
+    }
 }
 
 impl MemoryBackend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Backend tracking at most roughly `capacity` identities in total.
+    pub fn with_capacity(capacity: usize) -> Self {
+        let per_shard = NonZeroUsize::new(capacity.div_ceil(SHARDS).max(1)).expect("non-zero");
+        let shards = (0..SHARDS)
+            .map(|_| Mutex::new(LruCache::new(per_shard)))
+            .collect();
+        Self {
+            shards,
+            hasher: Default::default(),
+        }
+    }
+
+    fn shard(&self, identity: &str) -> MutexGuard<'_, LruCache<String, TokenBucketState>> {
+        let idx = (self.hasher.hash_one(identity) as usize) % self.shards.len();
+        // A panic while holding the lock cannot leave a bucket half-updated in a
+        // way that matters, so recover from poisoning instead of failing forever.
+        self.shards[idx]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Number of identities currently tracked (all shards).
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| s.lock().unwrap_or_else(|p| p.into_inner()).len())
+            .sum()
     }
 }
 
@@ -61,32 +112,28 @@ impl RateLimitBackend for MemoryBackend {
             };
         }
 
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
-
+        let now = Instant::now();
         let tokens_per_sec = limit_per_min as f64 / 60.0;
-        let mut buckets = self.buckets.lock().unwrap();
+        let mut shard = self.shard(identity);
 
-        // Bound memory: prune stale entries if map is too large.
-        if buckets.len() >= MAX_TRACKED_IDENTITIES {
-            let cutoff = now_secs - 60.0;
-            buckets.retain(|_, state| state.last_refill_secs > cutoff);
+        // `get_mut` promotes the entry to most-recently-used; `push` of a new
+        // identity into a full shard evicts the least-recently-used one (O(1)).
+        if !shard.contains(identity) {
+            shard.push(
+                identity.to_string(),
+                TokenBucketState {
+                    tokens: limit_per_min as f64,
+                    last_refill: now,
+                },
+            );
         }
+        let bucket = shard.get_mut(identity).expect("present: just checked or inserted");
 
-        let bucket = buckets
-            .entry(identity.to_string())
-            .or_insert_with(|| TokenBucketState {
-                tokens: limit_per_min as f64,
-                last_refill_secs: now_secs,
-            });
-
-        // Refill tokens based on elapsed time.
-        let elapsed = now_secs - bucket.last_refill_secs;
+        // Refill tokens based on elapsed monotonic time (never negative).
+        let elapsed = now.saturating_duration_since(bucket.last_refill).as_secs_f64();
         let refilled = elapsed * tokens_per_sec;
         bucket.tokens = (bucket.tokens + refilled).min(limit_per_min as f64);
-        bucket.last_refill_secs = now_secs;
+        bucket.last_refill = now;
 
         if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;
@@ -327,5 +374,26 @@ mod tests {
         assert!(status.retry_after_secs.is_some());
         let retry = status.retry_after_secs.unwrap();
         assert!(retry > 50 && retry <= 61, "retry_after should be ~60s, got {retry}s");
+    }
+
+    #[test]
+    fn identity_map_stays_bounded_under_unique_identity_flood() {
+        let backend = MemoryBackend::with_capacity(1_000);
+        for i in 0..10_000 {
+            assert!(backend.check(&format!("flood-{i}"), 60).allowed);
+        }
+        let per_shard = 1_000usize.div_ceil(SHARDS);
+        assert!(backend.tracked() <= per_shard * SHARDS);
+    }
+
+    #[test]
+    fn recently_used_identity_survives_eviction() {
+        let backend = MemoryBackend::with_capacity(SHARDS * 4);
+        assert!(backend.check("hot", 1).allowed);
+        for i in 0..(SHARDS * 16) {
+            backend.check(&format!("cold-{i}"), 60);
+            // Touch "hot" so it stays most-recently-used in its shard.
+            assert!(!backend.check("hot", 1).allowed, "hot bucket was evicted at {i}");
+        }
     }
 }

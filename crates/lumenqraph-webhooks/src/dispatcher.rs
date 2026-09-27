@@ -378,9 +378,40 @@ async fn send(http: &reqwest::Client, d: &DueDelivery, config: &Config) -> anyho
         .await
         .context("request failed")?;
 
-    let status = resp.status();
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok());
+    delivery_outcome(resp.status(), location)
+}
+
+/// Build the HTTP client used for webhook deliveries.
+///
+/// Redirects are never followed: `validate_webhook_url_at_delivery` only vets
+/// the subscriber's URL, so following a `3xx` would let a subscriber bounce a
+/// signed request to an internal address (cloud metadata, databases, ...).
+pub fn build_delivery_client(
+    connect_timeout: std::time::Duration,
+    total_timeout: std::time::Duration,
+) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(total_timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
+/// Map a delivery response to success/failure. Only `2xx` counts as delivered;
+/// a `3xx` is a failure because redirects are not followed.
+fn delivery_outcome(status: reqwest::StatusCode, location: Option<&str>) -> anyhow::Result<()> {
     if status.is_success() {
         Ok(())
+    } else if status.is_redirection() {
+        Err(anyhow::anyhow!(
+            "redirects are not followed: endpoint returned {} (Location: {})",
+            status,
+            location.unwrap_or("<none>")
+        ))
     } else {
         Err(anyhow::anyhow!("non-2xx status {}", status))
     }
@@ -731,5 +762,93 @@ mod tests {
             format!("sha256={computed_hex}"),
             format!("sha256={expected_hex}")
         );
+    }
+}
+#[cfg(test)]
+mod redirect_tests {
+    //! Regression tests for #447: a subscriber answering `302 Location:
+    //! <internal address>` must not make the dispatcher contact that address.
+    //! No database needed.
+
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration as StdDuration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn redirect_to_internal_target_is_not_followed() {
+        // Stand-in for an internal service (e.g. 169.254.169.254): counts hits.
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = target.accept().await {
+                hits_srv.fetch_add(1, Ordering::SeqCst);
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+
+        // Subscriber endpoint that always redirects to the internal target.
+        let hook = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hook_addr = hook.local_addr().unwrap();
+        let location = format!("http://{target_addr}/latest/meta-data/");
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = hook.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let http = build_delivery_client(StdDuration::from_secs(2), StdDuration::from_secs(5))
+            .expect("client");
+        let resp = http
+            .post(format!("http://{hook_addr}/hook"))
+            .header("Content-Type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("request to hook");
+
+        assert_eq!(resp.status(), reqwest::StatusCode::FOUND);
+        let loc = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let err = delivery_outcome(resp.status(), loc.as_deref()).unwrap_err();
+        assert!(
+            err.to_string().contains("redirects are not followed"),
+            "unexpected error: {err}"
+        );
+
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "redirect target was contacted");
+    }
+
+    #[test]
+    fn redirect_statuses_are_failures_with_clear_error() {
+        for code in [301u16, 302, 303, 307, 308] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            let err = delivery_outcome(status, Some("http://10.0.0.5:5432/")).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("redirects are not followed"), "{code}: {msg}");
+            assert!(msg.contains("http://10.0.0.5:5432/"), "{code}: {msg}");
+        }
+    }
+
+    #[test]
+    fn success_and_other_errors_unchanged() {
+        assert!(delivery_outcome(reqwest::StatusCode::OK, None).is_ok());
+        assert!(delivery_outcome(reqwest::StatusCode::NO_CONTENT, None).is_ok());
+        let err = delivery_outcome(reqwest::StatusCode::INTERNAL_SERVER_ERROR, None).unwrap_err();
+        assert!(err.to_string().contains("non-2xx status"));
     }
 }
