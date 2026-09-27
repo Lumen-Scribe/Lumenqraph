@@ -6,7 +6,7 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
-use axum::response::sse::{Event, Sse};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -72,21 +72,26 @@ pub async fn stream_events(
     // Validate poll interval (min 1 second, max 60 seconds)
     let poll_secs = q.poll_interval.clamp(1, 60);
 
-    // Resume cursor precedence: explicit query params, then `Last-Event-ID`.
-    let initial_cursor = match (q.cursor, q.cursor_event_id.clone()) {
-        (Some(ledger), Some(event_id)) => Cursor { ledger, event_id },
-        (Some(ledger), None) => Cursor {
-            ledger,
-            event_id: String::new(),
-        },
-        _ => headers
-            .get("last-event-id")
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_last_event_id)
-            .unwrap_or(Cursor {
-                ledger: 0,
+    // Resume cursor precedence: the standard `Last-Event-ID` header (sent
+    // automatically by `EventSource` on reconnect) takes priority over the
+    // explicit `?cursor` query params. When neither is present, start from the
+    // current head so a fresh stream tails new events instead of replaying the
+    // entire history from ledger 0.
+    let initial_cursor = if let Some(cursor) = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_last_event_id)
+    {
+        cursor
+    } else {
+        match (q.cursor, q.cursor_event_id.clone()) {
+            (Some(ledger), Some(event_id)) => Cursor { ledger, event_id },
+            (Some(ledger), None) => Cursor {
+                ledger,
                 event_id: String::new(),
-            }),
+            },
+            _ => current_head(&state, &contract_id).await?,
+        }
     };
 
     info!(
@@ -147,7 +152,31 @@ pub async fn stream_events(
         },
     );
 
-    Ok(Sse::new(stream))
+    // Emit a keep-alive comment at least every 15 s so idle streams aren't
+    // closed by proxies/load balancers with 60–100 s idle timeouts.
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+}
+
+/// Resolve the current head of the event log for a contract, used as the
+/// starting cursor for a fresh stream with no resume position.
+async fn current_head(state: &AppState, contract_id: &str) -> ApiResult<Cursor> {
+    let row: Option<(i64, String)> = sqlx::query_as(
+        "SELECT ledger, event_id
+         FROM events
+         WHERE contract_id = $1
+         ORDER BY ledger DESC, event_id DESC
+         LIMIT 1",
+    )
+    .bind(contract_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    Ok(row
+        .map(|(ledger, event_id)| Cursor { ledger, event_id })
+        .unwrap_or(Cursor {
+            ledger: 0,
+            event_id: String::new(),
+        }))
 }
 
 async fn fetch_new_events(
