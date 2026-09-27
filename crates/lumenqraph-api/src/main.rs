@@ -240,6 +240,11 @@ async fn main() -> anyhow::Result<()> {
         health_max_lag_ledgers: env_parse("HEALTH_MAX_LAG_LEDGERS", 100i64),
         health_max_stale_secs: env_parse("HEALTH_MAX_STALE_SECS", 120i64),
         metrics_require_auth: env_bool("METRICS_REQUIRE_API_KEY", false),
+        audit_tx: None,
+        audit_dropped: Arc::new(AtomicU64::new(0)),
+        webhook_limiter: Arc::new(RateLimiter::new()),
+        webhook_anon_rate_limit: env_parse("WEBHOOK_ANON_RATE_LIMIT_PER_MIN", 10),
+        webhook_max_subscriptions: env_parse("WEBHOOK_MAX_SUBSCRIPTIONS", 0usize),
     };
 
     let cors_layer = build_cors_layer();

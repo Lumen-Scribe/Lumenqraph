@@ -301,13 +301,17 @@ pub async fn rpc_auth_and_rate_limit(
 }
 
 /// Middleware for webhook subscription creation (POST /webhooks).
+/// Middleware for webhook subscription creation (POST /webhooks).
 /// Uses a separate rate limiter with a lower limit for anonymous callers
 /// to prevent unbounded subscription creation.
+///
+/// Injects `CallerKeyHash` into request extensions when the caller is
+/// authenticated, so `create_webhook` can set `owner_key_hash` (#421).
 pub async fn webhook_auth_and_rate_limit(
     State(state): State<AppState>,
     ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> ApiResult<Response> {
     state.http_requests.fetch_add(1, Ordering::Relaxed);
@@ -316,7 +320,7 @@ pub async fn webhook_auth_and_rate_limit(
     let uri = req.uri().to_string();
     let route = uri.split('?').next().unwrap_or("").to_string();
 
-    let (identity, limit, is_authenticated) = match extract_key(&headers) {
+    let (identity, limit, is_authenticated, key_hash_opt) = match extract_key(&headers) {
         Some(key) => {
             let hash = hash_key(&key);
             let row: Option<(bool, i32)> = sqlx::query_as(
@@ -326,7 +330,7 @@ pub async fn webhook_auth_and_rate_limit(
             .fetch_optional(&state.pool)
             .await?;
             match row {
-                Some((false, limit)) => (format!("key:{hash}"), limit, true),
+                Some((false, limit)) => (format!("key:{hash}"), limit, true, Some(hash)),
                 Some((true, _)) => {
                     log_audit_event(&state.pool, &hash, &route, &method, 401).await;
                     return Err(ApiError::unauthorized("API key revoked"))
@@ -342,7 +346,7 @@ pub async fn webhook_auth_and_rate_limit(
                 return Err(ApiError::unauthorized("missing API key"));
             }
             let client_ip = extract_client_ip(&headers, Some(socket_addr));
-            (format!("anon:{client_ip}"), state.webhook_anon_rate_limit, false)
+            (format!("anon:{client_ip}"), state.webhook_anon_rate_limit, false, None)
         }
     };
 
@@ -374,6 +378,12 @@ pub async fn webhook_auth_and_rate_limit(
         return Ok(response);
     }
 
+    // Inject the authenticated caller's key hash so create_webhook can set
+    // owner_key_hash on the new subscription (#421).
+    if let Some(hash) = key_hash_opt {
+        req.extensions_mut().insert(CallerKeyHash(hash));
+    }
+
     let response = next.run(req).await;
     let status = response.status().as_u16();
 
@@ -384,6 +394,89 @@ pub async fn webhook_auth_and_rate_limit(
 
     Ok(response)
 }
+
+/// Middleware for webhook management routes (GET/DELETE/PATCH /webhooks and
+/// related sub-routes). **Always** requires a valid API key, regardless of the
+/// `REQUIRE_API_KEY` setting (#420).
+///
+/// The rationale: `REQUIRE_API_KEY=false` is a "public data reads are allowed"
+/// flag. It was never intended to allow anonymous callers to enumerate, delete,
+/// or hijack webhook subscriptions. Webhook management is inherently a
+/// privileged, mutating operation and must always be authenticated.
+///
+/// Injects the caller's SHA-256 key hash as an Axum extension
+/// (`CallerKeyHash`) so that webhook handlers can scope their queries to the
+/// authenticated key (#421).
+pub async fn webhook_manage_auth_and_rate_limit(
+    State(state): State<AppState>,
+    ConnectInfo(_socket_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    mut req: Request,
+    next: Next,
+) -> ApiResult<Response> {
+    state.http_requests.fetch_add(1, Ordering::Relaxed);
+
+    let method = req.method().to_string();
+    let uri = req.uri().to_string();
+    let route = uri.split('?').next().unwrap_or("").to_string();
+
+    // Webhook management routes ALWAYS require a valid API key.
+    // We intentionally do not check `state.require_auth` here — anonymous
+    // callers cannot list or modify webhook subscriptions on any deployment.
+    let key = extract_key(&headers).ok_or_else(|| ApiError::unauthorized(
+        "webhook management routes require an API key regardless of REQUIRE_API_KEY"
+    ))?;
+
+    let hash = hash_key(&key);
+    let row: Option<(bool, i32)> = sqlx::query_as(
+        "SELECT revoked, rate_limit_per_min FROM api_keys WHERE key_hash = $1",
+    )
+    .bind(&hash)
+    .fetch_optional(&state.pool)
+    .await?;
+    let limit = match row {
+        Some((false, limit)) => limit,
+        Some((true, _)) => {
+            log_audit_event(&state.pool, &hash, &route, &method, 401).await;
+            return Err(ApiError::unauthorized("API key revoked"));
+        }
+        None => {
+            log_audit_event(&state.pool, &hash, &route, &method, 401).await;
+            return Err(ApiError::unauthorized("invalid API key"));
+        }
+    };
+
+    let identity = format!("key:{hash}");
+    let rl_status = state.limiter.check(&identity, limit);
+    if !rl_status.allowed {
+        let mut response = (StatusCode::TOO_MANY_REQUESTS, crate::error::rate_limit_error()).into_response();
+        if let Some(retry_after) = rl_status.retry_after_secs {
+            response.headers_mut().insert(
+                "Retry-After",
+                retry_after.to_string().parse().unwrap_or_else(|_| "60".parse().unwrap()),
+            );
+        }
+        log_audit_event(&state.pool, &hash, &route, &method, 429).await;
+        return Ok(response);
+    }
+
+    // Inject the caller's key hash into request extensions so webhook handlers
+    // can scope their queries (#421). Handlers extract it with
+    // `Extension::<CallerKeyHash>`.
+    req.extensions_mut().insert(CallerKeyHash(hash.clone()));
+
+    let response = next.run(req).await;
+    let status = response.status().as_u16();
+    log_audit_event(&state.pool, &hash, &route, &method, status).await;
+
+    Ok(response)
+}
+
+/// The SHA-256 key hash of the authenticated caller, injected into request
+/// extensions by [`webhook_manage_auth_and_rate_limit`] for use by webhook
+/// handlers to scope queries (#421).
+#[derive(Clone)]
+pub struct CallerKeyHash(pub String);
 
 /// Per-IP concurrency limiter middleware. Rejects requests when a single IP
 /// has too many in-flight requests, preventing slowloris-style attacks.
@@ -502,6 +595,9 @@ mod integration_tests {
             readyz_max_age_secs: 120,
             health_max_lag_ledgers: 100,
             health_max_stale_secs: 120,
+            metrics_require_auth: false,
+            audit_tx: None,
+            audit_dropped: Arc::new(AtomicU64::new(0)),
             webhook_limiter: Arc::new(RateLimiter::new()),
             webhook_anon_rate_limit: 10,
             webhook_max_subscriptions: 100,

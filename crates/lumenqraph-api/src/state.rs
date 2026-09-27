@@ -71,6 +71,13 @@ pub struct AppState {
     pub audit_tx: Option<mpsc::Sender<AuditEvent>>,
     /// Count of audit events dropped because the channel was full (#367).
     pub audit_dropped: Arc<AtomicU64>,
+    /// Separate rate limiter for webhook creation (POST /webhooks). Lower
+    /// limits prevent subscription-spam from unauthenticated callers.
+    pub webhook_limiter: Arc<RateLimiter>,
+    /// Requests/min allowed for unauthenticated callers on webhook creation.
+    pub webhook_anon_rate_limit: i32,
+    /// Maximum total webhook subscriptions allowed. 0 = unlimited.
+    pub webhook_max_subscriptions: usize,
 }
 
 pub struct BuildInfo {
