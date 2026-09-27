@@ -19,6 +19,7 @@ pub mod read;
 pub mod sanitize;
 pub mod spec;
 pub mod url_validation;
+pub mod webhook;
 pub mod xdr;
 
 pub use diff::SpecDiff;
@@ -42,5 +43,6 @@ pub use models::{
     WebhookSubscriptionKind,
 };
 pub use spec::ContractSpec;
+pub use webhook::{ContractEventData, ContractUpgradeData, WebhookEnvelope};
 pub use xdr::is_valid_contract_id;
 pub use xdr::parse_contract_ids;
