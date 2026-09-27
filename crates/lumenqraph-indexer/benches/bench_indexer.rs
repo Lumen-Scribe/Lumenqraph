@@ -1,14 +1,14 @@
 //! Indexer pipeline micro-benchmarks.
 //!
-//! Three isolated phases are benchmarked independently so that each measured
-//! number reflects one component — never network latency, which would swamp
-//! every other signal:
+//! The phases are isolated so that each measured number reflects one component
+//! — never network latency, which would swamp every other signal:
 //!
-//! | Phase        | What is measured                               | I/O  |
-//! |--------------|------------------------------------------------|------|
-//! | `xdr_decode` | Base64 XDR → decoded JSON per event           | none |
-//! | `enrichment` | Spec-driven named/typed enrichment per event   | none |
-//! | `db_insert`  | UNNEST batch INSERT into Postgres             | DB   |
+//! | Phase                   | What is measured                                   | I/O  |
+//! |-------------------------|----------------------------------------------------|------|
+//! | `xdr_decode`            | Base64 XDR → decoded JSON per event               | none |
+//! | `enrichment`            | Spec-driven named/typed enrichment per event       | none |
+//! | `enrichment_nested_udt` | Enrichment of an event carrying a nested UDT       | none |
+//! | `db_insert`             | UNNEST batch INSERT into Postgres                  | DB   |
 //!
 //! The XDR decode and enrichment phases are pure-CPU: they use hard-coded
 //! sample data and never touch a network or database.  The db_insert phase
@@ -28,7 +28,11 @@ use chrono::Utc;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use lumenqraph_core::{xdr, ContractSpec, NewEvent};
 use serde_json::json;
-use stellar_xdr::curr::{Limits, ScSpecEntry, ScSpecTypeDef, ScSymbol, WriteXdr};
+use stellar_xdr::curr::{
+    Limits, ScSpecEntry, ScSpecEventDataFormat, ScSpecEventParamLocationV0, ScSpecEventParamV0,
+    ScSpecEventV0, ScSpecTypeDef, ScSpecTypeUdt, ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0,
+    ScSpecUdtStructFieldV0, ScSpecUdtStructV0, ScSymbol, WriteXdr,
+};
 
 // ── Synthetic test data ───────────────────────────────────────────────────────
 
@@ -175,6 +179,140 @@ fn bench_enrichment(c: &mut Criterion) {
                 });
             },
         );
+    }
+
+    group.finish();
+}
+
+// ── Phase 2b: Enrichment of a nested UDT ──────────────────────────────────────
+
+/// Build a spec for
+/// `event PositionChanged { pos: Position }` where
+/// `struct Position { status: Status, size: i128 }` and
+/// `enum Status { Active = 0, Filled = 7 }`.
+///
+/// `padding` unrelated UDTs are declared **before** the nested ones, mirroring a
+/// large contract (the README's Aquarius router has 75 functions plus many
+/// types). Before UDTs were indexed by name, naming one nested value cost a
+/// linear scan over every declared type — per value, recursively — so the
+/// padding is what makes the regression this phase guards measurable.
+fn nested_udt_spec(padding: usize) -> ContractSpec {
+    let mut entries: Vec<ScSpecEntry> = Vec::new();
+
+    for i in 0..padding {
+        let name = format!("Padding{i}");
+        entries.push(ScSpecEntry::UdtEnumV0(ScSpecUdtEnumV0 {
+            doc: "".try_into().unwrap(),
+            lib: "".try_into().unwrap(),
+            name: name.as_str().try_into().unwrap(),
+            cases: vec![ScSpecUdtEnumCaseV0 {
+                doc: "".try_into().unwrap(),
+                name: "Only".try_into().unwrap(),
+                value: 0,
+            }]
+            .try_into()
+            .unwrap(),
+        }));
+    }
+
+    let udt = |name: &str| {
+        ScSpecTypeDef::Udt(ScSpecTypeUdt {
+            name: name.try_into().unwrap(),
+        })
+    };
+
+    // enum Status { Active = 0, Filled = 7 }
+    entries.push(ScSpecEntry::UdtEnumV0(ScSpecUdtEnumV0 {
+        doc: "".try_into().unwrap(),
+        lib: "".try_into().unwrap(),
+        name: "Status".try_into().unwrap(),
+        cases: vec![
+            ScSpecUdtEnumCaseV0 {
+                doc: "".try_into().unwrap(),
+                name: "Active".try_into().unwrap(),
+                value: 0,
+            },
+            ScSpecUdtEnumCaseV0 {
+                doc: "".try_into().unwrap(),
+                name: "Filled".try_into().unwrap(),
+                value: 7,
+            },
+        ]
+        .try_into()
+        .unwrap(),
+    }));
+
+    // struct Position { status: Status, size: i128 }
+    entries.push(ScSpecEntry::UdtStructV0(ScSpecUdtStructV0 {
+        doc: "".try_into().unwrap(),
+        lib: "".try_into().unwrap(),
+        name: "Position".try_into().unwrap(),
+        fields: vec![
+            ScSpecUdtStructFieldV0 {
+                doc: "".try_into().unwrap(),
+                name: "status".try_into().unwrap(),
+                type_: udt("Status"),
+            },
+            ScSpecUdtStructFieldV0 {
+                doc: "".try_into().unwrap(),
+                name: "size".try_into().unwrap(),
+                type_: ScSpecTypeDef::I128,
+            },
+        ]
+        .try_into()
+        .unwrap(),
+    }));
+
+    // event PositionChanged { pos: Position } — single-value data.
+    entries.push(ScSpecEntry::EventV0(ScSpecEventV0 {
+        doc: "".try_into().unwrap(),
+        lib: "".try_into().unwrap(),
+        name: ScSymbol("PositionChanged".try_into().unwrap()),
+        prefix_topics: vec![ScSymbol("PositionChanged".try_into().unwrap())]
+            .try_into()
+            .unwrap(),
+        params: vec![ScSpecEventParamV0 {
+            doc: "".try_into().unwrap(),
+            name: "pos".try_into().unwrap(),
+            type_: udt("Position"),
+            location: ScSpecEventParamLocationV0::Data,
+        }]
+        .try_into()
+        .unwrap(),
+        data_format: ScSpecEventDataFormat::SingleValue,
+    }));
+
+    let bytes: Vec<u8> = entries
+        .iter()
+        .flat_map(|e| e.to_xdr(Limits::none()).unwrap())
+        .collect();
+    ContractSpec::from_spec_xdr(&bytes).expect("nested-UDT spec should parse")
+}
+
+fn bench_enrichment_nested(c: &mut Criterion) {
+    let mut group = c.benchmark_group("enrichment_nested_udt");
+    let spec = nested_udt_spec(100);
+    let topics = vec![json!("PositionChanged")];
+    // A struct value whose `status` field is itself a UDT: enrichment must
+    // resolve Position and then, inside it, Status.
+    let value = json!({ "status": 7, "size": "100" });
+
+    for &batch in &[1usize, 100, 1_000] {
+        group.throughput(Throughput::Elements(batch as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(batch), &batch, |b, &n| {
+            b.iter(|| {
+                let mut enriched_count = 0usize;
+                for _ in 0..n {
+                    if spec
+                        .enrich_event("PositionChanged", &topics, &value)
+                        .is_some()
+                    {
+                        enriched_count += 1;
+                    }
+                }
+                enriched_count
+            });
+        });
     }
 
     group.finish();
@@ -331,5 +469,11 @@ fn bench_db_insert(c: &mut Criterion) {
     rt.block_on(pool.close());
 }
 
-criterion_group!(benches, bench_xdr_decode, bench_enrichment, bench_db_insert);
+criterion_group!(
+    benches,
+    bench_xdr_decode,
+    bench_enrichment,
+    bench_enrichment_nested,
+    bench_db_insert
+);
 criterion_main!(benches);

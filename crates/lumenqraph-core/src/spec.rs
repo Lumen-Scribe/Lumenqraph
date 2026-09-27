@@ -35,6 +35,36 @@ pub struct ContractSpec {
     /// event name -> index into `events`, for O(1) enrichment lookups.
     #[serde(skip)]
     events_by_name: HashMap<String, usize>,
+    /// function name -> index into `functions`, so the read layer resolves a
+    /// function to encode without scanning the whole interface.
+    #[serde(skip)]
+    functions_by_name: HashMap<String, usize>,
+    /// UDT name -> where its definition lives, so naming a value that carries a
+    /// user-defined type is one hash lookup rather than a linear scan over the
+    /// enums, then the unions, then the structs — per value, recursively.
+    #[serde(skip)]
+    udts_by_name: HashMap<String, UdtRef>,
+    /// enum index -> discriminant -> case name. Aligned with `enums`, so a bare
+    /// numeric enum value can be named without scanning that enum's cases.
+    #[serde(skip)]
+    enum_cases: Vec<HashMap<u32, String>>,
+}
+
+/// Where a named UDT lives in the parsed spec. Recorded once by
+/// [`ContractSpec::reindex`], so resolving a UDT name never scans a list.
+#[derive(Debug, Clone, Copy)]
+enum UdtRef {
+    Enum(usize),
+    Union(usize),
+    Struct(usize),
+}
+
+/// A borrowed view of a resolved UDT definition, for callers (like the read
+/// layer's argument encoder) that need the definition rather than its index.
+pub(crate) enum UdtDef<'a> {
+    Enum(&'a UdtEnum),
+    Union(&'a UdtUnion),
+    Struct(&'a UdtStruct),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -166,6 +196,63 @@ impl ContractSpec {
             if let Some(first) = e.prefix_topics.first() {
                 self.events_by_name.insert(first.clone(), i);
             }
+        }
+
+        // Functions are looked up by name on every `/call`; first declaration
+        // wins, matching the previous linear `find`.
+        self.functions_by_name.clear();
+        for (i, f) in self.functions.iter().enumerate() {
+            self.functions_by_name.entry(f.name.clone()).or_insert(i);
+        }
+
+        // UDT names are resolved for every nested value during enrichment and
+        // for every `Udt` argument during encoding. The three kinds are indexed
+        // in the order the old scans probed them (enum, union, struct), so a
+        // name that appears in more than one kind resolves exactly as before.
+        self.udts_by_name.clear();
+        for (i, e) in self.enums.iter().enumerate() {
+            self.udts_by_name
+                .entry(e.name.clone())
+                .or_insert(UdtRef::Enum(i));
+        }
+        for (i, u) in self.unions.iter().enumerate() {
+            self.udts_by_name
+                .entry(u.name.clone())
+                .or_insert(UdtRef::Union(i));
+        }
+        for (i, s) in self.structs.iter().enumerate() {
+            self.udts_by_name
+                .entry(s.name.clone())
+                .or_insert(UdtRef::Struct(i));
+        }
+
+        // Discriminant -> case name, per enum. Kept parallel to `enums` (rather
+        // than keyed by name) so duplicate names can't shadow one another.
+        self.enum_cases.clear();
+        for e in &self.enums {
+            let mut cases: HashMap<u32, String> = HashMap::with_capacity(e.cases.len());
+            for (name, value) in &e.cases {
+                cases.insert(*value, name.clone());
+            }
+            self.enum_cases.push(cases);
+        }
+    }
+
+    /// Resolve a callable function by name. Built by [`Self::reindex`], so this
+    /// is a hash lookup rather than a scan over the interface.
+    pub(crate) fn function(&self, name: &str) -> Option<&FunctionSpec> {
+        self.functions_by_name
+            .get(name)
+            .map(|&i| &self.functions[i])
+    }
+
+    /// Resolve a UDT name to its definition, or `None` when the spec doesn't
+    /// declare it. Built by [`Self::reindex`], so this is a hash lookup.
+    pub(crate) fn udt_def(&self, name: &str) -> Option<UdtDef<'_>> {
+        match *self.udts_by_name.get(name)? {
+            UdtRef::Enum(i) => Some(UdtDef::Enum(&self.enums[i])),
+            UdtRef::Union(i) => Some(UdtDef::Union(&self.unions[i])),
+            UdtRef::Struct(i) => Some(UdtDef::Struct(&self.structs[i])),
         }
     }
 
@@ -377,71 +464,79 @@ impl ContractSpec {
     }
 
     fn relabel_udt(&self, v: &Value, udt_name: &str) -> Value {
-        // A unit enum decodes to its discriminant; swap in the case name.
-        if let Some(e) = self.enums.iter().find(|e| e.name == udt_name) {
-            if let Some(n) = v.as_u64() {
-                if let Some((case, _)) = e.cases.iter().find(|(_, val)| u64::from(*val) == n) {
-                    return Value::String(case.clone());
+        // Resolve the name once, via the index `reindex` built. This used to be
+        // three linear scans (enums, then unions, then structs) for every value.
+        match self.udts_by_name.get(udt_name).copied() {
+            // A unit enum decodes to its discriminant; swap in the case name.
+            Some(UdtRef::Enum(i)) => {
+                if let (Some(n), Some(cases)) = (v.as_u64(), self.enum_cases.get(i)) {
+                    if let Some(case) = u32::try_from(n).ok().and_then(|n| cases.get(&n)) {
+                        return Value::String(case.clone());
+                    }
                 }
+                v.clone()
             }
-            return v.clone();
-        }
 
-        // A union decodes to [Symbol(case), ..values]; key it by the case name,
-        // which is also the shape the read layer accepts back as input.
-        if let Some(u) = self.unions.iter().find(|u| u.name == udt_name) {
-            let Some(items) = v.as_array() else {
-                return v.clone();
-            };
-            let Some(Value::String(case_name)) = items.first() else {
-                return v.clone();
-            };
-            let Some(case) = u.cases.iter().find(|c| &c.name == case_name) else {
-                return v.clone();
-            };
-            let values = &items[1..];
-            if case.tys.is_empty() {
-                return Value::String(case.name.clone());
+            // A union decodes to [Symbol(case), ..values]; key it by the case
+            // name, which is also the shape the read layer accepts back as input.
+            Some(UdtRef::Union(i)) => {
+                let u = &self.unions[i];
+                let Some(items) = v.as_array() else {
+                    return v.clone();
+                };
+                let Some(Value::String(case_name)) = items.first() else {
+                    return v.clone();
+                };
+                let Some(case) = u.cases.iter().find(|c| &c.name == case_name) else {
+                    return v.clone();
+                };
+                let values = &items[1..];
+                if case.tys.is_empty() {
+                    return Value::String(case.name.clone());
+                }
+                if values.len() != case.tys.len() {
+                    return v.clone();
+                }
+                let labelled: Vec<Value> = values
+                    .iter()
+                    .zip(case.tys.iter())
+                    .map(|(el, et)| self.relabel(el, et))
+                    .collect();
+                json!({ case.name.clone(): labelled })
             }
-            if values.len() != case.tys.len() {
-                return v.clone();
-            }
-            let labelled: Vec<Value> = values
-                .iter()
-                .zip(case.tys.iter())
-                .map(|(el, et)| self.relabel(el, et))
-                .collect();
-            return json!({ case.name.clone(): labelled });
-        }
 
-        // A struct already decodes to a field-named object (or a positional vec
-        // for a tuple struct); recurse so nested UDTs inside it get named.
-        if let Some(s) = self.structs.iter().find(|s| s.name == udt_name) {
-            if let Some(o) = v.as_object() {
-                return Value::Object(
-                    o.iter()
-                        .map(|(k, val)| {
-                            let relabelled = match s.fields.iter().find(|f| &f.name == k) {
-                                Some(f) => self.relabel(val, &f.ty),
-                                None => val.clone(),
-                            };
-                            (k.clone(), relabelled)
-                        })
-                        .collect(),
-                );
-            }
-            if let Some(a) = v.as_array() {
-                if a.len() == s.fields.len() {
-                    return Value::Array(
-                        a.iter()
-                            .zip(s.fields.iter())
-                            .map(|(el, f)| self.relabel(el, &f.ty))
+            // A struct already decodes to a field-named object (or a positional
+            // vec for a tuple struct); recurse so nested UDTs get named too.
+            Some(UdtRef::Struct(i)) => {
+                let s = &self.structs[i];
+                if let Some(o) = v.as_object() {
+                    return Value::Object(
+                        o.iter()
+                            .map(|(k, val)| {
+                                let relabelled = match s.fields.iter().find(|f| &f.name == k) {
+                                    Some(f) => self.relabel(val, &f.ty),
+                                    None => val.clone(),
+                                };
+                                (k.clone(), relabelled)
+                            })
                             .collect(),
                     );
                 }
+                if let Some(a) = v.as_array() {
+                    if a.len() == s.fields.len() {
+                        return Value::Array(
+                            a.iter()
+                                .zip(s.fields.iter())
+                                .map(|(el, f)| self.relabel(el, &f.ty))
+                                .collect(),
+                        );
+                    }
+                }
+                v.clone()
             }
+
+            None => v.clone(),
         }
-        v.clone()
     }
 
     /// A stable JSON view of the whole interface, for `GET /contracts/:id/interface`.
@@ -936,6 +1031,38 @@ mod tests {
             // Wrong arity for Bid: keep the raw decode rather than guess.
             let out = enrich(&entries, json!(["Bid", 7, 9]));
             assert_eq!(out["params"]["status"]["value"], json!(["Bid", 7, 9]));
+        }
+
+        /// A single-variant unit enum, used to give the type list real length.
+        fn padding_enum(name: &str) -> ScSpecEntry {
+            ScSpecEntry::UdtEnumV0(ScSpecUdtEnumV0 {
+                doc: "".try_into().unwrap(),
+                lib: "".try_into().unwrap(),
+                name: name.try_into().unwrap(),
+                cases: vec![ScSpecUdtEnumCaseV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "Only".try_into().unwrap(),
+                    value: 0,
+                }]
+                .try_into()
+                .unwrap(),
+            })
+        }
+
+        /// The name index must cover every declared UDT, not just the ones near
+        /// the front: large contracts declare dozens of types before the one an
+        /// event nests, and a half-built index would silently stop labelling.
+        #[test]
+        fn nested_udts_resolve_when_declared_after_many_others() {
+            let mut entries: Vec<ScSpecEntry> = Vec::new();
+            for i in 0..64 {
+                entries.push(padding_enum(&format!("Padding{i}")));
+            }
+            entries.push(status_enum());
+            entries.push(changed_event(udt("Status")));
+
+            let out = enrich(&entries, json!(7));
+            assert_eq!(out["params"]["status"]["value"], "Filled");
         }
     }
 

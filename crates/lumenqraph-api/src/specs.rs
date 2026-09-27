@@ -50,10 +50,11 @@ use crate::error::{ApiError, ApiResult};
 /// reason about than one that pretends to be smart.
 const MAX_ENTRIES: usize = 256;
 
-/// A contract's interface in both the forms callers need: the raw section (the
-/// read layer's encoder re-parses it to encode call arguments) and the parsed
-/// view. `parsed` is `None` when the section doesn't parse — the read layer
-/// tolerates that, the diff endpoints don't.
+/// A contract's interface in both the forms callers need: the parsed, indexed
+/// view (the read layer's encoder resolves functions and UDTs against it, so a
+/// request never re-parses the section) and the raw section, retained for
+/// callers that need the original bytes. `parsed` is `None` when the section
+/// doesn't parse — the read layer tolerates that, the diff endpoints don't.
 pub struct CachedSpec {
     pub section: Vec<u8>,
     pub parsed: Option<ContractSpec>,
