@@ -57,11 +57,29 @@ pub async fn stream_events(
         "starting event stream"
     );
 
+    // Clone the shutdown token so the stream can end when the server is
+    // shutting down, allowing `with_graceful_shutdown` to complete promptly.
+    let shutdown = state.shutdown.clone();
+
     // Create the stream
     let stream = stream::unfold(
-        (state, contract_id, q.event_name, q.cursor.unwrap_or(0)),
-        move |(state, contract_id, event_name, mut last_ledger)| async move {
+        (state, contract_id, q.event_name, q.cursor.unwrap_or(0), shutdown),
+        move |(state, contract_id, event_name, mut last_ledger, shutdown)| async move {
             loop {
+                // If the server is shutting down, emit a final event with a
+                // retry hint so EventSource clients reconnect to another
+                // instance, then terminate the stream.
+                if shutdown.is_cancelled() {
+                    let final_event = Event::default()
+                        .event("shutdown")
+                        .retry(Duration::from_millis(1000))
+                        .data("server shutting down");
+                    return Some((
+                        Ok(final_event),
+                        (state.clone(), contract_id.clone(), event_name.clone(), last_ledger, shutdown),
+                    ));
+                }
+
                 match fetch_new_events(&state, &contract_id, &event_name, last_ledger).await {
                     Ok(events) => {
                         for event in events {
@@ -69,17 +87,30 @@ pub async fn stream_events(
                             last_ledger = event.ledger;
                             return Some((
                                 Ok(Event::default().data(event_json)),
-                                (state.clone(), contract_id.clone(), event_name.clone(), last_ledger),
+                                (state.clone(), contract_id.clone(), event_name.clone(), last_ledger, shutdown),
                             ));
                         }
-                        // No new events, wait before polling again
-                        sleep(Duration::from_secs(poll_secs)).await;
+                        // No new events, wait before polling again, but wake up
+                        // early if the server begins shutting down.
+                        tokio::select! {
+                            _ = sleep(Duration::from_secs(poll_secs)) => {}
+                            _ = shutdown.cancelled() => {
+                                let final_event = Event::default()
+                                    .event("shutdown")
+                                    .retry(Duration::from_millis(1000))
+                                    .data("server shutting down");
+                                return Some((
+                                    Ok(final_event),
+                                    (state.clone(), contract_id.clone(), event_name.clone(), last_ledger, shutdown),
+                                ));
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "error fetching events");
                         return Some((
                             Ok(Event::default().comment(format!("error: {}", e))),
-                            (state.clone(), contract_id.clone(), event_name.clone(), last_ledger),
+                            (state.clone(), contract_id.clone(), event_name.clone(), last_ledger, shutdown),
                         ));
                     }
                 }

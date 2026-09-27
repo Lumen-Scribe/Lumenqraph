@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use sqlx::PgPool;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::audit::AuditEvent;
 use crate::call_cache::CallCache;
@@ -71,6 +72,10 @@ pub struct AppState {
     pub audit_tx: Option<mpsc::Sender<AuditEvent>>,
     /// Count of audit events dropped because the channel was full (#367).
     pub audit_dropped: Arc<AtomicU64>,
+    /// Cancelled when the process receives a shutdown signal (#436). Long-lived
+    /// handlers such as the SSE stream select on this so they can end cleanly
+    /// instead of blocking `with_graceful_shutdown` until SIGKILL.
+    pub shutdown: CancellationToken,
 }
 
 pub struct BuildInfo {
