@@ -57,12 +57,111 @@ pub async fn refresh_pending_gauge(pool: &PgPool) -> anyhow::Result<i64> {
     Ok(pending)
 }
 
-/// Enqueue deliveries for everything new in both streams. Returns how many
-/// delivery rows were created.
+/// Enqueue deliveries for everything new in both streams, and advance any
+/// per-subscription backfill cursors. Returns how many delivery rows were
+/// created (live + backfill combined).
 pub async fn enqueue(pool: &PgPool, batch: i64) -> anyhow::Result<u64> {
     let events = enqueue_events(pool, batch).await?;
     let upgrades = enqueue_upgrades(pool, batch).await?;
-    Ok(events + upgrades)
+    let backfill = enqueue_backfill(pool, batch).await?;
+    Ok(events + upgrades + backfill)
+}
+
+/// Advance per-subscription backfill cursors.
+///
+/// Subscriptions created with a `since` parameter have `backfill_seq` set to
+/// a value below the global watermark at creation time. This pass delivers
+/// events in the window `(backfill_seq, global_last_seq_at_creation]` in
+/// bounded batches, advancing `backfill_seq` atomically so a crash cannot
+/// duplicate or skip deliveries.
+///
+/// Once `backfill_seq` reaches or exceeds the subscription's `starting_seq`
+/// (the watermark at creation) the column is cleared (set to NULL) and the
+/// subscription transitions fully to the live stream.
+async fn enqueue_backfill(pool: &PgPool, batch: i64) -> anyhow::Result<u64> {
+    // Fetch all subscriptions that still have an outstanding backfill cursor.
+    let subs: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT id::text, backfill_seq, starting_seq
+         FROM webhook_subscriptions
+         WHERE active AND backfill_seq IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    if subs.is_empty() {
+        return Ok(0);
+    }
+
+    let mut total: u64 = 0;
+
+    for (sub_id, backfill_seq, starting_seq) in subs {
+        // The backfill window is (backfill_seq, starting_seq].  Once the cursor
+        // reaches starting_seq the backfill is complete.
+        if backfill_seq >= starting_seq {
+            sqlx::query(
+                "UPDATE webhook_subscriptions SET backfill_seq = NULL WHERE id = $1::uuid",
+            )
+            .bind(&sub_id)
+            .execute(pool)
+            .await?;
+            continue;
+        }
+
+        let upper = (backfill_seq + batch).min(starting_seq);
+
+        let mut tx = pool.begin().await?;
+
+        let created = sqlx::query(
+            "INSERT INTO webhook_deliveries (subscription_id, event_id)
+             SELECT $1::uuid, e.event_id
+             FROM events e
+             JOIN webhook_subscriptions s ON s.id = $1::uuid
+             WHERE s.kind = 'event'
+               AND (s.contract_id IS NULL OR s.contract_id = e.contract_id)
+               AND (s.event_name  IS NULL OR s.event_name  = e.event_name)
+               AND e.seq > $2 AND e.seq <= $3
+             ON CONFLICT (subscription_id, event_id) DO NOTHING",
+        )
+        .bind(&sub_id)
+        .bind(backfill_seq)
+        .bind(upper)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        // Advance or clear the cursor.
+        if upper >= starting_seq {
+            sqlx::query(
+                "UPDATE webhook_subscriptions SET backfill_seq = NULL WHERE id = $1::uuid",
+            )
+            .bind(&sub_id)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                "UPDATE webhook_subscriptions SET backfill_seq = $2 WHERE id = $1::uuid",
+            )
+            .bind(&sub_id)
+            .bind(upper)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+
+        if created > 0 {
+            debug!(
+                sub_id = %sub_id,
+                created,
+                up_to_seq = upper,
+                "backfill: enqueued deliveries"
+            );
+        }
+
+        total += created;
+    }
+
+    Ok(total)
 }
 
 /// Match new events to `event` subscriptions and enqueue deliveries.
@@ -273,8 +372,13 @@ pub async fn deliver(
                 let _host_permit = host_semaphore.acquire().await.ok()?;
 
                 match send(&http, &d, &config).await {
-                    Ok(()) => {
-                        let _ = mark_delivered(&pool, d.id).await;
+                    Ok(outcome) => {
+                        let _ = mark_delivered(
+                            &pool,
+                            d.id,
+                            outcome.status_code as i32,
+                            &outcome.response_snippet,
+                        ).await;
                         let _ = sqlx::query(
                             "UPDATE webhook_subscriptions SET consecutive_failures = 0 WHERE id = $1"
                         )
@@ -284,7 +388,23 @@ pub async fn deliver(
                         Some((true, d.subscription_id.clone()))
                     }
                     Err(e) => {
-                        let _ = mark_retry(&pool, &d, &e.to_string(), config.max_attempts).await;
+                        // Extract status_code from the error chain if present.
+                        let err_str = e.to_string();
+                        let status_code: Option<i32> = e
+                            .chain()
+                            .find_map(|cause| {
+                                let s = cause.to_string();
+                                s.strip_prefix("status_code=")
+                                    .and_then(|n| n.parse::<i32>().ok())
+                            });
+                        let _ = mark_retry(
+                            &pool,
+                            &d,
+                            &err_str,
+                            config.max_attempts,
+                            status_code,
+                            None,
+                        ).await;
                         warn!(delivery = d.id, url = %d.url, error = %e, "webhook delivery failed");
 
                         let _ = sqlx::query(
@@ -335,7 +455,17 @@ fn extract_host(url: &str) -> String {
         .unwrap_or_default()
 }
 
-async fn send(http: &reqwest::Client, d: &DueDelivery, config: &Config) -> anyhow::Result<()> {
+/// Return type of [`send`]: the HTTP status code and first 512 bytes of the
+/// response body, recorded in `webhook_deliveries` for operator debugging.
+struct SendOutcome {
+    status_code: u16,
+    response_snippet: String,
+}
+
+/// Send one delivery. Returns `Ok(outcome)` when the subscriber returned 2xx,
+/// `Err` otherwise (network error or non-2xx). The status code and snippet are
+/// always recorded for debugging regardless of success or failure.
+async fn send(http: &reqwest::Client, d: &DueDelivery, config: &Config) -> anyhow::Result<SendOutcome> {
     // Re-validate URL at delivery time to prevent DNS rebinding attacks.
     // This ensures the hostname still resolves to a public address even if the
     // DNS record changed since registration.
@@ -379,20 +509,39 @@ async fn send(http: &reqwest::Client, d: &DueDelivery, config: &Config) -> anyho
         .context("request failed")?;
 
     let status = resp.status();
+    let status_code = status.as_u16();
+
+    // Capture the first 512 bytes of the response body for debugging.
+    let raw_bytes = resp.bytes().await.unwrap_or_default();
+    let snippet_bytes = &raw_bytes[..raw_bytes.len().min(512)];
+    let response_snippet = String::from_utf8_lossy(snippet_bytes).into_owned();
+
+    let outcome = SendOutcome { status_code, response_snippet };
+
     if status.is_success() {
-        Ok(())
+        Ok(outcome)
     } else {
-        Err(anyhow::anyhow!("non-2xx status {}", status))
+        Err(anyhow::anyhow!("non-2xx status {status_code}").context(
+            format!("response: {}", outcome.response_snippet)
+        ))
     }
 }
 
-async fn mark_delivered(pool: &PgPool, id: i64) -> anyhow::Result<()> {
+async fn mark_delivered(
+    pool: &PgPool,
+    id: i64,
+    status_code: i32,
+    response_snippet: &str,
+) -> anyhow::Result<()> {
     sqlx::query(
         "UPDATE webhook_deliveries
-         SET status='delivered', attempts=attempts+1, delivered_at=now(), last_error=NULL
+         SET status='delivered', attempts=attempts+1, delivered_at=now(), last_error=NULL,
+             last_status_code=$2, last_response_snippet=$3
          WHERE id=$1",
     )
     .bind(id)
+    .bind(status_code)
+    .bind(response_snippet)
     .execute(pool)
     .await?;
     Ok(())
@@ -403,6 +552,8 @@ async fn mark_retry(
     d: &DueDelivery,
     err: &str,
     max_attempts: i32,
+    status_code: Option<i32>,
+    response_snippet: Option<&str>,
 ) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
 
@@ -410,12 +561,15 @@ async fn mark_retry(
     if attempts >= max_attempts {
         sqlx::query(
             "UPDATE webhook_deliveries
-             SET status='failed', attempts=$2, last_error=$3
+             SET status='failed', attempts=$2, last_error=$3,
+                 last_status_code=$4, last_response_snippet=$5
              WHERE id=$1",
         )
         .bind(d.id)
         .bind(attempts)
         .bind(err)
+        .bind(status_code)
+        .bind(response_snippet)
         .execute(&mut *tx)
         .await?;
     } else {
@@ -425,13 +579,16 @@ async fn mark_retry(
         let next: DateTime<Utc> = Utc::now() + Duration::seconds(jittered_secs);
         sqlx::query(
             "UPDATE webhook_deliveries
-             SET attempts=$2, last_error=$3, next_attempt_at=$4
+             SET attempts=$2, last_error=$3, next_attempt_at=$4,
+                 last_status_code=$5, last_response_snippet=$6
              WHERE id=$1",
         )
         .bind(d.id)
         .bind(attempts)
         .bind(err)
         .bind(next)
+        .bind(status_code)
+        .bind(response_snippet)
         .execute(&mut *tx)
         .await?;
     }
