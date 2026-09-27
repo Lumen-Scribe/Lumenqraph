@@ -4,11 +4,18 @@
 //! depend on the fast-moving `stellar-xdr` crate, we decode the (stable) ScVal
 //! wire format directly into friendly JSON. Integers that don't fit a JS number
 //! are rendered as decimal strings; addresses are rendered as strkeys
-//! (`G...`/`C...`); bytes as hex.
+//! (`G...`/`C...`/`M...`/`B...`/`L...`); bytes as hex.
 //!
 //! Decoding is always best-effort: on any malformed input we fall back to
 //! `{"_xdr": "<base64>"}` so nothing is lost and one weird event can't break
 //! ingestion.
+//!
+//! # Recursion depth limit
+//!
+//! [`read_scval`] enforces a maximum nesting depth of [`MAX_DEPTH`] (256).
+//! Any value nested deeper than this limit causes the whole value to fall back
+//! to the `{"_xdr": …}` representation — the process is never at risk of a
+//! stack overflow regardless of input.
 
 use base64::Engine;
 use serde_json::{json, Map, Value};
@@ -34,16 +41,24 @@ const SCV_VEC: u32 = 16;
 const SCV_MAP: u32 = 17;
 const SCV_ADDRESS: u32 = 18;
 
-// ScAddressType discriminants.
+// ScAddressType discriminants (Protocol 23+).
 const SC_ADDRESS_ACCOUNT: u32 = 0;
 const SC_ADDRESS_CONTRACT: u32 = 1;
+const SC_ADDRESS_MUXED_ACCOUNT: u32 = 2;
+const SC_ADDRESS_CLAIMABLE_BALANCE: u32 = 3;
+const SC_ADDRESS_LIQUIDITY_POOL: u32 = 4;
+
+/// Maximum nesting depth for `ScVal` decoding. Values nested deeper than this
+/// cause the whole decode to return the `{"_xdr": …}` fallback rather than
+/// risk a stack overflow.
+const MAX_DEPTH: u32 = 256;
 
 /// Decode a base64 `ScVal` into friendly JSON. Never panics.
 pub fn decode_scval_base64(b64: &str) -> Value {
     match base64::engine::general_purpose::STANDARD.decode(b64) {
         Ok(bytes) => {
             let mut cur = Cursor::new(&bytes);
-            match cur.read_scval() {
+            match cur.read_scval(0) {
                 Some(v) => v,
                 None => json!({ "_type": "unknown", "xdr": b64 }),
             }
@@ -111,16 +126,52 @@ impl<'a> Cursor<'a> {
         Some(data)
     }
 
-    fn read_scval(&mut self) -> Option<Value> {
+    fn read_scval(&mut self, depth: u32) -> Option<Value> {
+        if depth > MAX_DEPTH {
+            return None;
+        }
         let tag = self.u32()?;
         Some(match tag {
             SCV_BOOL => Value::Bool(self.u32()? != 0),
             SCV_VOID => Value::Null,
             SCV_ERROR => {
-                // Skip: (type u32, code u32). Represent opaquely.
-                let _ = self.u32()?;
-                let _ = self.u32()?;
-                json!({ "_error": true })
+                // SCError: type (u32) then either a code (u32 for Contract errors)
+                // or an SCErrorCode enum (u32) for host errors.
+                let error_type = self.u32()?;
+                let code = self.u32()?;
+                let type_name = match error_type {
+                    0 => "Contract",
+                    1 => "WasmVm",
+                    2 => "Context",
+                    3 => "Storage",
+                    4 => "Object",
+                    5 => "Crypto",
+                    6 => "Events",
+                    7 => "Budget",
+                    8 => "Value",
+                    9 => "Auth",
+                    _ => "Unknown",
+                };
+                // Contract errors carry a raw u32 code; host errors carry an
+                // SCErrorCode enum. Render host codes by name where known.
+                if error_type == 0 {
+                    json!({ "error": { "type": type_name, "code": code } })
+                } else {
+                    let code_name = match code {
+                        0 => "ArithDomain",
+                        1 => "IndexBounds",
+                        2 => "InvalidInput",
+                        3 => "MissingValue",
+                        4 => "ExistingValue",
+                        5 => "ExceededLimit",
+                        6 => "InvalidAction",
+                        7 => "InternalError",
+                        8 => "UnexpectedType",
+                        9 => "UnexpectedSize",
+                        _ => "Unknown",
+                    };
+                    json!({ "error": { "type": type_name, "code": code_name } })
+                }
             }
             SCV_U32 => json!(self.u32()?),
             SCV_I32 => json!(self.i32()?),
@@ -140,10 +191,23 @@ impl<'a> Cursor<'a> {
                 let lo = self.u64()? as i128;
                 Value::String(((hi << 64) | lo).to_string())
             }
-            SCV_U256 | SCV_I256 => {
-                // 256-bit: no native type; render the 32 bytes as hex.
-                let raw = self.take(32)?;
-                json!({ "_u256_hex": hex(raw) })
+            SCV_U256 => {
+                // UInt256Parts: hi_hi(u64), hi_lo(u64), lo_hi(u64), lo_lo(u64)
+                let hi_hi = self.u64()? as u128;
+                let hi_lo = self.u64()? as u128;
+                let lo_hi = self.u64()? as u128;
+                let lo_lo = self.u64()? as u128;
+                let decimal = u256_to_decimal([hi_hi as u64, hi_lo as u64, lo_hi as u64, lo_lo as u64]);
+                Value::String(decimal)
+            }
+            SCV_I256 => {
+                // Int256Parts: hi_hi(i64), hi_lo(u64), lo_hi(u64), lo_lo(u64)
+                let hi_hi = self.i64()?;
+                let hi_lo = self.u64()?;
+                let lo_hi = self.u64()?;
+                let lo_lo = self.u64()?;
+                let decimal = i256_to_decimal(hi_hi, hi_lo, lo_hi, lo_lo);
+                Value::String(decimal)
             }
             SCV_BYTES => Value::String(format!("0x{}", hex(&self.var_bytes()?))),
             SCV_STRING => match String::from_utf8(self.var_bytes()?) {
@@ -162,7 +226,7 @@ impl<'a> Cursor<'a> {
                     let len = self.u32()? as usize;
                     let mut items = Vec::with_capacity(len.min(1024));
                     for _ in 0..len {
-                        items.push(self.read_scval()?);
+                        items.push(self.read_scval(depth + 1)?);
                     }
                     Value::Array(items)
                 }
@@ -172,7 +236,7 @@ impl<'a> Cursor<'a> {
                     Value::Object(Map::new())
                 } else {
                     let len = self.u32()? as usize;
-                    self.read_map(len)?
+                    self.read_map(len, depth + 1)?
                 }
             }
             SCV_ADDRESS => Value::String(self.read_address()?),
@@ -180,13 +244,13 @@ impl<'a> Cursor<'a> {
         })
     }
 
-    fn read_map(&mut self, len: usize) -> Option<Value> {
+    fn read_map(&mut self, len: usize, depth: u32) -> Option<Value> {
         let mut obj = Map::new();
         let mut pairs = Vec::new();
         let mut all_stringy = true;
         for _ in 0..len {
-            let k = self.read_scval()?;
-            let v = self.read_scval()?;
+            let k = self.read_scval(depth)?;
+            let v = self.read_scval(depth)?;
             match &k {
                 Value::String(s) => {
                     obj.insert(s.clone(), v.clone());
@@ -215,7 +279,35 @@ impl<'a> Cursor<'a> {
                 let raw = self.take(32)?;
                 Some(strkey(VERSION_CONTRACT, raw))
             }
-            other => Some(format!("_addr_type_{other}")),
+            SC_ADDRESS_MUXED_ACCOUNT => {
+                // MuxedAccountMed25519: id (u64, big-endian) + ed25519 key (32 bytes).
+                // Strkey M…: version byte (12<<3 = 0x60), then ed25519(32) + id(8).
+                let id = self.u64()?;
+                let key = self.take(32)?;
+                let mut payload = [0u8; 40];
+                payload[..32].copy_from_slice(key);
+                payload[32..].copy_from_slice(&id.to_be_bytes());
+                Some(strkey(VERSION_MUXED, &payload))
+            }
+            SC_ADDRESS_CLAIMABLE_BALANCE => {
+                // ClaimableBalanceID: discriminant (u32) + 32-byte hash.
+                // Strkey B…: version byte (1<<3 = 0x08), then type byte (0) + hash(32).
+                let balance_type = self.u32()?;
+                let hash = self.take(32)?;
+                let mut payload = [0u8; 33];
+                payload[0] = balance_type as u8;
+                payload[1..].copy_from_slice(hash);
+                Some(strkey(VERSION_CLAIMABLE_BALANCE, &payload))
+            }
+            SC_ADDRESS_LIQUIDITY_POOL => {
+                // LiquidityPoolID: 32-byte pool hash.
+                // Strkey L…: version byte (11<<3 = 0x58), then hash(32).
+                let raw = self.take(32)?;
+                Some(strkey(VERSION_LIQUIDITY_POOL, raw))
+            }
+            // Truly unknown address type: return None so the whole ScVal falls
+            // back to the _xdr representation rather than misaligning the cursor.
+            _ => None,
         }
     }
 }
@@ -228,10 +320,71 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+// ---- 256-bit integer → decimal string helpers ----------------------------
+//
+// Rust has no u256/i256 native type and the crate carries no bignum dependency.
+// Both types are stored as four big-endian 64-bit limbs (index 0 = most
+// significant), which is what UInt256Parts / Int256Parts use on the wire.
+
+type Limbs4 = [u64; 4];
+
+/// Divide a 256-bit big-endian limbs value by 10, returning the remainder.
+fn divrem10(limbs: &mut Limbs4) -> u64 {
+    let mut rem: u128 = 0;
+    for l in limbs.iter_mut() {
+        let acc = (rem << 64) | (*l as u128);
+        *l = (acc / 10) as u64;
+        rem = acc % 10;
+    }
+    rem as u64
+}
+
+/// Convert four big-endian 64-bit limbs (u256) to a decimal string.
+fn u256_to_decimal(mut limbs: Limbs4) -> String {
+    if limbs == [0; 4] {
+        return "0".to_string();
+    }
+    let mut digits = Vec::with_capacity(78);
+    while limbs != [0; 4] {
+        digits.push(b'0' + divrem10(&mut limbs) as u8);
+    }
+    digits.reverse();
+    String::from_utf8(digits).unwrap_or_else(|_| "0".to_string())
+}
+
+/// Two's-complement negation of four 64-bit limbs.
+fn negate_limbs(limbs: Limbs4) -> Limbs4 {
+    let mut out = limbs.map(|x| !x);
+    let mut carry: u128 = 1;
+    for i in (0..4).rev() {
+        let acc = out[i] as u128 + carry;
+        out[i] = acc as u64;
+        carry = acc >> 64;
+    }
+    out
+}
+
+/// Convert a signed 256-bit value (stored as i64 hi_hi + three u64 limbs) to
+/// a decimal string, with a leading `-` for negative values.
+fn i256_to_decimal(hi_hi: i64, hi_lo: u64, lo_hi: u64, lo_lo: u64) -> String {
+    let negative = hi_hi < 0;
+    let limbs: Limbs4 = [hi_hi as u64, hi_lo, lo_hi, lo_lo];
+    let abs_limbs = if negative { negate_limbs(limbs) } else { limbs };
+    let dec = u256_to_decimal(abs_limbs);
+    if negative {
+        format!("-{dec}")
+    } else {
+        dec
+    }
+}
+
 // ---- Strkey encoding (base32 of version || payload || crc16-xmodem LE) ----
 
 const VERSION_ACCOUNT: u8 = 6 << 3; // 'G'
 const VERSION_CONTRACT: u8 = 2 << 3; // 'C'
+const VERSION_MUXED: u8 = 12 << 3; // 'M'
+const VERSION_CLAIMABLE_BALANCE: u8 = 1 << 3; // 'B'
+const VERSION_LIQUIDITY_POOL: u8 = 11 << 3; // 'L'
 
 /// Returns `true` if `s` is a well-formed Stellar contract ID (`C…` strkey).
 ///
@@ -431,6 +584,270 @@ mod tests {
         // Should return a structured unknown marker.
         assert_eq!(result.get("_type").and_then(|v| v.as_str()), Some("unknown"));
         assert_eq!(result.get("xdr_tag").and_then(|v| v.as_u64()), Some(999));
+    }
+
+    // ── #406: recursion depth limit ──────────────────────────────────────────
+
+    /// Build a deeply nested ScVal::Vec: depth levels of Vec([inner]).
+    fn nested_vec(depth: usize) -> Vec<u8> {
+        // Build from the inside out.
+        // Innermost: SCV_VOID
+        let void: Vec<u8> = SCV_VOID.to_be_bytes().to_vec();
+        let mut inner = void;
+        for _ in 0..depth {
+            // SCV_VEC (16), presence=1, len=1, <inner>
+            let mut v: Vec<u8> = Vec::new();
+            v.extend_from_slice(&SCV_VEC.to_be_bytes());
+            v.extend_from_slice(&1u32.to_be_bytes()); // presence flag
+            v.extend_from_slice(&1u32.to_be_bytes()); // length
+            v.extend_from_slice(&inner);
+            inner = v;
+        }
+        inner
+    }
+
+    #[test]
+    fn deeply_nested_vec_falls_back_without_crashing() {
+        // 100 000 levels — far beyond MAX_DEPTH (256).
+        let bytes = nested_vec(100_000);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        // Must not panic and must return the _xdr / _type fallback.
+        let result = decode_scval_base64(&encoded);
+        assert!(
+            result.get("_type").is_some() || result.get("xdr").is_some(),
+            "expected _xdr fallback for deeply nested value, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn depth_within_limit_decodes_normally() {
+        // 10 levels is well within MAX_DEPTH — should decode as a nested array.
+        let bytes = nested_vec(10);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&encoded);
+        assert!(
+            matches!(result, Value::Array(_)),
+            "expected array for shallow nesting, got: {result:?}"
+        );
+    }
+
+    // ── #407: muxed / claimable-balance / liquidity-pool addresses ───────────
+
+    fn scval_address(type_discriminant: u32, payload: &[u8]) -> Vec<u8> {
+        let mut v: Vec<u8> = Vec::new();
+        v.extend_from_slice(&SCV_ADDRESS.to_be_bytes());
+        v.extend_from_slice(&type_discriminant.to_be_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[test]
+    fn decodes_muxed_account_to_m_strkey() {
+        // SC_ADDRESS_TYPE_MUXED_ACCOUNT (2): id(u64) + ed25519(32)
+        let id: u64 = 42;
+        let key = [0u8; 32];
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&id.to_be_bytes());
+        payload.extend_from_slice(&key);
+        let bytes = scval_address(2, &payload);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&encoded);
+        match result {
+            Value::String(s) => {
+                assert!(s.starts_with('M'), "expected M-strkey, got: {s}");
+                assert_eq!(s.len(), 69, "M-strkey should be 69 chars: {s}");
+            }
+            other => panic!("expected M-strkey string, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_claimable_balance_to_b_strkey() {
+        // SC_ADDRESS_TYPE_CLAIMABLE_BALANCE (3): balance_type(u32) + hash(32)
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_be_bytes()); // ClaimableBalanceIDType::V0 = 0
+        payload.extend_from_slice(&[0u8; 32]);
+        let bytes = scval_address(3, &payload);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&encoded);
+        match result {
+            Value::String(s) => {
+                assert!(s.starts_with('B'), "expected B-strkey, got: {s}");
+            }
+            other => panic!("expected B-strkey string, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_liquidity_pool_to_l_strkey() {
+        // SC_ADDRESS_TYPE_LIQUIDITY_POOL (4): 32-byte pool id
+        let bytes = scval_address(4, &[0u8; 32]);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&encoded);
+        match result {
+            Value::String(s) => {
+                assert!(s.starts_with('L'), "expected L-strkey, got: {s}");
+            }
+            other => panic!("expected L-strkey string, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_address_type_returns_xdr_fallback() {
+        // Unknown type (99): no payload consumed — cursor stays valid but the
+        // value should fall back rather than misalign.
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&SCV_ADDRESS.to_be_bytes());
+        bytes.extend_from_slice(&99u32.to_be_bytes());
+        bytes.extend_from_slice(&[0u8; 32]); // some trailing bytes
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&encoded);
+        // Must be a fallback, not a garbage address string.
+        assert!(
+            result.get("_type").is_some() || result.get("xdr").is_some(),
+            "expected fallback for unknown address type, got: {result:?}"
+        );
+    }
+
+    // ── #408: SCV_ERROR decoding ─────────────────────────────────────────────
+
+    fn scval_error(error_type: u32, code: u32) -> Vec<u8> {
+        let mut v: Vec<u8> = Vec::new();
+        v.extend_from_slice(&SCV_ERROR.to_be_bytes());
+        v.extend_from_slice(&error_type.to_be_bytes());
+        v.extend_from_slice(&code.to_be_bytes());
+        v
+    }
+
+    #[test]
+    fn contract_error_decodes_with_type_and_numeric_code() {
+        let bytes = scval_error(0, 7); // Contract, code=7
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&encoded);
+        let error = result.get("error").expect("expected 'error' key");
+        assert_eq!(error["type"], "Contract");
+        assert_eq!(error["code"], 7);
+    }
+
+    #[test]
+    fn host_error_decodes_with_type_and_named_code() {
+        let bytes = scval_error(7, 5); // Budget, ExceededLimit
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&encoded);
+        let error = result.get("error").expect("expected 'error' key");
+        assert_eq!(error["type"], "Budget");
+        assert_eq!(error["code"], "ExceededLimit");
+    }
+
+    #[test]
+    fn wasm_vm_error_decodes_correctly() {
+        let bytes = scval_error(1, 2); // WasmVm, InvalidInput
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&encoded);
+        let error = result.get("error").expect("expected 'error' key");
+        assert_eq!(error["type"], "WasmVm");
+        assert_eq!(error["code"], "InvalidInput");
+    }
+
+    // ── #409: u256/i256 as decimal strings ───────────────────────────────────
+
+    fn scval_u256(hi_hi: u64, hi_lo: u64, lo_hi: u64, lo_lo: u64) -> Vec<u8> {
+        let mut v: Vec<u8> = Vec::new();
+        v.extend_from_slice(&SCV_U256.to_be_bytes());
+        v.extend_from_slice(&hi_hi.to_be_bytes());
+        v.extend_from_slice(&hi_lo.to_be_bytes());
+        v.extend_from_slice(&lo_hi.to_be_bytes());
+        v.extend_from_slice(&lo_lo.to_be_bytes());
+        v
+    }
+
+    fn scval_i256(hi_hi: i64, hi_lo: u64, lo_hi: u64, lo_lo: u64) -> Vec<u8> {
+        let mut v: Vec<u8> = Vec::new();
+        v.extend_from_slice(&SCV_I256.to_be_bytes());
+        v.extend_from_slice(&hi_hi.to_be_bytes());
+        v.extend_from_slice(&hi_lo.to_be_bytes());
+        v.extend_from_slice(&lo_hi.to_be_bytes());
+        v.extend_from_slice(&lo_lo.to_be_bytes());
+        v
+    }
+
+    #[test]
+    fn u256_zero_decodes_as_decimal_string() {
+        let bytes = scval_u256(0, 0, 0, 0);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&encoded);
+        assert_eq!(result, Value::String("0".to_string()));
+    }
+
+    #[test]
+    fn u256_one_decodes_as_decimal_string() {
+        let bytes = scval_u256(0, 0, 0, 1);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&encoded);
+        assert_eq!(result, Value::String("1".to_string()));
+    }
+
+    #[test]
+    fn u256_max_decodes_as_decimal_string() {
+        // u256::MAX = 2^256 - 1 = 115792089237316195423570985008687907853269984665640564039457584007913129639935
+        let bytes = scval_u256(u64::MAX, u64::MAX, u64::MAX, u64::MAX);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&encoded);
+        assert_eq!(
+            result,
+            Value::String(
+                "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn i256_positive_decodes_as_decimal_string() {
+        let bytes = scval_i256(0, 0, 0, 42);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&encoded);
+        assert_eq!(result, Value::String("42".to_string()));
+    }
+
+    #[test]
+    fn i256_negative_one_decodes_as_decimal_string() {
+        // -1 is all ones in two's complement
+        let bytes = scval_i256(-1, u64::MAX, u64::MAX, u64::MAX);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&encoded);
+        assert_eq!(result, Value::String("-1".to_string()));
+    }
+
+    #[test]
+    fn i256_min_decodes_as_decimal_string() {
+        // i256::MIN = -2^255
+        let bytes = scval_i256(i64::MIN, 0, 0, 0);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&encoded);
+        assert_eq!(
+            result,
+            Value::String(
+                "-57896044618658097711785492504343953926634992332820282019728792003956564819968"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn u256_does_not_produce_hex_object() {
+        // Regression: old decoder emitted {"_u256_hex": "..."} — ensure that's gone.
+        let bytes = scval_u256(0, 0, 0, 1);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&encoded);
+        assert!(
+            result.get("_u256_hex").is_none(),
+            "u256 should decode to a decimal string, not a hex object: {result:?}"
+        );
+        assert!(
+            result.as_str().is_some(),
+            "u256 should decode to a string: {result:?}"
+        );
     }
 
     #[test]

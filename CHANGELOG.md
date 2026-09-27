@@ -82,6 +82,32 @@ a write conflict on `webhook_deliveries` during migration `0008`.
 ### Fixed
 - `START_LEDGER` now clamped to RPC retention window on fresh start
 - Documentation clarified `MAX_LOOKBACK_LEDGERS` vs `MAX_CATCHUP_LEDGERS`
+- **#406 — XDR decoder stack-overflow on deeply nested `ScVal`.** `read_scval`
+  and `read_map` now thread a recursion depth counter and return the `_xdr`
+  fallback for any value nested beyond 256 levels (larger than any legitimate
+  Soroban value). A malformed or malicious input can no longer crash the
+  indexer or API process. ([#406](https://github.com/Lumen-Scribe/Lumenqraph/issues/406))
+- **#407 — Protocol 23 address types decoded to garbage.** `read_address` now
+  handles `SC_ADDRESS_TYPE_MUXED_ACCOUNT` (→ `M…` strkey),
+  `SC_ADDRESS_TYPE_CLAIMABLE_BALANCE` (→ `B…` strkey), and
+  `SC_ADDRESS_TYPE_LIQUIDITY_POOL` (→ `L…` strkey). Unknown address types
+  fall back to `_xdr` without misaligning the cursor — fixing downstream
+  corruption when these addresses appeared inside a vec or map.
+  ([#407](https://github.com/Lumen-Scribe/Lumenqraph/issues/407))
+
+### Changed (JSON shape — review before upgrading)
+- **#408 — `SCV_ERROR` now decodes to `{"error":{"type":…,"code":…}}`** instead
+  of the opaque `{"_error":true}`. Contract errors carry a numeric `code`;
+  host errors carry a named `SCErrorCode` string (e.g. `"ExceededLimit"`).
+  Consumers that matched the old `_error` key must be updated to read
+  `error.type` and `error.code`.
+  ([#408](https://github.com/Lumen-Scribe/Lumenqraph/issues/408))
+- **#409 — `u256`/`i256` values now decode to decimal strings** (e.g.
+  `"115792089…"` / `"-1"`) instead of the old `{"_u256_hex":"…"}` object.
+  This aligns with the existing `u128`/`i128` behaviour and restores the
+  decode → `/call` round trip for 256-bit types. Consumers that parsed the
+  `_u256_hex` key must switch to reading the string value directly.
+  ([#409](https://github.com/Lumen-Scribe/Lumenqraph/issues/409))
 
 ## [0.1.0] - Initial Release
 
