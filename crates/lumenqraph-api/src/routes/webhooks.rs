@@ -1,6 +1,13 @@
 //! Webhook subscription management. Consumers register a URL (+ optional
 //! contract/event filters) and receive an HMAC-signing `secret` once, at
 //! creation. The `lumenqraph-webhooks` service does the actual delivery.
+//!
+//! Issue #421: Every subscription is scoped to the API key that created it.
+//! `list_webhooks` only returns the caller's own subscriptions; all other
+//! mutation endpoints return 404 for subscriptions owned by other keys (to
+//! avoid enumeration). Existing rows with NULL owner are only accessible to
+//! callers with the "admin" role (not yet implemented) — they are simply
+//! unreachable from normal keys.
 
 use axum::extract::{Path, Query, State};
 use axum::response::Response;
@@ -15,6 +22,7 @@ use tracing::warn;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
+use crate::auth::CallerKeyHash;
 use crate::error::{ApiError, ApiResult};
 use crate::pagination::{self, IdCursor, Page, PageRequest};
 use crate::state::AppState;
@@ -100,15 +108,22 @@ pub fn spawn_webhook_delivery_pruner(pool: PgPool) {
     });
 }
 
+/// Log a webhook lifecycle event to the audit log.
+///
+/// `key_hash_prefix` is the caller's key hash (or a fallback string); it is
+/// truncated to 8 characters, matching the audit log convention used elsewhere.
 async fn log_webhook_action(
     pool: &PgPool,
+    key_hash_prefix: &str,
     action_type: &str,
     resource_id: &str,
 ) {
+    let prefix = key_hash_prefix.chars().take(8).collect::<String>();
     if let Err(e) = sqlx::query(
         "INSERT INTO audit_log (key_hash_prefix, route, http_method, status_code, action_type, resource_id)
-         VALUES ('webhook', '/webhooks', 'MUTATION', 200, $1, $2)"
+         VALUES ($1, '/webhooks', 'MUTATION', 200, $2, $3)"
     )
+    .bind(&prefix)
     .bind(action_type)
     .bind(resource_id)
     .execute(pool)
@@ -135,11 +150,11 @@ pub struct CreateWebhook {
 
 #[derive(Deserialize)]
 pub struct UpdateWebhook {
-    /// Toggle active/paused state of the subscription
+    /// Toggle active/paused state of the subscription.
     active: Option<bool>,
-    /// Update contract filter
+    /// Update contract filter.
     contract_id: Option<String>,
-    /// Update event name filter
+    /// Update event name filter.
     event_name: Option<String>,
 }
 
@@ -166,20 +181,10 @@ fn random_secret() -> String {
 
 pub async fn create_webhook(
     State(state): State<AppState>,
+    // CallerKeyHash may be absent for anonymous callers (when REQUIRE_API_KEY=false).
+    caller: Option<Extension<CallerKeyHash>>,
     Json(body): Json<CreateWebhook>,
 ) -> ApiResult<Json<CreatedWebhook>> {
-    if state.webhook_max_subscriptions > 0 {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_subscriptions")
-            .fetch_one(&state.pool)
-            .await?;
-        if count as usize >= state.webhook_max_subscriptions {
-            return Err(ApiError::bad_request(format!(
-                "maximum webhook subscriptions limit reached ({})",
-                state.webhook_max_subscriptions
-            )));
-        }
-    }
-
     url_validation::validate_webhook_url(&body.url)
         .map_err(|e| ApiError::bad_request(format!("invalid webhook url: {}", e)))?;
 
@@ -206,9 +211,15 @@ pub async fn create_webhook(
     let encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY")
         .unwrap_or_else(|_| "default-key-for-testing".to_string());
 
+    // Set owner_key_hash from the authenticated caller (#421). Anonymous callers
+    // (no API key) create subscriptions with NULL owner, which are only accessible
+    // to admin keys.
+    let owner_key_hash: Option<String> = caller.map(|ext| ext.0.0.clone());
+
     let sub: WebhookSubscription = sqlx::query_as(
-        "INSERT INTO webhook_subscriptions (url, kind, contract_id, event_name, encrypted_secret, starting_seq)
-         VALUES ($1, $2, $3, $4, pgp_sym_encrypt($5, $6), $7)
+        "INSERT INTO webhook_subscriptions
+             (url, kind, contract_id, event_name, encrypted_secret, starting_seq, owner_key_hash)
+         VALUES ($1, $2, $3, $4, pgp_sym_encrypt($5, $6), $7, $8)
          RETURNING id, url, kind, contract_id, event_name, active, created_at",
     )
     .bind(&body.url)
@@ -218,10 +229,12 @@ pub async fn create_webhook(
     .bind(&secret)
     .bind(&encryption_key)
     .bind(starting_seq)
+    .bind(&owner_key_hash)
     .fetch_one(&state.pool)
     .await?;
 
-    log_webhook_action(&state.pool, "webhook_create", &sub.id.to_string()).await;
+    let key_prefix = owner_key_hash.as_deref().unwrap_or("anon");
+    log_webhook_action(&state.pool, key_prefix, "webhook_create", &sub.id.to_string()).await;
 
     // Return the secret in the response (this is the only time it's exposed).
     Ok(Json(CreatedWebhook {

@@ -121,6 +121,100 @@ pub fn decode_scval_base64(b64: &str) -> Value {
     }
 }
 
+/// Decode an already-parsed `ScVal` directly to friendly JSON, without any
+/// base64 round-trip. Produces the same JSON shapes as [`decode_scval_base64`].
+///
+/// This is the fast path used by the read layer and state snapshots, where the
+/// value is already in memory as a typed Rust enum. Converting back to XDR and
+/// then base64 just to feed the byte-level decoder is wasted work.
+pub fn decode_scval(sv: &stellar_xdr::curr::ScVal) -> Value {
+    use stellar_xdr::curr::{ScAddress, ScVal};
+    match sv {
+        ScVal::Bool(b) => Value::Bool(*b),
+        ScVal::Void => Value::Null,
+        ScVal::Error(_) => json!({ "_error": true }),
+        ScVal::U32(n) => json!(n),
+        ScVal::I32(n) => json!(n),
+        ScVal::U64(n) => Value::String(n.to_string()),
+        ScVal::I64(n) => Value::String(n.to_string()),
+        ScVal::Timepoint(t) => Value::String(t.0.to_string()),
+        ScVal::Duration(d) => Value::String(d.0.to_string()),
+        ScVal::U128(p) => {
+            let hi = p.hi as u128;
+            let lo = p.lo as u128;
+            Value::String(((hi << 64) | lo).to_string())
+        }
+        ScVal::I128(p) => {
+            let hi = p.hi as i128;
+            let lo = p.lo as i128;
+            Value::String(((hi << 64) | lo).to_string())
+        }
+        ScVal::U256(p) => {
+            // Render as hex for now, matching the byte-level decoder.
+            let mut bytes = [0u8; 32];
+            bytes[0..8].copy_from_slice(&p.hi_hi.to_be_bytes());
+            bytes[8..16].copy_from_slice(&p.hi_lo.to_be_bytes());
+            bytes[16..24].copy_from_slice(&p.lo_hi.to_be_bytes());
+            bytes[24..32].copy_from_slice(&p.lo_lo.to_be_bytes());
+            json!({ "_u256_hex": hex(&bytes) })
+        }
+        ScVal::I256(p) => {
+            let mut bytes = [0u8; 32];
+            bytes[0..8].copy_from_slice(&(p.hi_hi as u64).to_be_bytes());
+            bytes[8..16].copy_from_slice(&p.hi_lo.to_be_bytes());
+            bytes[16..24].copy_from_slice(&p.lo_hi.to_be_bytes());
+            bytes[24..32].copy_from_slice(&p.lo_lo.to_be_bytes());
+            json!({ "_u256_hex": hex(&bytes) })
+        }
+        ScVal::Bytes(b) => Value::String(format!("0x{}", hex(&b.0))),
+        ScVal::String(s) => Value::String(s.to_utf8_string_lossy()),
+        ScVal::Symbol(s) => Value::String(s.to_utf8_string_lossy()),
+        ScVal::Vec(opt) => match opt {
+            None => Value::Array(vec![]),
+            Some(v) => Value::Array(v.0.iter().map(decode_scval).collect()),
+        },
+        ScVal::Map(opt) => match opt {
+            None => Value::Object(serde_json::Map::new()),
+            Some(m) => {
+                // Mirror the byte-level decoder: prefer a plain object when all
+                // keys are symbols/strings; fall back to [{key, val}] otherwise.
+                let mut obj = serde_json::Map::new();
+                let mut pairs = Vec::new();
+                let mut all_stringy = true;
+                for entry in m.0.iter() {
+                    let k = decode_scval(&entry.key);
+                    let v = decode_scval(&entry.val);
+                    match &k {
+                        Value::String(s) => {
+                            obj.insert(s.clone(), v.clone());
+                        }
+                        _ => all_stringy = false,
+                    }
+                    pairs.push(json!({ "key": k, "val": v }));
+                }
+                if all_stringy {
+                    Value::Object(obj)
+                } else {
+                    Value::Array(pairs)
+                }
+            }
+        },
+        ScVal::Address(addr) => {
+            Value::String(addr.to_string())
+        }
+        ScVal::LedgerKeyContractInstance => json!({ "_type": "LedgerKeyContractInstance" }),
+        ScVal::LedgerKeyNonce(n) => json!({ "_type": "LedgerKeyNonce", "nonce": n.nonce }),
+        ScVal::ContractInstance(inst) => {
+            // Best-effort: represent the instance type.
+            use stellar_xdr::curr::ContractExecutable;
+            match &inst.executable {
+                ContractExecutable::Wasm(hash) => json!({ "_type": "ContractInstance", "wasm_hash": hex(&hash.0) }),
+                ContractExecutable::StellarAsset => json!({ "_type": "ContractInstance", "stellar_asset": true }),
+            }
+        }
+    }
+}
+
 /// Decode each base64 topic into friendly JSON.
 pub fn decode_topics(topics: &[String]) -> Vec<Value> {
     topics.iter().map(|t| decode_scval_base64(t)).collect()

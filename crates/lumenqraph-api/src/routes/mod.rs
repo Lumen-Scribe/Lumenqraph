@@ -34,6 +34,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::auth::{
     auth_and_rate_limit, concurrency_limit, rpc_auth_and_rate_limit, webhook_auth_and_rate_limit,
+    webhook_manage_auth_and_rate_limit,
 };
 use crate::graphql::{self, AppSchema};
 use crate::metrics;
@@ -161,6 +162,20 @@ pub fn router(state: AppState) -> Router {
             "/transactions/:tx_hash/events",
             get(events::transaction_events),
         )
+        // GraphQL: POST executes queries, GET serves the GraphiQL IDE. Behind
+        // the same auth + rate-limit middleware as the REST data routes.
+        .route("/graphql", post(graphql_handler).get(graphiql))
+        .layer(Extension(schema))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_and_rate_limit,
+        ));
+
+    // Webhook management routes: GET /webhooks, DELETE/PATCH /webhooks/:id,
+    // and related sub-routes. These ALWAYS require a valid API key regardless
+    // of REQUIRE_API_KEY (#420 — anonymous callers must not be able to list,
+    // modify, or delete webhook subscriptions).
+    let webhook_manage_routes = Router::new()
         .route(
             "/webhooks",
             get(webhooks::list_webhooks),
@@ -177,7 +192,7 @@ pub fn router(state: AppState) -> Router {
         .layer(Extension(schema))
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            auth_and_rate_limit,
+            webhook_manage_auth_and_rate_limit,
         ));
 
     // Webhook creation route with separate, lower rate limiting (prevents subscription spam).
@@ -194,6 +209,7 @@ pub fn router(state: AppState) -> Router {
         .merge(protected)
         .merge(rpc_routes)
         .merge(webhook_create_routes)
+        .merge(webhook_manage_routes)
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),

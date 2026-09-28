@@ -32,6 +32,9 @@ pub struct ContractSpec {
     pub structs: Vec<UdtStruct>,
     pub unions: Vec<UdtUnion>,
     pub enums: Vec<UdtEnum>,
+    /// Error enums from `UdtErrorEnumV0` entries. These map numeric contract
+    /// error codes to human-readable names and doc strings.
+    pub error_enums: Vec<UdtErrorEnum>,
     /// event name -> index into `events`, for O(1) enrichment lookups.
     #[serde(skip)]
     events_by_name: HashMap<String, usize>,
@@ -48,6 +51,10 @@ pub struct ContractSpec {
     /// numeric enum value can be named without scanning that enum's cases.
     #[serde(skip)]
     enum_cases: Vec<HashMap<u32, String>>,
+    /// Flat map of error code -> (name, doc) across all error enums, for O(1)
+    /// error-code lookup in the read layer. Built by [`Self::reindex`].
+    #[serde(skip)]
+    error_code_index: HashMap<u32, (String, String)>,
 }
 
 /// Where a named UDT lives in the parsed spec. Recorded once by
@@ -145,6 +152,23 @@ pub struct UdtEnum {
     pub cases: Vec<(String, u32)>,
 }
 
+/// A contract error enum case, as declared by `UdtErrorEnumV0` in the spec.
+/// These map numeric error codes (returned by the contract on failure) to
+/// human-readable names and optional doc strings.
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorCase {
+    pub name: String,
+    pub code: u32,
+    pub doc: String,
+}
+
+/// A parsed contract error enum (from `ScSpecEntry::UdtErrorEnumV0`).
+#[derive(Debug, Clone, Serialize)]
+pub struct UdtErrorEnum {
+    pub name: String,
+    pub cases: Vec<ErrorCase>,
+}
+
 impl ContractSpec {
     /// Parse a contract's interface out of its deployed WASM. Returns `None` if
     /// the module carries no `contractspecv0` section (e.g. a Stellar Asset
@@ -181,6 +205,7 @@ impl ContractSpec {
             && self.structs.is_empty()
             && self.unions.is_empty()
             && self.enums.is_empty()
+            && self.error_enums.is_empty()
     }
 
     fn reindex(&mut self) {
@@ -236,6 +261,17 @@ impl ContractSpec {
             }
             self.enum_cases.push(cases);
         }
+
+        // Build the flat error code -> (name, doc) index from all error enums.
+        // If the same code appears in multiple error enums (unlikely but valid),
+        // the last declaration wins — consistent with declaration order in the spec.
+        self.error_code_index.clear();
+        for error_enum in &self.error_enums {
+            for case in &error_enum.cases {
+                self.error_code_index
+                    .insert(case.code, (case.name.clone(), case.doc.clone()));
+            }
+        }
     }
 
     /// Resolve a callable function by name. Built by [`Self::reindex`], so this
@@ -254,6 +290,20 @@ impl ContractSpec {
             UdtRef::Union(i) => Some(UdtDef::Union(&self.unions[i])),
             UdtRef::Struct(i) => Some(UdtDef::Struct(&self.structs[i])),
         }
+    }
+
+    /// Look up a contract error code in the error-enum section of the spec.
+    ///
+    /// Returns `Some((name, doc))` when the code is declared in a
+    /// `UdtErrorEnumV0` entry, or `None` when the code is unknown (in which
+    /// case the caller should fall back to showing the numeric code).
+    ///
+    /// This is the key piece for issue #418: turning `Error(Contract, #6)` into
+    /// `InsufficientAllowance` when the spec declares it.
+    pub fn resolve_error_code(&self, code: u32) -> Option<(&str, &str)> {
+        self.error_code_index
+            .get(&code)
+            .map(|(name, doc)| (name.as_str(), doc.as_str()))
     }
 
     fn push_entry(&mut self, entry: ScSpecEntry) {
@@ -342,8 +392,20 @@ impl ContractSpec {
                     },
                 });
             }
-            // Error enums carry no data useful for event enrichment.
-            ScSpecEntry::UdtErrorEnumV0(_) => {}
+            // Error enums carry numeric codes → names, used by the read layer
+            // to map `Error(Contract, #N)` to the declared case name.
+            ScSpecEntry::UdtErrorEnumV0(e) => self.error_enums.push(UdtErrorEnum {
+                name: string_of(&e.name),
+                cases: e
+                    .cases
+                    .iter()
+                    .map(|c| ErrorCase {
+                        name: string_of(&c.name),
+                        code: c.value,
+                        doc: string_of(&c.doc),
+                    })
+                    .collect(),
+            }),
         }
     }
 
