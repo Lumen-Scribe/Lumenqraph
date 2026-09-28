@@ -138,15 +138,24 @@ const data = await lq.graphql<{ transfers: { edges: { node: unknown }[] } }>(`
 | `getState(id, { limit })` | `GET /contracts/:id/state` |
 | `getData(id, { label, limit })` | `GET /contracts/:id/data` |
 | `getDataKey(id, keyHash, { limit })` | `GET /contracts/:id/data/:keyHash` |
-| `listEvents(id, { limit, offset, eventName })` | `GET /contracts/:id/events` |
+| `listEvents(id, { limit, after, eventName })` | `GET /contracts/:id/events` |
 | `getStats(id, { resolution, window })` | `GET /contracts/:id/stats` |
-| `listTransfers(id?, { limit, offset })` | `GET /contracts/:id/transfers` |
+| `listTransfers(id?, { limit, after, from, to })` | `GET /contracts/:id/transfers` |
+| `listSwaps(id, { limit, after, sender, sellToken, buyToken })` | `GET /contracts/:id/swaps` |
+| `listNftEvents(id, { limit, after, kind, from, to, tokenId })` | `GET /contracts/:id/nfts` |
+| `listLiquidityEvents(id, { limit, after, kind, provider })` | `GET /contracts/:id/liquidity` |
+| `listDeliveries(webhookId, { limit, after, includeSummary })` | `GET /webhooks/:id/deliveries` |
+| `paginateEventsRest` / `paginateTransfers` / `paginateSwaps` / `paginateNftEvents` / `paginateLiquidityEvents` / `paginateDeliveries` | REST keyset cursor (`after` / `next_cursor`) |
 | `listFunctions(id)` | `GET /contracts/:id/functions` |
 | `call(id, { function, args, sourceAccount })` | `POST /contracts/:id/call` |
 | `simulate(id, { function, args, sourceAccount })` | `POST /contracts/:id/simulate` |
 | `graphql(query, variables)` | `POST /graphql` |
 | `eventsPage` / `paginateEvents` | `POST /graphql` (cursor) |
 | `verifyWebhook(rawBody, sigHeader, secret)` *(standalone)* | — |
+
+Every REST list endpoint returns the same envelope, `{ data, has_more, next_cursor }`.
+Pass `next_cursor` as `after` to get the next page. `offset` still works but is
+deprecated and capped at 10,000 rows.
 
 Errors for non-2xx responses are thrown as `LumenqraphError` (`.status`, `.body`).
 

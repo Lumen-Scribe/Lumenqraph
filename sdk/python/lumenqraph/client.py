@@ -101,6 +101,18 @@ class LumenqraphError(Exception):
         self.body = body
 
 
+def _page_query(limit: int, offset: int, after: Optional[str],
+                extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Build a list-endpoint query. ``offset`` is only sent when non-zero
+    (it is deprecated server-side) and never alongside a cursor."""
+    query: Dict[str, Any] = {"limit": limit, "after": after}
+    if offset and not after:
+        query["offset"] = offset
+    if extra:
+        query.update(extra)
+    return query
+
+
 class LumenqraphClient:
     """Lumenqraph API client with retry and timeout logic."""
 
@@ -259,10 +271,95 @@ class LumenqraphClient:
         return self._get(f"/contracts/{contract_id}/events", query)
 
     def list_transfers(self, contract_id: Optional[str] = None, limit: int = 50,
-                       offset: int = 0) -> Dict[str, Any]:
-        """Get materialized SEP-41 transfers."""
+                       offset: int = 0, after: Optional[str] = None,
+                       from_addr: Optional[str] = None,
+                       to_addr: Optional[str] = None) -> Dict[str, Any]:
+        """Get materialized SEP-41 transfers, newest first.
+
+        Returns ``{"data": [...], "has_more": bool, "next_cursor": str | None}``.
+        Pass ``next_cursor`` as ``after`` for the next page; ``offset`` is
+        deprecated and capped at 10,000 by the server.
+        """
         path = f"/contracts/{contract_id}/transfers" if contract_id else "/transfers"
-        return self._get(path, {"limit": limit, "offset": offset})
+        return self._get(path, _page_query(limit, offset, after,
+                                           {"from": from_addr, "to": to_addr}))
+
+    def list_swaps(self, contract_id: str, limit: int = 50, offset: int = 0,
+                   after: Optional[str] = None, sender: Optional[str] = None,
+                   sell_token: Optional[str] = None,
+                   buy_token: Optional[str] = None) -> Dict[str, Any]:
+        """Get materialized AMM swaps, newest first (cursor-paginated)."""
+        return self._get(f"/contracts/{contract_id}/swaps", _page_query(
+            limit, offset, after,
+            {"sender": sender, "sell_token": sell_token, "buy_token": buy_token}))
+
+    def list_nft_events(self, contract_id: str, limit: int = 50, offset: int = 0,
+                        after: Optional[str] = None, kind: Optional[str] = None,
+                        from_addr: Optional[str] = None, to_addr: Optional[str] = None,
+                        token_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get materialized NFT mint/transfer/burn events, newest first (cursor-paginated)."""
+        return self._get(f"/contracts/{contract_id}/nfts", _page_query(
+            limit, offset, after,
+            {"kind": kind, "from": from_addr, "to": to_addr, "token_id": token_id}))
+
+    def list_liquidity_events(self, contract_id: str, limit: int = 50, offset: int = 0,
+                              after: Optional[str] = None, kind: Optional[str] = None,
+                              provider: Optional[str] = None) -> Dict[str, Any]:
+        """Get materialized liquidity add/remove events, newest first (cursor-paginated)."""
+        return self._get(f"/contracts/{contract_id}/liquidity", _page_query(
+            limit, offset, after, {"kind": kind, "provider": provider}))
+
+    def list_deliveries(self, webhook_id: str, limit: int = 50, offset: int = 0,
+                        after: Optional[str] = None,
+                        include_summary: bool = False) -> Dict[str, Any]:
+        """Get a webhook's delivery attempts, newest first (cursor-paginated).
+
+        Per-status counts are only returned (under ``summary``) when
+        ``include_summary`` is true.
+        """
+        return self._get(f"/webhooks/{webhook_id}/deliveries", _page_query(
+            limit, offset, after,
+            {"include_summary": "true" if include_summary else None}))
+
+    def _paginate(self, path: str, query: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+        """Follow ``next_cursor`` until ``has_more`` is false."""
+        after: Optional[str] = None
+        while True:
+            response = self._get(path, {**query, "after": after})
+            yield from response.get("data", [])
+            after = response.get("next_cursor")
+            if not response.get("has_more", False) or not after:
+                break
+
+    def paginate_transfers(self, contract_id: str, page_size: int = 100,
+                           from_addr: Optional[str] = None,
+                           to_addr: Optional[str] = None) -> Iterator[Dict[str, Any]]:
+        """Iterate over all of a contract's transfers via cursor pagination."""
+        return self._paginate(f"/contracts/{contract_id}/transfers",
+                              {"limit": page_size, "from": from_addr, "to": to_addr})
+
+    def paginate_swaps(self, contract_id: str, page_size: int = 100,
+                       **filters: Optional[str]) -> Iterator[Dict[str, Any]]:
+        """Iterate over all of a contract's AMM swaps (filters: sender, sell_token, buy_token)."""
+        return self._paginate(f"/contracts/{contract_id}/swaps",
+                              {"limit": page_size, **filters})
+
+    def paginate_nft_events(self, contract_id: str, page_size: int = 100,
+                            **filters: Optional[str]) -> Iterator[Dict[str, Any]]:
+        """Iterate over all of a contract's NFT events (filters: kind, from, to, token_id)."""
+        return self._paginate(f"/contracts/{contract_id}/nfts",
+                              {"limit": page_size, **filters})
+
+    def paginate_liquidity_events(self, contract_id: str, page_size: int = 100,
+                                  **filters: Optional[str]) -> Iterator[Dict[str, Any]]:
+        """Iterate over all of a contract's liquidity events (filters: kind, provider)."""
+        return self._paginate(f"/contracts/{contract_id}/liquidity",
+                              {"limit": page_size, **filters})
+
+    def paginate_deliveries(self, webhook_id: str,
+                            page_size: int = 100) -> Iterator[Dict[str, Any]]:
+        """Iterate over all delivery attempts of a webhook."""
+        return self._paginate(f"/webhooks/{webhook_id}/deliveries", {"limit": page_size})
 
     def list_functions(self, contract_id: str) -> Dict[str, Any]:
         """Get a contract's callable view functions."""
