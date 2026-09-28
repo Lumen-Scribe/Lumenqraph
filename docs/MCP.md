@@ -25,6 +25,8 @@ If you're just trying this out, run the indexer for a few minutes so it has some
 
 Pipe newline-delimited JSON-RPC messages to stdin and read responses from stdout:
 
+#### stdio
+
 ```bash
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}' \
@@ -37,14 +39,28 @@ printf '%s\n' \
 
 You should see three responses: an `initialize` result, the tool list, and your indexed contracts.
 
+#### streamable HTTP
+
+```bash
+MCP_AUTH_TOKEN=secret \
+DATABASE_URL='postgres://lumenqraph:lumenqraph@localhost:5432/lumenqraph' \
+RPC_URL='https://soroban-testnet.stellar.org' \
+MCP_HTTP_BIND='0.0.0.0:8090' \
+./target/release/lumenqraph-mcp
+```
+
+Then connect over HTTPS to `http://<host>:8090/mcp` with an `Authorization: Bearer secret` header and JSON-RPC requests.
+
 ## Transport & Environment
 
 ### Transport
 
-The server uses **newline-delimited JSON-RPC 2.0 over stdio**, the standard MCP transport:
-- Read JSON-RPC requests from stdin, one per line.
-- Write JSON-RPC responses to stdout, one per line.
-- Log messages go to stderr (so stdout stays a clean protocol channel).
+The server supports two transports:
+
+- **stdio**: newline-delimited JSON-RPC 2.0 over stdin/stdout for local agents and desktop clients.
+- **streamable HTTP**: JSON-RPC over HTTPS for shared, remote deployments. The server listens on a bind address such as `0.0.0.0:8090` and exposes the MCP endpoint at `/mcp`.
+
+For stdio mode, log messages go to stderr so stdout stays a clean protocol channel. For HTTP mode, send `Authorization: Bearer <token>` when `MCP_AUTH_TOKEN` is configured and use `Mcp-Session-Id` for session continuity.
 
 ### Environment Variables
 

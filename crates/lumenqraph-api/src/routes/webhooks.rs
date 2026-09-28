@@ -128,8 +128,16 @@ pub struct CreateWebhook {
     /// every caller written before upgrade subscriptions existed.
     #[serde(default = "default_kind")]
     kind: String,
+    #[serde(default)]
     contract_id: Option<String>,
+    #[serde(default)]
+    contract_ids: Option<Vec<String>>,
+    #[serde(default)]
     event_name: Option<String>,
+    #[serde(default)]
+    event_names: Option<Vec<String>>,
+    #[serde(default)]
+    filter: Option<Value>,
     /// Optional backfill: "last N", a ledger number, or a timestamp (ISO-8601).
     /// Defaults to current watermark (no backfill).
     #[serde(default)]
@@ -140,10 +148,16 @@ pub struct CreateWebhook {
 pub struct UpdateWebhook {
     /// Toggle active/paused state of the subscription.
     active: Option<bool>,
-    /// Update contract filter.
+    /// Update legacy single contract filter.
     contract_id: Option<String>,
-    /// Update event name filter.
+    /// Update legacy single event filter.
     event_name: Option<String>,
+    #[serde(default)]
+    contract_ids: Option<Vec<String>>,
+    #[serde(default)]
+    event_names: Option<Vec<String>>,
+    #[serde(default)]
+    filter: Option<Value>,
 }
 
 /// Response returned by `create_webhook`. Carries the one-time plaintext
@@ -189,12 +203,28 @@ pub async fn create_webhook(
         ));
     }
 
-    // #424: validate contract_id and event_name on creation.
-    if let Some(ref cid) = body.contract_id {
-        validate_contract_id(cid)?;
+    let contract_ids = normalize_contract_ids(body.contract_id.as_deref(), body.contract_ids.clone());
+    let event_names = normalize_event_names(body.event_name.as_deref(), body.event_names.clone());
+
+    if let Some(ref filter) = body.filter {
+        validate_webhook_filter(filter)?;
     }
-    if let Some(ref en) = body.event_name {
-        validate_event_name(en)?;
+
+    if let Some(ref ids) = contract_ids {
+        if ids.len() > 25 {
+            return Err(ApiError::bad_request("contract_ids must contain at most 25 entries"));
+        }
+        for cid in ids {
+            validate_contract_id(cid)?;
+        }
+    }
+    if let Some(ref names) = event_names {
+        if names.len() > 25 {
+            return Err(ApiError::bad_request("event_names must contain at most 25 entries"));
+        }
+        for name in names {
+            validate_event_name(name)?;
+        }
     }
 
     let secret = random_secret();
@@ -235,14 +265,17 @@ pub async fn create_webhook(
 
     let sub: WebhookSubscription = sqlx::query_as(
         "INSERT INTO webhook_subscriptions
-             (url, kind, contract_id, event_name, encrypted_secret, starting_seq, owner_key_hash)
-         VALUES ($1, $2, $3, $4, pgp_sym_encrypt($5, $6), $7, $8)
-         RETURNING id, url, kind, contract_id, event_name, active, created_at",
+             (url, kind, contract_id, event_name, contract_ids, event_names, filter, encrypted_secret, starting_seq, owner_key_hash)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, pgp_sym_encrypt($8, $9), $10, $11)
+         RETURNING id, url, kind, contract_id, event_name, contract_ids, event_names, filter, active, created_at",
     )
     .bind(&body.url)
     .bind(&body.kind)
-    .bind(&body.contract_id)
-    .bind(&body.event_name)
+    .bind(contract_ids.as_ref().and_then(|ids| ids.first().cloned()))
+    .bind(event_names.as_ref().and_then(|names| names.first().cloned()))
+    .bind(&contract_ids)
+    .bind(&event_names)
+    .bind(body.filter.as_ref().unwrap_or(&Value::Null))
     .bind(&secret)
     .bind(encryption_key)
     .bind(starting_seq)
@@ -292,6 +325,70 @@ fn validate_event_name(name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn validate_webhook_filter(filter: &Value) -> Result<(), ApiError> {
+    match filter {
+        Value::Object(obj) => {
+            if obj.len() > 16 {
+                return Err(ApiError::bad_request("filter contains too many keys (max 16)"));
+            }
+            for (key, value) in obj {
+                if key.len() > 64 {
+                    return Err(ApiError::bad_request("filter key names must be <=64 chars"));
+                }
+                match value {
+                    Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+                    Value::Array(arr) if arr.len() <= 8 => {}
+                    Value::Object(_) => {
+                        return Err(ApiError::bad_request(
+                            "nested filter objects are not supported; use flat keys like topic2 or to",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        Value::Null => Ok(()),
+        _ => Err(ApiError::bad_request(
+            "filter must be a JSON object or null; use keys like topic2 or to",
+        )),
+    }
+}
+
+fn normalize_contract_ids(
+    legacy_single: Option<&str>,
+    multi: Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    let mut values = Vec::new();
+    if let Some(val) = legacy_single {
+        if !val.is_empty() {
+            values.push(val.to_string());
+        }
+    }
+    if let Some(mut list) = multi {
+        values.append(&mut list);
+    }
+    let values = values.into_iter().filter(|v| !v.is_empty()).collect::<Vec<_>>();
+    if values.is_empty() { None } else { Some(values) }
+}
+
+fn normalize_event_names(
+    legacy_single: Option<&str>,
+    multi: Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    let mut values = Vec::new();
+    if let Some(val) = legacy_single {
+        if !val.is_empty() {
+            values.push(val.to_string());
+        }
+    }
+    if let Some(mut list) = multi {
+        values.append(&mut list);
+    }
+    let values = values.into_iter().filter(|v| !v.is_empty()).collect::<Vec<_>>();
+    if values.is_empty() { None } else { Some(values) }
+}
+
 async fn calculate_starting_seq(pool: &sqlx::PgPool, since: &str) -> ApiResult<i64> {
     if since.starts_with("last ") {
         let count_str = since.strip_prefix("last ").unwrap_or("0");
@@ -333,6 +430,9 @@ type WebhookListRow = (
     String,
     Option<String>,
     Option<String>,
+    Option<Vec<String>>,
+    Option<Vec<String>>,
+    Option<Value>,
     bool,
     chrono::DateTime<chrono::Utc>,
     Option<chrono::DateTime<chrono::Utc>>,
@@ -342,7 +442,7 @@ type WebhookListRow = (
 /// List subscriptions without exposing their secrets.
 pub async fn list_webhooks(State(state): State<AppState>) -> ApiResult<Json<Vec<Value>>> {
     let rows: Vec<WebhookListRow> = sqlx::query_as(
-        "SELECT id, url, kind, contract_id, event_name, active, created_at, auto_disabled_at, auto_disabled_reason
+        "SELECT id, url, kind, contract_id, event_name, contract_ids, event_names, filter, active, created_at, auto_disabled_at, auto_disabled_reason
              FROM webhook_subscriptions ORDER BY created_at DESC",
     )
     .fetch_all(&state.pool)
@@ -351,13 +451,16 @@ pub async fn list_webhooks(State(state): State<AppState>) -> ApiResult<Json<Vec<
     let out = rows
         .into_iter()
         .map(
-            |(id, url, kind, contract_id, event_name, active, created_at, auto_disabled_at, auto_disabled_reason)| {
+            |(id, url, kind, contract_id, event_name, contract_ids, event_names, filter, active, created_at, auto_disabled_at, auto_disabled_reason)| {
                 json!({
                     "id": id,
                     "url": url,
                     "kind": kind,
                     "contract_id": contract_id,
                     "event_name": event_name,
+                    "contract_ids": contract_ids,
+                    "event_names": event_names,
+                    "filter": filter,
                     "active": active,
                     "created_at": created_at,
                     "auto_disabled_at": auto_disabled_at,
@@ -374,49 +477,76 @@ pub async fn update_webhook(
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateWebhook>,
 ) -> ApiResult<Json<Value>> {
-    // Check that at least one field is being updated
-    if body.active.is_none() && body.contract_id.is_none() && body.event_name.is_none() {
+    if body.active.is_none() && body.contract_id.is_none() && body.event_name.is_none() && body.contract_ids.is_none() && body.event_names.is_none() && body.filter.is_none() {
         return Err(ApiError::bad_request("no fields to update"));
     }
 
-    // Validate filters if updating them
-    if let Some(ref contract_id) = body.contract_id {
-        if contract_id.is_empty() {
-            return Err(ApiError::bad_request("contract_id cannot be empty"));
-        }
+    if let Some(ref filter) = body.filter {
+        validate_webhook_filter(filter)?;
     }
 
-    // Get current subscription
-    let current: (String, bool, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT kind, active, contract_id, event_name FROM webhook_subscriptions WHERE id = $1",
+    let current: (String, bool, Option<String>, Option<String>, Option<Vec<String>>, Option<Vec<String>>, Option<Value>) = sqlx::query_as(
+        "SELECT kind, active, contract_id, event_name, contract_ids, event_names, filter FROM webhook_subscriptions WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(&state.pool)
     .await?
     .ok_or_else(|| ApiError::not_found("webhook subscription not found"))?;
 
-    let (kind, _active, cur_contract, cur_event) = current;
-
-    // Validate kind-specific constraints
-    if kind == "upgrade" && body.event_name.is_some() {
+    let (kind, _active, cur_contract, cur_event, cur_contracts, cur_events, cur_filter) = current;
+    if kind == "upgrade" && (body.event_name.is_some() || body.event_names.is_some()) {
         return Err(ApiError::bad_request(
             "event_name does not apply to an `upgrade` subscription",
         ));
     }
 
-    // Apply updates
-    let updated: (Uuid, String, String, Option<String>, Option<String>, bool, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+    let next_contract_id = body.contract_id.as_deref().or(cur_contract.as_deref());
+    let next_event_name = body.event_name.as_deref().or(cur_event.as_deref());
+    let next_contract_ids = match body.contract_ids {
+        Some(ref ids) => Some(ids.clone()),
+        None => cur_contracts,
+    };
+    let next_event_names = match body.event_names {
+        Some(ref names) => Some(names.clone()),
+        None => cur_events,
+    };
+    let next_filter = body.filter.or(cur_filter);
+
+    if let Some(ref ids) = next_contract_ids {
+        if ids.len() > 25 {
+            return Err(ApiError::bad_request("contract_ids must contain at most 25 entries"));
+        }
+        for cid in ids {
+            validate_contract_id(cid)?;
+        }
+    }
+    if let Some(ref names) = next_event_names {
+        if names.len() > 25 {
+            return Err(ApiError::bad_request("event_names must contain at most 25 entries"));
+        }
+        for name in names {
+            validate_event_name(name)?;
+        }
+    }
+
+    let updated: (Uuid, String, String, Option<String>, Option<String>, Option<Vec<String>>, Option<Vec<String>>, Option<Value>, bool, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
         "UPDATE webhook_subscriptions
             SET active      = COALESCE($2, active),
                 contract_id = COALESCE($3, contract_id),
-                event_name  = COALESCE($4, event_name)
+                event_name  = COALESCE($4, event_name),
+                contract_ids = COALESCE($5, contract_ids),
+                event_names = COALESCE($6, event_names),
+                filter      = COALESCE($7, filter)
           WHERE id = $1
-          RETURNING id, url, kind, contract_id, event_name, active, created_at",
+          RETURNING id, url, kind, contract_id, event_name, contract_ids, event_names, filter, active, created_at",
     )
     .bind(id)
     .bind(body.active)
-    .bind(body.contract_id.as_ref().or(cur_contract.as_ref()))
-    .bind(body.event_name.as_ref().or(cur_event.as_ref()))
+    .bind(next_contract_id)
+    .bind(next_event_name)
+    .bind(&next_contract_ids)
+    .bind(&next_event_names)
+    .bind(&next_filter)
     .fetch_one(&state.pool)
     .await?;
 
@@ -428,8 +558,11 @@ pub async fn update_webhook(
         "kind": updated.2,
         "contract_id": updated.3,
         "event_name": updated.4,
-        "active": updated.5,
-        "created_at": updated.6,
+        "contract_ids": updated.5,
+        "event_names": updated.6,
+        "filter": updated.7,
+        "active": updated.8,
+        "created_at": updated.9,
     })))
 }
 
@@ -457,6 +590,8 @@ pub struct DeliveryRow {
     status: String,
     attempts: i32,
     last_error: Option<String>,
+    last_status_code: Option<i32>,
+    last_response_snippet: Option<String>,
     delivered_at: Option<chrono::DateTime<chrono::Utc>>,
     created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -517,7 +652,7 @@ pub async fn list_webhook_deliveries(
     }
 
     let rows: Vec<DeliveryRow> = sqlx::query_as(
-        "SELECT id, status, attempts, last_error, delivered_at, created_at
+        "SELECT id, status, attempts, last_error, last_status_code, last_response_snippet, delivered_at, created_at
          FROM webhook_deliveries
          WHERE subscription_id = $1
            AND ($2::bigint IS NULL OR id < $2)

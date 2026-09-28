@@ -80,6 +80,8 @@ pub struct WebhookDeliveryResponse {
     pub status: String,
     pub attempts: i32,
     pub last_error: Option<String>,
+    pub last_status_code: Option<i32>,
+    pub last_response_snippet: Option<String>,
     pub delivered_at: Option<String>,
     pub created_at: String,
 }
@@ -131,6 +133,9 @@ pub struct WebhookSubscriptionResponse {
     pub url: String,
     pub contract_id: Option<String>,
     pub event_name: Option<String>,
+    pub contract_ids: Option<Vec<String>>,
+    pub event_names: Option<Vec<String>>,
+    pub filter: Option<serde_json::Value>,
     pub active: bool,
     pub created_at: String,
 }
