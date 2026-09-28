@@ -17,6 +17,7 @@
 //! | Code                  | HTTP status | When                                                    |
 //! |-----------------------|-------------|---------------------------------------------------------|
 //! | `bad_request`         | 400         | Malformed input, invalid parameter value, wrong type.  |
+//! | `invalid_contract_id` | 400         | `:contract_id` path segment is not a valid `C…` strkey. |
 //! | `unauthorized`        | 401         | Missing or revoked API key.                            |
 //! | `not_found`           | 404         | Requested resource does not exist.                     |
 //! | `rate_limited`        | 429         | Caller exceeded the request-per-minute limit. Carries a `Retry-After` header. |
@@ -40,6 +41,7 @@ use serde_json::json;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
     BadRequest,
+    InvalidContractId,
     Unauthorized,
     NotFound,
     RateLimited,
@@ -54,6 +56,7 @@ impl ErrorCode {
     pub fn as_str(self) -> &'static str {
         match self {
             ErrorCode::BadRequest => "bad_request",
+            ErrorCode::InvalidContractId => "invalid_contract_id",
             ErrorCode::Unauthorized => "unauthorized",
             ErrorCode::NotFound => "not_found",
             ErrorCode::RateLimited => "rate_limited",
@@ -82,6 +85,13 @@ pub enum ApiError {
         retry_after_secs: Option<u64>,
         message: String,
     },
+    /// A simulation failure with a named contract error detail (issue #418).
+    /// The `contract_error` field is included in the response body alongside
+    /// the standard `code`/`error` fields.
+    SimulationFailedWithContractError {
+        message: String,
+        contract_error: serde_json::Value,
+    },
     /// An unexpected internal failure (500); details are logged, not exposed.
     Internal(anyhow::Error),
 }
@@ -101,6 +111,14 @@ impl ApiError {
     pub fn bad_request(msg: impl Into<String>) -> Self {
         ApiError::Status(StatusCode::BAD_REQUEST, ErrorCode::BadRequest, msg.into())
     }
+    /// A malformed `:contract_id` path segment (#440).
+    pub fn invalid_contract_id() -> Self {
+        ApiError::Status(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidContractId,
+            "invalid contract id".into(),
+        )
+    }
     pub fn not_found(msg: impl Into<String>) -> Self {
         ApiError::Status(StatusCode::NOT_FOUND, ErrorCode::NotFound, msg.into())
     }
@@ -110,6 +128,36 @@ impl ApiError {
             ErrorCode::SimulationFailed,
             msg.into(),
         )
+    }
+
+    /// A simulation failure with an optional named contract error detail (#418).
+    ///
+    /// When `contract_error` is `Some`, the response body includes a
+    /// `contract_error` field alongside the standard `code`/`error` fields:
+    /// ```json
+    /// {
+    ///   "code": "simulation_failed",
+    ///   "error": "simulation failed: …",
+    ///   "contract_error": { "code": 6, "name": "InsufficientAllowance", "doc": "…" }
+    /// }
+    /// ```
+    /// When `contract_error` is `None`, the response is identical to
+    /// [`Self::simulation_failed`].
+    pub fn simulation_failed_with_contract_error(
+        msg: impl Into<String>,
+        contract_error: Option<serde_json::Value>,
+    ) -> Self {
+        match contract_error {
+            None => ApiError::Status(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::SimulationFailed,
+                msg.into(),
+            ),
+            Some(detail) => ApiError::SimulationFailedWithContractError {
+                message: msg.into(),
+                contract_error: detail,
+            },
+        }
     }
     pub fn spec_unavailable(msg: impl Into<String>) -> Self {
         ApiError::Status(
@@ -150,6 +198,9 @@ impl fmt::Display for ApiError {
         match self {
             ApiError::Status(_, _, msg) => write!(f, "{}", msg),
             ApiError::RateLimited { message, .. } => write!(f, "{}", message),
+            ApiError::SimulationFailedWithContractError { message, .. } => {
+                write!(f, "{}", message)
+            }
             ApiError::Internal(e) => write!(f, "{}", e),
         }
     }
@@ -161,12 +212,31 @@ impl std::error::Error for ApiError {
             ApiError::Internal(e) => Some(e.as_ref()),
             ApiError::Status(_, _, _) => None,
             ApiError::RateLimited { .. } => None,
+            ApiError::SimulationFailedWithContractError { .. } => None,
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        match self {
+            ApiError::SimulationFailedWithContractError {
+                message,
+                contract_error,
+            } => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "code": ErrorCode::SimulationFailed.as_str(),
+                        "error": message,
+                        "contract_error": contract_error,
+                    })),
+                )
+                    .into_response();
+            }
+            _ => {}
+        }
+
         let (status, code, message, retry_after_secs) = match self {
             ApiError::Status(s, c, m) => (s, c, m, None),
             ApiError::RateLimited {
@@ -187,6 +257,8 @@ impl IntoResponse for ApiError {
                     None,
                 )
             }
+            // handled above in the match
+            ApiError::SimulationFailedWithContractError { .. } => unreachable!(),
         };
         let mut response = (
             status,

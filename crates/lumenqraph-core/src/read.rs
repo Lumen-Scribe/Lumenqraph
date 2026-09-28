@@ -815,13 +815,11 @@ pub fn decode_events(
     out
 }
 
-/// Decode an already-parsed `ScVal` to JSON by re-encoding it through the same
-/// decoder events use (keeps one JSON shape across the whole system).
+/// Decode an already-parsed `ScVal` to JSON using the shared decoder, without
+/// any base64 round-trip. This keeps one JSON shape across the whole system
+/// (events, read layer, state snapshots) and avoids wasted re-serialisation.
 fn scval_to_json(sv: &ScVal) -> Value {
-    match sv.to_xdr_base64(Limits::none()) {
-        Ok(b64) => crate::xdr::decode_scval_base64(&b64),
-        Err(_) => Value::Null,
-    }
+    crate::xdr::decode_scval(sv)
 }
 
 // ---- small helpers ----

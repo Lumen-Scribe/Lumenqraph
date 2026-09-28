@@ -29,6 +29,12 @@ pub struct Config {
     pub max_concurrent_per_host: usize,
     pub max_concurrent_deliveries: usize,
     pub failure_threshold: i32,
+    pub metrics_bind_addr: String,
+    pub db_max_connections: u32,
+    pub db_min_connections: u32,
+    pub db_acquire_timeout_secs: u64,
+    pub db_idle_timeout_secs: u64,
+    pub db_connect_retries: u32,
     /// The `pgp_sym_encrypt` / `pgp_sym_decrypt` key used for the webhook
     /// shared secrets. Read once at startup and never falls back to a default,
     /// so a missing key is a hard startup failure rather than a silent
@@ -48,6 +54,13 @@ impl std::fmt::Debug for Config {
             .field("max_concurrent_per_host", &self.max_concurrent_per_host)
             .field("max_concurrent_deliveries", &self.max_concurrent_deliveries)
             .field("failure_threshold", &self.failure_threshold)
+            .field("metrics_bind_addr", &self.metrics_bind_addr)
+            .field("db_max_connections", &self.db_max_connections)
+            .field("db_min_connections", &self.db_min_connections)
+            .field("db_acquire_timeout_secs", &self.db_acquire_timeout_secs)
+            .field("db_idle_timeout_secs", &self.db_idle_timeout_secs)
+            .field("db_connect_retries", &self.db_connect_retries)
+            .field("encryption_key", &"[REDACTED]")
             .finish()
     }
 }
@@ -70,14 +83,23 @@ impl Config {
 
         Ok(Self {
             database_url: std::env::var("DATABASE_URL").context("missing DATABASE_URL")?,
-            tick_secs: parse("WEBHOOK_TICK_SECS", 3),
-            batch_size: parse("WEBHOOK_BATCH_SIZE", 100),
-            max_attempts: parse("WEBHOOK_MAX_ATTEMPTS", 6),
-            connect_timeout_secs: parse("WEBHOOK_CONNECT_TIMEOUT_SECS", 5),
-            total_timeout_secs: parse("WEBHOOK_TOTAL_TIMEOUT_SECS", 10),
-            max_concurrent_per_host: parse("WEBHOOK_MAX_CONCURRENT_PER_HOST", 5),
-            max_concurrent_deliveries: parse("WEBHOOK_MAX_CONCURRENT_DELIVERIES", 100),
-            failure_threshold: parse("WEBHOOK_FAILURE_THRESHOLD", 10),
+            tick_secs: parse("WEBHOOK_TICK_SECS", 3)?,
+            batch_size: parse("WEBHOOK_BATCH_SIZE", 100)?,
+            max_attempts: parse("WEBHOOK_MAX_ATTEMPTS", 6)?,
+            connect_timeout_secs: parse("WEBHOOK_CONNECT_TIMEOUT_SECS", 5)?,
+            total_timeout_secs: parse("WEBHOOK_TOTAL_TIMEOUT_SECS", 10)?,
+            max_concurrent_per_host: parse("WEBHOOK_MAX_CONCURRENT_PER_HOST", 5)?,
+            max_concurrent_deliveries: parse("WEBHOOK_MAX_CONCURRENT_DELIVERIES", 100)?,
+            failure_threshold: parse("WEBHOOK_FAILURE_THRESHOLD", 10)?,
+            metrics_bind_addr: std::env::var("WEBHOOKS_METRICS_BIND_ADDR")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "127.0.0.1:9091".to_string()),
+            db_max_connections: parse("DATABASE_MAX_CONNECTIONS", 5)?,
+            db_min_connections: parse("DATABASE_MIN_CONNECTIONS", 1)?,
+            db_acquire_timeout_secs: parse("DATABASE_ACQUIRE_TIMEOUT_SECS", 30)?,
+            db_idle_timeout_secs: parse("DATABASE_IDLE_TIMEOUT_SECS", 600)?,
+            db_connect_retries: parse("DATABASE_CONNECT_RETRIES", 30)?,
             encryption_key,
         })
     }
@@ -91,11 +113,20 @@ impl Config {
     }
 }
 
-fn parse<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+/// Parse `key`, or return `default` when unset/empty. A present but
+/// unparseable value is a startup error naming the variable (#441) — a typo
+/// like `WEBHOOK_MAX_ATTEMPTS=6x` must not silently become the default.
+fn parse<T: std::str::FromStr>(key: &str, default: T) -> anyhow::Result<T>
+where
+    T::Err: std::fmt::Display,
+{
+    match std::env::var(key) {
+        Ok(v) if !v.trim().is_empty() => v
+            .trim()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid {key}={v:?}: {e}")),
+        _ => Ok(default),
+    }
 }
 
 #[cfg(test)]
@@ -125,5 +156,21 @@ mod tests {
             err.to_string().contains("WEBHOOK_ENCRYPTION_KEY"),
             "error should mention the missing var: {err}"
         );
+    }
+
+    #[test]
+    fn parse_rejects_garbage_and_names_the_variable() {
+        let key = "LUMENQRAPH_WEBHOOKS_TEST_PARSE";
+        std::env::set_var(key, "6x");
+        let err = parse::<i32>(key, 6).unwrap_err().to_string();
+        std::env::remove_var(key);
+        assert!(err.contains(key), "error should name the variable: {err}");
+    }
+
+    #[test]
+    fn parse_uses_default_when_unset() {
+        let key = "LUMENQRAPH_WEBHOOKS_TEST_UNSET";
+        std::env::remove_var(key);
+        assert_eq!(parse::<u64>(key, 3).unwrap(), 3);
     }
 }

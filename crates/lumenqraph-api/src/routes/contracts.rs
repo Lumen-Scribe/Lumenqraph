@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 use sqlx::types::Json as SqlxJson;
 
 use crate::error::{ApiError, ApiResult};
+use crate::extract::ValidContractId;
 use crate::specs::CachedSpec;
 use crate::state::AppState;
 
@@ -160,13 +161,10 @@ pub struct InterfaceQuery {
 
 pub async fn contract_interface(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
     Query(q): Query<InterfaceQuery>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, ApiError> {
-    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
-        return Err(ApiError::bad_request("invalid contract id"));
-    }
     if let Some(version) = q.version {
         return contract_interface_at_version(&state, &contract_id, version, &headers).await;
     }
@@ -279,14 +277,10 @@ fn parse_history_cursor(cursor: &str) -> Result<i32, ApiError> {
 /// Pass the `next_cursor` from a previous response as `after` to continue.
 pub async fn contract_interface_history(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
     Query(q): Query<HistoryQuery>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, ApiError> {
-    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
-        return Err(ApiError::bad_request("invalid contract id"));
-    }
-
     // Parse the cursor before hitting the DB so a malformed value returns 400
     // immediately rather than after an unnecessary round-trip.
     let after_version: Option<i32> = q
@@ -424,12 +418,9 @@ pub struct DiffQuery {
 /// can ask "what changed between v1 and v5" in one call, not four.
 pub async fn contract_interface_diff(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
     Query(q): Query<DiffQuery>,
 ) -> ApiResult<Json<Value>> {
-    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
-        return Err(ApiError::bad_request("invalid contract id"));
-    }
     // Reject an explicit bad range before touching the database.
     if let (Some(from), Some(to)) = (q.from, q.to) {
         validate_diff_range(from, to)?;
@@ -527,13 +518,10 @@ fn default_state_limit() -> i64 {
 /// storage, newest first. `limit=1` (default) is the current state.
 pub async fn contract_state(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
     Query(q): Query<StateQuery>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, ApiError> {
-    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
-        return Err(ApiError::bad_request("invalid contract id"));
-    }
     let limit = q.limit.clamp(1, 200);
     let rows: Vec<(i64, SqlxJson<Value>, DateTime<Utc>)> = sqlx::query_as(
         "SELECT ledger, storage, captured_at
@@ -613,12 +601,9 @@ type DataRow = (
 /// per key (its latest snapshot). Requires the indexer's key indexing.
 pub async fn contract_data(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
     Query(q): Query<DataQuery>,
 ) -> ApiResult<Json<Value>> {
-    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
-        return Err(ApiError::bad_request("invalid contract id"));
-    }
     let limit = q.limit.clamp(1, 1000);
     // DISTINCT ON gives the newest row per key_hash; the outer query orders and
     // bounds the set of keys returned.
@@ -690,12 +675,10 @@ pub struct DataHistoryQuery {
 /// per-key entry (e.g. one holder's balance over time), newest first.
 pub async fn contract_data_key(
     State(state): State<AppState>,
-    Path((contract_id, key_hash)): Path<(String, String)>,
+    ValidContractId(contract_id): ValidContractId,
+    Path((_, key_hash)): Path<(String, String)>,
     Query(q): Query<DataHistoryQuery>,
 ) -> ApiResult<Json<Value>> {
-    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
-        return Err(ApiError::bad_request("invalid contract id"));
-    }
     let limit = q.limit.clamp(1, 500);
     // (key, durability, ledger, value, label, captured_at)
     type HistRow = (
@@ -901,8 +884,13 @@ mod tests {
                 health_max_lag_ledgers: 100,
                 health_max_stale_secs: 120,
                 metrics_require_auth: false,
+                proxy_limiter: Arc::new(RateLimiter::new()),
+                config: Arc::new(crate::config::ApiConfig::test_default()),
+                key_cache: Arc::new(crate::key_cache::KeyCache::new(256)),
+                ip_config: crate::auth::IpConfig { trusted_proxy_hops: 0, platform_header: None },
                 audit_tx: None,
                 audit_dropped: Arc::new(AtomicU64::new(0)),
+                shutdown: tokio_util::sync::CancellationToken::new(),
             }
         }
 

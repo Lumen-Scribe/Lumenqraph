@@ -4,7 +4,7 @@
 //! depend on the fast-moving `stellar-xdr` crate, we decode the (stable) ScVal
 //! wire format directly into friendly JSON. Integers that don't fit a JS number
 //! are rendered as decimal strings; addresses are rendered as strkeys
-//! (`G...`/`C...`); bytes as hex.
+//! (`G...`/`C...`/`M...`/`B...`/`L...`); bytes as hex.
 //!
 //! Decoding is always best-effort: on any malformed input we fall back to
 //! `{"_xdr": "<base64>"}` so nothing is lost and one weird event can't break
@@ -88,9 +88,17 @@ const SCV_CONTRACT_INSTANCE: u32 = 19;
 const SCV_LEDGER_KEY_CONTRACT_INSTANCE: u32 = 20;
 const SCV_LEDGER_KEY_NONCE: u32 = 21;
 
-// ScAddressType discriminants.
+// ScAddressType discriminants (Protocol 23+).
 const SC_ADDRESS_ACCOUNT: u32 = 0;
 const SC_ADDRESS_CONTRACT: u32 = 1;
+const SC_ADDRESS_MUXED_ACCOUNT: u32 = 2;
+const SC_ADDRESS_CLAIMABLE_BALANCE: u32 = 3;
+const SC_ADDRESS_LIQUIDITY_POOL: u32 = 4;
+
+/// Maximum nesting depth for `ScVal` decoding. Values nested deeper than this
+/// cause the whole decode to return the `{"_xdr": …}` fallback rather than
+/// risk a stack overflow.
+const MAX_DEPTH: u32 = 256;
 
 /// Decode a base64 `ScVal` into friendly JSON. Never panics.
 ///
@@ -110,6 +118,100 @@ pub fn decode_scval_base64(b64: &str) -> Value {
             }
         }
         Err(_) => json!({ "_type": "unknown", "xdr": b64 }),
+    }
+}
+
+/// Decode an already-parsed `ScVal` directly to friendly JSON, without any
+/// base64 round-trip. Produces the same JSON shapes as [`decode_scval_base64`].
+///
+/// This is the fast path used by the read layer and state snapshots, where the
+/// value is already in memory as a typed Rust enum. Converting back to XDR and
+/// then base64 just to feed the byte-level decoder is wasted work.
+pub fn decode_scval(sv: &stellar_xdr::curr::ScVal) -> Value {
+    use stellar_xdr::curr::{ScAddress, ScVal};
+    match sv {
+        ScVal::Bool(b) => Value::Bool(*b),
+        ScVal::Void => Value::Null,
+        ScVal::Error(_) => json!({ "_error": true }),
+        ScVal::U32(n) => json!(n),
+        ScVal::I32(n) => json!(n),
+        ScVal::U64(n) => Value::String(n.to_string()),
+        ScVal::I64(n) => Value::String(n.to_string()),
+        ScVal::Timepoint(t) => Value::String(t.0.to_string()),
+        ScVal::Duration(d) => Value::String(d.0.to_string()),
+        ScVal::U128(p) => {
+            let hi = p.hi as u128;
+            let lo = p.lo as u128;
+            Value::String(((hi << 64) | lo).to_string())
+        }
+        ScVal::I128(p) => {
+            let hi = p.hi as i128;
+            let lo = p.lo as i128;
+            Value::String(((hi << 64) | lo).to_string())
+        }
+        ScVal::U256(p) => {
+            // Render as hex for now, matching the byte-level decoder.
+            let mut bytes = [0u8; 32];
+            bytes[0..8].copy_from_slice(&p.hi_hi.to_be_bytes());
+            bytes[8..16].copy_from_slice(&p.hi_lo.to_be_bytes());
+            bytes[16..24].copy_from_slice(&p.lo_hi.to_be_bytes());
+            bytes[24..32].copy_from_slice(&p.lo_lo.to_be_bytes());
+            json!({ "_u256_hex": hex(&bytes) })
+        }
+        ScVal::I256(p) => {
+            let mut bytes = [0u8; 32];
+            bytes[0..8].copy_from_slice(&(p.hi_hi as u64).to_be_bytes());
+            bytes[8..16].copy_from_slice(&p.hi_lo.to_be_bytes());
+            bytes[16..24].copy_from_slice(&p.lo_hi.to_be_bytes());
+            bytes[24..32].copy_from_slice(&p.lo_lo.to_be_bytes());
+            json!({ "_u256_hex": hex(&bytes) })
+        }
+        ScVal::Bytes(b) => Value::String(format!("0x{}", hex(&b.0))),
+        ScVal::String(s) => Value::String(s.to_utf8_string_lossy()),
+        ScVal::Symbol(s) => Value::String(s.to_utf8_string_lossy()),
+        ScVal::Vec(opt) => match opt {
+            None => Value::Array(vec![]),
+            Some(v) => Value::Array(v.0.iter().map(decode_scval).collect()),
+        },
+        ScVal::Map(opt) => match opt {
+            None => Value::Object(serde_json::Map::new()),
+            Some(m) => {
+                // Mirror the byte-level decoder: prefer a plain object when all
+                // keys are symbols/strings; fall back to [{key, val}] otherwise.
+                let mut obj = serde_json::Map::new();
+                let mut pairs = Vec::new();
+                let mut all_stringy = true;
+                for entry in m.0.iter() {
+                    let k = decode_scval(&entry.key);
+                    let v = decode_scval(&entry.val);
+                    match &k {
+                        Value::String(s) => {
+                            obj.insert(s.clone(), v.clone());
+                        }
+                        _ => all_stringy = false,
+                    }
+                    pairs.push(json!({ "key": k, "val": v }));
+                }
+                if all_stringy {
+                    Value::Object(obj)
+                } else {
+                    Value::Array(pairs)
+                }
+            }
+        },
+        ScVal::Address(addr) => {
+            Value::String(addr.to_string())
+        }
+        ScVal::LedgerKeyContractInstance => json!({ "_type": "LedgerKeyContractInstance" }),
+        ScVal::LedgerKeyNonce(n) => json!({ "_type": "LedgerKeyNonce", "nonce": n.nonce }),
+        ScVal::ContractInstance(inst) => {
+            // Best-effort: represent the instance type.
+            use stellar_xdr::curr::ContractExecutable;
+            match &inst.executable {
+                ContractExecutable::Wasm(hash) => json!({ "_type": "ContractInstance", "wasm_hash": hex(&hash.0) }),
+                ContractExecutable::StellarAsset => json!({ "_type": "ContractInstance", "stellar_asset": true }),
+            }
+        }
     }
 }
 
@@ -172,7 +274,10 @@ impl<'a> Cursor<'a> {
         Some(data)
     }
 
-    fn read_scval(&mut self) -> Option<Value> {
+    fn read_scval(&mut self, depth: u32) -> Option<Value> {
+        if depth > MAX_DEPTH {
+            return None;
+        }
         let tag = self.u32()?;
         Some(match tag {
             // #410: strict bool — XDR bool must be exactly 0 or 1.
@@ -186,10 +291,43 @@ impl<'a> Cursor<'a> {
             }
             SCV_VOID => Value::Null,
             SCV_ERROR => {
-                // Skip: (type u32, code u32). Represent opaquely.
-                let _ = self.u32()?;
-                let _ = self.u32()?;
-                json!({ "_error": true })
+                // SCError: type (u32) then either a code (u32 for Contract errors)
+                // or an SCErrorCode enum (u32) for host errors.
+                let error_type = self.u32()?;
+                let code = self.u32()?;
+                let type_name = match error_type {
+                    0 => "Contract",
+                    1 => "WasmVm",
+                    2 => "Context",
+                    3 => "Storage",
+                    4 => "Object",
+                    5 => "Crypto",
+                    6 => "Events",
+                    7 => "Budget",
+                    8 => "Value",
+                    9 => "Auth",
+                    _ => "Unknown",
+                };
+                // Contract errors carry a raw u32 code; host errors carry an
+                // SCErrorCode enum. Render host codes by name where known.
+                if error_type == 0 {
+                    json!({ "error": { "type": type_name, "code": code } })
+                } else {
+                    let code_name = match code {
+                        0 => "ArithDomain",
+                        1 => "IndexBounds",
+                        2 => "InvalidInput",
+                        3 => "MissingValue",
+                        4 => "ExistingValue",
+                        5 => "ExceededLimit",
+                        6 => "InvalidAction",
+                        7 => "InternalError",
+                        8 => "UnexpectedType",
+                        9 => "UnexpectedSize",
+                        _ => "Unknown",
+                    };
+                    json!({ "error": { "type": type_name, "code": code_name } })
+                }
             }
             SCV_U32 => json!(self.u32()?),
             SCV_I32 => json!(self.i32()?),
@@ -233,7 +371,7 @@ impl<'a> Cursor<'a> {
                     let len = self.u32()? as usize;
                     let mut items = Vec::with_capacity(len.min(1024));
                     for _ in 0..len {
-                        items.push(self.read_scval()?);
+                        items.push(self.read_scval(depth + 1)?);
                     }
                     Value::Array(items)
                 }
@@ -243,7 +381,7 @@ impl<'a> Cursor<'a> {
                     Value::Object(Map::new())
                 } else {
                     let len = self.u32()? as usize;
-                    self.read_map(len)?
+                    self.read_map(len, depth + 1)?
                 }
             }
             SCV_ADDRESS => Value::String(self.read_address()?),
@@ -319,8 +457,8 @@ impl<'a> Cursor<'a> {
         let mut has_collision = false;
 
         for _ in 0..len {
-            let k = self.read_scval()?;
-            let v = self.read_scval()?;
+            let k = self.read_scval(depth)?;
+            let v = self.read_scval(depth)?;
             match &k {
                 Value::String(s) => {
                     if obj.contains_key(s.as_str()) {
@@ -361,7 +499,35 @@ impl<'a> Cursor<'a> {
                 payload.copy_from_slice(raw);
                 Some(Contract(payload).to_string())
             }
-            other => Some(format!("_addr_type_{other}")),
+            SC_ADDRESS_MUXED_ACCOUNT => {
+                // MuxedAccountMed25519: id (u64, big-endian) + ed25519 key (32 bytes).
+                // Strkey M…: version byte (12<<3 = 0x60), then ed25519(32) + id(8).
+                let id = self.u64()?;
+                let key = self.take(32)?;
+                let mut payload = [0u8; 40];
+                payload[..32].copy_from_slice(key);
+                payload[32..].copy_from_slice(&id.to_be_bytes());
+                Some(strkey(VERSION_MUXED, &payload))
+            }
+            SC_ADDRESS_CLAIMABLE_BALANCE => {
+                // ClaimableBalanceID: discriminant (u32) + 32-byte hash.
+                // Strkey B…: version byte (1<<3 = 0x08), then type byte (0) + hash(32).
+                let balance_type = self.u32()?;
+                let hash = self.take(32)?;
+                let mut payload = [0u8; 33];
+                payload[0] = balance_type as u8;
+                payload[1..].copy_from_slice(hash);
+                Some(strkey(VERSION_CLAIMABLE_BALANCE, &payload))
+            }
+            SC_ADDRESS_LIQUIDITY_POOL => {
+                // LiquidityPoolID: 32-byte pool hash.
+                // Strkey L…: version byte (11<<3 = 0x58), then hash(32).
+                let raw = self.take(32)?;
+                Some(strkey(VERSION_LIQUIDITY_POOL, raw))
+            }
+            // Truly unknown address type: return None so the whole ScVal falls
+            // back to the _xdr representation rather than misaligning the cursor.
+            _ => None,
         }
     }
 }

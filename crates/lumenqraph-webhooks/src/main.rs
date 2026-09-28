@@ -14,22 +14,18 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use config::Config;
 
-async fn connect_with_retry(database_url: &str, max_retries: u32) -> anyhow::Result<sqlx::PgPool> {
+async fn connect_with_retry(config: &Config) -> anyhow::Result<sqlx::PgPool> {
+    let database_url = &config.database_url;
+    let max_retries = config.db_connect_retries;
     let mut attempt = 0;
     let mut retry_delay = Duration::from_secs(1);
     let max_delay = Duration::from_secs(30);
     loop {
         match PgPoolOptions::new()
-            .max_connections(env_parse_u32("DATABASE_MAX_CONNECTIONS", 5))
-            .min_connections(env_parse_u32("DATABASE_MIN_CONNECTIONS", 1))
-            .acquire_timeout(Duration::from_secs(env_parse_u64(
-                "DATABASE_ACQUIRE_TIMEOUT_SECS",
-                30,
-            )))
-            .idle_timeout(Duration::from_secs(env_parse_u64(
-                "DATABASE_IDLE_TIMEOUT_SECS",
-                600,
-            )))
+            .max_connections(config.db_max_connections)
+            .min_connections(config.db_min_connections)
+            .acquire_timeout(Duration::from_secs(config.db_acquire_timeout_secs))
+            .idle_timeout(Duration::from_secs(config.db_idle_timeout_secs))
             .connect(database_url)
             .await
         {
@@ -75,18 +71,17 @@ async fn main() -> anyhow::Result<()> {
 
     // Config::from_env() validates and reads WEBHOOK_ENCRYPTION_KEY, failing
     // fast if it is absent or empty — no separate check needed here.
+    // Every numeric setting is validated here too: an invalid value exits with
+    // a message naming the variable instead of silently using the default.
     let config = Config::from_env()?;
-    let max_connect_retries = env_parse_u32("DATABASE_CONNECT_RETRIES", 30);
-    let pool = connect_with_retry(&config.database_url, max_connect_retries).await?;
+    info!(config = ?config, "effective configuration");
+    let pool = connect_with_retry(&config).await?;
 
     // Redirects are never followed (SSRF guard, see `build_delivery_client`).
     let http = dispatcher::build_delivery_client(config.connect_timeout(), config.total_timeout())?;
 
-    let metrics_bind_addr = std::env::var("WEBHOOKS_METRICS_BIND_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:9091".to_string());
-
     let pool_arc = std::sync::Arc::new(pool.clone());
-    metrics::start_metrics_server(pool_arc, &metrics_bind_addr).await?;
+    metrics::start_metrics_server(pool_arc, &config.metrics_bind_addr).await?;
 
     info!(tick_secs = config.tick_secs, "starting lumenqraph webhooks");
     let interval = Duration::from_secs(config.tick_secs.max(1));
@@ -110,20 +105,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-}
-
-fn env_parse_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(default)
-}
-
-fn env_parse_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(default)
 }
 
 async fn shutdown_signal() {

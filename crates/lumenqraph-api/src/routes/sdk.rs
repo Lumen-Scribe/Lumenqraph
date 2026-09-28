@@ -6,13 +6,14 @@
 //! version, i.e. "the client your integration was built against before the
 //! upgrade".
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use lumenqraph_core::codegen;
 use serde::Deserialize;
 
 use crate::error::{ApiError, ApiResult};
+use crate::extract::ValidContractId;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -60,7 +61,7 @@ impl Lang {
 
 pub async fn contract_sdk(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
     Query(q): Query<SdkQuery>,
 ) -> ApiResult<Response> {
     let lang_str = q.lang.as_deref().unwrap_or("ts");

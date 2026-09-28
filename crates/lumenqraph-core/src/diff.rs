@@ -373,209 +373,10 @@ fn event_sigs(spec: &ContractSpec) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Diff events with awareness of `PotentiallyBreaking` additions to
-/// map-format events.
-///
-/// If an event exists in both old and new but the signature differs, we check
-/// whether only new parameters were *appended* to a `map`-format event body.
-/// That case is `PotentiallyBreaking` rather than `Breaking` because consumers
-/// reading named fields from the map are still correct; exhaustive decoders
-/// that reject unknown keys would fail.
-fn diff_events(old: &ContractSpec, new: &ContractSpec) -> SectionDiff {
-    let old_sigs = event_sigs(old);
-    let new_sigs = event_sigs(new);
-
-    // Build indexed maps of event name → event spec for structured inspection.
-    let old_map: BTreeMap<&str, _> = old.events.iter().map(|e| (e.name.as_str(), e)).collect();
-    let new_map: BTreeMap<&str, _> = new.events.iter().map(|e| (e.name.as_str(), e)).collect();
-
-    let names: BTreeSet<&String> = old_sigs.keys().chain(new_sigs.keys()).collect();
-    let mut diff = SectionDiff::default();
-
-    for name in names {
-        match (old_sigs.get(name), new_sigs.get(name)) {
-            (Some(before), Some(after)) if before != after => {
-                // Check if this is just new params appended to a map-format event.
-                if let (Some(oe), Some(ne)) = (old_map.get(name.as_str()), new_map.get(name.as_str())) {
-                    if let Some(desc) = is_map_event_additive_extension(oe, ne) {
-                        diff.potentially_breaking.push(PotentiallyBreakingItem {
-                            name: name.clone(),
-                            from: before.clone(),
-                            to: after.clone(),
-                            severity: Severity::PotentiallyBreaking,
-                            description: desc,
-                        });
-                        continue;
-                    }
-                }
-                diff.changed.push(ChangedItem {
-                    name: name.clone(),
-                    from: before.clone(),
-                    to: after.clone(),
-                    severity: Severity::Breaking,
-                });
-            }
-            (Some(_), Some(_)) => {}
-            (Some(before), None) => diff.removed.push(before.clone()),
-            (None, Some(after)) => diff.added.push(after.clone()),
-            (None, None) => unreachable!("name came from one of the two maps"),
-        }
-    }
-    diff
-}
-
-/// Returns `Some(description)` if the event change is purely additive (new
-/// params appended to a map-format event), `None` if it is a breaking change.
-///
-/// Map-format events are decoded by field name, so appending new named params
-/// does not break consumers that only read the fields they know. However,
-/// exhaustive decoders (that reject unknown fields) will fail, so this is
-/// `PotentiallyBreaking` rather than `Additive`.
-fn is_map_event_additive_extension(
-    old: &crate::spec::EventSpec,
-    new: &crate::spec::EventSpec,
-) -> Option<String> {
-    // Only applies to map-format events. data_format is a &'static str: "map".
-    if old.data_format != "map" || new.data_format != "map" {
-        return None;
-    }
-    // The old params must be a prefix of the new params (same names, types, locations).
-    if new.params.len() <= old.params.len() {
-        return None;
-    }
-    let prefix_matches = old
-        .params
-        .iter()
-        .zip(new.params.iter())
-        .all(|(op, np)| op.name == np.name && op.type_name == np.type_name && op.location == np.location);
-    if !prefix_matches {
-        return None;
-    }
-    let added_names: Vec<&str> = new.params[old.params.len()..]
-        .iter()
-        .map(|p| p.name.as_str())
-        .collect();
-    Some(format!("added map-format event fields: {}", added_names.join(", ")))
-}
-
-/// Diff user-defined types (structs, unions, enums) with severity awareness.
-///
-/// - Added enum/union cases → `PotentiallyBreaking` (exhaustive match arms may
-///   need updating; all other consumers are unaffected).
-/// - Changed enum discriminant values, removed cases/fields, type changes → `Breaking`.
-/// - Entirely new or removed types → `Additive` / `Breaking` respectively.
-fn diff_types(old: &ContractSpec, new: &ContractSpec) -> SectionDiff {
-    let old_sigs = type_sigs(old);
-    let new_sigs = type_sigs(new);
-
-    let names: BTreeSet<&String> = old_sigs.keys().chain(new_sigs.keys()).collect();
-    let mut diff = SectionDiff::default();
-
-    // Build indexed maps for structured inspection.
-    let old_enums: BTreeMap<&str, _> = old.enums.iter().map(|e| (e.name.as_str(), e)).collect();
-    let new_enums: BTreeMap<&str, _> = new.enums.iter().map(|e| (e.name.as_str(), e)).collect();
-    let old_unions: BTreeMap<&str, _> = old.unions.iter().map(|u| (u.name.as_str(), u)).collect();
-    let new_unions: BTreeMap<&str, _> = new.unions.iter().map(|u| (u.name.as_str(), u)).collect();
-
-    for name in names {
-        match (old_sigs.get(name), new_sigs.get(name)) {
-            (Some(before), Some(after)) if before != after => {
-                // Check if this is an additive enum case extension.
-                if let (Some(oe), Some(ne)) = (old_enums.get(name.as_str()), new_enums.get(name.as_str())) {
-                    if let Some(desc) = is_enum_additive_extension(oe, ne) {
-                        diff.potentially_breaking.push(PotentiallyBreakingItem {
-                            name: name.clone(),
-                            from: before.clone(),
-                            to: after.clone(),
-                            severity: Severity::PotentiallyBreaking,
-                            description: desc,
-                        });
-                        continue;
-                    }
-                }
-                // Check if this is an additive union case extension.
-                if let (Some(ou), Some(nu)) = (old_unions.get(name.as_str()), new_unions.get(name.as_str())) {
-                    if let Some(desc) = is_union_additive_extension(ou, nu) {
-                        diff.potentially_breaking.push(PotentiallyBreakingItem {
-                            name: name.clone(),
-                            from: before.clone(),
-                            to: after.clone(),
-                            severity: Severity::PotentiallyBreaking,
-                            description: desc,
-                        });
-                        continue;
-                    }
-                }
-                diff.changed.push(ChangedItem {
-                    name: name.clone(),
-                    from: before.clone(),
-                    to: after.clone(),
-                    severity: Severity::Breaking,
-                });
-            }
-            (Some(_), Some(_)) => {}
-            (Some(before), None) => diff.removed.push(before.clone()),
-            (None, Some(after)) => diff.added.push(after.clone()),
-            (None, None) => unreachable!("name came from one of the two maps"),
-        }
-    }
-    diff
-}
-
-/// Returns `Some(description)` when an enum changed only by adding new cases
-/// (without removing or changing any existing case name or value).
-fn is_enum_additive_extension(
-    old: &crate::spec::UdtEnum,
-    new: &crate::spec::UdtEnum,
-) -> Option<String> {
-    if new.cases.len() <= old.cases.len() {
-        return None;
-    }
-    // All old cases must be present in new with the same value.
-    let new_case_map: BTreeMap<&str, u32> =
-        new.cases.iter().map(|(n, v)| (n.as_str(), *v)).collect();
-    let all_preserved = old
-        .cases
-        .iter()
-        .all(|(name, val)| new_case_map.get(name.as_str()) == Some(val));
-    if !all_preserved {
-        return None;
-    }
-    let added_names: Vec<&str> = new
-        .cases
-        .iter()
-        .filter(|(n, _)| !old.cases.iter().any(|(on, _)| on == n))
-        .map(|(n, _)| n.as_str())
-        .collect();
-    Some(format!("added enum cases: {}", added_names.join(", ")))
-}
-
-/// Returns `Some(description)` when a union changed only by appending new cases
-/// (without removing or changing any existing case name or types).
-fn is_union_additive_extension(
-    old: &crate::spec::UdtUnion,
-    new: &crate::spec::UdtUnion,
-) -> Option<String> {
-    if new.cases.len() <= old.cases.len() {
-        return None;
-    }
-    // All old cases must be present in new at the same position with same names
-    // and same type signatures (compare by rendered type_names, not raw XDR).
-    let all_preserved = old.cases.iter().zip(new.cases.iter()).all(|(oc, nc)| {
-        oc.name == nc.name && oc.type_names == nc.type_names
-    });
-    if !all_preserved {
-        return None;
-    }
-    let added_names: Vec<&str> = new.cases[old.cases.len()..]
-        .iter()
-        .map(|c| c.name.as_str())
-        .collect();
-    Some(format!("added union cases: {}", added_names.join(", ")))
-}
-
-/// Structs, unions, and enums share one namespace, so they share one section —
-/// which also means a type that changes kind reads as a change, not a swap.
+/// Structs, unions, regular enums, and error enums share one type namespace,
+/// so they share one section — which also means a type that changes kind reads
+/// as a change, not a swap. Error enums are included because renumbering or
+/// removing a case is a breaking change for callers that match on numeric codes.
 fn type_sigs(spec: &ContractSpec) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
 
@@ -616,6 +417,18 @@ fn type_sigs(spec: &ContractSpec) -> BTreeMap<String, String> {
         out.insert(
             e.name.clone(),
             format!("enum {} {{ {} }}", e.name, cases.join(", ")),
+        );
+    }
+    // Error enums: renumbering a case changes its rendered sig → breaking change.
+    for e in &spec.errors {
+        let cases: Vec<String> = e
+            .cases
+            .iter()
+            .map(|(name, value)| format!("{name} = {value}"))
+            .collect();
+        out.insert(
+            e.name.clone(),
+            format!("error enum {} {{ {} }}", e.name, cases.join(", ")),
         );
     }
     out
@@ -1542,5 +1355,94 @@ mod tests {
         assert_eq!(d.events.removed.len(), 1);
         assert_eq!(d.events.added.len(), 1);
         assert_eq!(d.types.removed.len(), 1);
+    }
+
+    // ── #403: error enum diffing ──────────────────────────────────────────────
+
+    mod error_enum_diff {
+        use super::*;
+        use stellar_xdr::curr::{ScSpecUdtErrorEnumCaseV0, ScSpecUdtErrorEnumV0};
+
+        fn error_enum(name: &str, cases: &[(&str, u32)]) -> ScSpecEntry {
+            ScSpecEntry::UdtErrorEnumV0(ScSpecUdtErrorEnumV0 {
+                doc: "".try_into().unwrap(),
+                lib: "".try_into().unwrap(),
+                name: name.try_into().unwrap(),
+                cases: cases
+                    .iter()
+                    .map(|(n, v)| ScSpecUdtErrorEnumCaseV0 {
+                        doc: "".try_into().unwrap(),
+                        name: (*n).try_into().unwrap(),
+                        value: *v,
+                    })
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap(),
+            })
+        }
+
+        /// Adding a new error case is NOT breaking (additive).
+        #[test]
+        fn adding_an_error_case_is_not_breaking() {
+            let old = spec_of(&[
+                func("balance", &[], Some(ScSpecTypeDef::I128)),
+                error_enum("ContractError", &[("InsufficientBalance", 1)]),
+            ]);
+            let new = spec_of(&[
+                func("balance", &[], Some(ScSpecTypeDef::I128)),
+                error_enum(
+                    "ContractError",
+                    &[("InsufficientBalance", 1), ("Unauthorized", 2)],
+                ),
+            ]);
+            let d = SpecDiff::between(&old, &new);
+            assert!(!d.breaking, "adding an error case must not be breaking");
+            assert_eq!(d.types.changed.len(), 1, "the error enum sig changed");
+        }
+
+        /// Renumbering an error case IS breaking.
+        #[test]
+        fn renumbering_an_error_case_is_breaking() {
+            let old = spec_of(&[error_enum(
+                "ContractError",
+                &[("InsufficientBalance", 1), ("Unauthorized", 2)],
+            )]);
+            // Unauthorized moved from 2 to 3 — clients matching on the old code break.
+            let new = spec_of(&[error_enum(
+                "ContractError",
+                &[("InsufficientBalance", 1), ("Unauthorized", 3)],
+            )]);
+            let d = SpecDiff::between(&old, &new);
+            assert!(d.breaking, "renumbering an error case must be breaking");
+            assert_eq!(d.types.changed.len(), 1);
+            assert!(d.types.changed[0].from.contains("Unauthorized = 2"));
+            assert!(d.types.changed[0].to.contains("Unauthorized = 3"));
+        }
+
+        /// Removing an error case IS breaking.
+        #[test]
+        fn removing_an_error_case_is_breaking() {
+            let old = spec_of(&[error_enum(
+                "ContractError",
+                &[("InsufficientBalance", 1), ("Unauthorized", 2)],
+            )]);
+            let new = spec_of(&[error_enum("ContractError", &[("InsufficientBalance", 1)])]);
+            let d = SpecDiff::between(&old, &new);
+            assert!(d.breaking, "removing an error case must be breaking");
+        }
+
+        /// Removing an entire error enum IS breaking.
+        #[test]
+        fn removing_an_error_enum_is_breaking() {
+            let old = spec_of(&[
+                func("balance", &[], Some(ScSpecTypeDef::I128)),
+                error_enum("ContractError", &[("InsufficientBalance", 1)]),
+            ]);
+            let new = spec_of(&[func("balance", &[], Some(ScSpecTypeDef::I128))]);
+            let d = SpecDiff::between(&old, &new);
+            assert!(d.breaking, "removing an error enum must be breaking");
+            assert_eq!(d.types.removed.len(), 1);
+            assert!(d.types.removed[0].contains("error enum ContractError"));
+        }
     }
 }

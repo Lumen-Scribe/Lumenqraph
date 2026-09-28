@@ -9,7 +9,7 @@
 //! Argument encoding is driven by the contract's on-chain spec (captured at
 //! index time), so calls are type-checked before they ever hit the network.
 
-use axum::extract::{Path, State};
+use axum::extract::{State};
 use axum::http::StatusCode;
 use axum::Json;
 use lumenqraph_core::read::{self, EncodeError};
@@ -17,17 +17,15 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::{ApiError, ApiResult};
+use crate::extract::ValidContractId;
 use crate::read_cost_limit::validate_call_request;
 use crate::rpc::SimOutcome;
 use crate::state::AppState;
 
 pub async fn list_functions(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
 ) -> ApiResult<Json<Value>> {
-    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
-        return Err(ApiError::bad_request("invalid contract id"));
-    }
     let spec = state.specs.current(&state.pool, &contract_id).await?;
     // List from the cached parse rather than re-reading and re-parsing the
     // stored section on every request.
@@ -56,12 +54,9 @@ pub struct CallRequest {
 
 pub async fn call_function(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
     Json(req): Json<CallRequest>,
 ) -> ApiResult<Json<Value>> {
-    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
-        return Err(ApiError::bad_request("invalid contract id"));
-    }
 
     // Estimate request body size (function name + args serialization)
     let estimated_body_size = req.function.len() + serde_json::to_string(&req.args)
@@ -121,10 +116,17 @@ pub async fn call_function(
             // Log the full upstream detail server-side; only return a concise,
             // sanitised copy to the caller (see issue #154).
             tracing::warn!(rpc_error = %msg, "contract simulation failed");
-            Err(ApiError::simulation_failed(format!(
-                "simulation failed: {}",
-                lumenqraph_core::sanitize::sanitize_simulation_error(&msg)
-            )))
+            // If the error is a typed contract error (Error(Contract, #N)), try
+            // to resolve the code to its declared name from the spec (#418).
+            let contract_error =
+                build_contract_error_detail(&msg, Some(parsed));
+            Err(ApiError::simulation_failed_with_contract_error(
+                format!(
+                    "simulation failed: {}",
+                    lumenqraph_core::sanitize::sanitize_simulation_error(&msg)
+                ),
+                contract_error,
+            ))
         }
     }
 }
@@ -135,12 +137,9 @@ pub async fn call_function(
 /// submitted. Soroban's answer to Tenderly's transaction preview.
 pub async fn simulate_call(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
     Json(req): Json<CallRequest>,
 ) -> ApiResult<Json<Value>> {
-    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
-        return Err(ApiError::bad_request("invalid contract id"));
-    }
 
     // Estimate request body size (function name + args serialization)
     let estimated_body_size = req.function.len() + serde_json::to_string(&req.args)
@@ -194,10 +193,16 @@ pub async fn simulate_call(
             // Log the full upstream detail server-side; only return a concise,
             // sanitised copy to the caller (see issue #154).
             tracing::warn!(rpc_error = %msg, "contract simulation failed");
-            Err(ApiError::simulation_failed(format!(
-                "simulation failed: {}",
-                lumenqraph_core::sanitize::sanitize_simulation_error(&msg)
-            )))
+            // Resolve typed contract error codes to their declared names (#418).
+            let contract_error =
+                build_contract_error_detail(&msg, Some(parsed));
+            Err(ApiError::simulation_failed_with_contract_error(
+                format!(
+                    "simulation failed: {}",
+                    lumenqraph_core::sanitize::sanitize_simulation_error(&msg)
+                ),
+                contract_error,
+            ))
         }
     }
 }
@@ -205,6 +210,29 @@ pub async fn simulate_call(
 /// All `EncodeError`s are client-fixable, so they map to `400`.
 fn encode_error_to_api(e: EncodeError) -> ApiError {
     ApiError::bad_request(e.to_string())
+}
+
+/// Build a structured `contract_error` detail from a simulation error message.
+///
+/// If the error is `Error(Contract, #N)`, look up code `N` in the spec's error
+/// enums and return `{ "code": N, "name": "CaseName", "doc": "…" }`.
+/// If the code is unknown, return `{ "code": N }` (numeric only — no name).
+/// If the error is not a typed contract error, return `None`.
+fn build_contract_error_detail(
+    error_msg: &str,
+    spec: Option<&lumenqraph_core::ContractSpec>,
+) -> Option<serde_json::Value> {
+    let code = lumenqraph_core::sanitize::parse_contract_error_code(error_msg)?;
+    let detail = if let Some(spec) = spec {
+        if let Some((name, doc)) = spec.resolve_error_code(code) {
+            json!({ "code": code, "name": name, "doc": doc })
+        } else {
+            json!({ "code": code })
+        }
+    } else {
+        json!({ "code": code })
+    };
+    Some(detail)
 }
 
 #[cfg(test)]
@@ -291,8 +319,9 @@ mod tests {
             },
         );
 
-        use crate::concurrency_limit::ConcurrencyLimiter;
         use crate::call_cache::CallCache;
+        use crate::concurrency_limit::ConcurrencyLimiter;
+        use crate::key_cache::KeyCache;
         use crate::read_cost_limit::ReadCostLimitConfig;
 
         AppState {
@@ -322,6 +351,14 @@ mod tests {
             readyz_max_age_secs: 120,
             health_max_lag_ledgers: 100,
             health_max_stale_secs: 120,
+            metrics_require_auth: false,
+            proxy_limiter: Arc::new(RateLimiter::new()),
+            config: Arc::new(crate::config::ApiConfig::test_default()),
+            key_cache: Arc::new(KeyCache::new(256)),
+            ip_config: crate::auth::IpConfig { trusted_proxy_hops: 0, platform_header: None },
+            audit_tx: None,
+            audit_dropped: Arc::new(AtomicU64::new(0)),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         }
     }
 

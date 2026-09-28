@@ -6,11 +6,13 @@
 //! `offset` is deprecated, capped at [`crate::pagination::MAX_OFFSET`], and
 //! answered with a `Deprecation` header.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
+use axum::Json;
 use lumenqraph_core::AmmSwap;
 use serde::Deserialize;
 
 use crate::error::{ApiError, ApiResult};
+use crate::extract::ValidContractId;
 use crate::pagination::{LedgerCursor, Page, PageRequest};
 use crate::state::AppState;
 
@@ -36,12 +38,9 @@ pub type SwapsResponse = Page<AmmSwap>;
 
 pub async fn list_swaps(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
     Query(q): Query<SwapsQuery>,
-) -> ApiResult<SwapsResponse> {
-    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
-        return Err(ApiError::bad_request("invalid contract id"));
-    }
+) -> ApiResult<Json<SwapsResponse>> {
     let page = PageRequest::<LedgerCursor>::parse(q.limit, 1000, q.offset, q.after.as_deref())?;
     let (after_ledger, after_event_id) = match page.after {
         Some(ref c) => (Some(c.ledger), Some(c.event_id.as_str())),
