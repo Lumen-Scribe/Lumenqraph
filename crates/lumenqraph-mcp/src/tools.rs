@@ -16,11 +16,17 @@ struct CachedSpec {
 
 /// JSON-Schema tool definitions returned by `tools/list`.
 pub fn definitions() -> Value {
+    let base_output = json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": true
+    });
     json!([
         {
             "name": "list_contracts",
             "description": "List Soroban contracts the indexer has seen events for, with per-contract event counts and ledger ranges.",
-            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+            "outputSchema": base_output.clone()
         },
         {
             "name": "get_contract_interface",
@@ -29,7 +35,8 @@ pub fn definitions() -> Value {
                 "type": "object",
                 "properties": { "contract_id": { "type": "string", "description": "Contract id (C...)" } },
                 "required": ["contract_id"], "additionalProperties": false
-            }
+            },
+            "outputSchema": base_output.clone()
         },
         {
             "name": "get_contract_upgrades",
@@ -41,7 +48,8 @@ pub fn definitions() -> Value {
                     "limit": { "type": "integer", "description": "How many versions, newest first (1-200, default 20)" }
                 },
                 "required": ["contract_id"], "additionalProperties": false
-            }
+            },
+            "outputSchema": base_output.clone()
         },
         {
             "name": "get_contract_state",
@@ -53,7 +61,8 @@ pub fn definitions() -> Value {
                     "limit": { "type": "integer", "description": "How many versions, newest first (1-200, default 1 = current state)" }
                 },
                 "required": ["contract_id"], "additionalProperties": false
-            }
+            },
+            "outputSchema": base_output.clone()
         },
         {
             "name": "get_contract_data",
@@ -66,7 +75,8 @@ pub fn definitions() -> Value {
                     "limit": { "type": "integer", "description": "Max keys, latest value of each (1-1000, default 100)" }
                 },
                 "required": ["contract_id"], "additionalProperties": false
-            }
+            },
+            "outputSchema": base_output.clone()
         },
         {
             "name": "query_events",
@@ -79,7 +89,55 @@ pub fn definitions() -> Value {
                     "limit": { "type": "integer", "description": "Max events (1-200, default 20)" }
                 },
                 "required": ["contract_id"], "additionalProperties": false
-            }
+            },
+            "outputSchema": base_output.clone()
+        },
+        {
+            "name": "get_event",
+            "description": "Fetch a single indexed event by its unique event id, including the raw topics/value and any decoded enrichment.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "event_id": { "type": "string", "description": "Unique event id" } },
+                "required": ["event_id"], "additionalProperties": false
+            },
+            "outputSchema": base_output.clone()
+        },
+        {
+            "name": "get_transaction_events",
+            "description": "List every indexed event for a transaction, preserving the original on-chain emission order and optionally filtering only successful calls.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tx_hash": { "type": "string", "description": "Transaction hash (hex or XDR string)" },
+                    "limit": { "type": "integer", "description": "Max events to return (1-1000, default 100)" },
+                    "successful_only": { "type": "boolean", "description": "Only include events from successful calls" }
+                },
+                "required": ["tx_hash"], "additionalProperties": false
+            },
+            "outputSchema": base_output.clone()
+        },
+        {
+            "name": "get_contract_stats",
+            "description": "Summarize a contract's event activity by event name and total counts, helping answer 'how active is this contract?'.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "contract_id": { "type": "string", "description": "Contract id (C...)" },
+                    "limit": { "type": "integer", "description": "Maximum top event names to return (1-50, default 10)" }
+                },
+                "required": ["contract_id"], "additionalProperties": false
+            },
+            "outputSchema": base_output.clone()
+        },
+        {
+            "name": "list_contract_functions",
+            "description": "List the callable functions for a contract, including typed inputs and outputs, without returning the full interface payload.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "contract_id": { "type": "string", "description": "Contract id (C...)" } },
+                "required": ["contract_id"], "additionalProperties": false
+            },
+            "outputSchema": base_output.clone()
         },
         {
             "name": "call_contract",
@@ -92,7 +150,8 @@ pub fn definitions() -> Value {
                     "args": { "description": "Arguments as an object keyed by parameter name, or a positional array" }
                 },
                 "required": ["contract_id", "function"], "additionalProperties": false
-            }
+            },
+            "outputSchema": base_output.clone()
         },
         {
             "name": "simulate_call",
@@ -106,9 +165,10 @@ pub fn definitions() -> Value {
                     "source_account": { "type": "string", "description": "Optional G... source account for the simulation" }
                 },
                 "required": ["contract_id", "function"], "additionalProperties": false
-            }
+            },
+            "outputSchema": base_output.clone()
         },
-        {
+        { 
             "name": "query_transfers",
             "description": "Query materialized token transfers for a contract, newest first. Each transfer includes from/to addresses and amount. Optionally filter by sender or recipient address.",
             "inputSchema": {
@@ -120,7 +180,8 @@ pub fn definitions() -> Value {
                     "limit": { "type": "integer", "description": "Max transfers (1-200, default 20)" }
                 },
                 "required": ["contract_id"], "additionalProperties": false
-            }
+            },
+            "outputSchema": base_output.clone()
         },
         {
             "name": "diff_contract_interface",
@@ -133,7 +194,8 @@ pub fn definitions() -> Value {
                     "to": { "type": "integer", "description": "Ending version" }
                 },
                 "required": ["contract_id", "from", "to"], "additionalProperties": false
-            }
+            },
+            "outputSchema": base_output.clone()
         },
         {
             "name": "query_swaps",
@@ -148,7 +210,8 @@ pub fn definitions() -> Value {
                     "limit": { "type": "integer", "description": "Max swaps (1-200, default 20)" }
                 },
                 "required": ["contract_id"], "additionalProperties": false
-            }
+            },
+            "outputSchema": base_output.clone()
         },
         {
             "name": "query_nft_events",
@@ -164,7 +227,8 @@ pub fn definitions() -> Value {
                     "limit": { "type": "integer", "description": "Max events (1-200, default 20)" }
                 },
                 "required": ["contract_id"], "additionalProperties": false
-            }
+            },
+            "outputSchema": base_output.clone()
         },
         {
             "name": "query_liquidity_events",
@@ -178,7 +242,8 @@ pub fn definitions() -> Value {
                     "limit": { "type": "integer", "description": "Max events (1-200, default 20)" }
                 },
                 "required": ["contract_id"], "additionalProperties": false
-            }
+            },
+            "outputSchema": base_output.clone()
         }
     ])
 }
@@ -223,6 +288,25 @@ pub async fn call(state: &State, name: &str, args: &Value) -> anyhow::Result<Val
             )
             .await
         }
+        "get_event" => get_event(state, str_arg(args, "event_id")?).await,
+        "get_transaction_events" => {
+            get_transaction_events(
+                state,
+                str_arg(args, "tx_hash")?,
+                args.get("limit").and_then(Value::as_i64),
+                args.get("successful_only").and_then(Value::as_bool),
+            )
+            .await
+        }
+        "get_contract_stats" => {
+            get_contract_stats(
+                state,
+                str_arg(args, "contract_id")?,
+                args.get("limit").and_then(Value::as_i64),
+            )
+            .await
+        }
+        "list_contract_functions" => list_contract_functions(state, str_arg(args, "contract_id")?).await,
         "call_contract" => {
             call_contract(
                 state,
@@ -507,6 +591,90 @@ async fn query_events(
     Ok(json!({ "contract_id": contract_id, "count": events.len(), "events": events }))
 }
 
+async fn get_event(state: &State, event_id: &str) -> anyhow::Result<Value> {
+    let row: Option<EventRow> = sqlx::query_as(
+        "SELECT event_id, contract_id, ledger, ledger_closed_at, event_type,
+                topics, decoded_topics, event_name, value, decoded_value,
+                enriched, tx_hash, in_successful_call, paging_token, created_at
+         FROM events
+         WHERE event_id = $1",
+    )
+    .bind(event_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    match row {
+        Some(event) => Ok(json!({ "event": event })),
+        None => anyhow::bail!("no event found with id '{event_id}'"),
+    }
+}
+
+async fn get_transaction_events(
+    state: &State,
+    tx_hash: &str,
+    limit: Option<i64>,
+    successful_only: Option<bool>,
+) -> anyhow::Result<Value> {
+    let limit = limit.unwrap_or(100).clamp(1, 1000);
+    let events: Vec<EventRow> = sqlx::query_as(
+        "SELECT event_id, contract_id, ledger, ledger_closed_at, event_type,
+                topics, decoded_topics, event_name, value, decoded_value,
+                enriched, tx_hash, in_successful_call, paging_token, created_at
+         FROM events
+         WHERE tx_hash = $1
+           AND ($2::boolean IS NULL OR in_successful_call = $2)
+         ORDER BY ledger ASC, event_id ASC
+         LIMIT $3",
+    )
+    .bind(tx_hash)
+    .bind(successful_only)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(json!({ "tx_hash": tx_hash, "count": events.len(), "events": events }))
+}
+
+async fn get_contract_stats(state: &State, contract_id: &str, limit: Option<i64>) -> anyhow::Result<Value> {
+    validate_contract_id(contract_id)?;
+    let limit = limit.unwrap_or(10).clamp(1, 50);
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE contract_id = $1")
+        .bind(contract_id)
+        .fetch_one(&state.pool)
+        .await?;
+    let counts: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT event_name, COUNT(*)::bigint AS count
+         FROM events
+         WHERE contract_id = $1 AND event_name IS NOT NULL
+         GROUP BY event_name
+         ORDER BY count DESC, event_name ASC
+         LIMIT $2",
+    )
+    .bind(contract_id)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(json!({
+        "contract_id": contract_id,
+        "total_events": total,
+        "counts": counts.into_iter().map(|(name, count)| json!({"event_name": name, "count": count})).collect::<Vec<_>>(),
+    }))
+}
+
+async fn list_contract_functions(state: &State, contract_id: &str) -> anyhow::Result<Value> {
+    validate_contract_id(contract_id)?;
+    let interface = get_interface(state, contract_id).await?;
+    let functions = interface
+        .get("interface")
+        .and_then(Value::as_object)
+        .and_then(|obj| obj.get("functions"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    Ok(json!({
+        "contract_id": contract_id,
+        "count": functions.as_array().map_or(0, |v| v.len()),
+        "functions": functions,
+    }))
+}
+
 async fn query_transfers(
     state: &State,
     contract_id: &str,
@@ -722,6 +890,18 @@ async fn call_contract(
     preview: bool,
 ) -> anyhow::Result<Value> {
     validate_contract_id(contract_id)?;
+    let args_json = serde_json::to_string(&args).unwrap_or_default();
+    let estimated_body_size = function.len() + args_json.len();
+    if estimated_body_size > 256 * 1024 {
+        anyhow::bail!("MCP RPC request too large: {} bytes (limit: {} bytes)", estimated_body_size, 256 * 1024);
+    }
+    if args_json.len() > 128 * 1024 {
+        anyhow::bail!("MCP RPC args too large: {} bytes (limit: {} bytes)", args_json.len(), 128 * 1024);
+    }
+    if !state.rpc_limiter.try_consume() {
+        anyhow::bail!("MCP RPC rate limit exceeded: too many simulation calls in the last minute");
+    }
+
     let row: Option<(String,)> =
         sqlx::query_as("SELECT spec_section FROM contract_specs WHERE contract_id = $1")
             .bind(contract_id)
