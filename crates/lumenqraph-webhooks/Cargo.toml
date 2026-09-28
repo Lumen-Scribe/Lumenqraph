@@ -28,3 +28,4 @@ hex.workspace = true
 rand.workspace = true
 axum.workspace = true
 tower.workspace = true
+futures.workspace = true

@@ -105,10 +105,58 @@ export interface ContractsResponse {
   next_cursor: string | null;
 }
 
-export interface EventsResponse {
-  data: EventRecord[];
+/**
+ * Uniform keyset-paginated envelope returned by every REST list endpoint.
+ * Pass `next_cursor` as `after` to fetch the next page.
+ */
+export interface ListPage<T> {
+  data: T[];
   has_more: boolean;
+  /** Pass as `after` on the next call. `null` on the last page. */
   next_cursor: string | null;
+}
+
+export type EventsResponse = ListPage<EventRecord>;
+
+/** Materialized AMM swap row (`/contracts/:id/swaps`). */
+export interface Swap {
+  event_id: string;
+  contract_id: string;
+  sender: string | null;
+  sell_token: string | null;
+  buy_token: string | null;
+  sell_amount: string | null;
+  buy_amount: string | null;
+  raw_event_name: string;
+  ledger: number;
+  ledger_closed_at: string;
+}
+
+/** Materialized NFT event row (`/contracts/:id/nfts`). */
+export interface NftEvent {
+  event_id: string;
+  contract_id: string;
+  event_kind: "mint" | "transfer" | "burn";
+  from_addr: string | null;
+  to_addr: string | null;
+  token_id: string | null;
+  ledger: number;
+  ledger_closed_at: string;
+}
+
+/** Materialized liquidity event row (`/contracts/:id/liquidity`). */
+export interface LiquidityEvent {
+  event_id: string;
+  contract_id: string;
+  event_kind: "add" | "remove";
+  provider: string | null;
+  amount_a: string | null;
+  amount_b: string | null;
+  shares: string | null;
+  raw_event_name: string;
+  extra_amounts: Json;
+  ledger: number;
+  ledger_closed_at: string;
 }
 
 export interface StatsBucket {
@@ -163,14 +211,34 @@ export interface Webhook {
 }
 
 export interface WebhookDelivery {
-  id: string;
-  webhook_id: string;
-  status: "pending" | "success" | "failed";
-  status_code?: number;
-  error?: string;
+  id: number;
+  status: "pending" | "delivered" | "failed";
   attempts: number;
+  last_error: string | null;
+  delivered_at: string | null;
   created_at: string;
-  updated_at: string;
+}
+
+/** Per-status counts, present only when `includeSummary` is requested. */
+export interface DeliverySummary {
+  total: number;
+  delivered: number;
+  failed: number;
+  pending: number;
+}
+
+export interface DeliveriesPage extends ListPage<WebhookDelivery> {
+  summary?: DeliverySummary;
+}
+
+/** Common keyset pagination options. `offset` is deprecated server-side. */
+export interface PageOptions {
+  limit?: number;
+  /** `next_cursor` from the previous page. */
+  after?: string;
+  /** @deprecated Capped at 10,000 by the server; use `after`. */
+  offset?: number;
+  signal?: AbortSignal;
 }
 
 export interface CreateWebhookOptions {
@@ -414,14 +482,15 @@ export class LumenqraphClient {
     }, opts.signal);
   }
 
-  /** Recent events for a contract, newest first (limit/offset). */
+  /** Recent events for a contract, newest first (cursor via `after`). */
   listEvents(
     contractId: string,
-    opts: { limit?: number; offset?: number; eventName?: string; signal?: AbortSignal } = {},
+    opts: PageOptions & { eventName?: string } = {},
   ): Promise<EventsResponse> {
     return this.get(`/contracts/${enc(contractId)}/events`, {
       limit: opts.limit,
       offset: opts.offset,
+      after: opts.after,
       event_name: opts.eventName,
     }, opts.signal);
   }
@@ -441,15 +510,71 @@ export class LumenqraphClient {
     }, opts.signal);
   }
 
-  /** Materialized SEP-41 transfers, newest first (limit/offset). */
+  /** Materialized SEP-41 transfers, newest first (cursor via `after`). */
   listTransfers(
     contractId?: string,
-    opts: { limit?: number; offset?: number; signal?: AbortSignal } = {},
-  ): Promise<Transfer[]> {
+    opts: PageOptions & { from?: string; to?: string } = {},
+  ): Promise<ListPage<Transfer>> {
     const path = contractId
       ? `/contracts/${enc(contractId)}/transfers`
       : `/transfers`;
-    return this.get(path, { limit: opts.limit, offset: opts.offset }, opts.signal);
+    return this.get(path, {
+      limit: opts.limit,
+      offset: opts.offset,
+      after: opts.after,
+      from: opts.from,
+      to: opts.to,
+    }, opts.signal);
+  }
+
+  /** Materialized AMM swaps, newest first (cursor via `after`). */
+  listSwaps(
+    contractId: string,
+    opts: PageOptions & { sender?: string; sellToken?: string; buyToken?: string } = {},
+  ): Promise<ListPage<Swap>> {
+    return this.get(`/contracts/${enc(contractId)}/swaps`, {
+      limit: opts.limit,
+      offset: opts.offset,
+      after: opts.after,
+      sender: opts.sender,
+      sell_token: opts.sellToken,
+      buy_token: opts.buyToken,
+    }, opts.signal);
+  }
+
+  /** Materialized NFT events, newest first (cursor via `after`). */
+  listNftEvents(
+    contractId: string,
+    opts: PageOptions & {
+      kind?: "mint" | "transfer" | "burn";
+      from?: string;
+      to?: string;
+      tokenId?: string;
+    } = {},
+  ): Promise<ListPage<NftEvent>> {
+    return this.get(`/contracts/${enc(contractId)}/nfts`, {
+      limit: opts.limit,
+      offset: opts.offset,
+      after: opts.after,
+      kind: opts.kind,
+      from: opts.from,
+      to: opts.to,
+      token_id: opts.tokenId,
+    }, opts.signal);
+  }
+
+  /** Materialized liquidity events, newest first (cursor via `after`). */
+  listLiquidityEvents(
+    contractId: string,
+    opts: PageOptions & { kind?: "add" | "remove"; provider?: string } = {},
+  ): Promise<ListPage<LiquidityEvent>> {
+    return this.get(`/contracts/${enc(contractId)}/liquidity`, {
+      limit: opts.limit,
+      offset: opts.offset,
+      after: opts.after,
+      kind: opts.kind,
+      provider: opts.provider,
+    }, opts.signal);
   }
 
   /** A contract's callable view functions and their typed signatures. */
@@ -504,11 +629,16 @@ export class LumenqraphClient {
     }, opts.signal);
   }
 
-  /** List delivery attempts for a webhook. */
-  listDeliveries(id: string, opts: { limit?: number; offset?: number; signal?: AbortSignal } = {}): Promise<WebhookDelivery[]> {
+  /** List delivery attempts for a webhook, newest first (cursor via `after`). */
+  listDeliveries(
+    id: string,
+    opts: PageOptions & { includeSummary?: boolean } = {},
+  ): Promise<DeliveriesPage> {
     return this.get(`/webhooks/${enc(id)}/deliveries`, {
       limit: opts.limit,
       offset: opts.offset,
+      after: opts.after,
+      include_summary: opts.includeSummary,
     }, opts.signal);
   }
 
@@ -635,29 +765,118 @@ export class LumenqraphClient {
       signal?: AbortSignal;
     } = {},
   ): AsyncGenerator<EventRecord> {
-    let nextCursor: string | undefined;
+    yield* this.paginateRest<EventRecord>(
+      `/contracts/${enc(contractId)}/events`,
+      {
+        limit: opts.limit ?? 100,
+        event_name: opts.eventName,
+        from_ledger: opts.fromLedger,
+        to_ledger: opts.toLedger,
+        since: opts.since,
+        until: opts.until,
+        topic0: opts.topic0,
+        topic1: opts.topic1,
+        topic2: opts.topic2,
+        topic3: opts.topic3,
+        param: opts.param,
+      },
+      opts.signal,
+    );
+  }
+
+  /** Async iterator over *all* of a contract's transfers via cursor pagination. */
+  paginateTransfers(
+    contractId: string,
+    opts: { limit?: number; from?: string; to?: string; signal?: AbortSignal } = {},
+  ): AsyncGenerator<Transfer> {
+    return this.paginateRest<Transfer>(
+      `/contracts/${enc(contractId)}/transfers`,
+      { limit: opts.limit ?? 100, from: opts.from, to: opts.to },
+      opts.signal,
+    );
+  }
+
+  /** Async iterator over *all* of a contract's AMM swaps via cursor pagination. */
+  paginateSwaps(
+    contractId: string,
+    opts: { limit?: number; sender?: string; sellToken?: string; buyToken?: string; signal?: AbortSignal } = {},
+  ): AsyncGenerator<Swap> {
+    return this.paginateRest<Swap>(
+      `/contracts/${enc(contractId)}/swaps`,
+      {
+        limit: opts.limit ?? 100,
+        sender: opts.sender,
+        sell_token: opts.sellToken,
+        buy_token: opts.buyToken,
+      },
+      opts.signal,
+    );
+  }
+
+  /** Async iterator over *all* of a contract's NFT events via cursor pagination. */
+  paginateNftEvents(
+    contractId: string,
+    opts: {
+      limit?: number;
+      kind?: "mint" | "transfer" | "burn";
+      from?: string;
+      to?: string;
+      tokenId?: string;
+      signal?: AbortSignal;
+    } = {},
+  ): AsyncGenerator<NftEvent> {
+    return this.paginateRest<NftEvent>(
+      `/contracts/${enc(contractId)}/nfts`,
+      {
+        limit: opts.limit ?? 100,
+        kind: opts.kind,
+        from: opts.from,
+        to: opts.to,
+        token_id: opts.tokenId,
+      },
+      opts.signal,
+    );
+  }
+
+  /** Async iterator over *all* of a contract's liquidity events via cursor pagination. */
+  paginateLiquidityEvents(
+    contractId: string,
+    opts: { limit?: number; kind?: "add" | "remove"; provider?: string; signal?: AbortSignal } = {},
+  ): AsyncGenerator<LiquidityEvent> {
+    return this.paginateRest<LiquidityEvent>(
+      `/contracts/${enc(contractId)}/liquidity`,
+      { limit: opts.limit ?? 100, kind: opts.kind, provider: opts.provider },
+      opts.signal,
+    );
+  }
+
+  /** Async iterator over *all* delivery attempts of a webhook via cursor pagination. */
+  paginateDeliveries(
+    id: string,
+    opts: { limit?: number; signal?: AbortSignal } = {},
+  ): AsyncGenerator<WebhookDelivery> {
+    return this.paginateRest<WebhookDelivery>(
+      `/webhooks/${enc(id)}/deliveries`,
+      { limit: opts.limit ?? 100 },
+      opts.signal,
+    );
+  }
+
+  /**
+   * Shared keyset paginator: follows `next_cursor` (sent as `after`) until
+   * `has_more` is false.
+   */
+  private async *paginateRest<T>(
+    path: string,
+    query: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): AsyncGenerator<T> {
+    let after: string | undefined;
     for (;;) {
-      const response = await this.get<EventsResponse>(
-        `/contracts/${enc(contractId)}/events`,
-        {
-          limit: opts.limit ?? 100,
-          event_name: opts.eventName,
-          from_ledger: opts.fromLedger,
-          to_ledger: opts.toLedger,
-          since: opts.since,
-          until: opts.until,
-          topic0: opts.topic0,
-          topic1: opts.topic1,
-          topic2: opts.topic2,
-          topic3: opts.topic3,
-          param: opts.param,
-          after: nextCursor,
-        },
-        opts.signal,
-      );
-      for (const event of response.data) yield event;
-      if (!response.next_cursor || !response.has_more) return;
-      nextCursor = response.next_cursor;
+      const page = await this.get<ListPage<T>>(path, { ...query, after }, signal);
+      for (const item of page.data) yield item;
+      if (!page.has_more || !page.next_cursor) return;
+      after = page.next_cursor;
     }
   }
 
@@ -768,25 +987,30 @@ export class LumenqraphClient {
   }
 }
 
-// ---- Webhook signature verification (#83) ----
+// ---- Webhook signature verification (#83, #449) ----
 
 /**
  * Verify a Lumenqraph webhook delivery using its HMAC-SHA256 signature.
  *
- * The server signs the raw request body with the subscription secret and sends
- * the result as `X-Lumenqraph-Signature: sha256=<hex>`. Pass that header value
+ * The server signs `"{timestamp}.{raw_body}"` with the subscription secret and sends
+ * the result as `X-Lumenqraph-Signature: t=<timestamp>,v1=<hex>`. Pass that header value
  * as `signatureHeader` and the **raw** (un-parsed) request body as either a
  * `string` or `Uint8Array`.
+ *
+ * This function enforces timestamp freshness to prevent replay attacks. By default,
+ * signatures older than 5 minutes are rejected. You can customize this via `toleranceSecs`.
  *
  * Comparison is performed in constant time via the Web Crypto API so this
  * helper is safe to use in security-sensitive contexts. It mirrors the
  * server-side `verify_hmac_signature()` in `lumenqraph-core/src/crypto.rs`.
  *
- * @param rawBody        Raw HTTP request body (string or bytes).
+ * @param rawBody         Raw HTTP request body (string or bytes).
  * @param signatureHeader Value of the `X-Lumenqraph-Signature` header,
- *                        e.g. `"sha256=abcdef…"`.
- * @param secret         The subscription secret returned at creation time.
- * @returns              `true` if the signature is valid, `false` otherwise.
+ *                        e.g. `"t=1727090000,v1=abcdef…"` or legacy `"sha256=abcdef…"`.
+ * @param secret          The subscription secret returned at creation time.
+ * @param toleranceSecs   Maximum age of the timestamp in seconds (default: 300 = 5 minutes).
+ *                        Set to 0 to disable timestamp validation (not recommended).
+ * @returns               `true` if the signature is valid and fresh, `false` otherwise.
  *
  * @example
  * // Express.js / Node
@@ -808,6 +1032,103 @@ export async function verifyWebhook(
   rawBody: string | Uint8Array,
   signatureHeader: string,
   secret: string,
+  toleranceSecs: number = 300,
+): Promise<boolean> {
+  // Try new timestamped format first: "t=<timestamp>,v1=<hex>"
+  if (signatureHeader.includes("t=") && signatureHeader.includes("v1=")) {
+    return verifyTimestampedSignature(rawBody, signatureHeader, secret, toleranceSecs);
+  }
+
+  // Fall back to legacy format: "sha256=<hex>"
+  // This path will be removed in a future release (deprecated)
+  return verifyLegacySignature(rawBody, signatureHeader, secret);
+}
+
+async function verifyTimestampedSignature(
+  rawBody: string | Uint8Array,
+  signatureHeader: string,
+  secret: string,
+  toleranceSecs: number,
+): Promise<boolean> {
+  // Parse "t=<timestamp>,v1=<hex>" format
+  const parts = signatureHeader.split(",");
+  let timestamp: number | null = null;
+  const signatures: string[] = [];
+
+  for (const part of parts) {
+    const [key, value] = part.split("=");
+    if (key === "t") {
+      timestamp = parseInt(value || "", 10);
+    } else if (key === "v1") {
+      signatures.push(value || "");
+    }
+  }
+
+  if (timestamp === null || signatures.length === 0) {
+    return false;
+  }
+
+  // Check timestamp freshness to prevent replay attacks
+  if (toleranceSecs > 0) {
+    const now = Math.floor(Date.now() / 1000);
+    const age = Math.abs(now - timestamp);
+    if (age > toleranceSecs) {
+      return false;
+    }
+  }
+
+  // Encode inputs
+  const enc = new TextEncoder();
+  const bodyBytes: ArrayBuffer =
+    typeof rawBody === "string"
+      ? (enc.encode(rawBody).buffer as ArrayBuffer)
+      : (rawBody.buffer.slice(rawBody.byteOffset, rawBody.byteOffset + rawBody.byteLength) as ArrayBuffer);
+  
+  const bodyStr = typeof rawBody === "string" 
+    ? rawBody 
+    : new TextDecoder().decode(rawBody);
+
+  // Construct signed payload: "{timestamp}.{body}"
+  const signedPayload = `${timestamp}.${bodyStr}`;
+  const signedPayloadBytes = enc.encode(signedPayload).buffer as ArrayBuffer;
+  const keyBuffer = enc.encode(secret).buffer as ArrayBuffer;
+
+  // Import the secret as an HMAC-SHA-256 key via Web Crypto
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    keyBuffer,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+
+  // Compute the expected signature
+  const sigBuffer = await crypto.subtle.sign("HMAC", cryptoKey, signedPayloadBytes);
+  const expectedHex = bufToHex(sigBuffer);
+
+  // Check against all provided v1 signatures (supports secret rotation)
+  for (const providedHex of signatures) {
+    if (expectedHex.length !== providedHex.length) continue;
+
+    const expectedBytes = enc.encode(expectedHex);
+    const providedBytes = enc.encode(providedHex);
+
+    // Constant-time comparison
+    let diff = 0;
+    for (let i = 0; i < expectedBytes.length; i++) {
+      // biome-ignore lint: intentional constant-time compare
+      diff |= (expectedBytes[i] ?? 0) ^ (providedBytes[i] ?? 0);
+    }
+    if (diff === 0) return true;
+  }
+
+  return false;
+}
+
+async function verifyLegacySignature(
+  rawBody: string | Uint8Array,
+  signatureHeader: string,
+  secret: string,
 ): Promise<boolean> {
   // Parse off the "sha256=" prefix. An absent or wrong prefix is an invalid
   // signature, not a fatal error.
@@ -817,16 +1138,13 @@ export async function verifyWebhook(
 
   // Encode inputs.
   const enc = new TextEncoder();
-  // `.buffer as ArrayBuffer` cast: TextEncoder returns Uint8Array<ArrayBufferLike>
-  // but Web Crypto expects ArrayBuffer specifically.  The underlying buffer is
-  // always a plain ArrayBuffer here; the cast is safe.
   const keyBuffer = enc.encode(secret).buffer as ArrayBuffer;
   const bodyBytes: ArrayBuffer =
     typeof rawBody === "string"
       ? (enc.encode(rawBody).buffer as ArrayBuffer)
       : (rawBody.buffer.slice(rawBody.byteOffset, rawBody.byteOffset + rawBody.byteLength) as ArrayBuffer);
 
-  // Import the secret as an HMAC-SHA-256 key via Web Crypto (Node 18+, browsers).
+  // Import the secret as an HMAC-SHA-256 key via Web Crypto
   const cryptoKey = await crypto.subtle.importKey(
     "raw",
     keyBuffer,
@@ -839,16 +1157,12 @@ export async function verifyWebhook(
   const sigBuffer = await crypto.subtle.sign("HMAC", cryptoKey, bodyBytes);
   const expectedHex = bufToHex(sigBuffer);
 
-  // Constant-time comparison: convert both hex strings to bytes and use
-  // timingSafeEqual-equivalent logic. We compare byte arrays of the same
-  // length so a length mismatch (different-length hex) also returns false
-  // without short-circuiting.
+  // Constant-time comparison
   if (expectedHex.length !== providedHex.length) return false;
 
   const expectedBytes = enc.encode(expectedHex);
   const providedBytes = enc.encode(providedHex);
 
-  // XOR every byte and accumulate — only equal if all XORs are 0.
   let diff = 0;
   for (let i = 0; i < expectedBytes.length; i++) {
     // biome-ignore lint: intentional constant-time compare

@@ -30,7 +30,7 @@ import urllib.request
 from typing import Any, AsyncGenerator, Dict, Optional
 from urllib.parse import urlencode
 
-from .client import LumenqraphError, RetryOptions
+from .client import LumenqraphError, RetryOptions, _page_query
 
 
 class AsyncLumenqraphClient:
@@ -251,10 +251,92 @@ class AsyncLumenqraphClient:
         contract_id: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
+        after: Optional[str] = None,
+        from_addr: Optional[str] = None,
+        to_addr: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Get materialized SEP-41 transfers."""
+        """Get materialized SEP-41 transfers, newest first (cursor-paginated)."""
         path = f"/contracts/{contract_id}/transfers" if contract_id else "/transfers"
-        return await self._get(path, {"limit": limit, "offset": offset})
+        return await self._get(
+            path, _page_query(limit, offset, after, {"from": from_addr, "to": to_addr})
+        )
+
+    async def list_swaps(
+        self,
+        contract_id: str,
+        limit: int = 50,
+        offset: int = 0,
+        after: Optional[str] = None,
+        sender: Optional[str] = None,
+        sell_token: Optional[str] = None,
+        buy_token: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get materialized AMM swaps, newest first (cursor-paginated)."""
+        return await self._get(
+            f"/contracts/{contract_id}/swaps",
+            _page_query(
+                limit,
+                offset,
+                after,
+                {"sender": sender, "sell_token": sell_token, "buy_token": buy_token},
+            ),
+        )
+
+    async def list_nft_events(
+        self,
+        contract_id: str,
+        limit: int = 50,
+        offset: int = 0,
+        after: Optional[str] = None,
+        kind: Optional[str] = None,
+        from_addr: Optional[str] = None,
+        to_addr: Optional[str] = None,
+        token_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get materialized NFT events, newest first (cursor-paginated)."""
+        return await self._get(
+            f"/contracts/{contract_id}/nfts",
+            _page_query(
+                limit,
+                offset,
+                after,
+                {"kind": kind, "from": from_addr, "to": to_addr, "token_id": token_id},
+            ),
+        )
+
+    async def list_liquidity_events(
+        self,
+        contract_id: str,
+        limit: int = 50,
+        offset: int = 0,
+        after: Optional[str] = None,
+        kind: Optional[str] = None,
+        provider: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get materialized liquidity events, newest first (cursor-paginated)."""
+        return await self._get(
+            f"/contracts/{contract_id}/liquidity",
+            _page_query(limit, offset, after, {"kind": kind, "provider": provider}),
+        )
+
+    async def list_deliveries(
+        self,
+        webhook_id: str,
+        limit: int = 50,
+        offset: int = 0,
+        after: Optional[str] = None,
+        include_summary: bool = False,
+    ) -> Dict[str, Any]:
+        """Get a webhook's delivery attempts, newest first (cursor-paginated)."""
+        return await self._get(
+            f"/webhooks/{webhook_id}/deliveries",
+            _page_query(
+                limit,
+                offset,
+                after,
+                {"include_summary": "true" if include_summary else None},
+            ),
+        )
 
     async def list_functions(self, contract_id: str) -> Dict[str, Any]:
         """Get a contract's callable view functions and their typed signatures."""
@@ -340,28 +422,68 @@ class AsyncLumenqraphClient:
             if not cursor:
                 break
 
-    async def paginate_transfers(
-        self,
-        contract_id: Optional[str] = None,
-        page_size: int = 100,
+    async def _paginate(
+        self, path: str, query: Dict[str, Any]
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Async generator over all materialized transfers.
+        """Follow ``next_cursor`` until ``has_more`` is false."""
+        after: Optional[str] = None
+        while True:
+            response = await self._get(path, {**query, "after": after})
+            for item in response.get("data", []):
+                yield item
+            after = response.get("next_cursor")
+            if not response.get("has_more", False) or not after:
+                break
+
+    def paginate_transfers(
+        self,
+        contract_id: str,
+        page_size: int = 100,
+        from_addr: Optional[str] = None,
+        to_addr: Optional[str] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Async generator over all of a contract's transfers via cursor pagination.
 
         Args:
-            contract_id:  Optional contract to scope the query to.
+            contract_id:  Contract to scope the query to.
             page_size:    Transfers per page (default 100).
 
         Yields:
             Transfer record dicts.
         """
-        offset = 0
-        while True:
-            response = await self.list_transfers(
-                contract_id, limit=page_size, offset=offset
-            )
-            items = response if isinstance(response, list) else response.get("data", [])
-            for item in items:
-                yield item
-            if not items or len(items) < page_size:
-                break
-            offset += len(items)
+        return self._paginate(
+            f"/contracts/{contract_id}/transfers",
+            {"limit": page_size, "from": from_addr, "to": to_addr},
+        )
+
+    def paginate_swaps(
+        self, contract_id: str, page_size: int = 100, **filters: Optional[str]
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """All AMM swaps for a contract (filters: sender, sell_token, buy_token)."""
+        return self._paginate(
+            f"/contracts/{contract_id}/swaps", {"limit": page_size, **filters}
+        )
+
+    def paginate_nft_events(
+        self, contract_id: str, page_size: int = 100, **filters: Optional[str]
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """All NFT events for a contract (filters: kind, from, to, token_id)."""
+        return self._paginate(
+            f"/contracts/{contract_id}/nfts", {"limit": page_size, **filters}
+        )
+
+    def paginate_liquidity_events(
+        self, contract_id: str, page_size: int = 100, **filters: Optional[str]
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """All liquidity events for a contract (filters: kind, provider)."""
+        return self._paginate(
+            f"/contracts/{contract_id}/liquidity", {"limit": page_size, **filters}
+        )
+
+    def paginate_deliveries(
+        self, webhook_id: str, page_size: int = 100
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """All delivery attempts of a webhook."""
+        return self._paginate(
+            f"/webhooks/{webhook_id}/deliveries", {"limit": page_size}
+        )

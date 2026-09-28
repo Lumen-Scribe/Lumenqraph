@@ -39,6 +39,18 @@ Breaking changes will be documented in the changelog with migration guidance whe
   `clawback`). Clients reading transfer payloads by positional index must
   update. Migration `0015` backfills existing rows as `"transfer"`.
 
+- **Uniform keyset pagination on every list endpoint (#445).** Transfers,
+  swaps, NFTs, liquidity, events and webhook deliveries all return
+  `{ data, has_more, next_cursor }` and accept `after=<next_cursor>`.
+  `offset` is capped at 10,000 and answered with `Deprecation: true`.
+  `GET /webhooks/:id/deliveries` no longer returns `deliveries`,
+  `total_count`, `limit` or `offset`; per-status counts moved behind
+  `?include_summary=true`. Migration `0024` adds the supporting index.
+
+- **Webhook deliveries no longer follow redirects (#447).** A `3xx` from a
+  subscriber endpoint is recorded as a failed attempt
+  (`last_error: "redirects are not followed: …"`).
+
 - **CORS is now same-origin only by default.** Set `CORS_ALLOWED_ORIGINS`
   if your frontend is on a different origin.
 

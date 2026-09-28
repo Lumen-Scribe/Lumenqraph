@@ -45,6 +45,63 @@ pub struct TransferResponse {
     pub ledger: i64,
 }
 
+/// Keyset-paginated page of events. Shared envelope of every list endpoint.
+///
+/// Requests that use the deprecated `offset` parameter (capped at 10,000) are
+/// answered with `Deprecation: true` and `Warning` headers.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct EventsPageResponse {
+    pub data: Vec<EventResponse>,
+    /// Whether more rows are available after this page.
+    pub has_more: bool,
+    /// Opaque cursor to pass as `after` for the next page; null on the last page.
+    pub next_cursor: Option<String>,
+}
+
+/// Keyset-paginated page of token transfers.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct TransfersPageResponse {
+    pub data: Vec<TransferResponse>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
+
+/// Keyset-paginated page of materialized rows (swaps, NFT events, liquidity events).
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct MaterializedPageResponse {
+    pub data: Vec<serde_json::Value>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct WebhookDeliveryResponse {
+    pub id: i64,
+    pub status: String,
+    pub attempts: i32,
+    pub last_error: Option<String>,
+    pub delivered_at: Option<String>,
+    pub created_at: String,
+}
+
+/// Per-status delivery counts, only present with `?include_summary=true`.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct DeliverySummaryResponse {
+    pub total: i64,
+    pub delivered: i64,
+    pub failed: i64,
+    pub pending: i64,
+}
+
+/// Keyset-paginated page of webhook deliveries (cursor is the delivery id).
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct DeliveriesPageResponse {
+    pub data: Vec<WebhookDeliveryResponse>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+    pub summary: Option<DeliverySummaryResponse>,
+}
+
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct ContractResponse {
     pub contract_id: String,
@@ -133,6 +190,12 @@ impl OpenApiBuilder {
             EventResponse,
             ErrorResponse,
             TransferResponse,
+            EventsPageResponse,
+            TransfersPageResponse,
+            MaterializedPageResponse,
+            WebhookDeliveryResponse,
+            DeliverySummaryResponse,
+            DeliveriesPageResponse,
             ContractResponse,
             ContractInterfaceResponse,
             ContractDataResponse,
@@ -152,11 +215,15 @@ impl OpenApiBuilder {
         get_event_by_id,
         list_transaction_events,
         list_contract_transfers,
+        list_contract_swaps,
+        list_contract_nfts,
+        list_contract_liquidity,
         get_contract_data,
         get_contract_data_history,
         list_webhooks,
         create_webhook,
-        delete_webhook
+        delete_webhook,
+        list_webhook_deliveries
     ),
     tags(
         (name = "Contracts", description = "Contract discovery and interface endpoints"),
@@ -224,11 +291,14 @@ pub async fn refresh_contract() {}
     params(
         ("contract_id" = String, Path, description = "Soroban contract ID"),
         ("limit" = Option<i64>, Query, description = "Max events to return (1-1000, default 50)"),
-        ("offset" = Option<i64>, Query, description = "Pagination offset"),
-        ("after" = Option<String>, Query, description = "Cursor for keyset pagination"),
+        ("offset" = Option<i64>, Query, description = "Deprecated: pagination offset (max 10000). Use `after`"),
+        ("after" = Option<String>, Query, description = "Opaque cursor from a previous response's `next_cursor`"),
         ("event_name" = Option<String>, Query, description = "Filter by event name")
     ),
-    responses((status = 200, description = "Contract events", body = Vec<EventResponse>)),
+    responses(
+        (status = 200, description = "Contract events, newest first", body = EventsPageResponse),
+        (status = 400, description = "Invalid cursor, contract id, or offset above the cap", body = ErrorResponse)
+    ),
     tag = "Events"
 )]
 pub async fn list_contract_events() {}
@@ -239,15 +309,78 @@ pub async fn list_contract_events() {}
     params(
         ("contract_id" = String, Path, description = "Soroban contract ID"),
         ("limit" = Option<i64>, Query, description = "Max transfers to return (1-1000, default 50)"),
-        ("offset" = Option<i64>, Query, description = "Pagination offset"),
-        ("after" = Option<String>, Query, description = "Cursor for keyset pagination"),
+        ("offset" = Option<i64>, Query, description = "Deprecated: pagination offset (max 10000). Use `after`"),
+        ("after" = Option<String>, Query, description = "Opaque cursor from a previous response's `next_cursor`"),
         ("from" = Option<String>, Query, description = "Filter by sender address"),
         ("to" = Option<String>, Query, description = "Filter by recipient address")
     ),
-    responses((status = 200, description = "Token transfers for the contract", body = Vec<TransferResponse>)),
+    responses(
+        (status = 200, description = "Token transfers for the contract, newest first", body = TransfersPageResponse),
+        (status = 400, description = "Invalid cursor, contract id, or offset above the cap", body = ErrorResponse)
+    ),
     tag = "Transfers"
 )]
 pub async fn list_contract_transfers() {}
+
+#[utoipa::path(
+    get,
+    path = "/contracts/{contract_id}/swaps",
+    params(
+        ("contract_id" = String, Path, description = "Soroban contract ID"),
+        ("limit" = Option<i64>, Query, description = "Max swaps to return (1-1000, default 50)"),
+        ("offset" = Option<i64>, Query, description = "Deprecated: pagination offset (max 10000). Use `after`"),
+        ("after" = Option<String>, Query, description = "Opaque cursor from a previous response's `next_cursor`"),
+        ("sender" = Option<String>, Query, description = "Filter by sender address"),
+        ("sell_token" = Option<String>, Query, description = "Filter by sold token"),
+        ("buy_token" = Option<String>, Query, description = "Filter by bought token")
+    ),
+    responses(
+        (status = 200, description = "AMM swaps for the contract, newest first", body = MaterializedPageResponse),
+        (status = 400, description = "Invalid cursor, contract id, or offset above the cap", body = ErrorResponse)
+    ),
+    tag = "Transfers"
+)]
+pub async fn list_contract_swaps() {}
+
+#[utoipa::path(
+    get,
+    path = "/contracts/{contract_id}/nfts",
+    params(
+        ("contract_id" = String, Path, description = "Soroban contract ID"),
+        ("limit" = Option<i64>, Query, description = "Max NFT events to return (1-1000, default 50)"),
+        ("offset" = Option<i64>, Query, description = "Deprecated: pagination offset (max 10000). Use `after`"),
+        ("after" = Option<String>, Query, description = "Opaque cursor from a previous response's `next_cursor`"),
+        ("kind" = Option<String>, Query, description = "mint | transfer | burn"),
+        ("from" = Option<String>, Query, description = "Filter by sender address"),
+        ("to" = Option<String>, Query, description = "Filter by recipient address"),
+        ("token_id" = Option<String>, Query, description = "Filter by token id")
+    ),
+    responses(
+        (status = 200, description = "NFT events for the contract, newest first", body = MaterializedPageResponse),
+        (status = 400, description = "Invalid cursor, kind, contract id, or offset above the cap", body = ErrorResponse)
+    ),
+    tag = "Transfers"
+)]
+pub async fn list_contract_nfts() {}
+
+#[utoipa::path(
+    get,
+    path = "/contracts/{contract_id}/liquidity",
+    params(
+        ("contract_id" = String, Path, description = "Soroban contract ID"),
+        ("limit" = Option<i64>, Query, description = "Max liquidity events to return (1-1000, default 50)"),
+        ("offset" = Option<i64>, Query, description = "Deprecated: pagination offset (max 10000). Use `after`"),
+        ("after" = Option<String>, Query, description = "Opaque cursor from a previous response's `next_cursor`"),
+        ("kind" = Option<String>, Query, description = "add | remove"),
+        ("provider" = Option<String>, Query, description = "Filter by liquidity provider")
+    ),
+    responses(
+        (status = 200, description = "Liquidity events for the contract, newest first", body = MaterializedPageResponse),
+        (status = 400, description = "Invalid cursor, kind, contract id, or offset above the cap", body = ErrorResponse)
+    ),
+    tag = "Transfers"
+)]
+pub async fn list_contract_liquidity() {}
 
 #[utoipa::path(
     get,
@@ -300,6 +433,25 @@ pub async fn create_webhook() {}
     tag = "Webhooks"
 )]
 pub async fn delete_webhook() {}
+
+#[utoipa::path(
+    get,
+    path = "/webhooks/{id}/deliveries",
+    params(
+        ("id" = String, Path, description = "Webhook subscription ID"),
+        ("limit" = Option<i64>, Query, description = "Max deliveries to return (1-500, default 50)"),
+        ("offset" = Option<i64>, Query, description = "Deprecated: pagination offset (max 10000). Use `after`"),
+        ("after" = Option<String>, Query, description = "Opaque cursor from a previous response's `next_cursor`"),
+        ("include_summary" = Option<bool>, Query, description = "Include per-status counts (extra aggregate query; default false)")
+    ),
+    responses(
+        (status = 200, description = "Delivery attempts, newest first", body = DeliveriesPageResponse),
+        (status = 400, description = "Invalid cursor or offset above the cap", body = ErrorResponse),
+        (status = 404, description = "Subscription not found", body = ErrorResponse)
+    ),
+    tag = "Webhooks"
+)]
+pub async fn list_webhook_deliveries() {}
 
 #[utoipa::path(
     get,
