@@ -760,3 +760,6 @@ Built for the <a href="https://stellar.org/soroban">Stellar / Soroban</a> ecosys
 
 <!-- handsoff-issue-364 -->
 - #364: Migration 0019 is a silent no-op on existing databases: `idx_events_enriched` already exists from 0004
+
+<!-- handsoff-issue-439 -->
+- #439: GraphQL schema lags behind REST: no swaps, NFTs, liquidity, stats, interface history, or transaction lookups

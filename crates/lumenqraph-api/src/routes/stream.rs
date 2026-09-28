@@ -11,10 +11,11 @@
 //! Polling is retained as a fallback when the listener is unavailable.
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::sse::{Event, Sse};
+use axum::http::HeaderMap;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -168,6 +169,9 @@ pub struct StreamQuery {
     event_name: Option<String>,
     /// Optional cursor to resume from. Events with ledger > cursor will be sent.
     cursor: Option<i64>,
+    /// Optional composite cursor to resume from within a ledger. Events with
+    /// `(ledger, event_id) > (cursor_ledger, cursor_event_id)` will be sent.
+    cursor_event_id: Option<String>,
     /// Poll interval in seconds for checking new events (default: 5).
     #[serde(default = "default_poll_interval")]
     poll_interval: u64,
@@ -187,79 +191,106 @@ struct StreamEvent {
     pub data: serde_json::Value,
 }
 
+/// Composite keyset cursor `(ledger, event_id)` used to resume the stream.
+#[derive(Clone, Debug)]
+struct Cursor {
+    ledger: i64,
+    event_id: String,
+}
+
+/// Parse a `Last-Event-ID` header value of the form `"<ledger>:<event_id>"`.
+fn parse_last_event_id(value: &str) -> Option<Cursor> {
+    let (ledger, event_id) = value.split_once(':')?;
+    let ledger = ledger.trim().parse::<i64>().ok()?;
+    Some(Cursor {
+        ledger,
+        event_id: event_id.to_string(),
+    })
+}
+
 pub async fn stream_events(
     State(state): State<AppState>,
     Path(contract_id): Path<String>,
     Query(q): Query<StreamQuery>,
+    headers: HeaderMap,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     // Validate poll interval (min 1 second, max 60 seconds)
     let poll_secs = q.poll_interval.clamp(1, 60);
 
-    // Enforce global and per-key stream caps.
-    let active = ACTIVE_STREAMS.fetch_add(1, Ordering::SeqCst) + 1;
-    if active > SSE_MAX_STREAMS {
-        ACTIVE_STREAMS.fetch_sub(1, Ordering::SeqCst);
-        return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "too many concurrent SSE streams",
-        ));
-    }
-    if active > SSE_MAX_STREAMS_PER_KEY {
-        ACTIVE_STREAMS.fetch_sub(1, Ordering::SeqCst);
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many concurrent SSE streams for this contract",
-        ));
-    }
+    // Resume cursor precedence: the standard `Last-Event-ID` header (sent
+    // automatically by `EventSource` on reconnect) takes priority over the
+    // explicit `?cursor` query params. When neither is present, start from the
+    // current head so a fresh stream tails new events instead of replaying the
+    // entire history from ledger 0.
+    let initial_cursor = if let Some(cursor) = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_last_event_id)
+    {
+        cursor
+    } else {
+        match (q.cursor, q.cursor_event_id.clone()) {
+            (Some(ledger), Some(event_id)) => Cursor { ledger, event_id },
+            (Some(ledger), None) => Cursor {
+                ledger,
+                event_id: String::new(),
+            },
+            _ => current_head(&state, &contract_id).await?,
+        }
+    };
 
     info!(
         contract_id = %contract_id,
         event_name = ?q.event_name,
-        cursor = ?q.cursor,
+        cursor_ledger = initial_cursor.ledger,
+        cursor_event_id = %initial_cursor.event_id,
         poll_secs,
         active_streams = active,
         "starting event stream"
     );
 
-    let fanout = state.event_fanout.clone();
-    let rx = fanout.subscribe();
-
-    // Create the stream: prefer broadcast fan-out, fall back to polling.
+    // Create the stream. The unfold state carries a buffer of already-fetched
+    // rows so a single DB query can serve up to its batch size of events.
     let stream = stream::unfold(
         (
             state,
             contract_id,
             q.event_name,
-            q.cursor.unwrap_or(0),
-            rx,
-            poll_secs,
+            initial_cursor,
+            VecDeque::<StreamEvent>::new(),
         ),
-        move |(state, contract_id, event_name, mut last_ledger, mut rx, poll_secs)| async move {
+        move |(state, contract_id, event_name, mut cursor, mut buffer)| async move {
             loop {
-                // Wait for a broadcast event, with a polling fallback timeout.
-                match tokio::time::timeout(Duration::from_secs(poll_secs), rx.recv()).await {
-                    Ok(Ok(event)) => {
-                        if event.contract_id != contract_id {
-                            continue;
+                // Emit any buffered events before issuing another query.
+                if let Some(event) = buffer.pop_front() {
+                    cursor = Cursor {
+                        ledger: event.ledger,
+                        event_id: event.event_id.clone(),
+                    };
+                    let event_json = serde_json::to_string(&event).ok()?;
+                    let sse = Event::default()
+                        .id(format!("{}:{}", event.ledger, event.event_id))
+                        .data(event_json);
+                    return Some((
+                        Ok(sse),
+                        (state, contract_id, event_name, cursor, buffer),
+                    ));
+                }
+
+                match fetch_new_events(&state, &contract_id, &event_name, &cursor).await {
+                    Ok(events) => {
+                        if events.is_empty() {
+                            // No new events, wait before polling again
+                            sleep(Duration::from_secs(poll_secs)).await;
+                        } else {
+                            buffer = VecDeque::from(events);
                         }
-                        if let Some(ref name) = event_name {
-                            if event.event_name.as_deref() != Some(name.as_str()) {
-                                continue;
-                            }
-                        }
-                        if event.ledger <= last_ledger {
-                            continue;
-                        }
-                        last_ledger = event.ledger;
-                        let stream_event = StreamEvent {
-                            ledger: event.ledger,
-                            event_id: event.event_id,
-                            data: event.data,
-                        };
-                        let event_json = serde_json::to_string(&stream_event).ok()?;
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "error fetching events");
                         return Some((
-                            Ok(Event::default().data(event_json)),
-                            (state.clone(), contract_id.clone(), event_name.clone(), last_ledger, rx, poll_secs),
+                            Ok(Event::default().comment(format!("error: {}", e))),
+                            (state, contract_id, event_name, cursor, buffer),
                         ));
                     }
                     Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
@@ -295,16 +326,40 @@ pub async fn stream_events(
         },
     );
 
-    Ok(Sse::new(stream))
+    // Emit a keep-alive comment at least every 15 s so idle streams aren't
+    // closed by proxies/load balancers with 60–100 s idle timeouts.
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+}
+
+/// Resolve the current head of the event log for a contract, used as the
+/// starting cursor for a fresh stream with no resume position.
+async fn current_head(state: &AppState, contract_id: &str) -> ApiResult<Cursor> {
+    let row: Option<(i64, String)> = sqlx::query_as(
+        "SELECT ledger, event_id
+         FROM events
+         WHERE contract_id = $1
+         ORDER BY ledger DESC, event_id DESC
+         LIMIT 1",
+    )
+    .bind(contract_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    Ok(row
+        .map(|(ledger, event_id)| Cursor { ledger, event_id })
+        .unwrap_or(Cursor {
+            ledger: 0,
+            event_id: String::new(),
+        }))
 }
 
 async fn fetch_new_events(
     state: &AppState,
     contract_id: &str,
     event_name: &Option<String>,
-    cursor: i64,
+    cursor: &Cursor,
 ) -> ApiResult<Vec<StreamEvent>> {
-    // Query for new events since the cursor ledger
+    // Query for new events after the composite `(ledger, event_id)` cursor.
     let rows: Vec<(i64, String, String)> = sqlx::query_as(
         "SELECT ledger, event_id,
                 json_build_object(
@@ -327,13 +382,14 @@ async fn fetch_new_events(
          FROM events
          WHERE contract_id = $1
            AND ($2::text IS NULL OR event_name = $2)
-           AND ledger > $3
+           AND (ledger, event_id) > ($3, $4)
          ORDER BY ledger ASC, event_id ASC
          LIMIT 100",
     )
     .bind(contract_id)
     .bind(event_name)
-    .bind(cursor)
+    .bind(cursor.ledger)
+    .bind(&cursor.event_id)
     .fetch_all(&state.pool)
     .await?;
 
