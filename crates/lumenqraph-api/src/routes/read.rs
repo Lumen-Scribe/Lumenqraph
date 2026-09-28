@@ -121,10 +121,17 @@ pub async fn call_function(
             // Log the full upstream detail server-side; only return a concise,
             // sanitised copy to the caller (see issue #154).
             tracing::warn!(rpc_error = %msg, "contract simulation failed");
-            Err(ApiError::simulation_failed(format!(
-                "simulation failed: {}",
-                lumenqraph_core::sanitize::sanitize_simulation_error(&msg)
-            )))
+            // If the error is a typed contract error (Error(Contract, #N)), try
+            // to resolve the code to its declared name from the spec (#418).
+            let contract_error =
+                build_contract_error_detail(&msg, Some(parsed));
+            Err(ApiError::simulation_failed_with_contract_error(
+                format!(
+                    "simulation failed: {}",
+                    lumenqraph_core::sanitize::sanitize_simulation_error(&msg)
+                ),
+                contract_error,
+            ))
         }
     }
 }
@@ -194,10 +201,16 @@ pub async fn simulate_call(
             // Log the full upstream detail server-side; only return a concise,
             // sanitised copy to the caller (see issue #154).
             tracing::warn!(rpc_error = %msg, "contract simulation failed");
-            Err(ApiError::simulation_failed(format!(
-                "simulation failed: {}",
-                lumenqraph_core::sanitize::sanitize_simulation_error(&msg)
-            )))
+            // Resolve typed contract error codes to their declared names (#418).
+            let contract_error =
+                build_contract_error_detail(&msg, Some(parsed));
+            Err(ApiError::simulation_failed_with_contract_error(
+                format!(
+                    "simulation failed: {}",
+                    lumenqraph_core::sanitize::sanitize_simulation_error(&msg)
+                ),
+                contract_error,
+            ))
         }
     }
 }
@@ -205,6 +218,29 @@ pub async fn simulate_call(
 /// All `EncodeError`s are client-fixable, so they map to `400`.
 fn encode_error_to_api(e: EncodeError) -> ApiError {
     ApiError::bad_request(e.to_string())
+}
+
+/// Build a structured `contract_error` detail from a simulation error message.
+///
+/// If the error is `Error(Contract, #N)`, look up code `N` in the spec's error
+/// enums and return `{ "code": N, "name": "CaseName", "doc": "…" }`.
+/// If the code is unknown, return `{ "code": N }` (numeric only — no name).
+/// If the error is not a typed contract error, return `None`.
+fn build_contract_error_detail(
+    error_msg: &str,
+    spec: Option<&lumenqraph_core::ContractSpec>,
+) -> Option<serde_json::Value> {
+    let code = lumenqraph_core::sanitize::parse_contract_error_code(error_msg)?;
+    let detail = if let Some(spec) = spec {
+        if let Some((name, doc)) = spec.resolve_error_code(code) {
+            json!({ "code": code, "name": name, "doc": doc })
+        } else {
+            json!({ "code": code })
+        }
+    } else {
+        json!({ "code": code })
+    };
+    Some(detail)
 }
 
 #[cfg(test)]
@@ -291,8 +327,10 @@ mod tests {
             },
         );
 
-        use crate::concurrency_limit::ConcurrencyLimiter;
+        use crate::auth::IpConfig;
         use crate::call_cache::CallCache;
+        use crate::concurrency_limit::ConcurrencyLimiter;
+        use crate::key_cache::KeyCache;
         use crate::read_cost_limit::ReadCostLimitConfig;
 
         AppState {
@@ -322,6 +360,12 @@ mod tests {
             readyz_max_age_secs: 120,
             health_max_lag_ledgers: 100,
             health_max_stale_secs: 120,
+            metrics_require_auth: false,
+            webhook_limiter: Arc::new(RateLimiter::new()),
+            webhook_anon_rate_limit: 10,
+            webhook_max_subscriptions: 0,
+            key_cache: Arc::new(KeyCache::new(256)),
+            ip_config: IpConfig { trusted_proxy_hops: 0, platform_header: None },
         }
     }
 

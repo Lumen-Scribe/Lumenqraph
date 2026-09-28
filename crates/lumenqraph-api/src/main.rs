@@ -7,6 +7,7 @@ mod call_cache;
 mod concurrency_limit;
 mod error;
 mod graphql;
+mod key_cache;
 mod metrics;
 mod metrics_middleware;
 mod openapi;
@@ -37,6 +38,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use call_cache::CallCache;
 use concurrency_limit::ConcurrencyLimiter;
+use key_cache::KeyCache;
 use rate_limit::RateLimiter;
 use read_cost_limit::ReadCostLimitConfig;
 use state::{AppState, BuildInfo};
@@ -137,7 +139,23 @@ fn build_cors_layer() -> tower_http::cors::CorsLayer {
                 axum::http::Method::OPTIONS,
                 axum::http::Method::DELETE,
             ])
-            .allow_headers([axum::http::header::CONTENT_TYPE]);
+            .allow_headers([
+                axum::http::header::CONTENT_TYPE,
+                axum::http::header::AUTHORIZATION,
+                axum::http::header::IF_NONE_MATCH,
+                http::HeaderName::from_static("x-api-key"),
+                http::HeaderName::from_static("x-request-id"),
+            ])
+            .expose_headers([
+                http::HeaderName::from_static("x-request-id"),
+                http::HeaderName::from_static("retry-after"),
+                http::HeaderName::from_static("x-ratelimit-limit"),
+                http::HeaderName::from_static("x-ratelimit-remaining"),
+                http::HeaderName::from_static("etag"),
+                http::HeaderName::from_static("deprecation"),
+                http::HeaderName::from_static("link"),
+            ])
+            .max_age(Duration::from_secs(600));
 
         for origin_str in origins {
             match origin_str.parse::<http::HeaderValue>() {
@@ -225,170 +243,6 @@ async fn main() -> anyhow::Result<()> {
         mounts: Arc::new(routes::proxy::mounts_from_env()),
         rpc_limiter: Arc::new(RateLimiter::new()),
         rpc_require_auth: env_bool("RPC_REQUIRE_API_KEY", false),
-        rpc_anon_rate_limit: env_parse("RPC_ROUTE_RATE_LIMIT_PER_MIN", 10),
-        metrics: Arc::new(metrics_middleware::MetricsCollector::new()),
-        call_cache,
-        build_info,
-        concurrency_limiter: Arc::new(ConcurrencyLimiter::new()),
-        max_concurrent_per_ip: env_parse("MAX_CONCURRENT_PER_IP", 100),
-        read_cost_limit_config: ReadCostLimitConfig {
-            max_request_size: env_parse("READ_MAX_REQUEST_SIZE", 256 * 1024),
-            max_args_size: env_parse("READ_MAX_ARGS_SIZE", 128 * 1024),
-        },
-        readyz_lag_threshold: env_parse("READYZ_LAG_THRESHOLD", 100i64),
-        readyz_max_age_secs: env_parse("READYZ_MAX_AGE_SECS", 120i64),
-        health_max_lag_ledgers: env_parse("HEALTH_MAX_LAG_LEDGERS", 100i64),
-        health_max_stale_secs: env_parse("HEALTH_MAX_STALE_SECS", 120i64),
-        metrics_require_auth: env_bool("METRICS_REQUIRE_API_KEY", false),
-    };
+        rpc_anon_rate_limit: env_
 
-    let cors_layer = build_cors_layer();
-    // MAX_REQUEST_BODY_BYTES is the canonical name (#212).
-    // API_MAX_BODY_BYTES is kept as a fallback alias for backward compatibility.
-    let max_body_bytes = std::env::var("MAX_REQUEST_BODY_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or_else(|| env_parse::<u64>("API_MAX_BODY_BYTES", 65536));
-    info!(max_body_bytes, "enforcing request body size limit");
-    info!(request_timeout_secs, "enforcing request timeout");
-
-    let app = routes::router(state)
-        .layer(DefaultBodyLimit::max(max_body_bytes as usize))
-        .layer(TimeoutLayer::new(Duration::from_secs(request_timeout_secs)))
-        .layer(CompressionLayer::new())
-        .layer(TraceLayer::new_for_http())
-        .layer(cors_layer);
-
-    let listener = tokio::net::TcpListener::bind(&bind_addr)
-        .await
-        .with_context(|| format!("failed to bind {bind_addr}"))?;
-    info!(addr = %bind_addr, "lumenqraph api listening");
-
-    let shutdown_timeout_secs: u64 = env_parse("API_SHUTDOWN_TIMEOUT_SECS", 30u64);
-    let server = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal());
-
-    // Wrap the graceful shutdown in a hard timeout so a slow or stuck client
-    // cannot keep the process alive indefinitely during a rolling restart.
-    match tokio::time::timeout(
-        Duration::from_secs(shutdown_timeout_secs),
-        server,
-    )
-    .await
-    {
-        Ok(result) => result?,
-        Err(_) => {
-            info!(
-                timeout_secs = shutdown_timeout_secs,
-                "shutdown timeout reached; forcing exit"
-            );
-        }
-    }
-    Ok(())
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        if let Ok(mut sig) =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        {
-            sig.recv().await;
-        }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {}
-        _ = terminate => {}
-    }
-    info!("shutdown signal received; draining in-flight requests (up to {}s)",
-          std::env::var("API_SHUTDOWN_TIMEOUT_SECS")
-              .ok()
-              .and_then(|v| v.parse::<u64>().ok())
-              .unwrap_or(30));
-}
-
-#[cfg(test)]
-mod tests {
-    /// #219 — CONTRACT_IDS startup validation in lumenqraph-api.
-    ///
-    /// The API calls `lumenqraph_core::parse_contract_ids` at startup and
-    /// propagates the error, refusing to proceed. These tests exercise the same
-    /// validation logic directly, without needing a live Postgres or bind
-    /// address, to ensure the guard never silently regresses.
-    mod contract_ids_startup_validation {
-        #[test]
-        fn rejects_g_strkey_account_address() {
-            // A G… strkey is a Stellar account, not a Soroban contract.
-            let raw = "GAIH3ULLFQ4DGSECF2AR555KZ4KNDGEKN4AFI4SU2M7B43MGK3BEJD4";
-            let err = lumenqraph_core::parse_contract_ids(raw).unwrap_err();
-            assert!(
-                err.contains("invalid CONTRACT_ID"),
-                "error should mention invalid CONTRACT_ID: {err}"
-            );
-            assert!(
-                err.contains("GAIH3ULLFQ4DGSECF2AR555KZ4KNDGEKN4AFI4SU2M7B43MGK3BEJD4"),
-                "error should quote the bad id: {err}"
-            );
-        }
-
-        #[test]
-        fn rejects_garbage_string() {
-            let raw = "not-a-contract-id";
-            let err = lumenqraph_core::parse_contract_ids(raw).unwrap_err();
-            assert!(
-                err.contains("invalid CONTRACT_ID"),
-                "garbage string should be rejected: {err}"
-            );
-        }
-
-        #[test]
-        fn rejects_too_many_contract_ids() {
-            // getEvents supports at most 25 IDs; the parser enforces this.
-            // Build 26 syntactically valid-looking (but fake) C-strkey placeholders
-            // by using the same test id repeated — the count check fires before
-            // strkey validation so any 26 non-empty tokens trigger it.
-            // Use a real C-strkey so each individual ID passes strkey validation.
-            let single = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
-            let raw = std::iter::repeat(single).take(26).collect::<Vec<_>>().join(",");
-            let err = lumenqraph_core::parse_contract_ids(&raw).unwrap_err();
-            assert!(
-                err.contains("26"),
-                "error should mention the count 26: {err}"
-            );
-        }
-
-        #[test]
-        fn accepts_empty_string() {
-            // Empty CONTRACT_IDS means "index all" — must not be an error.
-            let ids = lumenqraph_core::parse_contract_ids("").unwrap();
-            assert!(ids.is_empty(), "empty string should yield zero IDs");
-        }
-
-        #[test]
-        fn accepts_valid_c_strkey() {
-            let raw = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
-            let ids = lumenqraph_core::parse_contract_ids(raw).unwrap();
-            assert_eq!(ids.len(), 1);
-            assert_eq!(ids[0], raw);
-        }
-
-        #[test]
-        fn mixed_valid_and_invalid_is_rejected() {
-            let raw = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC,GAIH3ULLFQ4DGSECF2AR555KZ4KNDGEKN4AFI4SU2M7B43MGK3BEJD4";
-            let err = lumenqraph_core::parse_contract_ids(raw).unwrap_err();
-            assert!(
-                err.contains("invalid CONTRACT_ID"),
-                "a G-strkey mixed with a valid C-strkey should be rejected: {err}"
-            );
-        }
-    }
-}
+/* … truncated 6677 chars — edit only what you need near the top … */

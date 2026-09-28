@@ -44,13 +44,13 @@
     "lumenqraph"
   ],
   "devDependencies": {
-    "@eslint/js": "^9.20.0",
-    "eslint": "^9.20.0",
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.11.0",
     "openapi-typescript": "^7.13.0",
     "typedoc": "^0.28.20",
-    "typescript": "^5.4.0",
-    "typescript-eslint": "^8.24.0",
-    "vitest": "^3.2.7"
+    "typescript": "^7.0.2",
+    "typescript-eslint": "^8.70.1",
+    "vitest": "^5.0.1"
   },
   "overrides": {
     "brace-expansion": "^5.0.8",

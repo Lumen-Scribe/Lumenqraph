@@ -34,6 +34,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::auth::{
     auth_and_rate_limit, concurrency_limit, rpc_auth_and_rate_limit, webhook_auth_and_rate_limit,
+    webhook_manage_auth_and_rate_limit,
 };
 use crate::graphql::{self, AppSchema};
 use crate::metrics;
@@ -161,6 +162,20 @@ pub fn router(state: AppState) -> Router {
             "/transactions/:tx_hash/events",
             get(events::transaction_events),
         )
+        // GraphQL: POST executes queries, GET serves the GraphiQL IDE. Behind
+        // the same auth + rate-limit middleware as the REST data routes.
+        .route("/graphql", post(graphql_handler).get(graphiql))
+        .layer(Extension(schema))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_and_rate_limit,
+        ));
+
+    // Webhook management routes: GET /webhooks, DELETE/PATCH /webhooks/:id,
+    // and related sub-routes. These ALWAYS require a valid API key regardless
+    // of REQUIRE_API_KEY (#420 — anonymous callers must not be able to list,
+    // modify, or delete webhook subscriptions).
+    let webhook_manage_routes = Router::new()
         .route(
             "/webhooks",
             get(webhooks::list_webhooks),
@@ -170,13 +185,14 @@ pub fn router(state: AppState) -> Router {
         .route("/webhooks/:id/redrive", post(webhooks::redrive_webhook))
         .route("/webhooks/:id/reenable", post(webhooks::reenable_webhook))
         .route("/webhooks/:id/rotate-secret", post(webhooks::rotate_webhook_secret))
+        .route("/webhooks/:id/test", post(webhooks::test_webhook))
         // GraphQL: POST executes queries, GET serves the GraphiQL IDE. Behind
         // the same auth + rate-limit middleware as the REST data routes.
         .route("/graphql", post(graphql_handler).get(graphiql))
         .layer(Extension(schema))
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            auth_and_rate_limit,
+            webhook_manage_auth_and_rate_limit,
         ));
 
     // Webhook creation route with separate, lower rate limiting (prevents subscription spam).
@@ -193,6 +209,7 @@ pub fn router(state: AppState) -> Router {
         .merge(protected)
         .merge(rpc_routes)
         .merge(webhook_create_routes)
+        .merge(webhook_manage_routes)
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -207,7 +224,15 @@ pub fn router(state: AppState) -> Router {
     // Sibling instances under a path prefix (see `proxy`). Registered outside
     // the auth middleware: each upstream enforces its own policy.
     if !state.mounts.is_empty() {
-        let client = Arc::new(reqwest::Client::new());
+        // Never follow redirects: a 3xx from the upstream is relayed to the
+        // caller as-is instead of letting the upstream steer this server into
+        // an arbitrary (possibly internal) address (#447).
+        let client = Arc::new(
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("build proxy http client"),
+        );
         for (name, upstream) in state.mounts.iter() {
             let (client, upstream, prefix) = (
                 Arc::clone(&client),

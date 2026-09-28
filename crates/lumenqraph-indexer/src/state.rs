@@ -368,17 +368,16 @@ async fn try_write_snapshot_data(
     Ok(())
 }
 
-/// Decode an instance-storage `ScVal` to friendly JSON by re-encoding it and
-/// running it through the same decoder events use — so state and events share
-/// one JSON shape (symbol-keyed maps become objects, i128 as decimal strings…).
+/// Decode an instance-storage `ScVal` to friendly JSON directly, without any
+/// base64 round-trip, using the shared decoder so state and events share one
+/// JSON shape (symbol-keyed maps become objects, i128 as decimal strings…).
 fn decode_storage(storage: &ScVal) -> serde_json::Value {
     decode_scval(storage)
 }
 
 /// Decode any `ScVal` to friendly JSON via the shared event decoder.
+/// No base64 encoding/decoding is performed — the value is decoded directly
+/// from the already-parsed typed enum.
 fn decode_scval(v: &ScVal) -> serde_json::Value {
-    match v.to_xdr_base64(Limits::none()) {
-        Ok(b64) => xdr::decode_scval_base64(&b64),
-        Err(_) => serde_json::Value::Null,
-    }
+    xdr::decode_scval(v)
 }
