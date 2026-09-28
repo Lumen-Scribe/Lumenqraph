@@ -5,10 +5,12 @@ use std::sync::Arc;
 
 use sqlx::PgPool;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
-use crate::audit::AuditEvent;
+use crate::auth::IpConfig;
 use crate::call_cache::CallCache;
 use crate::concurrency_limit::ConcurrencyLimiter;
+use crate::key_cache::KeyCache;
 use crate::metrics_middleware::MetricsCollector;
 use crate::rate_limit::RateLimiter;
 use crate::read_cost_limit::ReadCostLimitConfig;
@@ -71,13 +73,10 @@ pub struct AppState {
     pub audit_tx: Option<mpsc::Sender<AuditEvent>>,
     /// Count of audit events dropped because the channel was full (#367).
     pub audit_dropped: Arc<AtomicU64>,
-    /// Separate rate limiter for webhook creation (POST /webhooks). Lower
-    /// limits prevent subscription-spam from unauthenticated callers.
-    pub webhook_limiter: Arc<RateLimiter>,
-    /// Requests/min allowed for unauthenticated callers on webhook creation.
-    pub webhook_anon_rate_limit: i32,
-    /// Maximum total webhook subscriptions allowed. 0 = unlimited.
-    pub webhook_max_subscriptions: usize,
+    /// Cancelled when the process receives a shutdown signal (#436). Long-lived
+    /// handlers such as the SSE stream select on this so they can end cleanly
+    /// instead of blocking `with_graceful_shutdown` until SIGKILL.
+    pub shutdown: CancellationToken,
 }
 
 pub struct BuildInfo {

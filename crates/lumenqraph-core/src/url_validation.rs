@@ -71,14 +71,37 @@ fn is_reserved_ip(ip: &IpAddr) -> bool {
                 || (v4.octets()[0] == 0)
                 || is_documentation_v4(v4)
                 || is_reserved_v4(v4)
+                || is_shared_address_space_v4(v4)
+                || is_benchmarking_v4(v4)
         }
         IpAddr::V6(v6) => {
+            // Check for IPv4-mapped IPv6 addresses (::ffff:0:0/96)
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_reserved_ip(&IpAddr::V4(v4));
+            }
+            
+            // Check for NAT64 well-known prefix (64:ff9b::/96)
+            if is_nat64_wellknown(v6) {
+                return true;
+            }
+            
+            // Check for 6to4 (2002::/16) - may contain embedded IPv4
+            if is_6to4(v6) {
+                return true;
+            }
+            
+            // Check for IPv4-compatible IPv6 (::/96 except ::/128 and ::1/128)
+            if is_ipv4_compatible(v6) {
+                return true;
+            }
+            
             v6.is_loopback()
                 || v6.is_multicast()
                 || v6.is_unicast_link_local()
                 || v6.is_unspecified()
                 || v6.is_unique_local()
                 || is_documentation_v6(v6)
+                || is_discard_prefix(v6)
         }
     }
 }
@@ -98,6 +121,43 @@ fn is_reserved_v4(ip: &std::net::Ipv4Addr) -> bool {
         || (octets[0] == 10)
         || (octets[0] == 127)
         || (octets[0] == 169 && octets[1] == 254)
+        || (octets[0] >= 240) // 240.0.0.0/4 - Reserved for future use
+}
+
+fn is_shared_address_space_v4(ip: &std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 100 && octets[1] >= 64 && octets[1] <= 127
+}
+
+fn is_benchmarking_v4(ip: &std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 198 && (octets[1] == 18 || octets[1] == 19)
+}
+
+fn is_nat64_wellknown(ip: &std::net::Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0x64 && segments[1] == 0xff9b && segments[2] == 0 && segments[3] == 0
+}
+
+fn is_6to4(ip: &std::net::Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0x2002
+}
+
+fn is_ipv4_compatible(ip: &std::net::Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0
+        && segments[1] == 0
+        && segments[2] == 0
+        && segments[3] == 0
+        && segments[4] == 0
+        && segments[5] == 0
+        && !(segments[6] == 0 && (segments[7] == 0 || segments[7] == 1))
+}
+
+fn is_discard_prefix(ip: &std::net::Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0x100
 }
 
 fn is_documentation_v6(ip: &std::net::Ipv6Addr) -> bool {
@@ -115,30 +175,47 @@ fn is_localhost(host: &str) -> bool {
 /// Validate webhook URL at delivery time by resolving hostname and checking resolved IPs.
 /// This prevents DNS rebinding attacks where a URL initially validates but resolves
 /// to an internal address at delivery time.
-pub async fn validate_webhook_url_at_delivery(url: &str) -> Result<(), String> {
+///
+/// Returns the validated public IP address to be used for connection pinning.
+pub async fn validate_webhook_url_at_delivery(url: &str) -> Result<IpAddr, String> {
     let parsed = Url::parse(url).map_err(|e| format!("invalid URL: {}", e))?;
 
     if let Some(host_str) = parsed.host_str() {
-        // If it's already an IP address, we don't need to resolve
+        // If it's already an IP address, validate it again (rules may have changed)
         let addr_str = host_str
             .strip_prefix('[')
             .and_then(|s| s.strip_suffix(']'))
             .unwrap_or(host_str);
-        if addr_str.parse::<IpAddr>().is_ok() {
-            // Already validated at registration time; assume it's public if we got here
-            return Ok(());
+        
+        if let Ok(ip) = addr_str.parse::<IpAddr>() {
+            // Re-validate literal IP URLs at delivery time
+            if is_reserved_ip(&ip) {
+                return Err("IP address points to an internal/reserved network".to_string());
+            }
+            return Ok(ip);
         }
 
         // Resolve hostname to IP addresses
         match tokio::net::lookup_host(format!("{}:80", host_str)).await {
-            Ok(mut addrs) => {
-                // Check that at least one resolved address is public
-                let has_public = addrs.any(|addr| !is_reserved_ip(&addr.ip()));
-                if has_public {
-                    Ok(())
-                } else {
-                    Err("resolved address points to an internal/reserved network".to_string())
+            Ok(addrs) => {
+                let addrs: Vec<_> = addrs.collect();
+                
+                if addrs.is_empty() {
+                    return Err("hostname resolved to no addresses".to_string());
                 }
+                
+                // Require ALL resolved addresses to be public
+                for addr in &addrs {
+                    if is_reserved_ip(&addr.ip()) {
+                        return Err(format!(
+                            "hostname resolves to internal/reserved address: {}",
+                            addr.ip()
+                        ));
+                    }
+                }
+                
+                // Return the first public address for connection pinning
+                Ok(addrs[0].ip())
             }
             Err(_) => {
                 // DNS resolution failed; treat as a potential SSRF risk
@@ -153,6 +230,53 @@ pub async fn validate_webhook_url_at_delivery(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_ipv4_mapped_ipv6_loopback() {
+        assert!(validate_webhook_url("http://[::ffff:127.0.0.1]/hook").is_err());
+        assert!(validate_webhook_url("http://[::ffff:127.0.0.2]/hook").is_err());
+    }
+
+    #[test]
+    fn rejects_ipv4_mapped_ipv6_metadata() {
+        assert!(validate_webhook_url("http://[::ffff:169.254.169.254]/hook").is_err());
+    }
+
+    #[test]
+    fn rejects_ipv4_mapped_ipv6_private() {
+        assert!(validate_webhook_url("http://[::ffff:10.0.0.1]/hook").is_err());
+        assert!(validate_webhook_url("http://[::ffff:192.168.1.1]/hook").is_err());
+        assert!(validate_webhook_url("http://[::ffff:172.16.0.1]/hook").is_err());
+    }
+
+    #[test]
+    fn rejects_nat64_wellknown() {
+        assert!(validate_webhook_url("http://[64:ff9b::a9fe:a9fe]/hook").is_err());
+        assert!(validate_webhook_url("http://[64:ff9b::7f00:1]/hook").is_err());
+    }
+
+    #[test]
+    fn rejects_6to4() {
+        assert!(validate_webhook_url("http://[2002:a9fe:a9fe::1]/hook").is_err());
+    }
+
+    #[test]
+    fn rejects_ipv4_compatible_ipv6() {
+        assert!(validate_webhook_url("http://[::127.0.0.1]/hook").is_err());
+        assert!(validate_webhook_url("http://[::10.0.0.1]/hook").is_err());
+    }
+
+    #[test]
+    fn rejects_benchmarking_ranges() {
+        assert!(validate_webhook_url("http://198.18.0.1/hook").is_err());
+        assert!(validate_webhook_url("http://198.19.255.255/hook").is_err());
+    }
+
+    #[test]
+    fn rejects_reserved_future_use() {
+        assert!(validate_webhook_url("http://240.0.0.1/hook").is_err());
+        assert!(validate_webhook_url("http://255.255.255.254/hook").is_err());
+    }
 
     #[test]
     fn rejects_loopback_ips() {
