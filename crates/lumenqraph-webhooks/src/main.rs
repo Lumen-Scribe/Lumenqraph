@@ -79,10 +79,8 @@ async fn main() -> anyhow::Result<()> {
     let max_connect_retries = env_parse_u32("DATABASE_CONNECT_RETRIES", 30);
     let pool = connect_with_retry(&config.database_url, max_connect_retries).await?;
 
-    let http = reqwest::Client::builder()
-        .connect_timeout(config.connect_timeout())
-        .timeout(config.total_timeout())
-        .build()?;
+    // Redirects are never followed (SSRF guard, see `build_delivery_client`).
+    let http = dispatcher::build_delivery_client(config.connect_timeout(), config.total_timeout())?;
 
     let metrics_bind_addr = std::env::var("WEBHOOKS_METRICS_BIND_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:9091".to_string());
