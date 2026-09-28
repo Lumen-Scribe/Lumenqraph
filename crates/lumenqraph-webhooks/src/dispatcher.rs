@@ -218,7 +218,7 @@ async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::R
          JOIN webhook_subscriptions s ON s.id = d.subscription_id
          LEFT JOIN events e ON e.event_id = d.event_id
          LEFT JOIN contract_spec_versions v ON v.id = d.upgrade_id
-         WHERE d.status = 'pending' AND d.next_attempt_at <= now()
+         WHERE d.status = 'pending' AND d.next_attempt_at <= now() AND s.active
          ORDER BY d.next_attempt_at
          LIMIT $2",
     )
@@ -276,7 +276,10 @@ pub async fn deliver(
                     Ok(()) => {
                         let _ = mark_delivered(&pool, d.id).await;
                         let _ = sqlx::query(
-                            "UPDATE webhook_subscriptions SET consecutive_failures = 0 WHERE id = $1"
+                            "UPDATE webhook_subscriptions 
+                             SET consecutive_failures = 0, 
+                                 last_success_at = now() 
+                             WHERE id = $1"
                         )
                         .bind(&d.subscription_id)
                         .execute(&pool)
@@ -287,13 +290,7 @@ pub async fn deliver(
                         let _ = mark_retry(&pool, &d, &e.to_string(), config.max_attempts).await;
                         warn!(delivery = d.id, url = %d.url, error = %e, "webhook delivery failed");
 
-                        let _ = sqlx::query(
-                            "UPDATE webhook_subscriptions SET consecutive_failures = consecutive_failures + 1 WHERE id = $1"
-                        )
-                        .bind(&d.subscription_id)
-                        .execute(&pool)
-                        .await;
-
+                        // Atomic increment and check for auto-disable
                         let _ = check_and_auto_disable(&pool, &d.subscription_id, config.failure_threshold).await;
 
                         Some((false, d.subscription_id.clone()))
@@ -336,36 +333,54 @@ fn extract_host(url: &str) -> String {
 }
 
 async fn send(http: &reqwest::Client, d: &DueDelivery, config: &Config) -> anyhow::Result<()> {
-    // Re-validate URL at delivery time to prevent DNS rebinding attacks.
+    // Re-validate URL at delivery time and get the validated IP for connection pinning.
     // This ensures the hostname still resolves to a public address even if the
-    // DNS record changed since registration.
-    validate_webhook_url_at_delivery(&d.url).await
+    // DNS record changed since registration, and prevents DNS rebinding attacks.
+    let validated_ip = validate_webhook_url_at_delivery(&d.url).await
         .map_err(|e| anyhow::anyhow!("URL validation failed at delivery: {}", e))?;
 
     let body = serde_json::to_vec(&d.payload.0)?;
-    let timestamp = Utc::now().to_rfc3339();
+    let timestamp = Utc::now().timestamp();
 
-    // Compute HMAC-SHA256 signature using the webhook secret.
-    // NOTE: Verification of received signatures should use constant-time comparison
-    // to prevent timing attacks. Use lumenqraph_core::crypto::verify_hmac_signature()
-    // on the receiving end to safely verify signatures.
+    // New timestamped signature scheme (Stripe/Svix style):
+    // signed_payload = "{timestamp}.{body}"
+    // signature = HMAC-SHA256(secret, signed_payload)
+    let signed_payload = format!("{}.{}", timestamp, std::str::from_utf8(&body)?);
+    
     let mut mac =
         HmacSha256::new_from_slice(d.secret.as_bytes()).context("invalid webhook secret")?;
-    mac.update(&body);
-    let signature = hex::encode(mac.finalize().into_bytes());
+    mac.update(signed_payload.as_bytes());
+    let signature_v1 = hex::encode(mac.finalize().into_bytes());
+    
+    // Legacy signature for backwards compatibility (will be removed in future release)
+    let mut legacy_mac =
+        HmacSha256::new_from_slice(d.secret.as_bytes()).context("invalid webhook secret")?;
+    legacy_mac.update(&body);
+    let legacy_signature = hex::encode(legacy_mac.finalize().into_bytes());
 
     // Determine event type from payload
     let event_type = d.payload.0.get("type")
         .and_then(|v| v.as_str())
         .unwrap_or("contract.event");
 
-    let req = http
+    // Extract host for connection pinning
+    let parsed_url = Url::parse(&d.url).context("failed to parse URL")?;
+    let host = parsed_url.host_str().context("URL must have a host")?;
+    
+    // Build client with connection pinning to the validated IP
+    let client = reqwest::Client::builder()
+        .resolve(host, std::net::SocketAddr::new(validated_ip, parsed_url.port().unwrap_or(if parsed_url.scheme() == "https" { 443 } else { 80 })))
+        .build()
+        .context("failed to build pinned client")?;
+
+    let req = client
         .post(&d.url)
         .timeout(config.total_timeout())
         .header("Content-Type", "application/json")
-        .header("X-Lumenqraph-Signature", format!("sha256={signature}"))
+        .header("X-Lumenqraph-Signature", format!("t={},v1={}", timestamp, signature_v1))
+        .header("X-Lumenqraph-Signature-Legacy", format!("sha256={}", legacy_signature))
         .header("X-Lumenqraph-Delivery-Id", d.id.to_string())
-        .header("X-Lumenqraph-Timestamp", timestamp)
+        .header("X-Lumenqraph-Timestamp", timestamp.to_string())
         .header("X-Lumenqraph-Attempt", d.attempts.to_string())
         .header("X-Lumenqraph-Event", event_type)
         .header("User-Agent", USER_AGENT)
@@ -373,7 +388,7 @@ async fn send(http: &reqwest::Client, d: &DueDelivery, config: &Config) -> anyho
         .build()
         .context("failed to build request")?;
 
-    let resp = http
+    let resp = client
         .execute(req)
         .await
         .context("request failed")?;
@@ -476,34 +491,54 @@ async fn check_and_auto_disable(
     subscription_id: &str,
     failure_threshold: i32,
 ) -> anyhow::Result<()> {
-    let consecutive_failures: i32 = sqlx::query_scalar(
-        "SELECT consecutive_failures FROM webhook_subscriptions WHERE id = $1",
+    // Atomically increment consecutive_failures and return the updated value along with timing info
+    let result: Option<(i32, Option<DateTime<Utc>>, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "UPDATE webhook_subscriptions
+         SET consecutive_failures = consecutive_failures + 1,
+             first_failure_at = COALESCE(first_failure_at, now())
+         WHERE id = $1
+         RETURNING consecutive_failures, last_success_at, first_failure_at",
     )
     .bind(subscription_id)
     .fetch_optional(pool)
-    .await?
-    .unwrap_or(0);
+    .await?;
 
-    if consecutive_failures >= failure_threshold {
-        let reason = format!(
-            "Auto-disabled after {} consecutive delivery failures",
-            consecutive_failures
-        );
-        sqlx::query(
-            "UPDATE webhook_subscriptions
-             SET active = false, auto_disabled_at = now(), auto_disabled_reason = $2
-             WHERE id = $1",
-        )
-        .bind(subscription_id)
-        .bind(&reason)
-        .execute(pool)
-        .await?;
+    if let Some((consecutive_failures, last_success_at, first_failure_at)) = result {
+        // Auto-disable if:
+        // 1. Consecutive failures >= threshold, AND
+        // 2. No success in the last 24 hours (or never had a success and failing for 24h)
+        let should_disable = consecutive_failures >= failure_threshold && {
+            let now = Utc::now();
+            if let Some(last_success) = last_success_at {
+                (now - last_success).num_hours() >= 24
+            } else if let Some(first_failure) = first_failure_at {
+                (now - first_failure).num_hours() >= 24
+            } else {
+                false
+            }
+        };
 
-        warn!(
-            subscription_id = subscription_id,
-            consecutive_failures = consecutive_failures,
-            "webhook subscription auto-disabled"
-        );
+        if should_disable {
+            let reason = format!(
+                "Auto-disabled after {} consecutive delivery failures with no success for 24+ hours",
+                consecutive_failures
+            );
+            sqlx::query(
+                "UPDATE webhook_subscriptions
+                 SET active = false, auto_disabled_at = now(), auto_disabled_reason = $2
+                 WHERE id = $1",
+            )
+            .bind(subscription_id)
+            .bind(&reason)
+            .execute(pool)
+            .await?;
+
+            warn!(
+                subscription_id = subscription_id,
+                consecutive_failures = consecutive_failures,
+                "webhook subscription auto-disabled"
+            );
+        }
     }
     Ok(())
 }
