@@ -208,7 +208,15 @@ pub fn router(state: AppState) -> Router {
     // Sibling instances under a path prefix (see `proxy`). Registered outside
     // the auth middleware: each upstream enforces its own policy.
     if !state.mounts.is_empty() {
-        let client = Arc::new(reqwest::Client::new());
+        // Never follow redirects: a 3xx from the upstream is relayed to the
+        // caller as-is instead of letting the upstream steer this server into
+        // an arbitrary (possibly internal) address (#447).
+        let client = Arc::new(
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("build proxy http client"),
+        );
         for (name, upstream) in state.mounts.iter() {
             let (client, upstream, prefix) = (
                 Arc::clone(&client),

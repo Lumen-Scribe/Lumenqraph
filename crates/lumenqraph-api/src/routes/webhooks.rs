@@ -3,6 +3,7 @@
 //! creation. The `lumenqraph-webhooks` service does the actual delivery.
 
 use axum::extract::{Path, Query, State};
+use axum::response::Response;
 use axum::Json;
 use lumenqraph_core::WebhookSubscription;
 use rand::RngCore;
@@ -15,6 +16,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::error::{ApiError, ApiResult};
+use crate::pagination::{self, IdCursor, Page, PageRequest};
 use crate::state::AppState;
 use crate::url_validation;
 
@@ -238,69 +240,142 @@ async fn calculate_starting_seq(pool: &sqlx::PgPool, since: &str) -> ApiResult<i
             .await?;
         Ok((current_max - count).max(0))
     } else if let Ok(ledger) = since.parse::<i64>() {
-        let seq: Option<i64> = sqlx::query_scalar(
-            "SELECT seq FROM events WHERE ledger >= $1 ORDER BY seq ASC LIMIT 1",
-        )
-        .bind(ledger)
-        .fetch_optional(pool)
-        .await?;
-        Ok(seq.map(|s| s - 1).unwrap_or(0))
-    } else if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(since) {
-        let ts_utc = ts.with_timezone(&chrono::Utc);
-        let seq: Option<i64> = sqlx::query_scalar(
-            "SELECT seq FROM events WHERE ledger_closed_at >= $1 ORDER BY seq ASC LIMIT 1",
-        )
-        .bind(ts_utc)
-        .fetch_optional(pool)
-        .await?;
-        Ok(seq.map(|s| s - 1).unwrap_or(0))
+        let seq: Option<i64> = sqlx::query_scalar("SELECT min(seq) FROM events WHERE ledger >= $1")
+            .bind(ledger)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+        Ok(seq.unwrap_or(0))
     } else {
-        Err(ApiError::bad_request(
-            "invalid 'since' format; expected 'last N', a ledger number, or an ISO-8601 timestamp",
-        ))
+        let ts = chrono::DateTime::parse_from_rfc3339(since)
+            .map_err(|_| ApiError::bad_request("invalid timestamp format; expected ISO-8601"))?
+            .with_timezone(&chrono::Utc);
+        let seq: Option<i64> = sqlx::query_scalar("SELECT min(seq) FROM events WHERE ledger_closed_at >= $1")
+            .bind(ts)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+        Ok(seq.unwrap_or(0))
     }
 }
 
-#[derive(Deserialize)]
-pub struct ListWebhooksQuery {
-    limit: Option<i64>,
-    offset: Option<i64>,
-}
+/// (id, url, kind, contract_id, event_name, active, created_at, auto_disabled_at, auto_disabled_reason)
+type WebhookListRow = (
+    Uuid,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    bool,
+    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<String>,
+);
 
-pub async fn list_webhooks(
-    State(state): State<AppState>,
-    Query(params): Query<ListWebhooksQuery>,
-) -> ApiResult<Json<Value>> {
-    let limit = params.limit.unwrap_or(50).min(200);
-    let offset = params.offset.unwrap_or(0);
-
-    let rows: Vec<WebhookSubscription> = sqlx::query_as(
-        "SELECT id, url, kind, contract_id, event_name, active, created_at
-         FROM webhook_subscriptions
-         ORDER BY created_at DESC
-         LIMIT $1 OFFSET $2",
+/// List subscriptions without exposing their secrets.
+pub async fn list_webhooks(State(state): State<AppState>) -> ApiResult<Json<Vec<Value>>> {
+    let rows: Vec<WebhookListRow> = sqlx::query_as(
+        "SELECT id, url, kind, contract_id, event_name, active, created_at, auto_disabled_at, auto_disabled_reason
+             FROM webhook_subscriptions ORDER BY created_at DESC",
     )
-    .bind(limit)
-    .bind(offset)
     .fetch_all(&state.pool)
     .await?;
 
-    Ok(Json(json!({ "webhooks": rows, "count": rows.len() })))
+    let out = rows
+        .into_iter()
+        .map(
+            |(id, url, kind, contract_id, event_name, active, created_at, auto_disabled_at, auto_disabled_reason)| {
+                json!({
+                    "id": id,
+                    "url": url,
+                    "kind": kind,
+                    "contract_id": contract_id,
+                    "event_name": event_name,
+                    "active": active,
+                    "created_at": created_at,
+                    "auto_disabled_at": auto_disabled_at,
+                    "auto_disabled_reason": auto_disabled_reason,
+                })
+            },
+        )
+        .collect();
+    Ok(Json(out))
+}
+
+pub async fn update_webhook(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdateWebhook>,
+) -> ApiResult<Json<Value>> {
+    // Check that at least one field is being updated
+    if body.active.is_none() && body.contract_id.is_none() && body.event_name.is_none() {
+        return Err(ApiError::bad_request("no fields to update"));
+    }
+
+    // Validate filters if updating them
+    if let Some(ref contract_id) = body.contract_id {
+        if contract_id.is_empty() {
+            return Err(ApiError::bad_request("contract_id cannot be empty"));
+        }
+    }
+
+    // Get current subscription
+    let current: (String, bool, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT kind, active, contract_id, event_name FROM webhook_subscriptions WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("webhook subscription not found"))?;
+
+    let (kind, _active, cur_contract, cur_event) = current;
+
+    // Validate kind-specific constraints
+    if kind == "upgrade" && body.event_name.is_some() {
+        return Err(ApiError::bad_request(
+            "event_name does not apply to an `upgrade` subscription",
+        ));
+    }
+
+    // Apply updates
+    let updated: (Uuid, String, String, Option<String>, Option<String>, bool, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+        "UPDATE webhook_subscriptions
+            SET active      = COALESCE($2, active),
+                contract_id = COALESCE($3, contract_id),
+                event_name  = COALESCE($4, event_name)
+          WHERE id = $1
+          RETURNING id, url, kind, contract_id, event_name, active, created_at",
+    )
+    .bind(id)
+    .bind(body.active)
+    .bind(body.contract_id.as_ref().or(cur_contract.as_ref()))
+    .bind(body.event_name.as_ref().or(cur_event.as_ref()))
+    .fetch_one(&state.pool)
+    .await?;
+
+    log_webhook_action(&state.pool, "webhook_update", &id.to_string()).await;
+
+    Ok(Json(json!({
+        "id": updated.0,
+        "url": updated.1,
+        "kind": updated.2,
+        "contract_id": updated.3,
+        "event_name": updated.4,
+        "active": updated.5,
+        "created_at": updated.6,
+    })))
 }
 
 pub async fn delete_webhook(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let deleted = sqlx::query(
-        "DELETE FROM webhook_subscriptions WHERE id = $1",
-    )
-    .bind(id)
-    .execute(&state.pool)
-    .await?
-    .rows_affected();
+    let result = sqlx::query("DELETE FROM webhook_subscriptions WHERE id = $1")
+        .bind(id)
+        .execute(&state.pool)
+        .await?;
 
-    if deleted == 0 {
+    if result.rows_affected() == 0 {
         return Err(ApiError::not_found("webhook subscription not found"));
     }
 
@@ -308,295 +383,231 @@ pub async fn delete_webhook(
     Ok(Json(json!({ "deleted": true })))
 }
 
-pub async fn update_webhook(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Json(body): Json<UpdateWebhook>,
-) -> ApiResult<Json<WebhookSubscription>> {
-    // Verify it exists first.
-    let exists: Option<bool> = sqlx::query_scalar(
-        "SELECT active FROM webhook_subscriptions WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?;
+/// Delivery history row for a webhook subscription.
+#[derive(Serialize, sqlx::FromRow)]
+pub struct DeliveryRow {
+    id: i64,
+    status: String,
+    attempts: i32,
+    last_error: Option<String>,
+    delivered_at: Option<chrono::DateTime<chrono::Utc>>,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
 
-    if exists.is_none() {
-        return Err(ApiError::not_found("webhook subscription not found"));
-    }
+/// Per-status delivery counts, returned only with `?include_summary=true`.
+#[derive(Serialize, sqlx::FromRow)]
+pub struct DeliverySummary {
+    total: i64,
+    delivered: i64,
+    failed: i64,
+    pending: i64,
+}
 
-    let sub: WebhookSubscription = sqlx::query_as(
-        "UPDATE webhook_subscriptions
-         SET active       = COALESCE($2, active),
-             contract_id  = CASE WHEN $3::text IS NOT NULL THEN $3 ELSE contract_id END,
-             event_name   = CASE WHEN $4::text IS NOT NULL THEN $4 ELSE event_name END
-         WHERE id = $1
-         RETURNING id, url, kind, contract_id, event_name, active, created_at",
-    )
-    .bind(id)
-    .bind(body.active)
-    .bind(body.contract_id)
-    .bind(body.event_name)
-    .fetch_one(&state.pool)
-    .await?;
-
-    log_webhook_action(&state.pool, "webhook_update", &id.to_string()).await;
-    Ok(Json(sub))
+#[derive(Serialize)]
+pub struct DeliveriesResponse {
+    #[serde(flatten)]
+    page: Page<DeliveryRow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<DeliverySummary>,
 }
 
 #[derive(Deserialize)]
-pub struct ListDeliveriesQuery {
-    limit: Option<i64>,
-    offset: Option<i64>,
+pub struct DeliveriesQuery {
+    /// Maximum number of deliveries to return (default 50, max 500).
+    #[serde(default = "default_deliveries_limit")]
+    limit: i64,
+    /// Deprecated offset pagination (capped at `pagination::MAX_OFFSET`).
+    #[serde(default)]
+    offset: i64,
+    /// Opaque cursor from a previous response's `next_cursor`.
+    after: Option<String>,
+    /// Also return per-status counts. Costs an aggregate over every delivery
+    /// of the subscription, so it is opt-in.
+    #[serde(default)]
+    include_summary: bool,
 }
 
+fn default_deliveries_limit() -> i64 {
+    50
+}
+
+/// `GET /webhooks/:id/deliveries` — delivery attempts, newest first, keyset
+/// paginated on the delivery `id`.
 pub async fn list_webhook_deliveries(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-    Query(params): Query<ListDeliveriesQuery>,
-) -> ApiResult<Json<Value>> {
-    // Verify subscription exists.
-    let exists: Option<bool> = sqlx::query_scalar(
-        "SELECT active FROM webhook_subscriptions WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?;
+    Query(q): Query<DeliveriesQuery>,
+) -> ApiResult<Response> {
+    let page = PageRequest::<IdCursor>::parse(q.limit, 500, q.offset, q.after.as_deref())?;
 
-    if exists.is_none() {
-        return Err(ApiError::not_found("webhook subscription not found"));
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id = $1)")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await?;
+    if !exists {
+        return Err(ApiError::not_found("subscription not found"));
     }
 
-    let limit = params.limit.unwrap_or(50).min(200);
-    let offset = params.offset.unwrap_or(0);
-
-    let rows: Vec<(i64, String, i32, Option<String>, Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+    let rows: Vec<DeliveryRow> = sqlx::query_as(
         "SELECT id, status, attempts, last_error, delivered_at, created_at
          FROM webhook_deliveries
          WHERE subscription_id = $1
-         ORDER BY created_at DESC
-         LIMIT $2 OFFSET $3",
+           AND ($2::bigint IS NULL OR id < $2)
+         ORDER BY id DESC
+         LIMIT $3 OFFSET $4",
     )
     .bind(id)
-    .bind(limit)
-    .bind(offset)
+    .bind(page.after.map(|c| c.0))
+    .bind(page.fetch_limit())
+    .bind(page.offset)
     .fetch_all(&state.pool)
     .await?;
 
-    let deliveries: Vec<Value> = rows.into_iter().map(|(did, status, attempts, last_error, delivered_at, created_at)| {
-        json!({
-            "id": did,
-            "status": status,
-            "attempts": attempts,
-            "last_error": last_error,
-            "delivered_at": delivered_at,
-            "created_at": created_at,
-        })
-    }).collect();
+    let summary = if q.include_summary {
+        Some(
+            sqlx::query_as::<_, DeliverySummary>(
+                "SELECT
+                   COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE status = 'delivered') AS delivered,
+                   COUNT(*) FILTER (WHERE status = 'failed') AS failed,
+                   COUNT(*) FILTER (WHERE status = 'pending') AS pending
+                 FROM webhook_deliveries
+                 WHERE subscription_id = $1",
+            )
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await?,
+        )
+    } else {
+        None
+    };
 
-    Ok(Json(json!({ "deliveries": deliveries, "count": deliveries.len() })))
+    let page = page.finish(rows, |d| IdCursor(d.id));
+    let offset_deprecated = page.offset_deprecated;
+    Ok(pagination::respond(
+        DeliveriesResponse { page, summary },
+        offset_deprecated,
+    ))
 }
 
+#[derive(Deserialize)]
+pub struct RedriveQuery {
+    since: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// `POST /webhooks/:id/redrive` — reset failed deliveries (optionally only
+/// those created at or after `since`) back to pending.
 pub async fn redrive_webhook(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(query): Query<RedriveQuery>,
 ) -> ApiResult<Json<Value>> {
-    // Verify subscription exists.
-    let exists: Option<bool> = sqlx::query_scalar(
-        "SELECT active FROM webhook_subscriptions WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    if exists.is_none() {
-        return Err(ApiError::not_found("webhook subscription not found"));
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id = $1)")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await?;
+    if !exists {
+        return Err(ApiError::not_found("subscription not found"));
     }
 
-    // Re-queue all failed deliveries for this subscription.
-    let redriven = sqlx::query(
+    let affected = sqlx::query(
         "UPDATE webhook_deliveries
-         SET status = 'pending', attempts = 0, last_error = NULL, next_attempt_at = now()
-         WHERE subscription_id = $1 AND status = 'failed'",
+         SET status = 'pending', attempts = 0, next_attempt_at = now(), last_error = NULL
+         WHERE subscription_id = $1 AND status = 'failed'
+           AND ($2::timestamptz IS NULL OR created_at >= $2)",
+    )
+    .bind(id)
+    .bind(query.since)
+    .execute(&state.pool)
+    .await?
+    .rows_affected();
+
+    Ok(Json(json!({ "redriven": affected })))
+}
+
+/// `POST /webhooks/:id/reenable` — clear an auto-disable and reactivate.
+pub async fn reenable_webhook(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Value>> {
+    let affected = sqlx::query(
+        "UPDATE webhook_subscriptions
+         SET active = true, auto_disabled_at = NULL, auto_disabled_reason = NULL, consecutive_failures = 0
+         WHERE id = $1 AND auto_disabled_at IS NOT NULL",
     )
     .bind(id)
     .execute(&state.pool)
     .await?
     .rows_affected();
 
-    log_webhook_action(&state.pool, "webhook_redrive", &id.to_string()).await;
-    Ok(Json(json!({ "redriven": redriven })))
-}
-
-pub async fn reenable_webhook(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> ApiResult<Json<WebhookSubscription>> {
-    let sub: Option<WebhookSubscription> = sqlx::query_as(
-        "UPDATE webhook_subscriptions
-         SET active = true,
-             consecutive_failures = 0,
-             auto_disabled_at = NULL,
-             auto_disabled_reason = NULL
-         WHERE id = $1
-         RETURNING id, url, kind, contract_id, event_name, active, created_at",
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    match sub {
-        Some(s) => {
-            log_webhook_action(&state.pool, "webhook_reenable", &id.to_string()).await;
-            Ok(Json(s))
-        }
-        None => Err(ApiError::not_found("webhook subscription not found")),
+    if affected == 0 {
+        return Err(ApiError::bad_request(
+            "subscription not found or not auto-disabled",
+        ));
     }
+
+    Ok(Json(json!({ "reenabled": true })))
 }
 
+#[derive(Deserialize)]
+pub struct RotateSecret {
+    /// Grace period in seconds during which deliveries are signed with both the
+    /// previous and the new secret. Defaults to 24h.
+    #[serde(default = "default_grace_seconds")]
+    grace_seconds: i64,
+}
+
+fn default_grace_seconds() -> i64 {
+    86_400
+}
+
+/// Rotate the signing secret for a subscription.
+///
+/// The previous secret is retained (encrypted) for `grace_seconds` so the
+/// delivery service can sign with both secrets during the grace window; see
+/// `lumenqraph-webhooks::dispatcher::send`.
 pub async fn rotate_webhook_secret(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    body: Option<Json<RotateSecret>>,
 ) -> ApiResult<Json<Value>> {
-    let exists: Option<bool> = sqlx::query_scalar(
-        "SELECT active FROM webhook_subscriptions WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    if exists.is_none() {
-        return Err(ApiError::not_found("webhook subscription not found"));
+    let grace_seconds = body
+        .map(|Json(b)| b.grace_seconds)
+        .unwrap_or_else(default_grace_seconds);
+    if grace_seconds < 0 {
+        return Err(ApiError::bad_request("grace_seconds must be non-negative"));
     }
+
+    let encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY")
+        .unwrap_or_else(|_| "default-key-for-testing".to_string());
 
     let new_secret = random_secret();
-    let encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY")
-        .unwrap_or_else(|_| "default-key-for-testing".to_string());
 
-    sqlx::query(
+    let updated: Option<(Uuid,)> = sqlx::query_as(
         "UPDATE webhook_subscriptions
-         SET encrypted_secret = pgp_sym_encrypt($2, $3)
-         WHERE id = $1",
+            SET previous_encrypted_secret  = encrypted_secret,
+                previous_secret_expires_at = now() + ($1 * interval '1 second'),
+                encrypted_secret           = pgp_sym_encrypt($2, $3)
+          WHERE id = $4
+          RETURNING id",
     )
-    .bind(id)
+    .bind(grace_seconds)
     .bind(&new_secret)
     .bind(&encryption_key)
-    .execute(&state.pool)
-    .await?;
-
-    log_webhook_action(&state.pool, "webhook_rotate_secret", &id.to_string()).await;
-    Ok(Json(json!({ "secret": new_secret })))
-}
-
-/// Response for `POST /webhooks/:id/test` (#427).
-#[derive(Serialize)]
-pub struct TestWebhookResponse {
-    /// The HTTP status code the subscriber's endpoint returned, or `null` if
-    /// the request could not be delivered (network error, timeout, etc.).
-    pub status: Option<u16>,
-    /// Round-trip latency in milliseconds.
-    pub latency_ms: u64,
-    /// Whether the delivery was considered successful (2xx response).
-    pub success: bool,
-    /// Error message when the delivery failed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// `POST /webhooks/:id/test` — send a signed ping delivery to the subscriber's
-/// endpoint to let them verify their signature-checking code (#427).
-///
-/// The request is signed with the subscription's secret exactly like a real
-/// delivery. The response reports the receiver's HTTP status code and the
-/// round-trip latency so integrators can confirm end-to-end delivery without
-/// waiting for an on-chain event.
-pub async fn test_webhook(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> ApiResult<Json<TestWebhookResponse>> {
-    let encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY")
-        .unwrap_or_else(|_| "default-key-for-testing".to_string());
-
-    // Fetch the subscription and decrypt its secret in one query.
-    let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT url, pgp_sym_decrypt(encrypted_secret, $2)
-         FROM webhook_subscriptions
-         WHERE id = $1",
-    )
     .bind(id)
-    .bind(&encryption_key)
     .fetch_optional(&state.pool)
     .await?;
 
-    let (url, secret) = match row {
-        Some(r) => r,
-        None => return Err(ApiError::not_found("webhook subscription not found")),
-    };
+    let (id,) = updated.ok_or_else(|| ApiError::not_found("webhook subscription not found"))?;
 
-    // Validate the URL before sending (prevents SSRF against private networks).
-    crate::url_validation::validate_webhook_url(&url)
-        .map_err(|e| ApiError::bad_request(format!("subscription URL is invalid: {}", e)))?;
+    log_webhook_action(&state.pool, "webhook_rotate_secret", &id.to_string()).await;
 
-    // Build the signed ping payload.
-    let payload = json!({
-        "type": "ping",
-        "subscription_id": id.to_string(),
-        "sent_at": chrono::Utc::now().to_rfc3339(),
-    });
-
-    let body_bytes = serde_json::to_vec(&payload)
-        .map_err(|e| ApiError::Internal(e.into()))?;
-
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("invalid secret: {}", e)))?;
-    mac.update(&body_bytes);
-    let signature = hex::encode(mac.finalize().into_bytes());
-    let timestamp = chrono::Utc::now().to_rfc3339();
-
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| ApiError::Internal(e.into()))?;
-
-    let start = std::time::Instant::now();
-    let result = http
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("X-Lumenqraph-Signature", format!("sha256={signature}"))
-        .header("X-Lumenqraph-Timestamp", timestamp)
-        .header("X-Lumenqraph-Event", "ping")
-        .header(
-            "User-Agent",
-            concat!("lumenqraph-api/", env!("CARGO_PKG_VERSION")),
-        )
-        .body(body_bytes)
-        .send()
-        .await;
-    let latency_ms = start.elapsed().as_millis() as u64;
-
-    log_webhook_action(&state.pool, "webhook_test", &id.to_string()).await;
-
-    match result {
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            let success = resp.status().is_success();
-            let error = if success {
-                None
-            } else {
-                Some(format!("endpoint returned HTTP {}", status))
-            };
-            Ok(Json(TestWebhookResponse {
-                status: Some(status),
-                latency_ms,
-                success,
-                error,
-            }))
-        }
-        Err(e) => Ok(Json(TestWebhookResponse {
-            status: None,
-            latency_ms,
-            success: false,
-            error: Some(e.to_string()),
-        })),
-    }
+    Ok(Json(json!({
+        "id": id,
+        "secret": new_secret,
+        "previous_secret_expires_at": chrono::Utc::now()
+            + chrono::Duration::seconds(grace_seconds),
+    })))
 }

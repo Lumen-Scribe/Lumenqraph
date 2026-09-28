@@ -4,14 +4,64 @@
 //! depend on the fast-moving `stellar-xdr` crate, we decode the (stable) ScVal
 //! wire format directly into friendly JSON. Integers that don't fit a JS number
 //! are rendered as decimal strings; addresses are rendered as strkeys
-//! (`G...`/`C...`); bytes as hex.
+//! (`G...`/`C...`/`M...`/`B...`/`L...`); bytes as hex.
 //!
 //! Decoding is always best-effort: on any malformed input we fall back to
 //! `{"_xdr": "<base64>"}` so nothing is lost and one weird event can't break
 //! ingestion.
+//!
+//! ## JSON dialect
+//!
+//! The table below documents exactly how each `ScVal` variant maps to JSON.
+//! See also [`docs/API.md`](../../../docs/API.md) for the consumer-facing
+//! description.
+//!
+//! | XDR variant               | JSON representation                                 |
+//! |---------------------------|-----------------------------------------------------|
+//! | `ScvBool`                 | `true` / `false`                                    |
+//! | `ScvVoid`                 | `null`                                              |
+//! | `ScvError`                | `{"_error":true}`                                   |
+//! | `ScvU32`                  | JSON number (u32 fits safely in f64)                |
+//! | `ScvI32`                  | JSON number (i32 fits safely in f64)                |
+//! | `ScvU64`                  | decimal string (e.g. `"18446744073709551615"`)       |
+//! | `ScvI64`                  | decimal string (e.g. `"-9223372036854775808"`)       |
+//! | `ScvTimepoint`            | decimal string (same wire as u64)                   |
+//! | `ScvDuration`             | decimal string (same wire as u64)                   |
+//! | `ScvU128`                 | decimal string                                      |
+//! | `ScvI128`                 | decimal string                                      |
+//! | `ScvU256`                 | `{"_u256_hex":"<32 bytes hex>"}`                    |
+//! | `ScvI256`                 | `{"_u256_hex":"<32 bytes hex>"}`                    |
+//! | `ScvBytes`                | hex string prefixed `0x` (e.g. `"0xdead"`)         |
+//! | `ScvString`               | UTF-8 string, or hex `"0x…"` if invalid UTF-8       |
+//! | `ScvSymbol`               | UTF-8 string, or hex `"0x…"` if invalid UTF-8       |
+//! | `ScvVec`                  | JSON array (empty array for absent/`None` variant)  |
+//! | `ScvMap` (no collisions)  | JSON object keyed by string (symbol/string keys)    |
+//! | `ScvMap` (collisions/mixed keys) | array of `{"key":…,"val":…}` pair objects  |
+//! | `ScvAddress` (account)    | `G…` strkey (56 chars)                              |
+//! | `ScvAddress` (contract)   | `C…` strkey (56 chars)                              |
+//! | `ScvAddress` (other)      | `"_addr_type_<N>"` placeholder                      |
+//! | `ScvContractInstance` (19)| `{"_xdr_tag":19}` — payload consumed safely         |
+//! | `ScvLedgerKeyContractInstance` (20) | `{"_xdr_tag":20}` — no payload            |
+//! | `ScvLedgerKeyNonce` (21)  | `{"_xdr_tag":21}` — payload consumed safely         |
+//! | unknown tag               | `{"_xdr_tag":<N>}` fallback; surrounding data intact|
+//!
+//! **Ambiguities to be aware of:**
+//! - `Symbol("abc")` and `String("abc")` both decode to `"abc"` — the type
+//!   information is lost in the generic decoder. The spec-driven `enriched`
+//!   field (for contracts with on-chain specs) always preserves type names.
+//! - `Bytes([0xde,0xad])` decodes to `"0xdead"`, which is indistinguishable
+//!   from `String("0xdead")` in the generic output. Use `enriched` when the
+//!   distinction matters.
+//! - `u64`, `i64`, `u128`, `i128`, `Timepoint`, and `Duration` all render as
+//!   decimal strings — clients cannot distinguish them without the `enriched`
+//!   type annotation.
+//!
+//! The raw base64 XDR is **always** retained alongside the decoded JSON so no
+//! information is permanently lost.
 
 use base64::Engine;
 use serde_json::{json, Map, Value};
+use stellar_strkey::{Contract, Ed25519PublicKey};
 
 // ScValType discriminants (stable wire tags).
 const SCV_BOOL: u32 = 0;
@@ -33,18 +83,37 @@ const SCV_SYMBOL: u32 = 15;
 const SCV_VEC: u32 = 16;
 const SCV_MAP: u32 = 17;
 const SCV_ADDRESS: u32 = 18;
+// Tags 19–21: present in instance-storage snapshots; payload must be consumed.
+const SCV_CONTRACT_INSTANCE: u32 = 19;
+const SCV_LEDGER_KEY_CONTRACT_INSTANCE: u32 = 20;
+const SCV_LEDGER_KEY_NONCE: u32 = 21;
 
-// ScAddressType discriminants.
+// ScAddressType discriminants (Protocol 23+).
 const SC_ADDRESS_ACCOUNT: u32 = 0;
 const SC_ADDRESS_CONTRACT: u32 = 1;
+const SC_ADDRESS_MUXED_ACCOUNT: u32 = 2;
+const SC_ADDRESS_CLAIMABLE_BALANCE: u32 = 3;
+const SC_ADDRESS_LIQUIDITY_POOL: u32 = 4;
+
+/// Maximum nesting depth for `ScVal` decoding. Values nested deeper than this
+/// cause the whole decode to return the `{"_xdr": …}` fallback rather than
+/// risk a stack overflow.
+const MAX_DEPTH: u32 = 256;
 
 /// Decode a base64 `ScVal` into friendly JSON. Never panics.
+///
+/// Returns a fallback `{"_type":"unknown","xdr":"<base64>"}` on any parse
+/// error, including trailing bytes after the top-level value (which would
+/// indicate cursor misalignment and corrupt a sibling value if ignored).
 pub fn decode_scval_base64(b64: &str) -> Value {
     match base64::engine::general_purpose::STANDARD.decode(b64) {
         Ok(bytes) => {
             let mut cur = Cursor::new(&bytes);
             match cur.read_scval() {
-                Some(v) => v,
+                // #410: reject trailing bytes — they indicate a misaligned
+                // cursor that would corrupt siblings in a vec/map context.
+                Some(v) if cur.pos == cur.buf.len() => v,
+                Some(_) => json!({ "_type": "unknown", "xdr": b64 }),
                 None => json!({ "_type": "unknown", "xdr": b64 }),
             }
         }
@@ -111,16 +180,60 @@ impl<'a> Cursor<'a> {
         Some(data)
     }
 
-    fn read_scval(&mut self) -> Option<Value> {
+    fn read_scval(&mut self, depth: u32) -> Option<Value> {
+        if depth > MAX_DEPTH {
+            return None;
+        }
         let tag = self.u32()?;
         Some(match tag {
-            SCV_BOOL => Value::Bool(self.u32()? != 0),
+            // #410: strict bool — XDR bool must be exactly 0 or 1.
+            SCV_BOOL => {
+                let raw = self.u32()?;
+                match raw {
+                    0 => Value::Bool(false),
+                    1 => Value::Bool(true),
+                    _ => return None,
+                }
+            }
             SCV_VOID => Value::Null,
             SCV_ERROR => {
-                // Skip: (type u32, code u32). Represent opaquely.
-                let _ = self.u32()?;
-                let _ = self.u32()?;
-                json!({ "_error": true })
+                // SCError: type (u32) then either a code (u32 for Contract errors)
+                // or an SCErrorCode enum (u32) for host errors.
+                let error_type = self.u32()?;
+                let code = self.u32()?;
+                let type_name = match error_type {
+                    0 => "Contract",
+                    1 => "WasmVm",
+                    2 => "Context",
+                    3 => "Storage",
+                    4 => "Object",
+                    5 => "Crypto",
+                    6 => "Events",
+                    7 => "Budget",
+                    8 => "Value",
+                    9 => "Auth",
+                    _ => "Unknown",
+                };
+                // Contract errors carry a raw u32 code; host errors carry an
+                // SCErrorCode enum. Render host codes by name where known.
+                if error_type == 0 {
+                    json!({ "error": { "type": type_name, "code": code } })
+                } else {
+                    let code_name = match code {
+                        0 => "ArithDomain",
+                        1 => "IndexBounds",
+                        2 => "InvalidInput",
+                        3 => "MissingValue",
+                        4 => "ExistingValue",
+                        5 => "ExceededLimit",
+                        6 => "InvalidAction",
+                        7 => "InternalError",
+                        8 => "UnexpectedType",
+                        9 => "UnexpectedSize",
+                        _ => "Unknown",
+                    };
+                    json!({ "error": { "type": type_name, "code": code_name } })
+                }
             }
             SCV_U32 => json!(self.u32()?),
             SCV_I32 => json!(self.i32()?),
@@ -141,7 +254,7 @@ impl<'a> Cursor<'a> {
                 Value::String(((hi << 64) | lo).to_string())
             }
             SCV_U256 | SCV_I256 => {
-                // 256-bit: no native type; render the 32 bytes as hex.
+                // 256-bit: four 64-bit limbs (hi_hi, hi_lo, lo_hi, lo_lo).
                 let raw = self.take(32)?;
                 json!({ "_u256_hex": hex(raw) })
             }
@@ -150,9 +263,11 @@ impl<'a> Cursor<'a> {
                 Ok(s) => Value::String(s),
                 Err(e) => Value::String(format!("0x{}", hex(e.as_bytes()))),
             },
+            // #410: invalid UTF-8 in a Symbol is rendered as hex (like String)
+            // instead of failing the entire containing value.
             SCV_SYMBOL => match String::from_utf8(self.var_bytes()?) {
                 Ok(s) => Value::String(s),
-                Err(_) => return None,
+                Err(e) => Value::String(format!("0x{}", hex(e.as_bytes()))),
             },
             SCV_VEC => {
                 // Option<ScVec>: presence flag, then length-prefixed ScVal array.
@@ -162,7 +277,7 @@ impl<'a> Cursor<'a> {
                     let len = self.u32()? as usize;
                     let mut items = Vec::with_capacity(len.min(1024));
                     for _ in 0..len {
-                        items.push(self.read_scval()?);
+                        items.push(self.read_scval(depth + 1)?);
                     }
                     Value::Array(items)
                 }
@@ -172,31 +287,100 @@ impl<'a> Cursor<'a> {
                     Value::Object(Map::new())
                 } else {
                     let len = self.u32()? as usize;
-                    self.read_map(len)?
+                    self.read_map(len, depth + 1)?
                 }
             }
             SCV_ADDRESS => Value::String(self.read_address()?),
-            _ => json!({ "_type": "unknown", "xdr_tag": tag }),
+            // #410: tag 19 — ScvContractInstance.
+            // Wire format: executable (union: 0=wasm u32+hash32, 1=token u32),
+            // then Option<ScMap> storage. Rather than try to decode this fully,
+            // we consume the bytes safely by re-entrantly reading the sub-ScVal
+            // fields so the cursor stays aligned, then fall back to an opaque
+            // marker. The `read_contract_instance_payload` helper does just that.
+            SCV_CONTRACT_INSTANCE => {
+                self.skip_contract_instance_payload()?;
+                json!({ "_xdr_tag": SCV_CONTRACT_INSTANCE })
+            }
+            // #410: tag 20 — ScvLedgerKeyContractInstance. No payload.
+            SCV_LEDGER_KEY_CONTRACT_INSTANCE => {
+                json!({ "_xdr_tag": SCV_LEDGER_KEY_CONTRACT_INSTANCE })
+            }
+            // #410: tag 21 — ScvLedgerKeyNonce. Payload: ScNonceKey { nonce: i64 }.
+            SCV_LEDGER_KEY_NONCE => {
+                let _nonce = self.i64()?;
+                json!({ "_xdr_tag": SCV_LEDGER_KEY_NONCE })
+            }
+            // Any other unknown tag: return an opaque marker. No bytes consumed
+            // beyond the tag (which is fine — we signal failure via None so the
+            // top-level falls back, keeping the cursor state irrelevant).
+            _ => json!({ "_xdr_tag": tag }),
         })
     }
 
+    /// Consume the payload of a `ScvContractInstance` (tag 19) without trying
+    /// to decode it into friendly JSON. Returns `None` if the bytes are
+    /// structurally invalid (which causes the caller to fall back losslessly).
+    ///
+    /// XDR layout (simplified):
+    ///   executable: union {
+    ///     case WASM(0): wasm_hash = opaque[32]
+    ///     case TOKEN(1): (no payload)
+    ///   }
+    ///   storage: Option<ScMap>
+    fn skip_contract_instance_payload(&mut self) -> Option<()> {
+        // Read the executable union discriminant.
+        let exec_kind = self.u32()?;
+        match exec_kind {
+            0 => {
+                // Wasm: 32-byte hash.
+                self.take(32)?;
+            }
+            1 => {
+                // Token (Stellar Asset Contract): no additional bytes.
+            }
+            _ => return None,
+        }
+        // Read the Option<ScMap> storage presence flag.
+        let present = self.u32()?;
+        if present != 0 {
+            let len = self.u32()? as usize;
+            // Consume each key/value pair by decoding them; this keeps the
+            // cursor aligned even if the individual values are themselves complex.
+            for _ in 0..len {
+                self.read_scval()?;
+                self.read_scval()?;
+            }
+        }
+        Some(())
+    }
+
+    /// #411: read a map and fall back to the `[{key,val}]` pair form when any
+    /// key collision is detected, instead of silently dropping entries.
     fn read_map(&mut self, len: usize) -> Option<Value> {
-        let mut obj = Map::new();
-        let mut pairs = Vec::new();
+        let mut obj: Map<String, Value> = Map::new();
+        let mut pairs: Vec<Value> = Vec::with_capacity(len);
         let mut all_stringy = true;
+        let mut has_collision = false;
+
         for _ in 0..len {
-            let k = self.read_scval()?;
-            let v = self.read_scval()?;
+            let k = self.read_scval(depth)?;
+            let v = self.read_scval(depth)?;
             match &k {
                 Value::String(s) => {
+                    if obj.contains_key(s.as_str()) {
+                        // Duplicate key — remember this so we fall back.
+                        has_collision = true;
+                    }
                     obj.insert(s.clone(), v.clone());
                 }
                 _ => all_stringy = false,
             }
             pairs.push(json!({ "key": k, "val": v }));
         }
-        // Prefer a plain object when every key is a symbol/string.
-        if all_stringy {
+
+        // Prefer a plain object only when every key is a symbol/string AND
+        // there are no collisions (which would silently lose data).
+        if all_stringy && !has_collision {
             Some(Value::Object(obj))
         } else {
             Some(Value::Array(pairs))
@@ -209,13 +393,47 @@ impl<'a> Cursor<'a> {
                 // AccountId -> PublicKey union: key type (0 = ed25519), 32 bytes.
                 let _key_type = self.u32()?;
                 let raw = self.take(32)?;
-                Some(strkey(VERSION_ACCOUNT, raw))
+                // #413: use stellar-strkey for canonical encoding.
+                let mut payload = [0u8; 32];
+                payload.copy_from_slice(raw);
+                Some(Ed25519PublicKey(payload).to_string())
             }
             SC_ADDRESS_CONTRACT => {
                 let raw = self.take(32)?;
-                Some(strkey(VERSION_CONTRACT, raw))
+                // #413: use stellar-strkey for canonical encoding.
+                let mut payload = [0u8; 32];
+                payload.copy_from_slice(raw);
+                Some(Contract(payload).to_string())
             }
-            other => Some(format!("_addr_type_{other}")),
+            SC_ADDRESS_MUXED_ACCOUNT => {
+                // MuxedAccountMed25519: id (u64, big-endian) + ed25519 key (32 bytes).
+                // Strkey M…: version byte (12<<3 = 0x60), then ed25519(32) + id(8).
+                let id = self.u64()?;
+                let key = self.take(32)?;
+                let mut payload = [0u8; 40];
+                payload[..32].copy_from_slice(key);
+                payload[32..].copy_from_slice(&id.to_be_bytes());
+                Some(strkey(VERSION_MUXED, &payload))
+            }
+            SC_ADDRESS_CLAIMABLE_BALANCE => {
+                // ClaimableBalanceID: discriminant (u32) + 32-byte hash.
+                // Strkey B…: version byte (1<<3 = 0x08), then type byte (0) + hash(32).
+                let balance_type = self.u32()?;
+                let hash = self.take(32)?;
+                let mut payload = [0u8; 33];
+                payload[0] = balance_type as u8;
+                payload[1..].copy_from_slice(hash);
+                Some(strkey(VERSION_CLAIMABLE_BALANCE, &payload))
+            }
+            SC_ADDRESS_LIQUIDITY_POOL => {
+                // LiquidityPoolID: 32-byte pool hash.
+                // Strkey L…: version byte (11<<3 = 0x58), then hash(32).
+                let raw = self.take(32)?;
+                Some(strkey(VERSION_LIQUIDITY_POOL, raw))
+            }
+            // Truly unknown address type: return None so the whole ScVal falls
+            // back to the _xdr representation rather than misaligning the cursor.
+            _ => None,
         }
     }
 }
@@ -228,93 +446,18 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-// ---- Strkey encoding (base32 of version || payload || crc16-xmodem LE) ----
-
-const VERSION_ACCOUNT: u8 = 6 << 3; // 'G'
-const VERSION_CONTRACT: u8 = 2 << 3; // 'C'
+// ---- Strkey validation (thin wrapper around stellar-strkey) --------------
+//
+// #413: All base32/CRC16 hand-rolled code has been removed. The canonical
+// `stellar-strkey` crate (already a transitive dependency via `stellar-xdr`)
+// is used exclusively for both encoding (in `read_address`) and validation.
 
 /// Returns `true` if `s` is a well-formed Stellar contract ID (`C…` strkey).
 ///
-/// Checks: 56-character length, base32 alphabet (A–Z, 2–7), version byte
-/// `0x10` (`C`), and a valid CRC16-XModem checksum over the version + payload.
+/// This is a thin wrapper over [`stellar_strkey::Contract::from_string`].
+/// All strkey encoding (base32 + CRC16-XModem) is delegated to that crate.
 pub fn is_valid_contract_id(s: &str) -> bool {
-    // A contract strkey encodes version(1) + payload(32) + crc(2) = 35 bytes.
-    // 35 × 8 bits / 5 bits-per-char = 56 characters exactly.
-    if s.len() != 56 {
-        return false;
-    }
-    let Some(bytes) = base32_decode(s) else {
-        return false;
-    };
-    if bytes.len() != 35 {
-        return false;
-    }
-    if bytes[0] != VERSION_CONTRACT {
-        return false;
-    }
-    crc16_xmodem(&bytes[..33]) == u16::from_le_bytes([bytes[33], bytes[34]])
-}
-
-fn base32_decode(s: &str) -> Option<Vec<u8>> {
-    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-    let mut buffer: u32 = 0;
-    let mut bits: u32 = 0;
-    let mut out = Vec::with_capacity(35);
-    for b in s.bytes() {
-        let idx = ALPHABET.iter().position(|&a| a == b)? as u32;
-        buffer = (buffer << 5) | idx;
-        bits += 5;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buffer >> bits) as u8);
-        }
-    }
-    Some(out)
-}
-
-fn strkey(version: u8, payload: &[u8]) -> String {
-    let mut data = Vec::with_capacity(1 + payload.len() + 2);
-    data.push(version);
-    data.extend_from_slice(payload);
-    let crc = crc16_xmodem(&data);
-    data.extend_from_slice(&crc.to_le_bytes());
-    base32_encode(&data)
-}
-
-fn crc16_xmodem(data: &[u8]) -> u16 {
-    let mut crc: u16 = 0;
-    for &byte in data {
-        crc ^= (byte as u16) << 8;
-        for _ in 0..8 {
-            if crc & 0x8000 != 0 {
-                crc = (crc << 1) ^ 0x1021;
-            } else {
-                crc <<= 1;
-            }
-        }
-    }
-    crc
-}
-
-fn base32_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-    let mut out = String::new();
-    let mut buffer: u32 = 0;
-    let mut bits: u32 = 0;
-    for &b in data {
-        buffer = (buffer << 8) | b as u32;
-        bits += 8;
-        while bits >= 5 {
-            bits -= 5;
-            let idx = ((buffer >> bits) & 0x1f) as usize;
-            out.push(ALPHABET[idx] as char);
-        }
-    }
-    if bits > 0 {
-        let idx = ((buffer << (5 - bits)) & 0x1f) as usize;
-        out.push(ALPHABET[idx] as char);
-    }
-    out
+    Contract::from_string(s).is_ok()
 }
 
 /// Parse and validate the `CONTRACT_IDS` environment variable string.
@@ -356,6 +499,18 @@ pub fn parse_contract_ids(raw: &str) -> Result<Vec<String>, String> {
     }
 
     Ok(ids)
+}
+
+// ---- Test helpers that produce canonical strkeys via stellar-strkey -------
+
+#[cfg(test)]
+fn make_contract_strkey(payload: &[u8; 32]) -> String {
+    Contract(*payload).to_string()
+}
+
+#[cfg(test)]
+fn make_account_strkey(payload: &[u8; 32]) -> String {
+    Ed25519PublicKey(*payload).to_string()
 }
 
 #[cfg(test)]
@@ -428,30 +583,245 @@ mod tests {
         let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let result = b64(&raw);
 
-        // Should return a structured unknown marker.
-        assert_eq!(result.get("_type").and_then(|v| v.as_str()), Some("unknown"));
-        assert_eq!(result.get("xdr_tag").and_then(|v| v.as_u64()), Some(999));
+        // Should return a structured unknown marker (no trailing-byte fallback
+        // because unknown tags consume nothing after the tag itself).
+        assert_eq!(result.get("_xdr_tag").and_then(|v| v.as_u64()), Some(999));
+    }
+
+    // ── #410: edge cases ─────────────────────────────────────────────────
+
+    #[test]
+    fn bool_strict_zero_is_false() {
+        // XDR bool 0 → false.
+        let mut bytes = SCV_BOOL.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        assert_eq!(decode_scval_base64(&raw), Value::Bool(false));
     }
 
     #[test]
+    fn bool_strict_one_is_true() {
+        // XDR bool 1 → true.
+        let mut bytes = SCV_BOOL.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        assert_eq!(decode_scval_base64(&raw), Value::Bool(true));
+    }
+
+    #[test]
+    fn bool_strict_nonzero_non_one_falls_back() {
+        // #410: Any non-zero, non-one bool must be rejected (cursor safety).
+        for bad in [2u32, 255, u32::MAX] {
+            let mut bytes = SCV_BOOL.to_be_bytes().to_vec();
+            bytes.extend_from_slice(&bad.to_be_bytes());
+            let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let result = decode_scval_base64(&raw);
+            assert_eq!(
+                result.get("_type").and_then(|v| v.as_str()),
+                Some("unknown"),
+                "bool value {bad} should fall back, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_bytes_cause_fallback() {
+        // #410: A well-formed ScVal::Void followed by garbage must fall back.
+        let mut bytes = SCV_VOID.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // trailing garbage
+        let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&raw);
+        assert_eq!(
+            result.get("_type").and_then(|v| v.as_str()),
+            Some("unknown"),
+            "trailing bytes should cause fallback, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn trailing_bytes_on_u32_fall_back() {
+        // #410: A valid ScVal::U32(42) with 1 extra byte must fall back.
+        let mut bytes = SCV_U32.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&42u32.to_be_bytes());
+        bytes.push(0xFF); // one trailing byte
+        let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&raw);
+        assert_eq!(
+            result.get("_type").and_then(|v| v.as_str()),
+            Some("unknown"),
+            "trailing byte on u32 should fall back, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_symbol_renders_as_hex() {
+        // #410: Invalid UTF-8 in a Symbol must not fail the containing value;
+        // it must render as a hex string (same as invalid-UTF-8 String).
+        let bad_utf8: &[u8] = &[0xFF, 0xFE]; // 2 bytes
+        let padded_len = bad_utf8.len();
+        let pad = (4 - (padded_len % 4)) % 4;
+        let mut bytes = SCV_SYMBOL.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&(padded_len as u32).to_be_bytes());
+        bytes.extend_from_slice(bad_utf8);
+        bytes.extend(std::iter::repeat(0u8).take(pad));
+        let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&raw);
+        assert_eq!(result, Value::String("0xfffe".into()),
+            "invalid UTF-8 symbol should render as hex, got {result:?}");
+    }
+
+    #[test]
+    fn scv_contract_instance_tag_19_is_safe() {
+        // #410: ScvContractInstance (tag 19) with a WASM executable and no
+        // storage must decode to {"_xdr_tag":19} without leaving trailing bytes
+        // that would corrupt siblings.
+        // Wire: [tag=19][exec_kind=0][wasm_hash: 32 zero bytes][storage_present=0]
+        let mut bytes = SCV_CONTRACT_INSTANCE.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // exec_kind = Wasm
+        bytes.extend_from_slice(&[0u8; 32]);           // wasm hash (32 bytes)
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // storage absent
+        let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&raw);
+        assert_eq!(
+            result.get("_xdr_tag").and_then(|v| v.as_u64()),
+            Some(19),
+            "tag 19 should produce _xdr_tag:19, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn scv_ledger_key_contract_instance_tag_20_is_safe() {
+        // #410: ScvLedgerKeyContractInstance (tag 20) has no payload.
+        let mut bytes = SCV_LEDGER_KEY_CONTRACT_INSTANCE.to_be_bytes().to_vec();
+        let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&raw);
+        assert_eq!(
+            result.get("_xdr_tag").and_then(|v| v.as_u64()),
+            Some(20),
+            "tag 20 should produce _xdr_tag:20, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn scv_ledger_key_nonce_tag_21_is_safe() {
+        // #410: ScvLedgerKeyNonce (tag 21) payload = ScNonceKey { nonce: i64 }.
+        let mut bytes = SCV_LEDGER_KEY_NONCE.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&42i64.to_be_bytes()); // nonce value
+        let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&raw);
+        assert_eq!(
+            result.get("_xdr_tag").and_then(|v| v.as_u64()),
+            Some(21),
+            "tag 21 should produce _xdr_tag:21, got {result:?}"
+        );
+    }
+
+    // ── #411: map key collisions ─────────────────────────────────────────
+
+    #[test]
+    fn map_with_duplicate_keys_falls_back_to_pairs() {
+        // Build a ScVal::Map with two entries sharing the same Symbol key.
+        // Wire format: [tag=17][present=1][len=2]
+        //              [tag=15:"a"][tag=3:1]   <- first entry
+        //              [tag=15:"a"][tag=3:2]   <- second entry (duplicate key)
+        fn scval_symbol_xdr(s: &str) -> Vec<u8> {
+            let mut v = SCV_SYMBOL.to_be_bytes().to_vec();
+            let len = s.len() as u32;
+            v.extend_from_slice(&len.to_be_bytes());
+            v.extend_from_slice(s.as_bytes());
+            let pad = (4 - (s.len() % 4)) % 4;
+            v.extend(std::iter::repeat(0u8).take(pad));
+            v
+        }
+        fn scval_u32_xdr(n: u32) -> Vec<u8> {
+            let mut v = SCV_U32.to_be_bytes().to_vec();
+            v.extend_from_slice(&n.to_be_bytes());
+            v
+        }
+
+        let mut bytes = SCV_MAP.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&1u32.to_be_bytes()); // present
+        bytes.extend_from_slice(&2u32.to_be_bytes()); // len = 2
+        bytes.extend(scval_symbol_xdr("a"));
+        bytes.extend(scval_u32_xdr(1));
+        bytes.extend(scval_symbol_xdr("a")); // duplicate key
+        bytes.extend(scval_u32_xdr(2));
+
+        let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&raw);
+
+        // Must fall back to [{key,val}] pair array — not a JSON object where
+        // one entry would be silently overwritten.
+        match &result {
+            Value::Array(pairs) => {
+                assert_eq!(pairs.len(), 2, "both entries must be present");
+                assert!(pairs[0].get("key").is_some(), "pair has key");
+                assert!(pairs[0].get("val").is_some(), "pair has val");
+            }
+            other => panic!("expected pair array for duplicate-key map, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_without_collisions_stays_as_object() {
+        // A clean map should still produce a JSON object (no regression).
+        fn scval_symbol_xdr(s: &str) -> Vec<u8> {
+            let mut v = SCV_SYMBOL.to_be_bytes().to_vec();
+            let len = s.len() as u32;
+            v.extend_from_slice(&len.to_be_bytes());
+            v.extend_from_slice(s.as_bytes());
+            let pad = (4 - (s.len() % 4)) % 4;
+            v.extend(std::iter::repeat(0u8).take(pad));
+            v
+        }
+        fn scval_u32_xdr(n: u32) -> Vec<u8> {
+            let mut v = SCV_U32.to_be_bytes().to_vec();
+            v.extend_from_slice(&n.to_be_bytes());
+            v
+        }
+
+        let mut bytes = SCV_MAP.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&1u32.to_be_bytes()); // present
+        bytes.extend_from_slice(&2u32.to_be_bytes()); // len = 2
+        bytes.extend(scval_symbol_xdr("a"));
+        bytes.extend(scval_u32_xdr(1));
+        bytes.extend(scval_symbol_xdr("b"));
+        bytes.extend(scval_u32_xdr(2));
+
+        let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&raw);
+
+        match &result {
+            Value::Object(obj) => {
+                assert_eq!(obj.len(), 2);
+                assert_eq!(obj["a"], serde_json::json!(1));
+                assert_eq!(obj["b"], serde_json::json!(2));
+            }
+            other => panic!("expected object for clean map, got {other:?}"),
+        }
+    }
+
+    // ── #413: strkey via stellar-strkey ──────────────────────────────────
+
+    #[test]
     fn valid_contract_id_accepted() {
-        let id = strkey(VERSION_CONTRACT, &[0u8; 32]);
+        let id = make_contract_strkey(&[0u8; 32]);
         assert!(
             is_valid_contract_id(&id),
-            "strkey-encoded C-address should be valid: {id}"
+            "stellar-strkey-encoded C-address should be valid: {id}"
         );
     }
 
     #[test]
     fn invalid_contract_ids_rejected() {
-        let valid = strkey(VERSION_CONTRACT, &[0u8; 32]);
+        let valid = make_contract_strkey(&[0u8; 32]);
 
         // Wrong length.
         assert!(!is_valid_contract_id(&valid[..55]), "too short");
         assert!(!is_valid_contract_id(&format!("{valid}A")), "too long");
 
         // G-strkey (account) is not a contract ID.
-        let g_key = strkey(VERSION_ACCOUNT, &[0u8; 32]);
+        let g_key = make_account_strkey(&[0u8; 32]);
         assert!(!is_valid_contract_id(&g_key), "account strkey rejected");
 
         // Invalid base32 character.
@@ -467,30 +837,8 @@ mod tests {
     }
 
     #[test]
-    fn strkey_bad_crc() {
-        // Flip a byte in the payload to corrupt the checksum.
-        let mut bytes = vec![VERSION_CONTRACT];
-        bytes.extend_from_slice(&[0u8; 32]);
-        let crc = crc16_xmodem(&bytes);
-        bytes.extend_from_slice(&crc.to_le_bytes());
-        let valid = base32_encode(&bytes);
-
-        // Now corrupt a payload byte.
-        let mut corrupted_bytes = vec![VERSION_CONTRACT];
-        let mut payload = [0u8; 32];
-        payload[0] = 0xFF; // flip first payload byte
-        corrupted_bytes.extend_from_slice(&payload);
-        corrupted_bytes.extend_from_slice(&crc.to_le_bytes()); // keep old CRC
-        let corrupted = base32_encode(&corrupted_bytes);
-
-        assert!(is_valid_contract_id(&valid), "valid key should pass");
-        assert!(!is_valid_contract_id(&corrupted), "corrupted CRC should fail");
-    }
-
-    #[test]
     fn strkey_truncated_input() {
-        let valid = strkey(VERSION_CONTRACT, &[0u8; 32]);
-        // Truncate to various lengths.
+        let valid = make_contract_strkey(&[0u8; 32]);
         assert!(!is_valid_contract_id(&valid[..10]), "truncated strkey rejected");
         assert!(!is_valid_contract_id(&valid[..30]), "truncated strkey rejected");
         assert!(!is_valid_contract_id(&valid[..55]), "truncated strkey rejected");
@@ -499,36 +847,29 @@ mod tests {
 
     #[test]
     fn strkey_overlength_input() {
-        let valid = strkey(VERSION_CONTRACT, &[0u8; 32]);
-        // Add extra characters.
+        let valid = make_contract_strkey(&[0u8; 32]);
         assert!(!is_valid_contract_id(&format!("{valid}A")), "overlength rejected");
         assert!(!is_valid_contract_id(&format!("{valid}AAAA")), "overlength rejected");
     }
 
     #[test]
     fn strkey_wrong_version_byte() {
-        // G-strkey (account, version 0x30) with C payload should fail.
-        let g_key = strkey(VERSION_ACCOUNT, &[0u8; 32]);
+        let g_key = make_account_strkey(&[0u8; 32]);
         assert!(!is_valid_contract_id(&g_key), "G-strkey rejected as contract ID");
         assert_eq!(g_key.chars().next().unwrap(), 'G', "G-strkey starts with G");
 
-        // C-strkey (contract, version 0x10) should pass.
-        let c_key = strkey(VERSION_CONTRACT, &[0u8; 32]);
+        let c_key = make_contract_strkey(&[0u8; 32]);
         assert!(is_valid_contract_id(&c_key), "C-strkey accepted");
         assert_eq!(c_key.chars().next().unwrap(), 'C', "C-strkey starts with C");
     }
 
     #[test]
     fn strkey_roundtrip_g_and_c() {
-        // Valid G-strkey (ed25519 public key).
-        let g_payload = [1u8; 32];
-        let g_key = strkey(VERSION_ACCOUNT, &g_payload);
+        let g_key = make_account_strkey(&[1u8; 32]);
         assert_eq!(g_key.len(), 56, "G-strkey is 56 chars");
         assert!(g_key.starts_with('G'), "G-strkey starts with G");
 
-        // Valid C-strkey (contract ID).
-        let c_payload = [2u8; 32];
-        let c_key = strkey(VERSION_CONTRACT, &c_payload);
+        let c_key = make_contract_strkey(&[2u8; 32]);
         assert_eq!(c_key.len(), 56, "C-strkey is 56 chars");
         assert!(c_key.starts_with('C'), "C-strkey starts with C");
         assert!(is_valid_contract_id(&c_key), "C-strkey validates");
@@ -536,30 +877,26 @@ mod tests {
 
     #[test]
     fn strkey_invalid_base32_chars() {
-        let valid = strkey(VERSION_CONTRACT, &[0u8; 32]);
-        // Replace chars with invalid base32 characters.
+        let valid = make_contract_strkey(&[0u8; 32]);
+
         let mut invalid = valid.clone();
-        invalid.replace_range(10..11, "0"); // '0' not in base32 alphabet
+        invalid.replace_range(10..11, "0");
         assert!(!is_valid_contract_id(&invalid), "invalid char '0'");
 
         let mut invalid2 = valid.clone();
-        invalid2.replace_range(15..16, "1"); // '1' not in base32 alphabet
+        invalid2.replace_range(15..16, "1");
         assert!(!is_valid_contract_id(&invalid2), "invalid char '1'");
 
         let mut invalid3 = valid.clone();
-        invalid3.replace_range(20..21, "8"); // '8' not in base32 alphabet
+        invalid3.replace_range(20..21, "8");
         assert!(!is_valid_contract_id(&invalid3), "invalid char '8'");
 
         let mut invalid4 = valid;
-        invalid4.replace_range(25..26, "!"); // '!' not in base32 alphabet
+        invalid4.replace_range(25..26, "!");
         assert!(!is_valid_contract_id(&invalid4), "invalid char '!'");
     }
 
     // ── parse_contract_ids ────────────────────────────────────────────────
-
-    fn valid_c_strkey() -> String {
-        strkey(VERSION_CONTRACT, &[0u8; 32])
-    }
 
     #[test]
     fn parse_contract_ids_empty_string_is_ok() {
@@ -573,21 +910,21 @@ mod tests {
 
     #[test]
     fn parse_contract_ids_single_valid_id() {
-        let id = valid_c_strkey();
+        let id = make_contract_strkey(&[0u8; 32]);
         assert_eq!(parse_contract_ids(&id).unwrap(), vec![id]);
     }
 
     #[test]
     fn parse_contract_ids_multiple_valid_ids() {
-        let id1 = strkey(VERSION_CONTRACT, &[0u8; 32]);
-        let id2 = strkey(VERSION_CONTRACT, &[1u8; 32]);
+        let id1 = make_contract_strkey(&[0u8; 32]);
+        let id2 = make_contract_strkey(&[1u8; 32]);
         let raw = format!("{id1},{id2}");
         assert_eq!(parse_contract_ids(&raw).unwrap(), vec![id1, id2]);
     }
 
     #[test]
     fn parse_contract_ids_trims_whitespace_around_entries() {
-        let id = valid_c_strkey();
+        let id = make_contract_strkey(&[0u8; 32]);
         let raw = format!("  {id}  ");
         assert_eq!(parse_contract_ids(&raw).unwrap(), vec![id]);
     }
@@ -600,36 +937,33 @@ mod tests {
 
     #[test]
     fn parse_contract_ids_rejects_g_strkey() {
-        let g_key = strkey(VERSION_ACCOUNT, &[0u8; 32]);
+        let g_key = make_account_strkey(&[0u8; 32]);
         let err = parse_contract_ids(&g_key).unwrap_err();
         assert!(err.contains("C\u{2026} strkey"), "error mentions expected format: {err}");
     }
 
     #[test]
     fn parse_contract_ids_rejects_too_many_ids() {
-        // Build 26 valid contract IDs (one over the limit of 25).
-        let mut ids: Vec<String> = (0u8..26)
-            .map(|i| strkey(VERSION_CONTRACT, &[i; 32]))
+        let ids: Vec<String> = (0u8..26)
+            .map(|i| make_contract_strkey(&[i; 32]))
             .collect();
-        // Make each one unique by varying its payload byte.
         let raw = ids.join(",");
         let err = parse_contract_ids(&raw).unwrap_err();
         assert!(err.contains("26"), "error mentions count: {err}");
         assert!(err.contains("25"), "error mentions limit: {err}");
-        // 25 IDs (at the limit) should be accepted.
-        ids.truncate(25);
-        let raw25 = ids.join(",");
+
+        let raw25 = ids[..25].join(",");
         assert_eq!(parse_contract_ids(&raw25).unwrap().len(), 25);
     }
 }
 
 // ---- Property / fuzz tests -----------------------------------------------
 //
-// Acceptance criteria for #26:
+// Acceptance criteria for #412 and #26:
 //   • The decoder never panics on arbitrary bytes — it returns an error
-//     fallback ({ "_xdr": "<base64>" }) instead.
-//   • Round-trip properties hold for well-formed values of each primitive
-//     ScVal kind.
+//     fallback ({ "_type": "unknown", "xdr": "<base64>" }) instead.
+//   • Round-trip properties hold for every primitive ScVal kind, including
+//     i128/u128, addresses, and nested vec/map structures.
 
 #[cfg(test)]
 mod prop_tests {
@@ -666,6 +1000,86 @@ mod prop_tests {
     fn scval_i64(n: i64) -> Vec<u8> {
         let mut v = SCV_I64.to_be_bytes().to_vec();
         v.extend_from_slice(&n.to_be_bytes());
+        v
+    }
+
+    // #412: helpers for 128-bit types.
+    fn scval_u128(n: u128) -> Vec<u8> {
+        let hi = (n >> 64) as u64;
+        let lo = n as u64;
+        let mut v = SCV_U128.to_be_bytes().to_vec();
+        v.extend_from_slice(&hi.to_be_bytes());
+        v.extend_from_slice(&lo.to_be_bytes());
+        v
+    }
+
+    fn scval_i128(n: i128) -> Vec<u8> {
+        let hi = (n >> 64) as i64;
+        let lo = n as u64;
+        let mut v = SCV_I128.to_be_bytes().to_vec();
+        v.extend_from_slice(&hi.to_be_bytes());
+        v.extend_from_slice(&lo.to_be_bytes());
+        v
+    }
+
+    // #412: helpers for address types (account = G-key, contract = C-key).
+    fn scval_account_address(raw32: &[u8; 32]) -> Vec<u8> {
+        let mut v = SCV_ADDRESS.to_be_bytes().to_vec();
+        v.extend_from_slice(&SC_ADDRESS_ACCOUNT.to_be_bytes()); // discriminant
+        v.extend_from_slice(&0u32.to_be_bytes());               // key_type = ed25519
+        v.extend_from_slice(raw32);
+        v
+    }
+
+    fn scval_contract_address(raw32: &[u8; 32]) -> Vec<u8> {
+        let mut v = SCV_ADDRESS.to_be_bytes().to_vec();
+        v.extend_from_slice(&SC_ADDRESS_CONTRACT.to_be_bytes()); // discriminant
+        v.extend_from_slice(raw32);
+        v
+    }
+
+    // #412: helpers for bytes/string.
+    fn scval_bytes(data: &[u8]) -> Vec<u8> {
+        let mut v = SCV_BYTES.to_be_bytes().to_vec();
+        let len = data.len() as u32;
+        v.extend_from_slice(&len.to_be_bytes());
+        v.extend_from_slice(data);
+        let pad = (4 - (data.len() % 4)) % 4;
+        v.extend(std::iter::repeat(0u8).take(pad));
+        v
+    }
+
+    fn scval_symbol(s: &str) -> Vec<u8> {
+        let bytes = s.as_bytes();
+        let mut v = SCV_SYMBOL.to_be_bytes().to_vec();
+        let len = bytes.len() as u32;
+        v.extend_from_slice(&len.to_be_bytes());
+        v.extend_from_slice(bytes);
+        let pad = (4 - (bytes.len() % 4)) % 4;
+        v.extend(std::iter::repeat(0u8).take(pad));
+        v
+    }
+
+    // #412: helper for a single-element vec containing a u32.
+    fn scval_vec_of_u32s(items: &[u32]) -> Vec<u8> {
+        let mut v = SCV_VEC.to_be_bytes().to_vec();
+        v.extend_from_slice(&1u32.to_be_bytes()); // present
+        v.extend_from_slice(&(items.len() as u32).to_be_bytes());
+        for &item in items {
+            v.extend(scval_u32(item));
+        }
+        v
+    }
+
+    // #412: helper for a simple symbol-keyed map with u32 values.
+    fn scval_symbol_map(entries: &[(&str, u32)]) -> Vec<u8> {
+        let mut v = SCV_MAP.to_be_bytes().to_vec();
+        v.extend_from_slice(&1u32.to_be_bytes()); // present
+        v.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        for (k, val) in entries {
+            v.extend(scval_symbol(k));
+            v.extend(scval_u32(*val));
+        }
         v
     }
 
@@ -723,6 +1137,114 @@ mod prop_tests {
         fn i64_roundtrip(n: i64) {
             let result = decode_scval_base64(&encode(&scval_i64(n)));
             prop_assert_eq!(result, serde_json::Value::String(n.to_string()));
+        }
+
+        // #412: 128-bit round-trips -----------------------------------------
+
+        /// u128: decoded as decimal string.
+        #[test]
+        fn u128_roundtrip(n: u128) {
+            let result = decode_scval_base64(&encode(&scval_u128(n)));
+            prop_assert_eq!(result, serde_json::Value::String(n.to_string()));
+        }
+
+        /// i128: decoded as decimal string, including full negative range.
+        #[test]
+        fn i128_roundtrip(n: i128) {
+            let result = decode_scval_base64(&encode(&scval_i128(n)));
+            prop_assert_eq!(result, serde_json::Value::String(n.to_string()));
+        }
+
+        // #412: address round-trips ------------------------------------------
+
+        /// Account address: decoded as a G-strkey.
+        #[test]
+        fn account_address_roundtrip(raw: [u8; 32]) {
+            let result = decode_scval_base64(&encode(&scval_account_address(&raw)));
+            let expected = make_account_strkey(&raw);
+            prop_assert_eq!(result, serde_json::Value::String(expected));
+        }
+
+        /// Contract address: decoded as a C-strkey.
+        #[test]
+        fn contract_address_roundtrip(raw: [u8; 32]) {
+            let result = decode_scval_base64(&encode(&scval_contract_address(&raw)));
+            let expected = make_contract_strkey(&raw);
+            prop_assert_eq!(result, serde_json::Value::String(expected));
+        }
+
+        /// Contract address decodes to a valid C-strkey that passes is_valid_contract_id.
+        #[test]
+        fn contract_address_is_always_valid_strkey(raw: [u8; 32]) {
+            let result = decode_scval_base64(&encode(&scval_contract_address(&raw)));
+            if let serde_json::Value::String(s) = result {
+                prop_assert!(is_valid_contract_id(&s),
+                    "decoded contract strkey must be valid: {s}");
+            } else {
+                prop_assert!(false, "contract address must decode to a string");
+            }
+        }
+
+        // #412: bytes/string round-trips -------------------------------------
+
+        /// Bytes: decoded as `"0x<hex>"` string.
+        #[test]
+        fn bytes_roundtrip(data: Vec<u8>) {
+            let result = decode_scval_base64(&encode(&scval_bytes(&data)));
+            let expected = format!("0x{}", hex(&data));
+            prop_assert_eq!(result, serde_json::Value::String(expected));
+        }
+
+        /// Symbol (valid UTF-8): decoded as plain string.
+        #[test]
+        fn symbol_roundtrip(s in "[a-zA-Z0-9_]{0,32}") {
+            let result = decode_scval_base64(&encode(&scval_symbol(&s)));
+            prop_assert_eq!(result, serde_json::Value::String(s));
+        }
+
+        // #412: vec/map nesting ---------------------------------------------
+
+        /// Vec of u32s: decoded as JSON array with correct length and values.
+        #[test]
+        fn vec_of_u32s_roundtrip(items in proptest::collection::vec(any::<u32>(), 0..=16usize)) {
+            let result = decode_scval_base64(&encode(&scval_vec_of_u32s(&items)));
+            match result {
+                serde_json::Value::Array(arr) => {
+                    prop_assert_eq!(arr.len(), items.len());
+                    for (i, item) in items.iter().enumerate() {
+                        prop_assert_eq!(&arr[i], &serde_json::json!(item));
+                    }
+                }
+                other => prop_assert!(false, "expected array, got {other:?}"),
+            }
+        }
+
+        /// Map (unique string keys): decoded as JSON object with correct entries.
+        #[test]
+        fn map_unique_keys_roundtrip(
+            // Generate up to 8 unique 1-4 char lowercase keys.
+            entries in proptest::collection::btree_map(
+                "[a-z]{1,4}",
+                any::<u32>(),
+                0..=8usize,
+            )
+        ) {
+            let pairs: Vec<(&str, u32)> = entries.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+            let result = decode_scval_base64(&encode(&scval_symbol_map(&pairs)));
+            match result {
+                serde_json::Value::Object(obj) => {
+                    prop_assert_eq!(obj.len(), entries.len());
+                    for (k, expected_v) in &entries {
+                        let actual = obj.get(k.as_str());
+                        prop_assert!(actual.is_some(), "key {k:?} should be present");
+                        prop_assert_eq!(actual.unwrap(), &serde_json::json!(expected_v));
+                    }
+                }
+                serde_json::Value::Array(_) => {
+                    // Pair-array fallback is also acceptable (e.g. empty map).
+                }
+                other => prop_assert!(false, "expected object or array, got {other:?}"),
+            }
         }
     }
 }

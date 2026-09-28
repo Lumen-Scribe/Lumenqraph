@@ -4,6 +4,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use sqlx::PgPool;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::auth::IpConfig;
 use crate::call_cache::CallCache;
@@ -64,20 +66,17 @@ pub struct AppState {
     pub health_max_stale_secs: i64,
     /// When true, GET /metrics requires a valid API key (#213).
     pub metrics_require_auth: bool,
-    /// Rate limiter for webhook-related mutations (POST /webhooks).
-    pub webhook_limiter: Arc<RateLimiter>,
-    /// Requests/min allowed for unauthenticated callers on webhook create.
-    pub webhook_anon_rate_limit: i32,
-    /// Maximum webhook subscriptions allowed. 0 = unlimited.
-    pub webhook_max_subscriptions: usize,
-    /// In-process LRU cache for API key lookups (#430). Avoids a Postgres
-    /// round-trip on every authenticated request. Positive entries live for
-    /// `key_cache::TTL_SECS`; negative entries (revoked / unknown) for
-    /// `key_cache::NEG_TTL_SECS`.
-    pub key_cache: Arc<KeyCache>,
-    /// Client IP extraction config, built once from env vars at startup (#428).
-    /// Controls `TRUSTED_PROXY_HOPS` and `CLIENT_IP_HEADER`.
-    pub ip_config: IpConfig,
+    /// Bounded channel for off-request-path audit writes (#367). Auth
+    /// middleware pushes events here instead of awaiting an INSERT; a
+    /// background task drains and batch-inserts them. `None` disables audit
+    /// logging (e.g. in tests).
+    pub audit_tx: Option<mpsc::Sender<AuditEvent>>,
+    /// Count of audit events dropped because the channel was full (#367).
+    pub audit_dropped: Arc<AtomicU64>,
+    /// Cancelled when the process receives a shutdown signal (#436). Long-lived
+    /// handlers such as the SSE stream select on this so they can end cleanly
+    /// instead of blocking `with_graceful_shutdown` until SIGKILL.
+    pub shutdown: CancellationToken,
 }
 
 pub struct BuildInfo {

@@ -72,6 +72,10 @@ stellar-xdr = { version = "23", default-features = false, features = [
     "curr",
     "base64",
 ] }
+# Canonical Soroban strkey encoding/decoding (base32 + CRC16-XModem).
+# Already a transitive dependency via stellar-xdr; pinned here explicitly so
+# lumenqraph-core can use it directly in the hot XDR decode path (#413).
+stellar-strkey = "0.0.13"
 lru = "0.12"
 criterion = { version = "0.5", features = ["async_tokio"] }
 
