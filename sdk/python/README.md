@@ -50,6 +50,11 @@ for event in lq.paginate_events(contracts['data'][0]['contract_id']):
 - **Transfers**
   - `list_transfers(contract_id, limit, offset)` - Get SEP-41 transfers
 
+- **Webhooks**
+    - `redrive_webhook(webhook_id, since)` - Retry failed deliveries
+    - `reenable_webhook(webhook_id)` - Reactivate an auto-disabled subscription
+    - `rotate_webhook_secret(webhook_id, grace_seconds)` - Rotate its signing secret
+
 - **Read / Simulate**
   - `call(contract_id, function, args, source_account)` - Invoke a view function
   - `simulate(contract_id, function, args, source_account)` - Dry-run a call

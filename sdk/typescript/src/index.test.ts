@@ -177,6 +177,62 @@ describe("URL construction", () => {
     expect(url.pathname).toBe("/contracts/C1/interface");
     expect(url.searchParams.get("version")).toBe("3");
   });
+
+  it("getStats sends bucket, grouping, time, and ledger filters", async () => {
+    const f = mockFetch([{ status: 200, body: { data: [], total: 0 } }]);
+    await client(f).getStats("C1", {
+      bucket: "ledger",
+      groupBy: "event_name",
+      from: "2026-01-01T00:00:00Z",
+      to: "2026-01-02T00:00:00Z",
+      fromLedger: 10,
+      toLedger: 20,
+    });
+    const url = new URL(f.mock.calls[0]?.[0] as string);
+    expect(url.pathname).toBe("/contracts/C1/stats");
+    expect(url.searchParams.get("bucket")).toBe("ledger");
+    expect(url.searchParams.get("group_by")).toBe("event_name");
+    expect(url.searchParams.get("from_ledger")).toBe("10");
+    expect(url.searchParams.get("to_ledger")).toBe("20");
+  });
+
+  it("materialized list methods map typed filters to REST query names", async () => {
+    const f = mockFetch([
+      { status: 200, body: { data: [], has_more: false, next_cursor: null } },
+      { status: 200, body: { data: [], has_more: false, next_cursor: null } },
+      { status: 200, body: { data: [], has_more: false, next_cursor: null } },
+    ]);
+    const lq = client(f);
+    await lq.listSwaps("C1", { sender: "G1", sellToken: "A", buyToken: "B" });
+    await lq.listNftEvents("C1", { kind: "mint", tokenId: "7" });
+    await lq.listLiquidityEvents("C1", { kind: "add", provider: "G2" });
+    const urls = f.mock.calls.map(([url]) => new URL(url as string));
+    expect(urls[0]?.searchParams.get("sell_token")).toBe("A");
+    expect(urls[1]?.searchParams.get("token_id")).toBe("7");
+    expect(urls[2]?.searchParams.get("provider")).toBe("G2");
+  });
+
+  it("webhook lifecycle methods use the expected endpoints and payloads", async () => {
+    const f = mockFetch([
+      { status: 200, body: { redriven: 3 } },
+      { status: 200, body: { reenabled: true } },
+      {
+        status: 200,
+        body: { id: "wh-1", secret: "new-secret", previous_secret_expires_at: "2026-01-02T00:00:00Z" },
+      },
+    ]);
+    const lq = client(f);
+    expect(await lq.redriveWebhook("wh-1", { since: "2026-01-01T00:00:00Z" })).toEqual({ redriven: 3 });
+    expect(await lq.reenableWebhook("wh-1")).toEqual({ reenabled: true });
+    expect((await lq.rotateWebhookSecret("wh-1", { graceSeconds: 60 })).secret).toBe("new-secret");
+
+    const [redriveUrl, redriveInit] = f.mock.calls[0] as [string, RequestInit];
+    expect(new URL(redriveUrl).searchParams.get("since")).toBe("2026-01-01T00:00:00Z");
+    expect(redriveInit.method).toBe("POST");
+    expect(new URL(f.mock.calls[1]?.[0] as string).pathname).toBe("/webhooks/wh-1/reenable");
+    const rotateInit = f.mock.calls[2]?.[1] as RequestInit;
+    expect(JSON.parse(rotateInit.body as string)).toEqual({ grace_seconds: 60 });
+  });
 });
 
 // ---- Auth header injection ----
@@ -391,5 +447,18 @@ describe("paginateEvents", () => {
     });
     await expect(gen.next()).rejects.toThrow(/abort/i);
     expect(f).not.toHaveBeenCalled();
+  });
+});
+
+describe("materialized cursor pagination", () => {
+  it("follows next_cursor until has_more is false", async () => {
+    const f = mockFetch([
+      { status: 200, body: { data: [{ event_id: "s1" }], has_more: true, next_cursor: "cursor-1" } },
+      { status: 200, body: { data: [{ event_id: "s2" }], has_more: false, next_cursor: null } },
+    ]);
+    const events = [];
+    for await (const event of client(f).paginateSwaps("C1", { limit: 1 })) events.push(event);
+    expect(events.map((event) => event.event_id)).toEqual(["s1", "s2"]);
+    expect(new URL(f.mock.calls[1]?.[0] as string).searchParams.get("after")).toBe("cursor-1");
   });
 });
