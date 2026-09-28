@@ -114,7 +114,7 @@ fn minimal_contract_spec() -> ContractSpec {
         data_format: ScSpecEventDataFormat::SingleValue,
     });
     let bytes = entry.to_xdr(Limits::none()).unwrap();
-    ContractSpec::from_spec_xdr(&bytes).unwrap_or_default()
+    ContractSpec::from_spec_xdr_simple(&bytes).unwrap_or_default()
 }
 
 // ── Phase 1: XDR decode ───────────────────────────────────────────────────────
@@ -286,7 +286,7 @@ fn nested_udt_spec(padding: usize) -> ContractSpec {
         .iter()
         .flat_map(|e| e.to_xdr(Limits::none()).unwrap())
         .collect();
-    ContractSpec::from_spec_xdr(&bytes).expect("nested-UDT spec should parse")
+    ContractSpec::from_spec_xdr_simple(&bytes).expect("nested-UDT spec should parse")
 }
 
 fn bench_enrichment_nested(c: &mut Criterion) {

@@ -326,7 +326,7 @@ mod tests {
         for e in entries {
             body.extend(e.to_xdr(Limits::none()).unwrap());
         }
-        ContractSpec::from_spec_xdr(&body).expect("test spec should parse")
+        ContractSpec::from_spec_xdr_simple(&body).expect("test spec should parse")
     }
 
     /// `name(<inputs>) -> <output>`

@@ -706,7 +706,7 @@ async fn load_spec_at_version(
     }
 
     let section = hex::decode(&hex_section)?;
-    let spec = ContractSpec::from_spec_xdr(&section)
+    let spec = ContractSpec::from_spec_xdr(&section).map(|p| p.spec)
         .ok_or_else(|| anyhow::anyhow!("spec section for version {version} contains invalid XDR or has no entries"))?;
     Ok(Arc::new(spec))
 }
@@ -735,7 +735,7 @@ async fn call_contract(
     let call = read::encode_call(&section, contract_id, function, &args, source_account)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     // Parsed spec: names UDT values in the result (and enriches preview events).
-    let spec = ContractSpec::from_spec_xdr(&section);
+    let spec = ContractSpec::from_spec_xdr(&section).map(|p| p.spec);
 
     match state.rpc.simulate(&call.tx_xdr).await? {
         SimOutcome::Ok {

@@ -53,6 +53,8 @@ use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use config::Config;
+use deep_backfill::{GalexieSource, HistoricalSource};
+use lumenqraph_core::ContractSpec;
 use rpc_client::RpcClient;
 
 /// Postgres advisory lock id used to elect a single active indexer.
@@ -312,4 +314,98 @@ async fn run_migrations(pool: &sqlx::PgPool) -> anyhow::Result<()> {
         ),
     };
 
-/* … truncated 1692 chars — edit only what you need near the top … */
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Load .env if present (development convenience; no-op in production).
+    let _ = dotenvy::dotenv();
+
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(EnvFilter::from_default_env())
+        .init();
+
+    let config = Config::from_env().context("failed to load config")?;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&config.database_url)
+        .await
+        .context("failed to connect to Postgres")?;
+
+    // Build the RPC client with all configured endpoints (#398).
+    // RPC_URLS takes precedence over RPC_URL; both are parsed by Config::from_env.
+    let rpc = RpcClient::with_urls(config.rpc_urls.clone(), config.rpc_timeout_secs);
+
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.get(1).map(String::as_str) == Some("migrate") {
+        info!("running migrations only");
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .context("migrations failed")?;
+        return Ok(());
+    }
+
+    if args.get(1).map(String::as_str) == Some("inspect") {
+        let contract_id = args.get(2).context("inspect requires a contract id")?;
+        let (wasm_hash, wasm) = rpc
+            .get_contract_wasm(contract_id)
+            .await?
+            .context("no WASM found for contract")?;
+        match ContractSpec::from_wasm(&wasm) {
+            Some(parsed) => {
+                info!(wasm_hash, complete = parsed.complete, "interface");
+                println!("{}", serde_json::to_string_pretty(&parsed.spec).unwrap());
+            }
+            None => info!(wasm_hash, "no contractspecv0 section found"),
+        }
+        return Ok(());
+    }
+
+    // Acquire the leader lock and run migrations before dispatching.
+    let _lock = LeaderLock::acquire(&pool).await?;
+
+    sqlx::migrate!("../../migrations")
+        .run(&pool)
+        .await
+        .context("failed to run migrations")?;
+
+    let specs = specs::SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
+
+    if args.get(1).map(String::as_str) == Some("reenrich") {
+        info!("running in reenrich mode");
+        return reenrich::run_reenrich(pool, rpc, config).await;
+    }
+
+    if args.get(1).map(String::as_str) == Some("backfill") {
+        let from = args
+            .get(2)
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(config.start_ledger);
+        info!(from, "running in backfill mode");
+        return backfill::run(pool, rpc, config, from).await;
+    }
+
+    if args.get(1).map(String::as_str) == Some("recover-gaps") {
+        info!("running in recover-gaps mode");
+        return poller::recover_gaps(&pool, &rpc, &config, &specs).await;
+    }
+
+    info!(
+        rpc = %config.rpc_url,
+        rpc_endpoints = config.rpc_urls.len(),
+        contracts = ?config.contract_ids,
+        poll_secs = config.poll_interval_secs,
+        "starting lumenqraph indexer (live)"
+    );
+
+    let pool_arc = std::sync::Arc::new(pool.clone());
+    let specs_arc = std::sync::Arc::new(specs);
+    let bind_addr = std::env::var("INDEXER_HTTP_BIND_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:9090".to_string());
+    http::start_http_server(pool_arc, specs_arc.clone(), &bind_addr).await?;
+
+    poller::run(pool, rpc, config, specs_arc).await
+}

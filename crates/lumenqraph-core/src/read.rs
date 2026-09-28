@@ -76,7 +76,7 @@ pub fn encode_call(
     args: &Value,
     source_account: Option<&str>,
 ) -> Result<EncodedCall, EncodeError> {
-    match ContractSpec::from_spec_xdr(spec_section) {
+    match ContractSpec::from_spec_xdr_simple(spec_section) {
         Some(spec) => encode_call_with_spec(&spec, contract_id, function, args, source_account),
         // No parseable interface at all, so no function can exist in it.
         None => Err(EncodeError::FunctionNotFound(function.to_string())),
@@ -157,7 +157,7 @@ fn is_view_heuristic(f: &FunctionSpec) -> bool {
 /// This form re-parses `spec_section`; prefer [`functions_of`] when the caller
 /// already holds a parsed [`ContractSpec`].
 pub fn functions(spec_section: &[u8]) -> Vec<Value> {
-    match ContractSpec::from_spec_xdr(spec_section) {
+    match ContractSpec::from_spec_xdr_simple(spec_section) {
         Some(spec) => functions_of(&spec),
         None => Vec::new(),
     }
@@ -649,7 +649,11 @@ pub fn decode_events(
 ) -> Vec<Value> {
     let mut out = Vec::new();
     for b64 in events_xdr {
-        let Ok(diag) = DiagnosticEvent::from_xdr_base64(b64, Limits::none()) else {
+        // #400: use bounded limits — simulation results come from a potentially
+        // malicious contract; Limits::none() would allow stack overflow via
+        // deeply-nested ScVal types.
+        let xdr_limits = Limits { depth: 500, len: b64.len().max(1) * 3 / 4 + 16 };
+        let Ok(diag) = DiagnosticEvent::from_xdr_base64(b64, xdr_limits) else {
             continue;
         };
         let event = diag.event;
@@ -1062,7 +1066,7 @@ mod tests {
         assert_eq!(raw["value"], 7);
 
         // …with it, the case is named — in the shape the encoder accepts back.
-        let parsed = ContractSpec::from_spec_xdr(&spec).unwrap();
+        let parsed = ContractSpec::from_spec_xdr_simple(&spec).unwrap();
         let named = decode_result(&result_xdr, &call, Some(&parsed));
         assert_eq!(named["value"], "Filled");
         assert_eq!(named["type"], "Status");
