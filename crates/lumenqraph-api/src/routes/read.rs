@@ -291,8 +291,10 @@ mod tests {
             },
         );
 
-        use crate::concurrency_limit::ConcurrencyLimiter;
+        use crate::auth::IpConfig;
         use crate::call_cache::CallCache;
+        use crate::concurrency_limit::ConcurrencyLimiter;
+        use crate::key_cache::KeyCache;
         use crate::read_cost_limit::ReadCostLimitConfig;
 
         AppState {
@@ -322,6 +324,12 @@ mod tests {
             readyz_max_age_secs: 120,
             health_max_lag_ledgers: 100,
             health_max_stale_secs: 120,
+            metrics_require_auth: false,
+            webhook_limiter: Arc::new(RateLimiter::new()),
+            webhook_anon_rate_limit: 10,
+            webhook_max_subscriptions: 0,
+            key_cache: Arc::new(KeyCache::new(256)),
+            ip_config: IpConfig { trusted_proxy_hops: 0, platform_header: None },
         }
     }
 

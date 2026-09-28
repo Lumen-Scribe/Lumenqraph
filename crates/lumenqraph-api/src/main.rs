@@ -7,6 +7,7 @@ mod call_cache;
 mod concurrency_limit;
 mod error;
 mod graphql;
+mod key_cache;
 mod metrics;
 mod metrics_middleware;
 mod openapi;
@@ -37,6 +38,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use call_cache::CallCache;
 use concurrency_limit::ConcurrencyLimiter;
+use key_cache::KeyCache;
 use rate_limit::RateLimiter;
 use read_cost_limit::ReadCostLimitConfig;
 use state::{AppState, BuildInfo};

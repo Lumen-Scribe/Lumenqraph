@@ -12,11 +12,15 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 use sqlx::PgPool;
 use tracing::warn;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 
 use crate::error::{ApiError, ApiResult};
 use crate::pagination::{self, IdCursor, Page, PageRequest};
 use crate::state::AppState;
 use crate::url_validation;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Default retention window (in days) for delivered/failed `webhook_deliveries`
 /// rows. Overridable via `WEBHOOK_DELIVERY_RETENTION_DAYS`; `0` disables pruning.
