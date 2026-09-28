@@ -126,3 +126,32 @@ fn proxy_routes_registered_correctly() {
     // the explorer fallback, ensuring mounted paths can shadow nothing and
     // don't get shadowed by the fallback.
 }
+
+#[test]
+fn cors_allowlist_preflight_allows_authorization_and_api_key() {
+    // CORS allowlist mode is configured by build_cors_layer() in
+    // crates/lumenqraph-api/src/main.rs. When CORS_ALLOWED_ORIGINS is set to
+    // specific origins, the layer must:
+    //
+    // ✓ allow_headers([CONTENT_TYPE, AUTHORIZATION, x-api-key, x-request-id, IF_NONE_MATCH])
+    //     so a browser preflight carrying `Access-Control-Request-Headers:
+    //     authorization, x-api-key` succeeds for an allowlisted origin.
+    //
+    // ✓ expose_headers([x-request-id, retry-after, x-ratelimit-limit,
+    //     x-ratelimit-remaining, etag, deprecation, link]) so browser JS can
+    //     read X-Request-ID and Retry-After (used by the TS SDK retry logic).
+    //
+    // ✓ max_age(...) so preflight responses are cached by the browser.
+    //
+    // Expected preflight exchange for an allowlisted origin:
+    //   OPTIONS /v1/contracts
+    //   Origin: https://app.example
+    //   Access-Control-Request-Method: GET
+    //   Access-Control-Request-Headers: authorization, x-api-key
+    //
+    //   → 200/204 with:
+    //       Access-Control-Allow-Origin: https://app.example
+    //       Access-Control-Allow-Headers: ... authorization, x-api-key ...
+    //       Access-Control-Expose-Headers: ... x-request-id, retry-after ...
+    //       Access-Control-Max-Age: <seconds>
+}

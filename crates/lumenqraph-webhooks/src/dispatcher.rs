@@ -232,6 +232,28 @@ async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::R
                    (SELECT url FROM webhook_subscriptions WHERE id = d.subscription_id),
                    (SELECT safe_decrypt_webhook_secret(encrypted_secret, $4) FROM webhook_subscriptions WHERE id = d.subscription_id),
                    d.event_id, d.upgrade_id, d.created_at",
+    let rows: Vec<(i64, String, i32, String, String, Json<serde_json::Value>)> = sqlx::query_as(
+        "SELECT d.id, s.id, d.attempts, s.url,
+                pgp_sym_decrypt(s.encrypted_secret, $1),
+                CASE WHEN d.upgrade_id IS NOT NULL THEN
+                    jsonb_build_object(
+                        'type',               'contract.upgraded',
+                        'contract_id',        v.contract_id,
+                        'version',            v.version,
+                        'wasm_hash',          v.wasm_hash,
+                        'previous_wasm_hash', v.previous_wasm_hash,
+                        'breaking',           v.breaking,
+                        'diff',               v.diff,
+                        'observed_at',        v.observed_at
+                    )
+                ELSE to_jsonb(e) - 'seq' END AS payload
+         FROM webhook_deliveries d
+         JOIN webhook_subscriptions s ON s.id = d.subscription_id
+         LEFT JOIN events e ON e.event_id = d.event_id
+         LEFT JOIN contract_spec_versions v ON v.id = d.upgrade_id
+         WHERE d.status = 'pending' AND d.next_attempt_at <= now() AND s.active
+         ORDER BY d.next_attempt_at
+         LIMIT $2",
     )
     .bind(lock_duration)
     .bind(&worker)
@@ -347,7 +369,10 @@ pub async fn deliver(
                     Ok(()) => {
                         let _ = mark_delivered(&pool, d.id).await;
                         let _ = sqlx::query(
-                            "UPDATE webhook_subscriptions SET consecutive_failures = 0 WHERE id = $1"
+                            "UPDATE webhook_subscriptions 
+                             SET consecutive_failures = 0, 
+                                 last_success_at = now() 
+                             WHERE id = $1"
                         )
                         .bind(d.subscription_id)
                         .execute(&pool)
@@ -366,6 +391,8 @@ pub async fn deliver(
                         .await;
 
                         let _ = check_and_auto_disable(&pool, d.subscription_id, config.failure_threshold).await;
+                        // Atomic increment and check for auto-disable
+                        let _ = check_and_auto_disable(&pool, &d.subscription_id, config.failure_threshold).await;
 
                         Some((false, d.subscription_id))
                     }
@@ -478,12 +505,55 @@ async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &C
     let signature = hex::encode(mac.finalize().into_bytes());
 
     let req = http
+async fn send(http: &reqwest::Client, d: &DueDelivery, config: &Config) -> anyhow::Result<()> {
+    // Re-validate URL at delivery time and get the validated IP for connection pinning.
+    // This ensures the hostname still resolves to a public address even if the
+    // DNS record changed since registration, and prevents DNS rebinding attacks.
+    let validated_ip = validate_webhook_url_at_delivery(&d.url).await
+        .map_err(|e| anyhow::anyhow!("URL validation failed at delivery: {}", e))?;
+
+    let body = serde_json::to_vec(&d.payload.0)?;
+    let timestamp = Utc::now().timestamp();
+
+    // New timestamped signature scheme (Stripe/Svix style):
+    // signed_payload = "{timestamp}.{body}"
+    // signature = HMAC-SHA256(secret, signed_payload)
+    let signed_payload = format!("{}.{}", timestamp, std::str::from_utf8(&body)?);
+    
+    let mut mac =
+        HmacSha256::new_from_slice(d.secret.as_bytes()).context("invalid webhook secret")?;
+    mac.update(signed_payload.as_bytes());
+    let signature_v1 = hex::encode(mac.finalize().into_bytes());
+    
+    // Legacy signature for backwards compatibility (will be removed in future release)
+    let mut legacy_mac =
+        HmacSha256::new_from_slice(d.secret.as_bytes()).context("invalid webhook secret")?;
+    legacy_mac.update(&body);
+    let legacy_signature = hex::encode(legacy_mac.finalize().into_bytes());
+
+    // Determine event type from payload
+    let event_type = d.payload.0.get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("contract.event");
+
+    // Extract host for connection pinning
+    let parsed_url = Url::parse(&d.url).context("failed to parse URL")?;
+    let host = parsed_url.host_str().context("URL must have a host")?;
+    
+    // Build client with connection pinning to the validated IP
+    let client = reqwest::Client::builder()
+        .resolve(host, std::net::SocketAddr::new(validated_ip, parsed_url.port().unwrap_or(if parsed_url.scheme() == "https" { 443 } else { 80 })))
+        .build()
+        .context("failed to build pinned client")?;
+
+    let req = client
         .post(&d.url)
         .timeout(config.total_timeout())
         .header("Content-Type", "application/json")
-        .header("X-Lumenqraph-Signature", format!("sha256={signature}"))
+        .header("X-Lumenqraph-Signature", format!("t={},v1={}", timestamp, signature_v1))
+        .header("X-Lumenqraph-Signature-Legacy", format!("sha256={}", legacy_signature))
         .header("X-Lumenqraph-Delivery-Id", d.id.to_string())
-        .header("X-Lumenqraph-Timestamp", timestamp)
+        .header("X-Lumenqraph-Timestamp", timestamp.to_string())
         .header("X-Lumenqraph-Attempt", d.attempts.to_string())
         .header("X-Lumenqraph-Event", &envelope.payload_type)
         .header("User-Agent", USER_AGENT)
@@ -491,14 +561,45 @@ async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &C
         .build()
         .context("failed to build request")?;
 
-    let resp = http
+    let resp = client
         .execute(req)
         .await
         .context("request failed")?;
 
-    let status = resp.status();
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok());
+    delivery_outcome(resp.status(), location)
+}
+
+/// Build the HTTP client used for webhook deliveries.
+///
+/// Redirects are never followed: `validate_webhook_url_at_delivery` only vets
+/// the subscriber's URL, so following a `3xx` would let a subscriber bounce a
+/// signed request to an internal address (cloud metadata, databases, ...).
+pub fn build_delivery_client(
+    connect_timeout: std::time::Duration,
+    total_timeout: std::time::Duration,
+) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(total_timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
+/// Map a delivery response to success/failure. Only `2xx` counts as delivered;
+/// a `3xx` is a failure because redirects are not followed.
+fn delivery_outcome(status: reqwest::StatusCode, location: Option<&str>) -> anyhow::Result<()> {
     if status.is_success() {
         Ok(())
+    } else if status.is_redirection() {
+        Err(anyhow::anyhow!(
+            "redirects are not followed: endpoint returned {} (Location: {})",
+            status,
+            location.unwrap_or("<none>")
+        ))
     } else {
         Err(anyhow::anyhow!("non-2xx status {}", status))
     }
@@ -564,34 +665,59 @@ async fn check_and_auto_disable(
     subscription_id: Uuid,
     failure_threshold: i32,
 ) -> anyhow::Result<()> {
-    let consecutive_failures: i32 = sqlx::query_scalar(
-        "SELECT consecutive_failures FROM webhook_subscriptions WHERE id = $1",
+    // Atomically increment consecutive_failures and return the updated value along with timing info
+    let result: Option<(i32, Option<DateTime<Utc>>, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "UPDATE webhook_subscriptions
+         SET consecutive_failures = consecutive_failures + 1,
+             first_failure_at = COALESCE(first_failure_at, now())
+         WHERE id = $1
+         RETURNING consecutive_failures, last_success_at, first_failure_at",
     )
     .bind(subscription_id)
     .fetch_optional(pool)
-    .await?
-    .unwrap_or(0);
+    .await?;
 
-    if consecutive_failures >= failure_threshold {
-        let reason = format!(
-            "Auto-disabled after {} consecutive delivery failures",
-            consecutive_failures
-        );
-        sqlx::query(
-            "UPDATE webhook_subscriptions
-             SET active = false, auto_disabled_at = now(), auto_disabled_reason = $2
-             WHERE id = $1",
-        )
-        .bind(subscription_id)
-        .bind(&reason)
-        .execute(pool)
-        .await?;
+    if let Some((consecutive_failures, last_success_at, first_failure_at)) = result {
+        // Auto-disable if:
+        // 1. Consecutive failures >= threshold, AND
+        // 2. No success in the last 24 hours (or never had a success and failing for 24h)
+        let should_disable = consecutive_failures >= failure_threshold && {
+            let now = Utc::now();
+            if let Some(last_success) = last_success_at {
+                (now - last_success).num_hours() >= 24
+            } else if let Some(first_failure) = first_failure_at {
+                (now - first_failure).num_hours() >= 24
+            } else {
+                false
+            }
+        };
+
+        if should_disable {
+            let reason = format!(
+                "Auto-disabled after {} consecutive delivery failures with no success for 24+ hours",
+                consecutive_failures
+            );
+            sqlx::query(
+                "UPDATE webhook_subscriptions
+                 SET active = false, auto_disabled_at = now(), auto_disabled_reason = $2
+                 WHERE id = $1",
+            )
+            .bind(subscription_id)
+            .bind(&reason)
+            .execute(pool)
+            .await?;
 
         warn!(
             subscription_id = %subscription_id,
             consecutive_failures = consecutive_failures,
             "webhook subscription auto-disabled"
         );
+            warn!(
+                subscription_id = subscription_id,
+                consecutive_failures = consecutive_failures,
+                "webhook subscription auto-disabled"
+            );
+        }
     }
     Ok(())
 }
@@ -844,5 +970,93 @@ mod tests {
             format!("sha256={computed_hex}"),
             format!("sha256={expected_hex}")
         );
+    }
+}
+#[cfg(test)]
+mod redirect_tests {
+    //! Regression tests for #447: a subscriber answering `302 Location:
+    //! <internal address>` must not make the dispatcher contact that address.
+    //! No database needed.
+
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration as StdDuration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn redirect_to_internal_target_is_not_followed() {
+        // Stand-in for an internal service (e.g. 169.254.169.254): counts hits.
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = target.accept().await {
+                hits_srv.fetch_add(1, Ordering::SeqCst);
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+
+        // Subscriber endpoint that always redirects to the internal target.
+        let hook = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hook_addr = hook.local_addr().unwrap();
+        let location = format!("http://{target_addr}/latest/meta-data/");
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = hook.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let http = build_delivery_client(StdDuration::from_secs(2), StdDuration::from_secs(5))
+            .expect("client");
+        let resp = http
+            .post(format!("http://{hook_addr}/hook"))
+            .header("Content-Type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("request to hook");
+
+        assert_eq!(resp.status(), reqwest::StatusCode::FOUND);
+        let loc = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let err = delivery_outcome(resp.status(), loc.as_deref()).unwrap_err();
+        assert!(
+            err.to_string().contains("redirects are not followed"),
+            "unexpected error: {err}"
+        );
+
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "redirect target was contacted");
+    }
+
+    #[test]
+    fn redirect_statuses_are_failures_with_clear_error() {
+        for code in [301u16, 302, 303, 307, 308] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            let err = delivery_outcome(status, Some("http://10.0.0.5:5432/")).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("redirects are not followed"), "{code}: {msg}");
+            assert!(msg.contains("http://10.0.0.5:5432/"), "{code}: {msg}");
+        }
+    }
+
+    #[test]
+    fn success_and_other_errors_unchanged() {
+        assert!(delivery_outcome(reqwest::StatusCode::OK, None).is_ok());
+        assert!(delivery_outcome(reqwest::StatusCode::NO_CONTENT, None).is_ok());
+        let err = delivery_outcome(reqwest::StatusCode::INTERNAL_SERVER_ERROR, None).unwrap_err();
+        assert!(err.to_string().contains("non-2xx status"));
     }
 }

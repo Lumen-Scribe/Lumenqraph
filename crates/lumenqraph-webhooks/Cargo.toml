@@ -29,3 +29,4 @@ rand.workspace = true
 axum.workspace = true
 tower.workspace = true
 hostname = "0.4"
+futures.workspace = true
