@@ -43,6 +43,8 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
     let cache_evictions = state.call_cache.evictions();
     let cache_size = state.call_cache.size();
 
+    let sse_active_streams = state.sse_active_streams.load(Ordering::Relaxed);
+
     let mut body = format!(
         "# HELP lumenqraph_indexer_last_processed_ledger Last ledger the indexer processed\n\
          # TYPE lumenqraph_indexer_last_processed_ledger gauge\n\
@@ -100,7 +102,10 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
          lumenqraph_call_cache_evictions_total {cache_evictions}\n\
          # HELP lumenqraph_call_cache_size Current number of entries in /call cache\n\
          # TYPE lumenqraph_call_cache_size gauge\n\
-         lumenqraph_call_cache_size {cache_size}\n",
+         lumenqraph_call_cache_size {cache_size}\n\
+         # HELP lumenqraph_sse_active_streams Currently open SSE streams\n\
+         # TYPE lumenqraph_sse_active_streams gauge\n\
+         lumenqraph_sse_active_streams {sse_active_streams}\n",
         last = last,
         tip = tip,
         lag = lag,
@@ -120,6 +125,7 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
         cache_misses = cache_misses,
         cache_evictions = cache_evictions,
         cache_size = cache_size,
+        sse_active_streams = sse_active_streams,
     );
 
     body.push_str("# HELP lumenqraph_http_request_duration_ms Per-route HTTP request latency\n");
@@ -154,15 +160,6 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
             body.push_str(&format!("{key}_p50 {p50}\n"));
             body.push_str(&format!("{key}_p95 {p95}\n"));
             body.push_str(&format!("{key}_p99 {p99}\n"));
-        }
-    }
-
-    body.push_str("# HELP lumenqraph_http_request_status Per-route HTTP request status codes\n");
-    body.push_str("# TYPE lumenqraph_http_request_status counter\n");
-    {
-        let counters = state.metrics.status_counters.read();
-        for (key, count) in counters.iter() {
-            body.push_str(&format!("{key} {count}\n"));
         }
     }
 

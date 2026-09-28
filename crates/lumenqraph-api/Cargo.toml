@@ -1,49 +1,17 @@
 [package]
 name = "lumenqraph-api"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[[bin]]
-name = "lumenqraph-api"
-path = "src/main.rs"
+version = "0.1.0"
+edition = "2021"
 
 [dependencies]
-lumenqraph-core.workspace = true
-tokio.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-chrono.workspace = true
-anyhow.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-dotenvy.workspace = true
-sqlx.workspace = true
-axum.workspace = true
-tower.workspace = true
-tower-http.workspace = true
-async-graphql.workspace = true
-async-graphql-axum.workspace = true
-uuid.workspace = true
-sha2.workspace = true
-hex.workspace = true
-reqwest.workspace = true
-url.workspace = true
-rand = "0.8"
-base64 = "0.22"
-utoipa = { version = "4", features = ["axum_extras", "chrono", "uuid"] }
-utoipa-swagger-ui = { version = "7", features = ["axum"] }
-utoipa-redoc = { version = "4", features = ["axum"] }
+axum = { version = "0.7", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
 futures = "0.3"
-parking_lot = "0.12"
-lru = "0.12"
-redis = "0.24"
-stellar-xdr.workspace = true
-
-[dev-dependencies]
-tower.workspace = true
-criterion.workspace = true
-
-[[bench]]
-name = "rate_limit"
-harness = false
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1"
+anyhow = "1"
