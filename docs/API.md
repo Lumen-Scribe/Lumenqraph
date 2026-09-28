@@ -77,6 +77,60 @@ Prometheus text: `lumenqraph_indexer_lag_ledgers`, `lumenqraph_events_total`,
 `lumenqraph_indexer_ingested_total`, `lumenqraph_indexer_errors_total`,
 `lumenqraph_api_requests_total`, …
 
+## Decoded JSON dialect
+
+Every event row carries both the raw base64 XDR (`topics`, `value`) and the
+decoded JSON (`decoded_topics`, `decoded_value`). The table below documents
+exactly how each `ScVal` XDR variant is rendered in the generic decoder. The
+spec-driven `enriched` field (present for contracts with an on-chain interface)
+always adds explicit type names and resolves ambiguities.
+
+| XDR variant | JSON representation |
+|---|---|
+| `ScvBool` | `true` / `false` |
+| `ScvVoid` | `null` |
+| `ScvError` | `{"_error":true}` |
+| `ScvU32` | JSON number (safe for all 32-bit values) |
+| `ScvI32` | JSON number (safe for all 32-bit values) |
+| `ScvU64` | decimal string, e.g. `"18446744073709551615"` |
+| `ScvI64` | decimal string, e.g. `"-9223372036854775808"` |
+| `ScvTimepoint` | decimal string (same wire format as `u64`) |
+| `ScvDuration` | decimal string (same wire format as `u64`) |
+| `ScvU128` | decimal string |
+| `ScvI128` | decimal string |
+| `ScvU256` | `{"_u256_hex":"<64 hex chars>"}` |
+| `ScvI256` | `{"_u256_hex":"<64 hex chars>"}` |
+| `ScvBytes` | `"0x<hex>"`, e.g. `"0xdead"` |
+| `ScvString` | UTF-8 string; `"0x<hex>"` if the bytes are not valid UTF-8 |
+| `ScvSymbol` | UTF-8 string; `"0x<hex>"` if the bytes are not valid UTF-8 |
+| `ScvVec` | JSON array; empty array for the absent/`None` variant |
+| `ScvMap` (no key collisions) | JSON object keyed by string |
+| `ScvMap` (collisions or non-string keys) | array of `{"key":…,"val":…}` pair objects |
+| `ScvAddress` (account) | `G…` strkey, 56 chars |
+| `ScvAddress` (contract) | `C…` strkey, 56 chars |
+| `ScvAddress` (other) | `"_addr_type_<N>"` placeholder |
+| `ScvContractInstance` (tag 19) | `{"_xdr_tag":19}` — payload consumed safely |
+| `ScvLedgerKeyContractInstance` (tag 20) | `{"_xdr_tag":20}` — no payload |
+| `ScvLedgerKeyNonce` (tag 21) | `{"_xdr_tag":21}` — payload consumed safely |
+| unknown tag | `{"_xdr_tag":<N>}` fallback; surrounding siblings unaffected |
+
+**Known ambiguities in the generic decoder** (use `enriched` to distinguish):
+
+- `Symbol("abc")` and `String("abc")` both decode to `"abc"`.
+- `Bytes([0xde,0xad])` → `"0xdead"`, indistinguishable from `String("0xdead")`.
+- `u64`, `i64`, `u128`, `i128`, `Timepoint`, and `Duration` all render as
+  decimal strings — clients cannot distinguish them without the `enriched` type
+  annotation.
+
+**Map key collisions** — if a map contains two entries with the same
+symbol/string key (which is technically invalid XDR but can appear in
+wild-caught data), the generic decoder falls back to the `[{key,val}]` pair
+form to preserve both entries rather than silently dropping one.
+
+**Lossless guarantee** — the raw base64 XDR is always retained in the `topics`
+and `value` fields, so no information is permanently lost even when a value
+falls back to `{"_type":"unknown","xdr":"<base64>"}`.
+
 ## Data (authenticated / rate-limited)
 
 ### `GET /contracts`

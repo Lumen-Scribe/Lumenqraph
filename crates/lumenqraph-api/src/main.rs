@@ -9,6 +9,7 @@ mod config;
 mod error;
 mod extract;
 mod graphql;
+mod key_cache;
 mod metrics;
 mod metrics_middleware;
 mod openapi;
@@ -40,6 +41,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use call_cache::CallCache;
 use concurrency_limit::ConcurrencyLimiter;
 use config::{ApiConfig, DbConfig};
+use key_cache::KeyCache;
 use rate_limit::RateLimiter;
 use read_cost_limit::ReadCostLimitConfig;
 use state::{AppState, BuildInfo};
@@ -119,7 +121,23 @@ fn build_cors_layer(origins_str: &str) -> tower_http::cors::CorsLayer {
                 axum::http::Method::OPTIONS,
                 axum::http::Method::DELETE,
             ])
-            .allow_headers([axum::http::header::CONTENT_TYPE]);
+            .allow_headers([
+                axum::http::header::CONTENT_TYPE,
+                axum::http::header::AUTHORIZATION,
+                axum::http::header::IF_NONE_MATCH,
+                http::HeaderName::from_static("x-api-key"),
+                http::HeaderName::from_static("x-request-id"),
+            ])
+            .expose_headers([
+                http::HeaderName::from_static("x-request-id"),
+                http::HeaderName::from_static("retry-after"),
+                http::HeaderName::from_static("x-ratelimit-limit"),
+                http::HeaderName::from_static("x-ratelimit-remaining"),
+                http::HeaderName::from_static("etag"),
+                http::HeaderName::from_static("deprecation"),
+                http::HeaderName::from_static("link"),
+            ])
+            .max_age(Duration::from_secs(600));
 
         for origin_str in origins {
             match origin_str.parse::<http::HeaderValue>() {
@@ -226,6 +244,11 @@ async fn main() -> anyhow::Result<()> {
         metrics_require_auth: config.metrics_require_auth,
         proxy_limiter: Arc::new(RateLimiter::new()),
         config: Arc::clone(&config),
+        key_cache: Arc::new(KeyCache::new(2000)),
+        ip_config: auth::IpConfig::from_env(),
+        audit_tx: None,
+        audit_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        shutdown: tokio_util::sync::CancellationToken::new(),
     };
 
     let bind_addr = config.bind_addr.clone();

@@ -77,10 +77,8 @@ async fn main() -> anyhow::Result<()> {
     info!(config = ?config, "effective configuration");
     let pool = connect_with_retry(&config).await?;
 
-    let http = reqwest::Client::builder()
-        .connect_timeout(config.connect_timeout())
-        .timeout(config.total_timeout())
-        .build()?;
+    // Redirects are never followed (SSRF guard, see `build_delivery_client`).
+    let http = dispatcher::build_delivery_client(config.connect_timeout(), config.total_timeout())?;
 
     let pool_arc = std::sync::Arc::new(pool.clone());
     metrics::start_metrics_server(pool_arc, &config.metrics_bind_addr).await?;

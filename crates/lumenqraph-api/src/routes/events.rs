@@ -4,8 +4,9 @@
 //!
 //! Cursor pagination is strongly recommended for production use. Offset pagination
 //! is deprecated due to linear performance degradation with large offsets and will
-//! be removed in a future version. Offsets are capped at 10,000; use cursor
-//! pagination for deeper pages.
+//! be removed in a future version. Offsets are capped at
+//! [`crate::pagination::MAX_OFFSET`] and answered with a `Deprecation` header;
+//! use cursor pagination for deeper pages.
 
 use axum::extract::{Path, Query, State};
 use axum::Json;
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ApiResult};
 use crate::extract::ValidContractId;
-use crate::pagination;
+use crate::pagination::{LedgerCursor, Page, PageRequest};
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -54,15 +55,8 @@ fn default_limit() -> i64 {
     50
 }
 
-#[derive(Serialize)]
-pub struct EventsResponse {
-    /// The event rows in the result set.
-    pub data: Vec<EventRow>,
-    /// Whether there are more results available.
-    pub has_more: bool,
-    /// Opaque cursor to fetch the next page. Null if this is the last page.
-    pub next_cursor: Option<String>,
-}
+/// Response envelope for `GET /contracts/:contract_id/events`.
+pub type EventsResponse = Page<EventRow>;
 
 pub async fn list_events(
     State(state): State<AppState>,
@@ -71,17 +65,11 @@ pub async fn list_events(
 ) -> ApiResult<Json<EventsResponse>> {
     let limit = q.limit.clamp(1, 1000);
 
-    // Enforce maximum offset to prevent performance issues
-    const MAX_OFFSET: i64 = 10_000;
-    if q.offset > MAX_OFFSET && q.after.is_none() {
-        return Err(ApiError::bad_request(
-            format!(
-                "offset pagination is limited to {} rows. For deeper pages, use cursor \
-                 pagination with the 'after' parameter (see API documentation).",
-                MAX_OFFSET
-            )
-        ));
-    }
+    let page = PageRequest::<LedgerCursor>::parse(q.limit, 1000, q.offset, q.after.as_deref())?;
+    let (after_ledger, after_event_id) = match page.after {
+        Some(ref c) => (Some(c.ledger), Some(c.event_id.as_str())),
+        None => (None, None),
+    };
 
     // Validate and parse time range if provided
     let since_datetime: Option<DateTime<chrono::Utc>> = if let Some(ref since) = q.since {
@@ -118,131 +106,52 @@ pub async fn list_events(
         }
     }
 
-    // Warn about deprecated offset pagination
-    let using_offset = q.after.is_none() && q.offset > 0;
+    let events: Vec<EventRow> = sqlx::query_as(
+        "SELECT event_id, contract_id, ledger, ledger_closed_at, event_type,
+                topics, decoded_topics, event_name, value, decoded_value,
+                enriched, tx_hash, in_successful_call, paging_token, created_at
+         FROM events
+         WHERE contract_id = $1
+           AND ($2::text IS NULL OR event_name = $2)
+           AND ($3::bigint IS NULL OR ledger >= $3)
+           AND ($4::bigint IS NULL OR ledger <= $4)
+           AND ($5::timestamp IS NULL OR ledger_closed_at >= $5)
+           AND ($6::timestamp IS NULL OR ledger_closed_at <= $6)
+           -- Topic filtering: decoded_topics is a JSONB array. To filter by position,
+           -- we use JSONB containment (@>) with null padding. For example, to match
+           -- decoded_topics[1], we build an array [null, value] and check containment.
+           -- This works because JSONB containment checks if the right side is a subset
+           -- of the left side, preserving position for array elements.
+           AND ($7::text IS NULL OR decoded_topics @> jsonb_build_array($7::jsonb))
+           AND ($8::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, $8::jsonb))
+           AND ($9::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, $9::jsonb))
+           AND ($10::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, jsonb_null::jsonb, $10::jsonb))
+           AND ($11::text IS NULL OR enriched @> ($11::jsonb))
+           AND ($15::boolean IS NULL OR in_successful_call = $15)
+           AND ($12::bigint IS NULL OR ledger < $12 OR (ledger = $12 AND event_id < $13))
+         ORDER BY ledger DESC, event_id DESC
+         LIMIT $14 OFFSET $16",
+    )
+    .bind(&contract_id)
+    .bind(&q.event_name)
+    .bind(q.from_ledger)
+    .bind(q.to_ledger)
+    .bind(since_datetime)
+    .bind(until_datetime)
+    .bind(&q.topic0)
+    .bind(&q.topic1)
+    .bind(&q.topic2)
+    .bind(&q.topic3)
+    .bind(&q.param)
+    .bind(after_ledger)
+    .bind(after_event_id)
+    .bind(page.fetch_limit())
+    .bind(q.successful_only)
+    .bind(page.offset)
+    .fetch_all(&state.pool)
+    .await?;
 
-    // If cursor is provided, use keyset pagination; otherwise fall back to offset.
-    let events: Vec<EventRow> = if let Some(ref cursor) = q.after {
-        let page_config = pagination::PaginationConfig::new(limit, Some(cursor))
-            .map_err(|e| ApiError::bad_request(format!("invalid cursor: {e}")))?;
-        sqlx::query_as(
-            "SELECT event_id, contract_id, ledger, ledger_closed_at, event_type,
-                    topics, decoded_topics, event_name, value, decoded_value,
-                    enriched, tx_hash, in_successful_call, paging_token, created_at
-             FROM events
-             WHERE contract_id = $1
-               AND ($2::text IS NULL OR event_name = $2)
-               AND ($3::bigint IS NULL OR ledger >= $3)
-               AND ($4::bigint IS NULL OR ledger <= $4)
-               AND ($5::timestamp IS NULL OR ledger_closed_at >= $5)
-               AND ($6::timestamp IS NULL OR ledger_closed_at <= $6)
-               -- Topic filtering: decoded_topics is a JSONB array. To filter by position,
-               -- we use JSONB containment (@>) with null padding. For example, to match
-               -- decoded_topics[1], we build an array [null, value] and check containment.
-               -- This works because JSONB containment checks if the right side is a subset
-               -- of the left side, preserving position for array elements.
-               AND ($7::text IS NULL OR decoded_topics @> jsonb_build_array($7::jsonb))
-               AND ($8::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, $8::jsonb))
-               AND ($9::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, $9::jsonb))
-               AND ($10::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, jsonb_null::jsonb, $10::jsonb))
-               AND ($11::text IS NULL OR enriched @> ($11::jsonb))
-               AND ($15::boolean IS NULL OR in_successful_call = $15)
-               AND ($12::bigint IS NULL OR ledger < $12 OR (ledger = $12 AND event_id < $13))
-             ORDER BY ledger DESC, event_id DESC
-             LIMIT $14",
-        )
-        .bind(&contract_id)
-        .bind(&q.event_name)
-        .bind(q.from_ledger)
-        .bind(q.to_ledger)
-        .bind(since_datetime)
-        .bind(until_datetime)
-        .bind(&q.topic0)
-        .bind(&q.topic1)
-        .bind(&q.topic2)
-        .bind(&q.topic3)
-        .bind(&q.param)
-        .bind(page_config.after_ledger)
-        .bind(page_config.after_event_id)
-        .bind(limit + 1)
-        .bind(q.successful_only)
-        .fetch_all(&state.pool)
-        .await?
-    } else {
-        // Backward compatibility: use offset pagination if no cursor provided
-        let offset = q.offset.max(0);
-        sqlx::query_as(
-            "SELECT event_id, contract_id, ledger, ledger_closed_at, event_type,
-                    topics, decoded_topics, event_name, value, decoded_value,
-                    enriched, tx_hash, in_successful_call, paging_token, created_at
-             FROM events
-             WHERE contract_id = $1
-               AND ($2::text IS NULL OR event_name = $2)
-               AND ($3::bigint IS NULL OR ledger >= $3)
-               AND ($4::bigint IS NULL OR ledger <= $4)
-               AND ($5::timestamp IS NULL OR ledger_closed_at >= $5)
-               AND ($6::timestamp IS NULL OR ledger_closed_at <= $6)
-               -- Topic filtering: decoded_topics is a JSONB array. To filter by position,
-               -- we use JSONB containment (@>) with null padding. For example, to match
-               -- decoded_topics[1], we build an array [null, value] and check containment.
-               -- This works because JSONB containment checks if the right side is a subset
-               -- of the left side, preserving position for array elements.
-               AND ($7::text IS NULL OR decoded_topics @> jsonb_build_array($7::jsonb))
-               AND ($8::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, $8::jsonb))
-               AND ($9::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, $9::jsonb))
-               AND ($10::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, jsonb_null::jsonb, $10::jsonb))
-               AND ($11::text IS NULL OR enriched @> ($11::jsonb))
-               AND ($14::boolean IS NULL OR in_successful_call = $14)
-             ORDER BY ledger DESC, event_id DESC
-             LIMIT $12 OFFSET $13",
-        )
-        .bind(&contract_id)
-        .bind(&q.event_name)
-        .bind(q.from_ledger)
-        .bind(q.to_ledger)
-        .bind(since_datetime)
-        .bind(until_datetime)
-        .bind(&q.topic0)
-        .bind(&q.topic1)
-        .bind(&q.topic2)
-        .bind(&q.topic3)
-        .bind(&q.param)
-        .bind(limit)
-        .bind(offset)
-        .bind(q.successful_only)
-        .fetch_all(&state.pool)
-        .await?
-    };
-
-    // Determine if there's a next page and slice the sentinel off.
-    let (has_next_page, result_events) = if q.after.is_some() && events.len() as i64 > limit {
-        let mut trimmed = events;
-        trimmed.truncate(limit as usize);
-        (true, trimmed)
-    } else {
-        (false, events)
-    };
-
-    let next_cursor = if has_next_page {
-        result_events
-            .last()
-            .map(|e| pagination::encode_cursor(e.ledger, &e.event_id))
-    } else {
-        None
-    };
-
-    let mut response = Json(EventsResponse {
-        data: result_events,
-        has_more: has_next_page,
-        next_cursor,
-    });
-
-    // Add deprecation header for offset pagination
-    if using_offset {
-        response.0.has_more = has_next_page; // Ensure consistency
-    }
-
-    Ok(response)
+    Ok(page.finish(events, |e| LedgerCursor::new(e.ledger, &e.event_id)))
 }
 
 /// `GET /events/:event_id` — fetch a single event by its unique id.

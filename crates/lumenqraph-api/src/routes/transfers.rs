@@ -2,18 +2,18 @@
 //! view for a contract (from/to/amount), newest first. Optional `?from=`/`?to=`
 //! address filters.
 //!
-//! Supports both offset (deprecated for large result sets) and cursor pagination.
-//! For large result sets, cursor pagination is strongly recommended as it has
-//! constant-time per-page performance, whereas offset pagination degrades linearly.
+//! Keyset pagination via `after=` (the `next_cursor` of the previous page).
+//! `offset` is deprecated, capped at [`crate::pagination::MAX_OFFSET`], and
+//! answered with a `Deprecation` header.
 
 use axum::extract::{Query, State};
 use axum::Json;
 use lumenqraph_core::TokenTransfer;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::error::{ApiError, ApiResult};
 use crate::extract::ValidContractId;
-use crate::pagination;
+use crate::pagination::{LedgerCursor, Page, PageRequest};
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -32,86 +32,39 @@ fn default_limit() -> i64 {
     50
 }
 
-#[derive(Serialize)]
-pub struct TransfersResponse {
-    /// The transfer rows in the result set.
-    pub data: Vec<TokenTransfer>,
-    /// Whether there are more results available.
-    pub has_more: bool,
-    /// Opaque cursor to fetch the next page. Null if this is the last page.
-    pub next_cursor: Option<String>,
-}
+/// Response envelope for `GET /contracts/:contract_id/transfers`.
+pub type TransfersResponse = Page<TokenTransfer>;
 
 pub async fn list_transfers(
     State(state): State<AppState>,
     ValidContractId(contract_id): ValidContractId,
     Query(q): Query<TransfersQuery>,
 ) -> ApiResult<Json<TransfersResponse>> {
-    let limit = q.limit.clamp(1, 1000);
-
-    // If cursor is provided, use keyset pagination; otherwise fall back to offset.
-    let transfers: Vec<TokenTransfer> = if let Some(ref cursor) = q.after {
-        let page_config = pagination::PaginationConfig::new(limit, Some(cursor))
-            .map_err(|e| ApiError::bad_request(format!("invalid cursor: {e}")))?;
-        sqlx::query_as(
-            "SELECT event_id, contract_id, from_addr, to_addr, amount, kind, ledger, ledger_closed_at
-             FROM token_transfers
-             WHERE contract_id = $1
-               AND ($2::text IS NULL OR from_addr = $2)
-               AND ($3::text IS NULL OR to_addr = $3)
-               AND ($4::bigint IS NULL OR ledger < $4 OR (ledger = $4 AND event_id < $5))
-             ORDER BY ledger DESC, event_id DESC
-             LIMIT $6",
-        )
-        .bind(&contract_id)
-        .bind(&q.from)
-        .bind(&q.to)
-        .bind(page_config.after_ledger)
-        .bind(page_config.after_event_id)
-        .bind(limit + 1)
-        .fetch_all(&state.pool)
-        .await?
-    } else {
-        // Backward compatibility: use offset pagination if no cursor provided
-        let offset = q.offset.max(0);
-        sqlx::query_as(
-            "SELECT event_id, contract_id, from_addr, to_addr, amount, kind, ledger, ledger_closed_at
-             FROM token_transfers
-             WHERE contract_id = $1
-               AND ($2::text IS NULL OR from_addr = $2)
-               AND ($3::text IS NULL OR to_addr = $3)
-             ORDER BY ledger DESC, event_id DESC
-             LIMIT $4 OFFSET $5",
-        )
-        .bind(&contract_id)
-        .bind(&q.from)
-        .bind(&q.to)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&state.pool)
-        .await?
+    let page = PageRequest::<LedgerCursor>::parse(q.limit, 1000, q.offset, q.after.as_deref())?;
+    let (after_ledger, after_event_id) = match page.after {
+        Some(ref c) => (Some(c.ledger), Some(c.event_id.as_str())),
+        None => (None, None),
     };
 
-    // Determine if there's a next page and extract the cursor.
-    let (has_next_page, result_transfers) = if q.after.is_some() && transfers.len() as i64 > limit {
-        let mut trimmed = transfers;
-        trimmed.truncate(limit as usize);
-        (true, trimmed)
-    } else {
-        (false, transfers)
-    };
+    let transfers: Vec<TokenTransfer> = sqlx::query_as(
+        "SELECT event_id, contract_id, from_addr, to_addr, amount, kind, ledger, ledger_closed_at
+         FROM token_transfers
+         WHERE contract_id = $1
+           AND ($2::text IS NULL OR from_addr = $2)
+           AND ($3::text IS NULL OR to_addr = $3)
+           AND ($4::bigint IS NULL OR ledger < $4 OR (ledger = $4 AND event_id < $5))
+         ORDER BY ledger DESC, event_id DESC
+         LIMIT $6 OFFSET $7",
+    )
+    .bind(&contract_id)
+    .bind(&q.from)
+    .bind(&q.to)
+    .bind(after_ledger)
+    .bind(after_event_id)
+    .bind(page.fetch_limit())
+    .bind(page.offset)
+    .fetch_all(&state.pool)
+    .await?;
 
-    let next_cursor = if has_next_page {
-        result_transfers
-            .last()
-            .map(|t| pagination::encode_cursor(t.ledger, &t.event_id))
-    } else {
-        None
-    };
-
-    Ok(Json(TransfersResponse {
-        data: result_transfers,
-        has_more: has_next_page,
-        next_cursor,
-    }))
+    Ok(page.finish(transfers, |t| LedgerCursor::new(t.ledger, &t.event_id)))
 }

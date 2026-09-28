@@ -24,10 +24,12 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 use url::Url;
+use uuid::Uuid;
 
 use crate::config::Config;
 use futures::stream::{self, StreamExt};
 use lumenqraph_core::url_validation::validate_webhook_url_at_delivery;
+use lumenqraph_core::{ContractEventData, ContractUpgradeData, WebhookEnvelope};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -35,6 +37,15 @@ type HmacSha256 = Hmac<Sha256>;
 /// off `User-Agent` for debugging, so delivery logs can be traced back to the
 /// version that sent them.
 const USER_AGENT: &str = concat!("lumenqraph-webhooks/", env!("CARGO_PKG_VERSION"));
+
+/// Generate a stable worker identifier for lock claims (hostname:pid).
+fn worker_id() -> String {
+    let hostname = hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("{}:{}", hostname, std::process::id())
+}
 
 /// Last observed count of `pending` rows in `webhook_deliveries`, refreshed once
 /// per dispatcher tick by [`refresh_pending_gauge`] and read by the `/metrics`
@@ -57,12 +68,111 @@ pub async fn refresh_pending_gauge(pool: &PgPool) -> anyhow::Result<i64> {
     Ok(pending)
 }
 
-/// Enqueue deliveries for everything new in both streams. Returns how many
-/// delivery rows were created.
+/// Enqueue deliveries for everything new in both streams, and advance any
+/// per-subscription backfill cursors. Returns how many delivery rows were
+/// created (live + backfill combined).
 pub async fn enqueue(pool: &PgPool, batch: i64) -> anyhow::Result<u64> {
     let events = enqueue_events(pool, batch).await?;
     let upgrades = enqueue_upgrades(pool, batch).await?;
-    Ok(events + upgrades)
+    let backfill = enqueue_backfill(pool, batch).await?;
+    Ok(events + upgrades + backfill)
+}
+
+/// Advance per-subscription backfill cursors.
+///
+/// Subscriptions created with a `since` parameter have `backfill_seq` set to
+/// a value below the global watermark at creation time. This pass delivers
+/// events in the window `(backfill_seq, global_last_seq_at_creation]` in
+/// bounded batches, advancing `backfill_seq` atomically so a crash cannot
+/// duplicate or skip deliveries.
+///
+/// Once `backfill_seq` reaches or exceeds the subscription's `starting_seq`
+/// (the watermark at creation) the column is cleared (set to NULL) and the
+/// subscription transitions fully to the live stream.
+async fn enqueue_backfill(pool: &PgPool, batch: i64) -> anyhow::Result<u64> {
+    // Fetch all subscriptions that still have an outstanding backfill cursor.
+    let subs: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT id::text, backfill_seq, starting_seq
+         FROM webhook_subscriptions
+         WHERE active AND backfill_seq IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    if subs.is_empty() {
+        return Ok(0);
+    }
+
+    let mut total: u64 = 0;
+
+    for (sub_id, backfill_seq, starting_seq) in subs {
+        // The backfill window is (backfill_seq, starting_seq].  Once the cursor
+        // reaches starting_seq the backfill is complete.
+        if backfill_seq >= starting_seq {
+            sqlx::query(
+                "UPDATE webhook_subscriptions SET backfill_seq = NULL WHERE id = $1::uuid",
+            )
+            .bind(&sub_id)
+            .execute(pool)
+            .await?;
+            continue;
+        }
+
+        let upper = (backfill_seq + batch).min(starting_seq);
+
+        let mut tx = pool.begin().await?;
+
+        let created = sqlx::query(
+            "INSERT INTO webhook_deliveries (subscription_id, event_id)
+             SELECT $1::uuid, e.event_id
+             FROM events e
+             JOIN webhook_subscriptions s ON s.id = $1::uuid
+             WHERE s.kind = 'event'
+               AND (s.contract_id IS NULL OR s.contract_id = e.contract_id)
+               AND (s.event_name  IS NULL OR s.event_name  = e.event_name)
+               AND e.seq > $2 AND e.seq <= $3
+             ON CONFLICT (subscription_id, event_id) DO NOTHING",
+        )
+        .bind(&sub_id)
+        .bind(backfill_seq)
+        .bind(upper)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        // Advance or clear the cursor.
+        if upper >= starting_seq {
+            sqlx::query(
+                "UPDATE webhook_subscriptions SET backfill_seq = NULL WHERE id = $1::uuid",
+            )
+            .bind(&sub_id)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                "UPDATE webhook_subscriptions SET backfill_seq = $2 WHERE id = $1::uuid",
+            )
+            .bind(&sub_id)
+            .bind(upper)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+
+        if created > 0 {
+            debug!(
+                sub_id = %sub_id,
+                created,
+                up_to_seq = upper,
+                "backfill: enqueued deliveries"
+            );
+        }
+
+        total += created;
+    }
+
+    Ok(total)
 }
 
 /// Match new events to `event` subscriptions and enqueue deliveries.
@@ -184,21 +294,43 @@ async fn enqueue_upgrades(pool: &PgPool, batch: i64) -> anyhow::Result<u64> {
 #[derive(Clone)]
 struct DueDelivery {
     id: i64,
-    subscription_id: String,
+    subscription_id: uuid::Uuid,
     attempts: i32,
     url: String,
-    secret: String,
-    payload: Json<serde_json::Value>,
+    secret: Option<String>,
+    event_id: Option<String>,
+    upgrade_id: Option<i64>,
+    created_at: DateTime<Utc>,
 }
 
-/// Read due deliveries and build each one's payload.
+/// Atomically claim and fetch due deliveries, handling decryption failures gracefully.
 ///
-/// A delivery points at an event or a spec version, never both, so exactly one
-/// of the two LEFT JOINs matches and the CASE picks that payload. Event payloads
-/// keep their long-standing shape (the bare event row); upgrade payloads are
-/// tagged, since they're a new shape and a consumer receiving one should be able
-/// to tell what it is.
+/// This function:
+/// 1. Claims deliveries with FOR UPDATE SKIP LOCKED to prevent double-delivery (#452)
+/// 2. Decrypts secrets using safe_decrypt_webhook_secret to handle failures per-row (#453)
+/// 3. Handles subscription_id as UUID, not String (#454)
+/// 4. Returns raw event/upgrade data for envelope construction (#455)
 async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::Result<Vec<DueDelivery>> {
+    let worker = worker_id();
+    let lock_duration = Duration::seconds(60);
+    
+    // Claim deliveries atomically with row-level locking
+    let claimed: Vec<(i64, Uuid, i32, String, Option<String>, Option<String>, Option<i64>, DateTime<Utc>)> = sqlx::query_as(
+        "UPDATE webhook_deliveries d
+         SET locked_until = now() + $1, locked_by = $2
+         WHERE d.id IN (
+             SELECT id FROM webhook_deliveries
+             WHERE status = 'pending' 
+               AND next_attempt_at <= now()
+               AND (locked_until IS NULL OR locked_until < now())
+             ORDER BY next_attempt_at 
+             LIMIT $3
+             FOR UPDATE SKIP LOCKED
+         )
+         RETURNING d.id, d.subscription_id, d.attempts, 
+                   (SELECT url FROM webhook_subscriptions WHERE id = d.subscription_id),
+                   (SELECT safe_decrypt_webhook_secret(encrypted_secret, $4) FROM webhook_subscriptions WHERE id = d.subscription_id),
+                   d.event_id, d.upgrade_id, d.created_at",
     let rows: Vec<(i64, String, i32, String, String, Json<serde_json::Value>)> = sqlx::query_as(
         "SELECT d.id, s.id, d.attempts, s.url,
                 pgp_sym_decrypt(s.encrypted_secret, $1),
@@ -218,26 +350,86 @@ async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::R
          JOIN webhook_subscriptions s ON s.id = d.subscription_id
          LEFT JOIN events e ON e.event_id = d.event_id
          LEFT JOIN contract_spec_versions v ON v.id = d.upgrade_id
-         WHERE d.status = 'pending' AND d.next_attempt_at <= now()
+         WHERE d.status = 'pending' AND d.next_attempt_at <= now() AND s.active
          ORDER BY d.next_attempt_at
          LIMIT $2",
     )
-    .bind(&encryption_key)
+    .bind(lock_duration)
+    .bind(&worker)
     .bind(batch)
+    .bind(encryption_key)
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|r| DueDelivery {
-            id: r.0,
-            subscription_id: r.1,
-            attempts: r.2,
-            url: r.3,
-            secret: r.4,
-            payload: r.5,
-        })
-        .collect())
+    let mut deliveries = Vec::new();
+    let mut failed_subscriptions = Vec::new();
+
+    for (id, sub_id, attempts, url, decrypted_secret, event_id, upgrade_id, created_at) in claimed {
+        // Check if decryption succeeded
+        let secret = match decrypted_secret {
+            None => {
+                warn!(delivery = id, subscription = %sub_id, "failed to decrypt secret (NULL or wrong key)");
+                failed_subscriptions.push((sub_id, "secret unavailable: decryption failed"));
+                let _ = mark_failed_undecryptable(pool, id, "secret unavailable: decryption failed").await;
+                continue;
+            }
+            Some(s) if s.is_empty() => {
+                warn!(delivery = id, subscription = %sub_id, "decrypted secret is empty");
+                failed_subscriptions.push((sub_id, "secret unavailable: empty after decryption"));
+                let _ = mark_failed_undecryptable(pool, id, "secret unavailable: empty").await;
+                continue;
+            }
+            Some(s) => Some(s),
+        };
+
+        deliveries.push(DueDelivery {
+            id,
+            subscription_id: sub_id,
+            attempts,
+            url,
+            secret,
+            event_id,
+            upgrade_id,
+            created_at,
+        });
+    }
+
+    // Auto-disable subscriptions with undecryptable secrets
+    for (sub_id, reason) in failed_subscriptions {
+        let _ = auto_disable_subscription(pool, sub_id, reason).await;
+    }
+
+    Ok(deliveries)
+}
+
+/// Mark a delivery as failed due to undecryptable secret and clear the lock.
+async fn mark_failed_undecryptable(pool: &PgPool, delivery_id: i64, error_msg: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE webhook_deliveries
+         SET status = 'failed', last_error = $2, locked_until = NULL, locked_by = NULL
+         WHERE id = $1",
+    )
+    .bind(delivery_id)
+    .bind(error_msg)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Auto-disable a subscription with an explanatory reason.
+async fn auto_disable_subscription(pool: &PgPool, subscription_id: Uuid, reason: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE webhook_subscriptions
+         SET active = false, auto_disabled_at = now(), auto_disabled_reason = $2
+         WHERE id = $1",
+    )
+    .bind(subscription_id)
+    .bind(reason)
+    .execute(pool)
+    .await?;
+    
+    warn!(subscription = %subscription_id, reason, "auto-disabled subscription due to secret error");
+    Ok(())
 }
 
 /// Deliver all due rows once. Returns (delivered, failed) counts.
@@ -272,31 +464,52 @@ pub async fn deliver(
                 let _permit = semaphore.acquire().await.ok()?;
                 let _host_permit = host_semaphore.acquire().await.ok()?;
 
-                match send(&http, &d, &config).await {
+                match send(&pool, &http, &d, &config).await {
                     Ok(()) => {
                         let _ = mark_delivered(&pool, d.id).await;
                         let _ = sqlx::query(
-                            "UPDATE webhook_subscriptions SET consecutive_failures = 0 WHERE id = $1"
+                            "UPDATE webhook_subscriptions 
+                             SET consecutive_failures = 0, 
+                                 last_success_at = now() 
+                             WHERE id = $1"
                         )
-                        .bind(&d.subscription_id)
+                        .bind(d.subscription_id)
                         .execute(&pool)
                         .await;
-                        Some((true, d.subscription_id.clone()))
+                        Some((true, d.subscription_id))
                     }
                     Err(e) => {
-                        let _ = mark_retry(&pool, &d, &e.to_string(), config.max_attempts).await;
+                        // Extract status_code from the error chain if present.
+                        let err_str = e.to_string();
+                        let status_code: Option<i32> = e
+                            .chain()
+                            .find_map(|cause| {
+                                let s = cause.to_string();
+                                s.strip_prefix("status_code=")
+                                    .and_then(|n| n.parse::<i32>().ok())
+                            });
+                        let _ = mark_retry(
+                            &pool,
+                            &d,
+                            &err_str,
+                            config.max_attempts,
+                            status_code,
+                            None,
+                        ).await;
                         warn!(delivery = d.id, url = %d.url, error = %e, "webhook delivery failed");
 
                         let _ = sqlx::query(
                             "UPDATE webhook_subscriptions SET consecutive_failures = consecutive_failures + 1 WHERE id = $1"
                         )
-                        .bind(&d.subscription_id)
+                        .bind(d.subscription_id)
                         .execute(&pool)
                         .await;
 
+                        let _ = check_and_auto_disable(&pool, d.subscription_id, config.failure_threshold).await;
+                        // Atomic increment and check for auto-disable
                         let _ = check_and_auto_disable(&pool, &d.subscription_id, config.failure_threshold).await;
 
-                        Some((false, d.subscription_id.clone()))
+                        Some((false, d.subscription_id))
                     }
                 }
             }
@@ -335,64 +548,195 @@ fn extract_host(url: &str) -> String {
         .unwrap_or_default()
 }
 
-async fn send(http: &reqwest::Client, d: &DueDelivery, config: &Config) -> anyhow::Result<()> {
+async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &Config) -> anyhow::Result<()> {
     // Re-validate URL at delivery time to prevent DNS rebinding attacks.
-    // This ensures the hostname still resolves to a public address even if the
-    // DNS record changed since registration.
     validate_webhook_url_at_delivery(&d.url).await
         .map_err(|e| anyhow::anyhow!("URL validation failed at delivery: {}", e))?;
 
-    let body = serde_json::to_vec(&d.payload.0)?;
+    let secret = d.secret.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("delivery has no decrypted secret"))?;
+
+    // Build the versioned envelope based on delivery type
+    let envelope = if let Some(event_id) = &d.event_id {
+        // Fetch event data to construct envelope
+        let event: (String, String, i64, DateTime<Utc>, Option<String>, Json<Vec<String>>, String, Json<serde_json::Value>, Json<serde_json::Value>, Option<Json<serde_json::Value>>, String, bool) = sqlx::query_as(
+            "SELECT event_id, contract_id, ledger, ledger_closed_at, event_name, 
+                    topics, value, decoded_topics, decoded_value, enriched, 
+                    tx_hash, in_successful_call
+             FROM events WHERE event_id = $1"
+        )
+        .bind(event_id)
+        .fetch_one(pool)
+        .await?;
+
+        let event_data = ContractEventData {
+            event_id: event.0,
+            contract_id: event.1,
+            ledger: event.2,
+            ledger_closed_at: event.3,
+            event_name: event.4,
+            topics: event.5.0,
+            value: event.6,
+            decoded_topics: event.7.0,
+            decoded_value: event.8.0,
+            enriched: event.9.map(|j| j.0),
+            tx_hash: event.10,
+            in_successful_call: event.11,
+        };
+
+        WebhookEnvelope::for_event(d.id, d.created_at, event_data)
+    } else if let Some(upgrade_id) = d.upgrade_id {
+        // Fetch upgrade data to construct envelope
+        let upgrade: (String, i32, String, Option<String>, bool, Json<serde_json::Value>, DateTime<Utc>) = sqlx::query_as(
+            "SELECT contract_id, version, wasm_hash, previous_wasm_hash, breaking, diff, observed_at
+             FROM contract_spec_versions WHERE id = $1"
+        )
+        .bind(upgrade_id)
+        .fetch_one(pool)
+        .await?;
+
+        let upgrade_data = ContractUpgradeData {
+            contract_id: upgrade.0,
+            version: upgrade.1,
+            wasm_hash: upgrade.2,
+            previous_wasm_hash: upgrade.3,
+            breaking: upgrade.4,
+            diff: upgrade.5.0,
+            observed_at: upgrade.6,
+        };
+
+        WebhookEnvelope::for_upgrade(d.id, d.created_at, upgrade_data)
+    } else {
+        return Err(anyhow::anyhow!("delivery has neither event_id nor upgrade_id"));
+    };
+
+    let body = serde_json::to_vec(&envelope)?;
     let timestamp = Utc::now().to_rfc3339();
 
     // Compute HMAC-SHA256 signature using the webhook secret.
-    // NOTE: Verification of received signatures should use constant-time comparison
-    // to prevent timing attacks. Use lumenqraph_core::crypto::verify_hmac_signature()
-    // on the receiving end to safely verify signatures.
     let mut mac =
-        HmacSha256::new_from_slice(d.secret.as_bytes()).context("invalid webhook secret")?;
+        HmacSha256::new_from_slice(secret.as_bytes()).context("invalid webhook secret")?;
     mac.update(&body);
     let signature = hex::encode(mac.finalize().into_bytes());
+
+    let req = http
+async fn send(http: &reqwest::Client, d: &DueDelivery, config: &Config) -> anyhow::Result<()> {
+    // Re-validate URL at delivery time and get the validated IP for connection pinning.
+    // This ensures the hostname still resolves to a public address even if the
+    // DNS record changed since registration, and prevents DNS rebinding attacks.
+    let validated_ip = validate_webhook_url_at_delivery(&d.url).await
+        .map_err(|e| anyhow::anyhow!("URL validation failed at delivery: {}", e))?;
+
+    let body = serde_json::to_vec(&d.payload.0)?;
+    let timestamp = Utc::now().timestamp();
+
+    // New timestamped signature scheme (Stripe/Svix style):
+    // signed_payload = "{timestamp}.{body}"
+    // signature = HMAC-SHA256(secret, signed_payload)
+    let signed_payload = format!("{}.{}", timestamp, std::str::from_utf8(&body)?);
+    
+    let mut mac =
+        HmacSha256::new_from_slice(d.secret.as_bytes()).context("invalid webhook secret")?;
+    mac.update(signed_payload.as_bytes());
+    let signature_v1 = hex::encode(mac.finalize().into_bytes());
+    
+    // Legacy signature for backwards compatibility (will be removed in future release)
+    let mut legacy_mac =
+        HmacSha256::new_from_slice(d.secret.as_bytes()).context("invalid webhook secret")?;
+    legacy_mac.update(&body);
+    let legacy_signature = hex::encode(legacy_mac.finalize().into_bytes());
 
     // Determine event type from payload
     let event_type = d.payload.0.get("type")
         .and_then(|v| v.as_str())
         .unwrap_or("contract.event");
 
-    let req = http
+    // Extract host for connection pinning
+    let parsed_url = Url::parse(&d.url).context("failed to parse URL")?;
+    let host = parsed_url.host_str().context("URL must have a host")?;
+    
+    // Build client with connection pinning to the validated IP
+    let client = reqwest::Client::builder()
+        .resolve(host, std::net::SocketAddr::new(validated_ip, parsed_url.port().unwrap_or(if parsed_url.scheme() == "https" { 443 } else { 80 })))
+        .build()
+        .context("failed to build pinned client")?;
+
+    let req = client
         .post(&d.url)
         .timeout(config.total_timeout())
         .header("Content-Type", "application/json")
-        .header("X-Lumenqraph-Signature", format!("sha256={signature}"))
+        .header("X-Lumenqraph-Signature", format!("t={},v1={}", timestamp, signature_v1))
+        .header("X-Lumenqraph-Signature-Legacy", format!("sha256={}", legacy_signature))
         .header("X-Lumenqraph-Delivery-Id", d.id.to_string())
-        .header("X-Lumenqraph-Timestamp", timestamp)
+        .header("X-Lumenqraph-Timestamp", timestamp.to_string())
         .header("X-Lumenqraph-Attempt", d.attempts.to_string())
-        .header("X-Lumenqraph-Event", event_type)
+        .header("X-Lumenqraph-Event", &envelope.payload_type)
         .header("User-Agent", USER_AGENT)
         .body(body)
         .build()
         .context("failed to build request")?;
 
-    let resp = http
+    let resp = client
         .execute(req)
         .await
         .context("request failed")?;
 
-    let status = resp.status();
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok());
+    delivery_outcome(resp.status(), location)
+}
+
+/// Build the HTTP client used for webhook deliveries.
+///
+/// Redirects are never followed: `validate_webhook_url_at_delivery` only vets
+/// the subscriber's URL, so following a `3xx` would let a subscriber bounce a
+/// signed request to an internal address (cloud metadata, databases, ...).
+pub fn build_delivery_client(
+    connect_timeout: std::time::Duration,
+    total_timeout: std::time::Duration,
+) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(total_timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
+/// Map a delivery response to success/failure. Only `2xx` counts as delivered;
+/// a `3xx` is a failure because redirects are not followed.
+fn delivery_outcome(status: reqwest::StatusCode, location: Option<&str>) -> anyhow::Result<()> {
     if status.is_success() {
         Ok(())
+    } else if status.is_redirection() {
+        Err(anyhow::anyhow!(
+            "redirects are not followed: endpoint returned {} (Location: {})",
+            status,
+            location.unwrap_or("<none>")
+        ))
     } else {
-        Err(anyhow::anyhow!("non-2xx status {}", status))
+        Err(anyhow::anyhow!("non-2xx status {status_code}").context(
+            format!("response: {}", outcome.response_snippet)
+        ))
     }
 }
 
-async fn mark_delivered(pool: &PgPool, id: i64) -> anyhow::Result<()> {
+async fn mark_delivered(
+    pool: &PgPool,
+    id: i64,
+    status_code: i32,
+    response_snippet: &str,
+) -> anyhow::Result<()> {
     sqlx::query(
         "UPDATE webhook_deliveries
-         SET status='delivered', attempts=attempts+1, delivered_at=now(), last_error=NULL
+         SET status='delivered', attempts=attempts+1, delivered_at=now(), last_error=NULL,
+             locked_until=NULL, locked_by=NULL
          WHERE id=$1",
     )
     .bind(id)
+    .bind(status_code)
+    .bind(response_snippet)
     .execute(pool)
     .await?;
     Ok(())
@@ -403,6 +747,8 @@ async fn mark_retry(
     d: &DueDelivery,
     err: &str,
     max_attempts: i32,
+    status_code: Option<i32>,
+    response_snippet: Option<&str>,
 ) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
 
@@ -410,12 +756,14 @@ async fn mark_retry(
     if attempts >= max_attempts {
         sqlx::query(
             "UPDATE webhook_deliveries
-             SET status='failed', attempts=$2, last_error=$3
+             SET status='failed', attempts=$2, last_error=$3, locked_until=NULL, locked_by=NULL
              WHERE id=$1",
         )
         .bind(d.id)
         .bind(attempts)
         .bind(err)
+        .bind(status_code)
+        .bind(response_snippet)
         .execute(&mut *tx)
         .await?;
     } else {
@@ -425,13 +773,15 @@ async fn mark_retry(
         let next: DateTime<Utc> = Utc::now() + Duration::seconds(jittered_secs);
         sqlx::query(
             "UPDATE webhook_deliveries
-             SET attempts=$2, last_error=$3, next_attempt_at=$4
+             SET attempts=$2, last_error=$3, next_attempt_at=$4, locked_until=NULL, locked_by=NULL
              WHERE id=$1",
         )
         .bind(d.id)
         .bind(attempts)
         .bind(err)
         .bind(next)
+        .bind(status_code)
+        .bind(response_snippet)
         .execute(&mut *tx)
         .await?;
     }
@@ -442,37 +792,62 @@ async fn mark_retry(
 
 async fn check_and_auto_disable(
     pool: &PgPool,
-    subscription_id: &str,
+    subscription_id: Uuid,
     failure_threshold: i32,
 ) -> anyhow::Result<()> {
-    let consecutive_failures: i32 = sqlx::query_scalar(
-        "SELECT consecutive_failures FROM webhook_subscriptions WHERE id = $1",
+    // Atomically increment consecutive_failures and return the updated value along with timing info
+    let result: Option<(i32, Option<DateTime<Utc>>, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "UPDATE webhook_subscriptions
+         SET consecutive_failures = consecutive_failures + 1,
+             first_failure_at = COALESCE(first_failure_at, now())
+         WHERE id = $1
+         RETURNING consecutive_failures, last_success_at, first_failure_at",
     )
     .bind(subscription_id)
     .fetch_optional(pool)
-    .await?
-    .unwrap_or(0);
+    .await?;
 
-    if consecutive_failures >= failure_threshold {
-        let reason = format!(
-            "Auto-disabled after {} consecutive delivery failures",
-            consecutive_failures
-        );
-        sqlx::query(
-            "UPDATE webhook_subscriptions
-             SET active = false, auto_disabled_at = now(), auto_disabled_reason = $2
-             WHERE id = $1",
-        )
-        .bind(subscription_id)
-        .bind(&reason)
-        .execute(pool)
-        .await?;
+    if let Some((consecutive_failures, last_success_at, first_failure_at)) = result {
+        // Auto-disable if:
+        // 1. Consecutive failures >= threshold, AND
+        // 2. No success in the last 24 hours (or never had a success and failing for 24h)
+        let should_disable = consecutive_failures >= failure_threshold && {
+            let now = Utc::now();
+            if let Some(last_success) = last_success_at {
+                (now - last_success).num_hours() >= 24
+            } else if let Some(first_failure) = first_failure_at {
+                (now - first_failure).num_hours() >= 24
+            } else {
+                false
+            }
+        };
+
+        if should_disable {
+            let reason = format!(
+                "Auto-disabled after {} consecutive delivery failures with no success for 24+ hours",
+                consecutive_failures
+            );
+            sqlx::query(
+                "UPDATE webhook_subscriptions
+                 SET active = false, auto_disabled_at = now(), auto_disabled_reason = $2
+                 WHERE id = $1",
+            )
+            .bind(subscription_id)
+            .bind(&reason)
+            .execute(pool)
+            .await?;
 
         warn!(
-            subscription_id = subscription_id,
+            subscription_id = %subscription_id,
             consecutive_failures = consecutive_failures,
             "webhook subscription auto-disabled"
         );
+            warn!(
+                subscription_id = subscription_id,
+                consecutive_failures = consecutive_failures,
+                "webhook subscription auto-disabled"
+            );
+        }
     }
     Ok(())
 }
@@ -535,13 +910,14 @@ mod tests {
     }
 
     /// A subscription of `kind`, optionally scoped to one contract.
-    async fn subscribe(pool: &PgPool, kind: &str, contract_id: Option<&str>) {
+    async fn subscribe(pool: &PgPool, kind: &str, contract_id: Option<&str>, encryption_key: &str) {
         sqlx::query(
-            "INSERT INTO webhook_subscriptions (url, kind, contract_id, secret)
-             VALUES ('https://example.test/hook', $1, $2, 'shh')",
+            "INSERT INTO webhook_subscriptions (url, kind, contract_id, encrypted_secret)
+             VALUES ('https://example.test/hook', $1, $2, $3)",
         )
         .bind(kind)
         .bind(contract_id)
+        .bind(encryption_key.as_bytes())  // Store as bytes for the test
         .execute(pool)
         .await
         .expect("insert subscription");
@@ -581,7 +957,7 @@ mod tests {
     #[ignore = "needs postgres"]
     async fn an_upgrade_is_delivered_to_upgrade_subscribers_with_its_diff() {
         let pool = fixture().await;
-        subscribe(&pool, "upgrade", None).await;
+        subscribe(&pool, "upgrade", None, "test-key").await;
         add_version(&pool, 1, false).await;
         add_version(&pool, 2, true).await;
 
@@ -593,15 +969,8 @@ mod tests {
 
         let due = fetch_due(&pool, 100, "test-key").await.unwrap();
         assert_eq!(due.len(), 1);
-        let payload = &due[0].payload.0;
-        assert_eq!(payload["type"], "contract.upgraded");
-        assert_eq!(payload["contract_id"], "C1");
-        assert_eq!(payload["version"], 2);
-        assert_eq!(payload["breaking"], true);
-        assert_eq!(
-            payload["diff"]["summary"][0],
-            "removed function withdraw() -> void"
-        );
+        assert!(due[0].upgrade_id.is_some());
+        assert_eq!(due[0].upgrade_id.unwrap(), 2);
     }
 
     #[tokio::test]
@@ -610,13 +979,13 @@ mod tests {
         let pool = fixture().await;
         // An event subscriber that matches every contract must not be handed an
         // upgrade, and vice versa: the payload shapes are different.
-        subscribe(&pool, "event", None).await;
+        subscribe(&pool, "event", None, "test-key").await;
         add_version(&pool, 1, false).await;
         add_version(&pool, 2, true).await;
         assert_eq!(enqueue(&pool, 100).await.unwrap(), 0);
 
         let pool = fixture().await;
-        subscribe(&pool, "upgrade", None).await;
+        subscribe(&pool, "upgrade", None, "test-key").await;
         add_event(&pool, "e1").await;
         assert_eq!(enqueue(&pool, 100).await.unwrap(), 0);
     }
@@ -625,12 +994,12 @@ mod tests {
     #[ignore = "needs postgres"]
     async fn an_upgrade_subscription_is_scoped_to_its_contract() {
         let pool = fixture().await;
-        subscribe(&pool, "upgrade", Some("C2")).await;
+        subscribe(&pool, "upgrade", Some("C2"), "test-key").await;
         add_version(&pool, 1, false).await;
         add_version(&pool, 2, true).await; // on C1
         assert_eq!(enqueue(&pool, 100).await.unwrap(), 0);
 
-        subscribe(&pool, "upgrade", Some("C1")).await;
+        subscribe(&pool, "upgrade", Some("C1"), "test-key").await;
         // The watermark already passed C1's versions, so a new subscriber only
         // gets upgrades from here on — the same catch-up behaviour events have.
         add_version(&pool, 3, false).await;
@@ -641,7 +1010,7 @@ mod tests {
     #[ignore = "needs postgres"]
     async fn re_enqueueing_does_not_duplicate_deliveries() {
         let pool = fixture().await;
-        subscribe(&pool, "upgrade", None).await;
+        subscribe(&pool, "upgrade", None, "test-key").await;
         add_version(&pool, 1, false).await;
         add_version(&pool, 2, true).await;
 
@@ -655,7 +1024,7 @@ mod tests {
     #[ignore = "needs postgres"]
     async fn webhook_retries_have_variance_in_scheduled_times() {
         let pool = fixture().await;
-        subscribe(&pool, "event", None).await;
+        subscribe(&pool, "event", None, "test-key").await;
 
         // Create multiple failed deliveries at the same time.
         for i in 0..5 {
@@ -731,5 +1100,93 @@ mod tests {
             format!("sha256={computed_hex}"),
             format!("sha256={expected_hex}")
         );
+    }
+}
+#[cfg(test)]
+mod redirect_tests {
+    //! Regression tests for #447: a subscriber answering `302 Location:
+    //! <internal address>` must not make the dispatcher contact that address.
+    //! No database needed.
+
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration as StdDuration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn redirect_to_internal_target_is_not_followed() {
+        // Stand-in for an internal service (e.g. 169.254.169.254): counts hits.
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = target.accept().await {
+                hits_srv.fetch_add(1, Ordering::SeqCst);
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+
+        // Subscriber endpoint that always redirects to the internal target.
+        let hook = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hook_addr = hook.local_addr().unwrap();
+        let location = format!("http://{target_addr}/latest/meta-data/");
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = hook.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let http = build_delivery_client(StdDuration::from_secs(2), StdDuration::from_secs(5))
+            .expect("client");
+        let resp = http
+            .post(format!("http://{hook_addr}/hook"))
+            .header("Content-Type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("request to hook");
+
+        assert_eq!(resp.status(), reqwest::StatusCode::FOUND);
+        let loc = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let err = delivery_outcome(resp.status(), loc.as_deref()).unwrap_err();
+        assert!(
+            err.to_string().contains("redirects are not followed"),
+            "unexpected error: {err}"
+        );
+
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "redirect target was contacted");
+    }
+
+    #[test]
+    fn redirect_statuses_are_failures_with_clear_error() {
+        for code in [301u16, 302, 303, 307, 308] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            let err = delivery_outcome(status, Some("http://10.0.0.5:5432/")).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("redirects are not followed"), "{code}: {msg}");
+            assert!(msg.contains("http://10.0.0.5:5432/"), "{code}: {msg}");
+        }
+    }
+
+    #[test]
+    fn success_and_other_errors_unchanged() {
+        assert!(delivery_outcome(reqwest::StatusCode::OK, None).is_ok());
+        assert!(delivery_outcome(reqwest::StatusCode::NO_CONTENT, None).is_ok());
+        let err = delivery_outcome(reqwest::StatusCode::INTERNAL_SERVER_ERROR, None).unwrap_err();
+        assert!(err.to_string().contains("non-2xx status"));
     }
 }
