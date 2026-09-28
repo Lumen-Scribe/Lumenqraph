@@ -329,6 +329,28 @@ impl Gen<'_> {
             );
         }
 
+        // Error enums (#[contracterror]): numeric codes with human-readable names.
+        // Exported as a const enum so callers can match on `ContractError.InsufficientBalance`
+        // and the numeric value is still available.
+        for e in &spec.errors {
+            let cases: Vec<String> = e
+                .cases
+                .iter()
+                .map(|(name, value)| format!("  {name} = {value},"))
+                .collect();
+            let doc = if e.doc.trim().is_empty() {
+                format!("Error codes for `{}`.", e.name)
+            } else {
+                e.doc.trim().to_string()
+            };
+            let _ = write!(
+                out,
+                "\n/** {doc} */\nexport const enum {} {{\n{}\n}}\n",
+                e.name,
+                cases.join("\n"),
+            );
+        }
+
         out
     }
 
@@ -1379,5 +1401,62 @@ mod tests {
     #[test]
     fn rust_client_is_deterministic() {
         assert_eq!(rust_client(C, &full_spec()), rust_client(C, &full_spec()));
+    }
+
+    // ── #403: error enum codegen ──────────────────────────────────────────────
+
+    mod error_enum_codegen {
+        use super::*;
+        use stellar_xdr::curr::{ScSpecUdtErrorEnumCaseV0, ScSpecUdtErrorEnumV0};
+
+        fn error_enum_entry() -> ScSpecEntry {
+            ScSpecEntry::UdtErrorEnumV0(ScSpecUdtErrorEnumV0 {
+                doc: "Contract error codes.".try_into().unwrap(),
+                lib: "".try_into().unwrap(),
+                name: "ContractError".try_into().unwrap(),
+                cases: vec![
+                    ScSpecUdtErrorEnumCaseV0 {
+                        doc: "Insufficient balance.".try_into().unwrap(),
+                        name: "InsufficientBalance".try_into().unwrap(),
+                        value: 1,
+                    },
+                    ScSpecUdtErrorEnumCaseV0 {
+                        doc: "Unauthorized caller.".try_into().unwrap(),
+                        name: "Unauthorized".try_into().unwrap(),
+                        value: 2,
+                    },
+                ]
+                .try_into()
+                .unwrap(),
+            })
+        }
+
+        #[test]
+        fn typescript_emits_const_enum_for_error_enum() {
+            let s = spec(&[error_enum_entry()]);
+            let ts = typescript_client(C, &s);
+            assert!(
+                ts.contains("export const enum ContractError"),
+                "should emit const enum: {ts}"
+            );
+            assert!(ts.contains("InsufficientBalance = 1,"));
+            assert!(ts.contains("Unauthorized = 2,"));
+        }
+
+        #[test]
+        fn typescript_error_enum_includes_doc_comment() {
+            let s = spec(&[error_enum_entry()]);
+            let ts = typescript_client(C, &s);
+            assert!(
+                ts.contains("Contract error codes."),
+                "should include doc comment: {ts}"
+            );
+        }
+
+        #[test]
+        fn error_enum_codegen_is_deterministic() {
+            let s = spec(&[error_enum_entry()]);
+            assert_eq!(typescript_client(C, &s), typescript_client(C, &s));
+        }
     }
 }

@@ -266,8 +266,10 @@ fn event_sigs(spec: &ContractSpec) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Structs, unions, and enums share one namespace, so they share one section —
-/// which also means a type that changes kind reads as a change, not a swap.
+/// Structs, unions, regular enums, and error enums share one type namespace,
+/// so they share one section — which also means a type that changes kind reads
+/// as a change, not a swap. Error enums are included because renumbering or
+/// removing a case is a breaking change for callers that match on numeric codes.
 fn type_sigs(spec: &ContractSpec) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
 
@@ -308,6 +310,18 @@ fn type_sigs(spec: &ContractSpec) -> BTreeMap<String, String> {
         out.insert(
             e.name.clone(),
             format!("enum {} {{ {} }}", e.name, cases.join(", ")),
+        );
+    }
+    // Error enums: renumbering a case changes its rendered sig → breaking change.
+    for e in &spec.errors {
+        let cases: Vec<String> = e
+            .cases
+            .iter()
+            .map(|(name, value)| format!("{name} = {value}"))
+            .collect();
+        out.insert(
+            e.name.clone(),
+            format!("error enum {} {{ {} }}", e.name, cases.join(", ")),
         );
     }
     out
@@ -943,5 +957,94 @@ mod tests {
         assert_eq!(d.events.removed.len(), 1);
         assert_eq!(d.events.added.len(), 1);
         assert_eq!(d.types.removed.len(), 1);
+    }
+
+    // ── #403: error enum diffing ──────────────────────────────────────────────
+
+    mod error_enum_diff {
+        use super::*;
+        use stellar_xdr::curr::{ScSpecUdtErrorEnumCaseV0, ScSpecUdtErrorEnumV0};
+
+        fn error_enum(name: &str, cases: &[(&str, u32)]) -> ScSpecEntry {
+            ScSpecEntry::UdtErrorEnumV0(ScSpecUdtErrorEnumV0 {
+                doc: "".try_into().unwrap(),
+                lib: "".try_into().unwrap(),
+                name: name.try_into().unwrap(),
+                cases: cases
+                    .iter()
+                    .map(|(n, v)| ScSpecUdtErrorEnumCaseV0 {
+                        doc: "".try_into().unwrap(),
+                        name: (*n).try_into().unwrap(),
+                        value: *v,
+                    })
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap(),
+            })
+        }
+
+        /// Adding a new error case is NOT breaking (additive).
+        #[test]
+        fn adding_an_error_case_is_not_breaking() {
+            let old = spec_of(&[
+                func("balance", &[], Some(ScSpecTypeDef::I128)),
+                error_enum("ContractError", &[("InsufficientBalance", 1)]),
+            ]);
+            let new = spec_of(&[
+                func("balance", &[], Some(ScSpecTypeDef::I128)),
+                error_enum(
+                    "ContractError",
+                    &[("InsufficientBalance", 1), ("Unauthorized", 2)],
+                ),
+            ]);
+            let d = SpecDiff::between(&old, &new);
+            assert!(!d.breaking, "adding an error case must not be breaking");
+            assert_eq!(d.types.changed.len(), 1, "the error enum sig changed");
+        }
+
+        /// Renumbering an error case IS breaking.
+        #[test]
+        fn renumbering_an_error_case_is_breaking() {
+            let old = spec_of(&[error_enum(
+                "ContractError",
+                &[("InsufficientBalance", 1), ("Unauthorized", 2)],
+            )]);
+            // Unauthorized moved from 2 to 3 — clients matching on the old code break.
+            let new = spec_of(&[error_enum(
+                "ContractError",
+                &[("InsufficientBalance", 1), ("Unauthorized", 3)],
+            )]);
+            let d = SpecDiff::between(&old, &new);
+            assert!(d.breaking, "renumbering an error case must be breaking");
+            assert_eq!(d.types.changed.len(), 1);
+            assert!(d.types.changed[0].from.contains("Unauthorized = 2"));
+            assert!(d.types.changed[0].to.contains("Unauthorized = 3"));
+        }
+
+        /// Removing an error case IS breaking.
+        #[test]
+        fn removing_an_error_case_is_breaking() {
+            let old = spec_of(&[error_enum(
+                "ContractError",
+                &[("InsufficientBalance", 1), ("Unauthorized", 2)],
+            )]);
+            let new = spec_of(&[error_enum("ContractError", &[("InsufficientBalance", 1)])]);
+            let d = SpecDiff::between(&old, &new);
+            assert!(d.breaking, "removing an error case must be breaking");
+        }
+
+        /// Removing an entire error enum IS breaking.
+        #[test]
+        fn removing_an_error_enum_is_breaking() {
+            let old = spec_of(&[
+                func("balance", &[], Some(ScSpecTypeDef::I128)),
+                error_enum("ContractError", &[("InsufficientBalance", 1)]),
+            ]);
+            let new = spec_of(&[func("balance", &[], Some(ScSpecTypeDef::I128))]);
+            let d = SpecDiff::between(&old, &new);
+            assert!(d.breaking, "removing an error enum must be breaking");
+            assert_eq!(d.types.removed.len(), 1);
+            assert!(d.types.removed[0].contains("error enum ContractError"));
+        }
     }
 }
