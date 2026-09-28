@@ -38,6 +38,14 @@ pub enum EncodeError {
     FunctionNotFound(String),
     #[error("missing argument {0:?}")]
     MissingArgument(String),
+    #[error("unknown argument {name:?}{suggestion}")]
+    UnknownArgument {
+        name: String,
+        /// "did you mean …?" hint when there is a close match, otherwise "".
+        suggestion: String,
+    },
+    #[error("expected {expected} argument(s) but got {got}")]
+    WrongArity { expected: usize, got: usize },
     #[error("argument {name:?}: {msg}")]
     BadArgument { name: String, msg: String },
     #[error("argument {name:?}: type {ty} is not yet supported by the read layer")]
@@ -99,6 +107,37 @@ pub fn encode_call_with_spec(
         .function(function)
         .ok_or_else(|| EncodeError::FunctionNotFound(function.to_string()))?;
 
+    // --- Validate argument shape before encoding ---
+    match args {
+        Value::Object(m) => {
+            // Collect the set of declared parameter names for fast lookup and
+            // "did you mean?" suggestions.
+            let param_names: Vec<&str> = func.inputs.iter().map(|i| i.name.as_str()).collect();
+            for key in m.keys() {
+                if !param_names.contains(&key.as_str()) {
+                    let suggestion = did_you_mean(key, &param_names);
+                    return Err(EncodeError::UnknownArgument {
+                        name: key.clone(),
+                        suggestion,
+                    });
+                }
+            }
+        }
+        Value::Array(a) => {
+            // Positional array: length must match the function arity exactly.
+            // Missing Option arguments encoded as positional null are allowed, but
+            // the array must still have exactly the right number of elements so
+            // callers cannot silently truncate a call.
+            if a.len() != func.inputs.len() {
+                return Err(EncodeError::WrongArity {
+                    expected: func.inputs.len(),
+                    got: a.len(),
+                });
+            }
+        }
+        _ => {}
+    }
+
     let mut scvals: Vec<ScVal> = Vec::with_capacity(func.inputs.len());
     for (i, input) in func.inputs.iter().enumerate() {
         let jv = match args {
@@ -123,6 +162,51 @@ pub fn encode_call_with_spec(
         output_type,
         output_ty,
     })
+}
+
+/// Return a " (did you mean \"<name>\"?)" suggestion string, or `""` when no
+/// close candidate exists. Uses edit distance: a threshold of ≤2 edits avoids
+/// noisy suggestions on completely different names.
+fn did_you_mean(name: &str, candidates: &[&str]) -> String {
+    let best = candidates
+        .iter()
+        .map(|c| (*c, edit_distance(name, c)))
+        .filter(|(_, d)| *d <= 2)
+        .min_by_key(|(_, d)| *d);
+    match best {
+        Some((candidate, _)) => format!(" (did you mean {:?}?)", candidate),
+        None => String::new(),
+    }
+}
+
+/// Levenshtein edit distance, capped at 3 for performance (we only care about
+/// small distances as "did you mean?" hints).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let m = a.len();
+    let n = b.len();
+    // Short-circuit: if the length difference alone exceeds the cap, don't bother.
+    if m.abs_diff(n) > 3 {
+        return 4;
+    }
+    let mut dp = vec![vec![0usize; n + 1]; m + 1];
+    for i in 0..=m {
+        dp[i][0] = i;
+    }
+    for j in 0..=n {
+        dp[0][j] = j;
+    }
+    for i in 1..=m {
+        for j in 1..=n {
+            dp[i][j] = if a[i - 1] == b[j - 1] {
+                dp[i - 1][j - 1]
+            } else {
+                1 + dp[i - 1][j].min(dp[i][j - 1]).min(dp[i - 1][j - 1])
+            };
+        }
+    }
+    dp[m][n]
 }
 
 /// Name prefixes conventionally used by state-changing Soroban functions.
@@ -270,13 +354,26 @@ fn json_to_scval(
         }
         T::Map(m) => {
             // Only symbol/string-keyed maps map cleanly from a JSON object.
-            // serde_json orders object keys, which is also what ScMap requires.
+            // After conversion, entries must be sorted by Soroban's ScVal total
+            // order (stellar-xdr's Ord impl) — JSON key order (lexicographic by
+            // string) differs for numeric and address-keyed maps. We also reject
+            // duplicate keys after conversion: e.g. JSON keys "01" and "1" both
+            // parse to u32(1) and would produce an invalid map.
             let obj = v.as_object().ok_or_else(|| bad("expected an object"))?;
             let mut items = Vec::with_capacity(obj.len());
             for (k, val) in obj {
                 let key = json_to_scval(&Value::String(k.clone()), &m.key_type, name, spec)?;
                 let val = json_to_scval(val, &m.value_type, name, spec)?;
                 items.push(ScMapEntry { key, val });
+            }
+            // Sort by the canonical Soroban ScVal total order.
+            items.sort_by(|a, b| a.key.cmp(&b.key));
+            // Reject duplicate keys (which can arise when two different JSON
+            // strings encode to the same ScVal, e.g. "01" and "1" as u32).
+            for window in items.windows(2) {
+                if window[0].key == window[1].key {
+                    return Err(bad("map contains duplicate keys after conversion"));
+                }
             }
             ScVal::Map(Some(ScMap(vecm(items, name)?)))
         }
@@ -289,14 +386,45 @@ fn json_to_scval(
             ScVal::Void
         }
         T::Udt(u) => udt_to_scval(v, &u.name.to_utf8_string_lossy(), name, spec)?,
-        // `Val` is untyped by definition, and Result/Error/MuxedAddress aren't
-        // things a view function takes as input in practice. Left as a clear
-        // client error rather than a guess.
+        // `Val` is untyped by definition, and Result/Error aren't things a
+        // view function takes as input in practice. Left as a clear client error
+        // rather than a guess.
         //
-        // Note: MuxedAccount (M… strkey) *is* supported as the `source_account`
-        // argument to `/call` and `/simulate`, but not as a typed function
-        // parameter in the contract spec.
-        T::Val | T::Result(_) | T::Error | T::MuxedAddress => {
+        // `MuxedAddress` is supported since Protocol 23: the SEP-41 token
+        // interface declares `transfer(from: Address, to: MuxedAddress, …)`, so
+        // the flagship simulate-a-transfer use case requires it.  We accept the
+        // same three strkey forms the SDK accepts:
+        //   G… → ScAddress::Account (plain Ed25519 public key)
+        //   M… → ScAddress::Account (Ed25519 key extracted from the muxed strkey;
+        //          the Soroban host ignores the mux ID at the XDR layer)
+        //   C… → ScAddress::Contract
+        T::MuxedAddress => {
+            let s = str_of(v, name)?;
+            let addr = if s.starts_with('M') {
+                // Parse the M… muxed-account strkey and extract the underlying
+                // Ed25519 public key. The Soroban host encodes MuxedAddress as a
+                // plain ScAddress::Account — the mux ID is not carried in the
+                // ScVal wire format.
+                use stellar_strkey::Strkey;
+                match Strkey::from_string(s)
+                    .map_err(|_| bad("invalid muxed address strkey (expected M…)"))?
+                {
+                    Strkey::MuxedAccountEd25519(mux) => {
+                        ScAddress::from_str(
+                            &stellar_strkey::ed25519::PublicKey(mux.ed25519).to_string(),
+                        )
+                        .map_err(|_| bad("could not re-encode muxed address as G… strkey"))?
+                    }
+                    _ => return Err(bad("expected an M… muxed account strkey")),
+                }
+            } else {
+                // G… or C… — both parse directly as ScAddress.
+                ScAddress::from_str(s)
+                    .map_err(|_| bad("invalid address strkey (expected G…, M…, or C…)"))?
+            };
+            ScVal::Address(addr)
+        }
+        T::Val | T::Result(_) | T::Error => {
             return Err(unsupported());
         }
     })
@@ -1560,11 +1688,249 @@ mod tests {
         }
 
         #[test]
-        fn muxed_address_type_is_unsupported() {
-            let err = unsupported_args_of("muxed_arg", json!({"m": null})).unwrap_err();
+        fn muxed_address_g_strkey_is_accepted() {
+            // G… plain public key accepted for MuxedAddress param.
+            let result = unsupported_args_of("muxed_arg", json!({"m": G}));
+            assert!(result.is_ok(), "G… strkey should be accepted for MuxedAddress: {:?}", result);
+            let args = result.unwrap();
+            assert!(matches!(args[0], ScVal::Address(_)), "should encode as ScVal::Address");
+        }
+
+        #[test]
+        fn muxed_address_m_strkey_is_accepted() {
+            // M… muxed account strkey: the mux ID is stripped and the underlying
+            // Ed25519 key is encoded as ScAddress::Account.
+            const M: &str = "MA7QYNF7SOWQ3GLR2BGMZEHXR776WJRK76K2GS4K4BRZ4LHE4AAAAAAAAAAPCIBVZA";
+            let result = unsupported_args_of("muxed_arg", json!({"m": M}));
+            assert!(result.is_ok(), "M… strkey should be accepted for MuxedAddress: {:?}", result);
+            let args = result.unwrap();
+            assert!(matches!(args[0], ScVal::Address(_)), "should encode as ScVal::Address");
+        }
+
+        #[test]
+        fn muxed_address_c_strkey_is_accepted() {
+            // C… contract strkey accepted for MuxedAddress param.
+            let result = unsupported_args_of("muxed_arg", json!({"m": C}));
+            assert!(result.is_ok(), "C… strkey should be accepted for MuxedAddress: {:?}", result);
+            let args = result.unwrap();
+            assert!(matches!(args[0], ScVal::Address(_)), "should encode as ScVal::Address");
+        }
+
+        #[test]
+        fn muxed_address_invalid_strkey_is_rejected() {
+            let err = unsupported_args_of("muxed_arg", json!({"m": "not-a-strkey"})).unwrap_err();
             let msg = format!("{err}");
-            assert!(msg.contains("MuxedAddress"), "error should mention MuxedAddress type: {msg}");
-            assert!(msg.contains("not yet supported"), "error should be clear: {msg}");
+            assert!(msg.contains("invalid"), "error should say 'invalid': {msg}");
         }
     }
 }
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    use serde_json::json;
+    use stellar_xdr::curr::{
+        Limits, ScSpecEntry, ScSpecFunctionInputV0, ScSpecFunctionV0, ScSpecTypeDef, ScSymbol,
+        WriteXdr,
+    };
+
+    const G: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+    const C: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+
+    // balance(id: Address) -> i128
+    fn balance_spec() -> Vec<u8> {
+        let entry = ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
+            doc: "".try_into().unwrap(),
+            name: ScSymbol("balance".try_into().unwrap()),
+            inputs: vec![ScSpecFunctionInputV0 {
+                doc: "".try_into().unwrap(),
+                name: "id".try_into().unwrap(),
+                type_: ScSpecTypeDef::Address,
+            }]
+            .try_into()
+            .unwrap(),
+            outputs: vec![ScSpecTypeDef::I128].try_into().unwrap(),
+        });
+        entry.to_xdr(Limits::none()).unwrap()
+    }
+
+    // transfer(from: Address, to: Address, amount: i128) -> void
+    fn transfer_spec() -> Vec<u8> {
+        let entry = ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
+            doc: "".try_into().unwrap(),
+            name: ScSymbol("transfer".try_into().unwrap()),
+            inputs: vec![
+                ScSpecFunctionInputV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "from".try_into().unwrap(),
+                    type_: ScSpecTypeDef::Address,
+                },
+                ScSpecFunctionInputV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "to".try_into().unwrap(),
+                    type_: ScSpecTypeDef::Address,
+                },
+                ScSpecFunctionInputV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "amount".try_into().unwrap(),
+                    type_: ScSpecTypeDef::I128,
+                },
+            ]
+            .try_into()
+            .unwrap(),
+            outputs: vec![].try_into().unwrap(),
+        });
+        entry.to_xdr(Limits::none()).unwrap()
+    }
+
+    // --- #415: unknown argument and wrong arity ---
+
+    #[test]
+    fn unknown_object_key_is_rejected() {
+        let err = encode_call(&balance_spec(), C, "balance", &json!({"id": G, "extra": 1}), None)
+            .unwrap_err();
+        assert!(
+            matches!(err, EncodeError::UnknownArgument { ref name, .. } if name == "extra"),
+            "expected UnknownArgument(extra), got: {err}"
+        );
+        let msg = format!("{err}");
+        assert!(msg.contains("extra"), "error should name the unknown key: {msg}");
+    }
+
+    #[test]
+    fn unknown_key_suggests_did_you_mean() {
+        // "ammount" is 2 edits from "amount" — should trigger a suggestion.
+        let err =
+            encode_call(&transfer_spec(), C, "transfer", &json!({"from": G, "to": G, "ammount": "5"}), None)
+                .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("amount"),
+            "error should suggest 'amount': {msg}"
+        );
+    }
+
+    #[test]
+    fn positional_array_too_long_is_rejected() {
+        // balance takes 1 arg; passing 2 should fail.
+        let err = encode_call(&balance_spec(), C, "balance", &json!([G, G]), None).unwrap_err();
+        assert!(
+            matches!(err, EncodeError::WrongArity { expected: 1, got: 2 }),
+            "expected WrongArity(1, 2), got: {err}"
+        );
+    }
+
+    #[test]
+    fn positional_array_too_short_is_rejected() {
+        // transfer takes 3 args; passing 2 should fail.
+        let err = encode_call(&transfer_spec(), C, "transfer", &json!([G, G]), None).unwrap_err();
+        assert!(
+            matches!(err, EncodeError::WrongArity { expected: 3, got: 2 }),
+            "expected WrongArity(3, 2), got: {err}"
+        );
+    }
+
+    #[test]
+    fn positional_array_exact_arity_is_accepted() {
+        let result = encode_call(&transfer_spec(), C, "transfer", &json!([G, G, "100"]), None);
+        assert!(result.is_ok(), "exact arity should encode: {:?}", result);
+    }
+
+    #[test]
+    fn object_with_all_known_keys_is_accepted() {
+        let result = encode_call(&balance_spec(), C, "balance", &json!({"id": G}), None);
+        assert!(result.is_ok(), "known key should be accepted: {:?}", result);
+    }
+
+    // --- #416: ScMap sorting and duplicate rejection ---
+
+    #[test]
+    fn map_with_u32_keys_is_sorted_by_scval_order() {
+        use stellar_xdr::curr::{ScSpecTypeMap, TransactionEnvelope, HostFunction, OperationBody};
+        // A Map with u32 keys. String "10" < "9" lexicographically but ScVal
+        // order for U32 is numeric, so 9 < 10.
+        let spec_bytes = {
+            let entry = ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
+                doc: "".try_into().unwrap(),
+                name: ScSymbol("check_map".try_into().unwrap()),
+                inputs: vec![ScSpecFunctionInputV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "m".try_into().unwrap(),
+                    type_: ScSpecTypeDef::Map(Box::new(ScSpecTypeMap {
+                        key_type: Box::new(ScSpecTypeDef::U32),
+                        value_type: Box::new(ScSpecTypeDef::Bool),
+                    })),
+                }]
+                .try_into()
+                .unwrap(),
+                outputs: vec![ScSpecTypeDef::Bool].try_into().unwrap(),
+            });
+            entry.to_xdr(Limits::none()).unwrap()
+        };
+
+        // Supply keys in string order: "10" before "9".
+        let call = encode_call(
+            &spec_bytes,
+            C,
+            "check_map",
+            &json!({"m": {"10": true, "9": false}}),
+            None,
+        )
+        .expect("should encode");
+
+        let env = TransactionEnvelope::from_xdr_base64(&call.tx_xdr, Limits::none()).unwrap();
+        let TransactionEnvelope::Tx(v1) = env else {
+            panic!("expected v1 envelope")
+        };
+        let OperationBody::InvokeHostFunction(op) = &v1.tx.operations[0].body else {
+            panic!("expected invoke host function")
+        };
+        let HostFunction::InvokeContract(ic) = &op.host_function else {
+            panic!("expected invoke contract")
+        };
+
+        let ScVal::Map(Some(m)) = &ic.args[0] else {
+            panic!("expected a map, got {:?}", ic.args[0])
+        };
+        // ScVal U32 ordering: 9 < 10.
+        assert_eq!(m[0].key, ScVal::U32(9), "first key should be U32(9)");
+        assert_eq!(m[1].key, ScVal::U32(10), "second key should be U32(10)");
+    }
+
+    #[test]
+    fn map_with_duplicate_keys_is_rejected() {
+        use stellar_xdr::curr::ScSpecTypeMap;
+        let spec_bytes = {
+            let entry = ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
+                doc: "".try_into().unwrap(),
+                name: ScSymbol("check_map".try_into().unwrap()),
+                inputs: vec![ScSpecFunctionInputV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "m".try_into().unwrap(),
+                    type_: ScSpecTypeDef::Map(Box::new(ScSpecTypeMap {
+                        key_type: Box::new(ScSpecTypeDef::U32),
+                        value_type: Box::new(ScSpecTypeDef::Bool),
+                    })),
+                }]
+                .try_into()
+                .unwrap(),
+                outputs: vec![ScSpecTypeDef::Bool].try_into().unwrap(),
+            });
+            entry.to_xdr(Limits::none()).unwrap()
+        };
+
+        // "01" and "1" both parse to U32(1) — duplicate after conversion.
+        let err = encode_call(
+            &spec_bytes,
+            C,
+            "check_map",
+            &json!({"m": {"1": true, "01": false}}),
+            None,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("duplicate"),
+            "error should mention duplicate keys: {msg}"
+        );
+    }
