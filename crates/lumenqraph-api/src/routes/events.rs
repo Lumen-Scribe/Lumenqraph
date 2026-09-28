@@ -15,6 +15,7 @@ use lumenqraph_core::EventRow;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ApiResult};
+use crate::extract::ValidContractId;
 use crate::pagination::{LedgerCursor, Page, PageRequest};
 use crate::state::AppState;
 
@@ -59,12 +60,11 @@ pub type EventsResponse = Page<EventRow>;
 
 pub async fn list_events(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
     Query(q): Query<EventsQuery>,
-) -> ApiResult<EventsResponse> {
-    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
-        return Err(ApiError::bad_request("invalid contract id"));
-    }
+) -> ApiResult<Json<EventsResponse>> {
+    let limit = q.limit.clamp(1, 1000);
+
     let page = PageRequest::<LedgerCursor>::parse(q.limit, 1000, q.offset, q.after.as_deref())?;
     let (after_ledger, after_event_id) = match page.after {
         Some(ref c) => (Some(c.ledger), Some(c.event_id.as_str())),

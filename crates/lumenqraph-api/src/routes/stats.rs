@@ -4,12 +4,13 @@
 //! Returns pre-aggregated event counts bucketed by hour, day, or ledger range,
 //! with optional grouping by event_name for multi-series visualization.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{ApiError, ApiResult};
+use crate::extract::ValidContractId;
 use crate::state::AppState;
 
 /// Maximum number of buckets that may be returned in a single response.
@@ -150,7 +151,7 @@ pub struct StatsResponse {
 
 pub async fn contract_stats(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
     Query(q): Query<StatsQuery>,
 ) -> ApiResult<Json<StatsResponse>> {
     validate_contract_id(&contract_id)?;

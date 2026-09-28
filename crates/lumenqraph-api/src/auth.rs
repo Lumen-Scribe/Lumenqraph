@@ -644,6 +644,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn spoofed_leftmost_entries_do_not_change_bucket() {
         // An attacker sends many different leftmost entries.
@@ -659,6 +660,35 @@ mod tests {
             );
         }
     }
+
+
+/// Per-client-IP rate limiting for sibling-instance mounts (#442).
+///
+/// API keys belong to the mounted upstream, not to this instance, so every
+/// caller is limited by IP here; the upstream still applies its own auth and
+/// per-key limits. The resolved IP is handed to the proxy handler, which
+/// appends it to `X-Forwarded-For` so the upstream sees the real client
+/// rather than this proxy's single address.
+pub async fn proxy_rate_limit(
+    State(state): State<AppState>,
+    ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    mut req: Request,
+    next: Next,
+) -> ApiResult<Response> {
+    state.http_requests.fetch_add(1, Ordering::Relaxed);
+
+    let client_ip = extract_client_ip(&headers, Some(socket_addr), &state.ip_config);
+    let rl_status = state
+        .proxy_limiter
+        .check(&format!("proxy:{client_ip}"), state.config.proxy.rate_limit_per_min);
+    if !rl_status.allowed {
+        return Err(ApiError::too_many_requests(rl_status.retry_after_secs));
+    }
+
+    req.extensions_mut()
+        .insert(crate::routes::proxy::ClientIp(client_ip));
+    Ok(next.run(req).await)
 }
 
 // ---- HTTP-level integration tests ----------------------------------------
@@ -747,11 +777,13 @@ mod integration_tests {
             health_max_lag_ledgers: 100,
             health_max_stale_secs: 120,
             metrics_require_auth: false,
-            webhook_limiter: Arc::new(RateLimiter::new()),
-            webhook_anon_rate_limit: 10,
-            webhook_max_subscriptions: 100,
+            proxy_limiter: Arc::new(RateLimiter::new()),
+            config: Arc::new(crate::config::ApiConfig::test_default()),
             key_cache: Arc::new(KeyCache::new(256)),
             ip_config: IpConfig { trusted_proxy_hops: 0, platform_header: None },
+            audit_tx: None,
+            audit_dropped: Arc::new(AtomicU64::new(0)),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         }
     }
 

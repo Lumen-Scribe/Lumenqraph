@@ -6,11 +6,13 @@
 //! `offset` is deprecated, capped at [`crate::pagination::MAX_OFFSET`], and
 //! answered with a `Deprecation` header.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
+use axum::Json;
 use lumenqraph_core::NftEvent;
 use serde::Deserialize;
 
 use crate::error::{ApiError, ApiResult};
+use crate::extract::ValidContractId;
 use crate::pagination::{LedgerCursor, Page, PageRequest};
 use crate::state::AppState;
 
@@ -38,12 +40,9 @@ pub type NftsResponse = Page<NftEvent>;
 
 pub async fn list_nft_events(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
     Query(q): Query<NftsQuery>,
-) -> ApiResult<NftsResponse> {
-    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
-        return Err(ApiError::bad_request("invalid contract id"));
-    }
+) -> ApiResult<Json<NftsResponse>> {
     // Validate kind filter early.
     if let Some(ref kind) = q.kind {
         if !matches!(kind.as_str(), "mint" | "transfer" | "burn") {

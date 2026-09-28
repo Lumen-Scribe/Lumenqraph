@@ -27,9 +27,9 @@ pub struct EventResponse {
 /// message is human-readable prose and may change between releases.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct ErrorResponse {
-    /// Stable machine-readable code. One of: `bad_request`, `unauthorized`,
-    /// `not_found`, `rate_limited`, `simulation_failed`, `spec_unavailable`,
-    /// `internal_error`.
+    /// Stable machine-readable code. One of: `bad_request`,
+    /// `invalid_contract_id`, `unauthorized`, `not_found`, `rate_limited`,
+    /// `simulation_failed`, `spec_unavailable`, `internal_error`.
     pub code: String,
     /// Human-readable description of the error. Do not parse this field.
     pub error: String,

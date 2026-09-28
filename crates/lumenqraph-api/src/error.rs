@@ -17,6 +17,7 @@
 //! | Code                  | HTTP status | When                                                    |
 //! |-----------------------|-------------|---------------------------------------------------------|
 //! | `bad_request`         | 400         | Malformed input, invalid parameter value, wrong type.  |
+//! | `invalid_contract_id` | 400         | `:contract_id` path segment is not a valid `C…` strkey. |
 //! | `unauthorized`        | 401         | Missing or revoked API key.                            |
 //! | `not_found`           | 404         | Requested resource does not exist.                     |
 //! | `rate_limited`        | 429         | Caller exceeded the request-per-minute limit. Carries a `Retry-After` header. |
@@ -40,6 +41,7 @@ use serde_json::json;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
     BadRequest,
+    InvalidContractId,
     Unauthorized,
     NotFound,
     RateLimited,
@@ -54,6 +56,7 @@ impl ErrorCode {
     pub fn as_str(self) -> &'static str {
         match self {
             ErrorCode::BadRequest => "bad_request",
+            ErrorCode::InvalidContractId => "invalid_contract_id",
             ErrorCode::Unauthorized => "unauthorized",
             ErrorCode::NotFound => "not_found",
             ErrorCode::RateLimited => "rate_limited",
@@ -107,6 +110,14 @@ impl ApiError {
     }
     pub fn bad_request(msg: impl Into<String>) -> Self {
         ApiError::Status(StatusCode::BAD_REQUEST, ErrorCode::BadRequest, msg.into())
+    }
+    /// A malformed `:contract_id` path segment (#440).
+    pub fn invalid_contract_id() -> Self {
+        ApiError::Status(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidContractId,
+            "invalid contract id".into(),
+        )
     }
     pub fn not_found(msg: impl Into<String>) -> Self {
         ApiError::Status(StatusCode::NOT_FOUND, ErrorCode::NotFound, msg.into())

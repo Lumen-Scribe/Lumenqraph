@@ -10,7 +10,7 @@
 //! SSE connection filters the broadcast in memory by contract and event name.
 //! Polling is retained as a fallback when the listener is unavailable.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::{self, Stream};
@@ -24,7 +24,8 @@ use tokio::sync::broadcast;
 use tokio::time::{interval, sleep};
 use tracing::{info, warn};
 
-use crate::error::{ApiError, ApiResult};
+use crate::error::ApiResult;
+use crate::extract::ValidContractId;
 use crate::state::AppState;
 
 /// Maximum number of concurrent SSE streams allowed globally.
@@ -210,7 +211,7 @@ fn parse_last_event_id(value: &str) -> Option<Cursor> {
 
 pub async fn stream_events(
     State(state): State<AppState>,
-    Path(contract_id): Path<String>,
+    ValidContractId(contract_id): ValidContractId,
     Query(q): Query<StreamQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
