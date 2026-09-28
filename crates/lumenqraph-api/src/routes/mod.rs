@@ -180,7 +180,7 @@ pub fn router(state: AppState) -> Router {
             "/webhooks",
             get(webhooks::list_webhooks),
         )
-        .route("/webhooks/:id", delete(webhooks::delete_webhook).patch(webhooks::update_webhook))
+        .route("/webhooks/:id", get(webhooks::get_webhook).delete(webhooks::delete_webhook).patch(webhooks::update_webhook))
         .route("/webhooks/:id/deliveries", get(webhooks::list_webhook_deliveries))
         .route("/webhooks/:id/redrive", post(webhooks::redrive_webhook))
         .route("/webhooks/:id/reenable", post(webhooks::reenable_webhook))

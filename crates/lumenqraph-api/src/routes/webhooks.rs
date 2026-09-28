@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 use sqlx::PgPool;
+use sqlx::Row as _;
 use tracing::warn;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -200,12 +201,36 @@ pub async fn create_webhook(
              use contract_id to watch one contract, or omit it to watch all",
         ));
     }
+
+    // #424: validate contract_id and event_name on creation.
+    if let Some(ref cid) = body.contract_id {
+        validate_contract_id(cid)?;
+    }
+    if let Some(ref en) = body.event_name {
+        validate_event_name(en)?;
+    }
+
     let secret = random_secret();
 
-    let starting_seq = if let Some(ref since) = body.since {
-        calculate_starting_seq(&state.pool, since).await?
+    // #423: when `since` is given, set up per-subscription backfill.
+    //
+    // `backfill_start` is the seq *before* the first event we want to
+    // backfill; `starting_seq` becomes the current global max (the watermark
+    // at which the live stream takes over once the backfill completes).
+    let (starting_seq, backfill_seq): (i64, Option<i64>) = if let Some(ref since) = body.since {
+        let backfill_start = calculate_starting_seq(&state.pool, since).await?;
+        let global_max: i64 =
+            sqlx::query_scalar("SELECT COALESCE(max(seq), 0) FROM events")
+                .fetch_one(&state.pool)
+                .await?;
+        // Only arm the backfill if there are actually events in the window.
+        if backfill_start < global_max {
+            (global_max, Some(backfill_start))
+        } else {
+            (global_max, None)
+        }
     } else {
-        0
+        (0, None)
     };
 
     let encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY")
@@ -243,11 +268,48 @@ pub async fn create_webhook(
     }))
 }
 
+/// Hard cap on `last N` backfill to prevent runaway queries.
+const MAX_BACKFILL_COUNT: i64 = 100_000;
+
+/// Validate a `contract_id` string as a Soroban contract address (C-strkey).
+fn validate_contract_id(id: &str) -> Result<(), ApiError> {
+    if lumenqraph_core::xdr::is_valid_contract_id(id) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(format!(
+            "invalid contract_id `{id}`; expected a Soroban contract address (C… strkey)"
+        )))
+    }
+}
+
+/// Validate an `event_name` as a Soroban symbol (≤32 chars, `[a-zA-Z0-9_]`).
+fn validate_event_name(name: &str) -> Result<(), ApiError> {
+    if name.is_empty() {
+        return Err(ApiError::bad_request("event_name must not be empty"));
+    }
+    if name.len() > 32 {
+        return Err(ApiError::bad_request(
+            "event_name must be ≤32 characters (Soroban symbol limit)",
+        ));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(ApiError::bad_request(
+            "event_name must contain only ASCII letters, digits, and underscores",
+        ));
+    }
+    Ok(())
+}
+
 async fn calculate_starting_seq(pool: &sqlx::PgPool, since: &str) -> ApiResult<i64> {
     if since.starts_with("last ") {
         let count_str = since.strip_prefix("last ").unwrap_or("0");
         let count: i64 = count_str.parse()
             .map_err(|_| ApiError::bad_request("invalid 'last N' format; expected 'last <number>'"))?;
+        if count > MAX_BACKFILL_COUNT {
+            return Err(ApiError::bad_request(format!(
+                "since 'last N' exceeds maximum allowed backfill count ({MAX_BACKFILL_COUNT})"
+            )));
+        }
         let current_max: i64 = sqlx::query_scalar("SELECT COALESCE(max(seq), 0) FROM events")
             .fetch_one(pool)
             .await?;
