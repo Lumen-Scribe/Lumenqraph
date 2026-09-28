@@ -229,7 +229,7 @@ fn spec_sep41_transfer_function_and_event() {
     });
 
     let bytes = spec_bytes(&[transfer_fn, transfer_event]);
-    let spec = ContractSpec::from_spec_xdr(&bytes).expect("spec must parse");
+    let spec = ContractSpec::from_spec_xdr_simple(&bytes).expect("spec must parse");
 
     // Functions
     assert_eq!(spec.functions.len(), 1, "expected one function");
@@ -290,7 +290,7 @@ fn spec_udt_struct_fields_parsed() {
     });
 
     let bytes = spec_bytes(&[dummy_fn, order_struct]);
-    let spec = ContractSpec::from_spec_xdr(&bytes).expect("spec must parse");
+    let spec = ContractSpec::from_spec_xdr_simple(&bytes).expect("spec must parse");
 
     assert_eq!(spec.structs.len(), 1);
     let s = &spec.structs[0];
@@ -337,7 +337,7 @@ fn spec_udt_enum_cases_parsed() {
     });
 
     let bytes = spec_bytes(&[dummy_fn, status_enum]);
-    let spec = ContractSpec::from_spec_xdr(&bytes).expect("spec must parse");
+    let spec = ContractSpec::from_spec_xdr_simple(&bytes).expect("spec must parse");
 
     assert_eq!(spec.enums.len(), 1);
     let e = &spec.enums[0];
@@ -380,7 +380,7 @@ fn spec_udt_union_cases_parsed() {
     });
 
     let bytes = spec_bytes(&[dummy_fn, action_union]);
-    let spec = ContractSpec::from_spec_xdr(&bytes).expect("spec must parse");
+    let spec = ContractSpec::from_spec_xdr_simple(&bytes).expect("spec must parse");
 
     assert_eq!(spec.unions.len(), 1);
     let u = &spec.unions[0];
@@ -395,7 +395,7 @@ fn spec_udt_union_cases_parsed() {
 /// An empty / no-spec WASM section returns None cleanly.
 #[test]
 fn spec_empty_bytes_returns_none() {
-    assert!(ContractSpec::from_spec_xdr(&[]).is_none());
+    assert!(ContractSpec::from_spec_xdr_simple(&[]).is_none());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -461,7 +461,7 @@ fn sep41_spec() -> ContractSpec {
         data_format: ScSpecEventDataFormat::SingleValue,
     });
 
-    ContractSpec::from_spec_xdr(&spec_bytes(&[transfer_fn, transfer_event]))
+    ContractSpec::from_spec_xdr_simple(&spec_bytes(&[transfer_fn, transfer_event]))
         .expect("sep41 spec must parse")
 }
 
@@ -589,7 +589,7 @@ fn udt_spec() -> ContractSpec {
         outputs: vec![ScSpecTypeDef::Void].try_into().unwrap(),
     });
 
-    ContractSpec::from_spec_xdr(&spec_bytes(&[dummy_fn, status_enum, action_union, order_struct]))
+    ContractSpec::from_spec_xdr_simple(&spec_bytes(&[dummy_fn, status_enum, action_union, order_struct]))
         .expect("udt spec must parse")
 }
 

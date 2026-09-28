@@ -23,7 +23,12 @@ pub fn redact_database_url(url: &str) -> String {
 #[derive(Clone)]
 pub struct Config {
     pub database_url: String,
+    /// Primary RPC URL (first in `rpc_urls`). Kept for compatibility with code
+    /// that logs or displays the active endpoint.
     pub rpc_url: String,
+    /// Ordered list of RPC endpoints. The first is primary; subsequent entries
+    /// are failover candidates. At least one element is always present.
+    pub rpc_urls: Vec<String>,
     /// Contract IDs to index. Empty => index all contract events.
     pub contract_ids: Vec<String>,
     pub poll_interval_secs: u64,
@@ -58,6 +63,7 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("database_url", &redact_database_url(&self.database_url))
             .field("rpc_url", &self.rpc_url)
+            .field("rpc_urls", &self.rpc_urls)
             .field("contract_ids", &self.contract_ids)
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("page_size", &self.page_size)
@@ -234,9 +240,32 @@ impl Config {
         let max_consecutive_errors = env_parse("MAX_CONSECUTIVE_ERRORS", 20u32)?;
         let degraded_poll_interval_secs = env_parse("DEGRADED_POLL_INTERVAL_SECS", 300u64)?;
 
+        // Build the ordered endpoint list: RPC_URLS (comma-separated, priority
+        // order) takes precedence; RPC_URL is the single-endpoint fallback for
+        // backward compatibility. At least one URL must be present.
+        let rpc_urls: Vec<String> = {
+            let multi = std::env::var("RPC_URLS").unwrap_or_default();
+            if !multi.trim().is_empty() {
+                multi
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            } else {
+                vec![env("RPC_URL")?]
+            }
+        };
+        if rpc_urls.is_empty() {
+            return Err(anyhow::anyhow!(
+                "at least one RPC endpoint is required: set RPC_URL or RPC_URLS"
+            ));
+        }
+        let rpc_url = rpc_urls[0].clone();
+
         Ok(Self {
             database_url: env("DATABASE_URL")?,
-            rpc_url: env("RPC_URL")?,
+            rpc_url,
+            rpc_urls,
             poll_interval_secs,
             page_size,
             start_ledger: env_parse("START_LEDGER", 0)?,

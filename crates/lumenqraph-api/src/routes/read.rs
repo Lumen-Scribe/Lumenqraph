@@ -314,7 +314,7 @@ mod tests {
         cache.seed(
             contract_id,
             CachedSpec {
-                parsed: lumenqraph_core::ContractSpec::from_spec_xdr(&spec_section),
+                parsed: lumenqraph_core::ContractSpec::from_spec_xdr(&spec_section).map(|p| p.spec),
                 section: spec_section,
             },
         );

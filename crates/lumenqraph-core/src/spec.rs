@@ -169,34 +169,102 @@ pub struct UdtErrorEnum {
     pub cases: Vec<ErrorCase>,
 }
 
+/// The result of parsing a `contractspecv0` XDR section (#401).
+///
+/// `complete = false` means one or more entries were skipped (unknown
+/// discriminant, exceeded XDR limits, or truncated bytes). The `spec`
+/// still contains all entries that *were* successfully decoded.
+#[derive(Debug, Clone)]
+pub struct ParsedSpec {
+    pub spec: ContractSpec,
+    /// `true` when every byte in the section decoded successfully.
+    pub complete: bool,
+    /// Number of entries that could not be decoded.
+    pub skipped_entries: usize,
+    /// The first parse error encountered, for logging.
+    pub error: Option<String>,
+}
+
 impl ContractSpec {
     /// Parse a contract's interface out of its deployed WASM. Returns `None` if
     /// the module carries no `contractspecv0` section (e.g. a Stellar Asset
     /// Contract) or the section can't be parsed.
-    pub fn from_wasm(wasm: &[u8]) -> Option<Self> {
+    ///
+    /// Returns a [`ParsedSpec`] so callers know whether the section was fully
+    /// decoded (#401). Use [`Self::from_wasm_simple`] to get just the spec.
+    pub fn from_wasm(wasm: &[u8]) -> Option<ParsedSpec> {
         let section = spec_section_of(wasm)?;
         Self::from_spec_xdr(section)
     }
 
+    /// Convenience wrapper: parse and return just the `ContractSpec`.
+    pub fn from_wasm_simple(wasm: &[u8]) -> Option<Self> {
+        Self::from_wasm(wasm).map(|p| p.spec)
+    }
+
     /// Parse a concatenated stream of XDR `ScSpecEntry` (the raw section body).
-    pub fn from_spec_xdr(bytes: &[u8]) -> Option<Self> {
+    ///
+    /// Uses bounded XDR limits (#400) to guard against crafted spec sections with
+    /// deeply-nested type recursion or huge declared lengths that would overflow the
+    /// stack or force large allocations. The limits mirror soroban-env's defaults:
+    /// depth = 500, len = size of the input (tightly bounded to the actual WASM
+    /// section length so a small section cannot claim a huge allocation).
+    ///
+    /// Returns a [`ParsedSpec`] indicating whether the section was fully parsed or
+    /// truncated (#401). Callers should check `complete` before diffing.
+    pub fn from_spec_xdr(bytes: &[u8]) -> Option<ParsedSpec> {
+        // Cap the XDR length limit to the actual byte slice to prevent a spec that
+        // declares huge lengths from forcing allocations beyond what is on-chain.
+        let xdr_limits = Limits {
+            depth: 500,
+            len: bytes.len().max(1),
+        };
         let mut spec = ContractSpec::default();
+        let mut skipped_entries: usize = 0;
+        let mut first_error: Option<String> = None;
+        let mut complete = true;
+
         // The section is a back-to-back sequence of ScSpecEntry with no outer
         // length prefix; the iterator reads entries until the stream is drained.
-        let mut limited = Limited::new(bytes, Limits::none());
+        let mut limited = Limited::new(bytes, xdr_limits);
         for entry in ScSpecEntry::read_xdr_iter(&mut limited) {
             match entry {
                 Ok(e) => spec.push_entry(e),
-                // A trailing partial / unrecognised entry ends parsing; keep what we have.
-                Err(_) => break,
+                Err(e) => {
+                    // #401: record the first error but keep parsing past unknown
+                    // discriminants when possible, rather than stopping entirely.
+                    if first_error.is_none() {
+                        first_error = Some(e.to_string());
+                    }
+                    skipped_entries += 1;
+                    complete = false;
+                    // Exceeded limits (#400) — this is unrecoverable; stop now.
+                    if e.to_string().contains("ExceededLimit") {
+                        break;
+                    }
+                    // For other errors (unknown discriminant, truncated entry),
+                    // continue iterating — the XDR iterator may be able to resync.
+                }
             }
         }
         if spec.is_empty() {
             None
         } else {
             spec.reindex();
-            Some(spec)
+            Some(ParsedSpec {
+                spec,
+                complete,
+                skipped_entries,
+                error: first_error,
+            })
         }
+    }
+
+    /// Convenience wrapper: parse and return just the `ContractSpec`, ignoring
+    /// completeness metadata. Existing callers that do not need to diff can use
+    /// this without change.
+    pub fn from_spec_xdr_simple(bytes: &[u8]) -> Option<Self> {
+        Self::from_spec_xdr(bytes).map(|p| p.spec)
     }
 
     fn is_empty(&self) -> bool {
@@ -915,7 +983,7 @@ mod tests {
     #[test]
     fn enriches_a_transfer_event() {
         let body = spec_section(&[transfer_event_entry()]);
-        let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+        let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
 
         let topics = vec![json!("transfer"), json!("GFROM"), json!("GTO")];
         let value = json!("105000000");
@@ -932,7 +1000,7 @@ mod tests {
     #[test]
     fn unknown_event_is_not_enriched() {
         let body = spec_section(&[transfer_event_entry()]);
-        let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+        let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
         assert!(spec
             .enrich_event("mint", &[json!("mint")], &json!(1))
             .is_none());
@@ -1218,7 +1286,7 @@ mod tests {
         #[test]
         fn enrichment_returns_none_for_unknown_event() {
             let body = spec_section(&[transfer_event_entry()]);
-            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
             assert!(spec
                 .enrich_event("unknown", &[json!("unknown")], &json!(0))
                 .is_none());
@@ -1227,7 +1295,7 @@ mod tests {
         #[test]
         fn enrichment_with_fewer_topics_than_expected_fills_with_null() {
             let body = spec_section(&[transfer_event_entry()]);
-            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
 
             // Only one topic when we expect two (from, to)
             let topics = vec![json!("transfer"), json!("GFROM")];
@@ -1243,7 +1311,7 @@ mod tests {
         #[test]
         fn enrichment_with_more_topics_than_expected_ignores_extra() {
             let body = spec_section(&[transfer_event_entry()]);
-            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
 
             // Extra topics beyond what the spec expects
             let topics = vec![
@@ -1297,7 +1365,7 @@ mod tests {
             });
 
             let body = spec_section(&[vec_event]);
-            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
 
             let topics = vec![json!("mint"), json!("GTO")];
             let value = json!(["105000000", "1234567890"]);
@@ -1339,7 +1407,7 @@ mod tests {
             });
 
             let body = spec_section(&[map_event]);
-            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
 
             let topics = vec![json!("transfer"), json!("GFROM")];
             let value = json!({"amount": "100000"});
@@ -1372,7 +1440,7 @@ mod tests {
             });
 
             let body = spec_section(&[vec_event]);
-            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
 
             // Data is not a vec (it's a single value)
             let topics = vec![json!("mint")];
@@ -1430,7 +1498,7 @@ mod tests {
             });
 
             let body = spec_section(&[position_struct, position_event]);
-            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
 
             let topics = vec![json!("opened")];
             let value = json!({"borrower": "GBORROW", "debt": "50000"});
@@ -1447,7 +1515,7 @@ mod tests {
             // If a value doesn't match what the spec expects, it should be
             // returned unchanged rather than being lost or corrupted
             let body = spec_section(&[transfer_event_entry()]);
-            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
 
             // Pass a number where an address is expected - should still enrich
             let topics = vec![json!("transfer"), json!(123), json!(456)];
@@ -1485,7 +1553,7 @@ mod tests {
             });
 
             let body = spec_section(&[optional_event]);
-            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
 
             let topics = vec![json!("optional_test")];
             let value = Value::Null;
@@ -1521,7 +1589,7 @@ mod tests {
             });
 
             let body = spec_section(&[optional_event]);
-            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
 
             let topics = vec![json!("optional_test")];
             let value = json!("42");
@@ -1530,6 +1598,99 @@ mod tests {
             assert_eq!(enriched["params"]["value"]["value"], "42");
             assert_eq!(enriched["params"]["value"]["type"], "Option<i128>");
         }
+    
+    // ── #400: bounded XDR limits ─────────────────────────────────────────────
+
+    /// Build a maximally-nested Option<Option<...<I128>...>> ScSpecTypeDef.
+    fn deeply_nested_type(depth: usize) -> ScSpecTypeDef {
+        let mut ty = ScSpecTypeDef::I128;
+        for _ in 0..depth {
+            ty = ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
+                value_type: Box::new(ty),
+            }));
+        }
+        ty
+    }
+
+    #[test]
+    fn bounded_limits_do_not_panic_on_deep_nesting() {
+        // Build a spec with a 10 000-deep nested type to verify #400 — parsing
+        // must return None (or a partial result) without panicking or overflowing.
+        use stellar_xdr::curr::{ScSpecFunctionV0, ScSpecFunctionInputV0, WriteXdr, Limits};
+
+        let fn_entry = ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
+            doc: "".try_into().unwrap(),
+            name: ScSymbol("deep".try_into().unwrap()),
+            inputs: vec![ScSpecFunctionInputV0 {
+                doc: "".try_into().unwrap(),
+                name: "x".try_into().unwrap(),
+                type_: deeply_nested_type(10_000),
+            }]
+            .try_into()
+            .unwrap(),
+            outputs: vec![].try_into().unwrap(),
+        });
+
+        // Serialise with no limits (we're constructing the attacker payload).
+        let mut body = Vec::new();
+        fn_entry.to_xdr(&mut body, Limits::none()).ok();
+
+        // Parsing with bounded limits must not panic, stack-overflow, or OOM.
+        // It may return None (limits exceeded) or Some partial spec.
+        let result = std::panic::catch_unwind(|| {
+            ContractSpec::from_spec_xdr(&body)
+        });
+        assert!(result.is_ok(), "from_spec_xdr panicked on deeply-nested input");
+    }
+
+    // ── #401: partial parse / incomplete spec ─────────────────────────────────
+
+    #[test]
+    fn partial_spec_returns_incomplete_flag() {
+        use stellar_xdr::curr::{ScSpecFunctionV0, WriteXdr, Limits};
+
+        // A valid function entry followed by garbage bytes.
+        let good_entry = ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
+            doc: "".try_into().unwrap(),
+            name: ScSymbol("ok_fn".try_into().unwrap()),
+            inputs: vec![].try_into().unwrap(),
+            outputs: vec![].try_into().unwrap(),
+        });
+
+        let mut body = Vec::new();
+        good_entry.to_xdr(&mut body, Limits::none()).unwrap();
+        // Append garbage that will fail to decode.
+        body.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x01]);
+
+        let result = ContractSpec::from_spec_xdr(&body);
+        assert!(result.is_some(), "expected Some partial spec");
+        let parsed = result.unwrap();
+        // The good function should be present.
+        assert_eq!(parsed.spec.functions.len(), 1);
+        assert_eq!(parsed.spec.functions[0].name, "ok_fn");
+        // The section is not complete because of the trailing garbage.
+        assert!(!parsed.complete, "expected complete=false for partial parse");
+        assert!(parsed.skipped_entries > 0);
+    }
+
+    #[test]
+    fn fully_valid_spec_is_marked_complete() {
+        use stellar_xdr::curr::{ScSpecFunctionV0, WriteXdr, Limits};
+
+        let fn_entry = ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
+            doc: "".try_into().unwrap(),
+            name: ScSymbol("my_fn".try_into().unwrap()),
+            inputs: vec![].try_into().unwrap(),
+            outputs: vec![].try_into().unwrap(),
+        });
+
+        let mut body = Vec::new();
+        fn_entry.to_xdr(&mut body, Limits::none()).unwrap();
+
+        let parsed = ContractSpec::from_spec_xdr(&body).expect("should parse");
+        assert!(parsed.complete, "a clean spec should be marked complete");
+        assert_eq!(parsed.skipped_entries, 0);
+    }
     }
 
     // ── #402: shared-prefix event matching ───────────────────────────────────

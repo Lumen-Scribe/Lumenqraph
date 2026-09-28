@@ -441,7 +441,11 @@ pub async fn run(
         let mut batch = Vec::with_capacity(page_len);
         for ev in &page.events {
             let spec = specs.get(&pool, &rpc, &ev.contract_id, ev.ledger).await;
-            batch.push(crate::convert::to_new_event(ev, spec.as_deref()));
+            if let Some(new_ev) = crate::convert::to_new_event(ev, spec.as_deref()) {
+                batch.push(new_ev);
+            }
+            // #399: None means unparseable timestamp — event silently skipped here;
+            // error is already logged by parse_ledger_closed_at.
         }
         let inserted = crate::store::insert_events(&pool, &batch).await?;
         total_inserted += inserted;

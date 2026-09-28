@@ -123,6 +123,16 @@ async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
             body.push_str("# HELP lumenqraph_spec_cache_size Current number of entries in the in-memory spec cache\n");
             body.push_str("# TYPE lumenqraph_spec_cache_size gauge\n");
             body.push_str(&format!("lumenqraph_spec_cache_size {cache_size}\n"));
+
+            // RPC failover counter (#398).
+            body.push_str("# HELP lumenqraph_indexer_rpc_failovers_total Total number of RPC endpoint failovers\n");
+            body.push_str("# TYPE lumenqraph_indexer_rpc_failovers_total counter\n");
+            body.push_str(&format!("lumenqraph_indexer_rpc_failovers_total {}\n", metrics.rpc_failovers_total));
+
+            // Timestamp parse error counter (#399).
+            body.push_str("# HELP lumenqraph_indexer_timestamp_parse_errors_total Total ledgerClosedAt parse failures (never stored as Utc::now())\n");
+            body.push_str("# TYPE lumenqraph_indexer_timestamp_parse_errors_total counter\n");
+            body.push_str(&format!("lumenqraph_indexer_timestamp_parse_errors_total {}\n", metrics.timestamp_parse_errors_total));
         }
         Err(e) => {
             error!(error = %e, "failed to gather indexer metrics");
@@ -176,29 +186,35 @@ struct IndexerMetrics {
     events_ingested_total: i64,
     errors_total: i64,
     enrichment_rate: f64,
+    /// Cumulative RPC endpoint failovers (#398).
+    rpc_failovers_total: i64,
+    /// Cumulative timestamp parse errors (#399).
+    timestamp_parse_errors_total: i64,
 }
 
 async fn gather_metrics(pool: &PgPool) -> anyhow::Result<IndexerMetrics> {
-    let status: Option<(i64, i64, i64, i64, i64, i64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-        "SELECT last_processed_ledger, chain_tip_ledger, events_ingested_total, errors_total, events_enriched_total, events_not_enriched_total, updated_at
+    let status: Option<(i64, i64, i64, i64, i64, i64, i64, i64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT last_processed_ledger, chain_tip_ledger, events_ingested_total, errors_total, events_enriched_total, events_not_enriched_total,
+                COALESCE(rpc_failovers_total, 0),
+                COALESCE(timestamp_parse_errors_total, 0),
+                updated_at
          FROM indexer_cursor WHERE id = 1",
     )
     .fetch_optional(pool)
     .await?;
 
-    let Some((last, tip, events, errors, enriched, not_enriched, updated_at)) = status else {
+    let Some((last, tip, events, errors, enriched, not_enriched, rpc_failovers, ts_errors, updated_at)) = status else {
         anyhow::bail!("indexer cursor not initialized");
     };
 
     let lag_ledgers = (tip - last).max(0);
     let secs_since_update = (Utc::now() - updated_at).num_seconds();
 
-    // Calculate enrichment rate
     let total_enriched = enriched + not_enriched;
     let enrichment_rate = if total_enriched > 0 {
         enriched as f64 / total_enriched as f64
     } else {
-        1.0 // Default to 1.0 (100%) if no events yet
+        1.0
     };
 
     Ok(IndexerMetrics {
@@ -209,6 +225,8 @@ async fn gather_metrics(pool: &PgPool) -> anyhow::Result<IndexerMetrics> {
         events_ingested_total: events,
         errors_total: errors,
         enrichment_rate,
+        rpc_failovers_total: rpc_failovers,
+        timestamp_parse_errors_total: ts_errors,
     })
 }
 

@@ -250,9 +250,16 @@ async fn poll_once(
     }
 
     // Record RPC metrics for this cycle
-    let (rpc_calls, rpc_errors, rpc_errors_32001) = rpc.take_metrics();
-    if rpc_calls > 0 || rpc_errors > 0 {
-        cursor::track_rpc_call(pool, rpc_calls, rpc_errors, rpc_errors_32001).await?;
+    let (rpc_calls, rpc_errors, rpc_errors_32001, rpc_failovers) = rpc.take_metrics();
+    if rpc_calls > 0 || rpc_errors > 0 || rpc_failovers > 0 {
+        if rpc_failovers > 0 {
+            tracing::warn!(
+                rpc_failovers,
+                active_endpoint = %rpc.active_endpoint_host(),
+                "rpc endpoint failover(s) occurred this cycle"
+            );
+        }
+        cursor::track_rpc_call(pool, rpc_calls, rpc_errors, rpc_errors_32001, rpc_failovers).await?;
     }
 
     cursor::write_progress(pool, latest, latest, inserted).await?;
@@ -288,6 +295,8 @@ pub async fn fetch_and_store(
     let mut total_inserted = 0u64;
     let mut enriched_count = 0u64;
     let mut not_enriched_count = 0u64;
+    let mut ts_parse_errors = 0u64; // #399
+    let mut ts_parse_errors = 0u64; // #399
     let mut page_count = 0usize;
     let mut last_seen_ledger = start;
     // Contracts seen this cycle, used to bound per-contract instance reads when
@@ -343,7 +352,11 @@ pub async fn fetch_and_store(
             if tracks_active_contracts {
                 active_contracts.insert(ev.contract_id.clone());
             }
-            let new_event = to_new_event(ev, spec.as_deref());
+            let Some(new_event) = to_new_event(ev, spec.as_deref()) else {
+                // #399: timestamp parse failure — event skipped, counter incremented.
+                ts_parse_errors += 1;
+                continue;
+            };
             // Track enrichment coverage: count enriched vs not-enriched events
             if new_event.enriched.is_some() {
                 enriched_count += 1;
@@ -382,6 +395,12 @@ pub async fn fetch_and_store(
     // Record enrichment metrics for this cycle
     if enriched_count > 0 || not_enriched_count > 0 {
         cursor::track_enrichment(pool, enriched_count, not_enriched_count).await?;
+        if ts_parse_errors > 0 {
+            let _ = cursor::track_timestamp_parse_error(pool, ts_parse_errors).await;
+        }
+        if ts_parse_errors > 0 {
+            let _ = cursor::track_timestamp_parse_error(pool, ts_parse_errors).await;
+        }
     }
 
     // Read each tracked contract's instance entry. With an explicit CONTRACT_IDS
@@ -522,8 +541,12 @@ pub async fn recover_gaps(
                     break;
                 }
                 let spec = specs.get(pool, rpc, &ev.contract_id, ev.ledger).await;
-                let new_event = to_new_event(ev, spec.as_deref());
-                batch.push(new_event);
+                if let Some(new_event) = to_new_event(ev, spec.as_deref()) {
+                    batch.push(new_event);
+                } else {
+                    // #399: unparseable timestamp — skip event.
+                    ts_parse_errors += 1;
+                }
             }
 
             let n = batch.len();
@@ -592,11 +615,18 @@ async fn fetch_and_upsert(
                 // Record enrichment metrics for reorg scan
                 if enriched_count > 0 || not_enriched_count > 0 {
                     let _ = cursor::track_enrichment(pool, enriched_count, not_enriched_count).await;
+                    if ts_parse_errors > 0 {
+                        let _ = cursor::track_timestamp_parse_error(pool, ts_parse_errors).await;
+                    }
                 }
                 return Ok(total_updated);
             }
             let spec = specs.get(pool, rpc, &ev.contract_id, ev.ledger).await;
-            let new_event = to_new_event(ev, spec.as_deref());
+            let Some(new_event) = to_new_event(ev, spec.as_deref()) else {
+                // #399: unparseable timestamp — skip event.
+                ts_parse_errors += 1;
+                continue;
+            };
             // Track enrichment coverage: count enriched vs not-enriched events
             if new_event.enriched.is_some() {
                 enriched_count += 1;

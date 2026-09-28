@@ -888,7 +888,7 @@ mod tests {
         for e in entries {
             body.extend(e.to_xdr(Limits::none()).unwrap());
         }
-        ContractSpec::from_spec_xdr(&body).expect("spec should parse")
+        ContractSpec::from_spec_xdr_simple(&body).expect("spec should parse")
     }
 
     fn full_spec() -> ContractSpec {

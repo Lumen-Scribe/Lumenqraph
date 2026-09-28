@@ -210,7 +210,7 @@ impl SpecCache {
 fn parse(hex_section: &str) -> ApiResult<CachedSpec> {
     let section = hex::decode(hex_section)
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("corrupt stored spec: {e}")))?;
-    let parsed = ContractSpec::from_spec_xdr(&section);
+    let parsed = ContractSpec::from_spec_xdr(&section).map(|p| p.spec);
     Ok(CachedSpec { section, parsed })
 }
 
