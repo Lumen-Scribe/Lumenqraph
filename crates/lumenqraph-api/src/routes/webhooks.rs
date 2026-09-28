@@ -1,6 +1,13 @@
 //! Webhook subscription management. Consumers register a URL (+ optional
 //! contract/event filters) and receive an HMAC-signing `secret` once, at
 //! creation. The `lumenqraph-webhooks` service does the actual delivery.
+//!
+//! Issue #421: Every subscription is scoped to the API key that created it.
+//! `list_webhooks` only returns the caller's own subscriptions; all other
+//! mutation endpoints return 404 for subscriptions owned by other keys (to
+//! avoid enumeration). Existing rows with NULL owner are only accessible to
+//! callers with the "admin" role (not yet implemented) — they are simply
+//! unreachable from normal keys.
 
 use axum::extract::{Path, Query, State};
 use axum::response::Response;
@@ -11,35 +18,28 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 use sqlx::PgPool;
+use sqlx::Row as _;
 use tracing::warn;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 
+use crate::auth::CallerKeyHash;
 use crate::error::{ApiError, ApiResult};
 use crate::pagination::{self, IdCursor, Page, PageRequest};
 use crate::state::AppState;
 use crate::url_validation;
 
+type HmacSha256 = Hmac<Sha256>;
+
 /// Default retention window (in days) for delivered/failed `webhook_deliveries`
-/// rows. Overridable via `WEBHOOK_DELIVERY_RETENTION_DAYS`; `0` disables pruning.
+/// rows. Overridable via `WEBHOOK_DELIVERY_RETENTION_DAYS` (parsed once into
+/// `ApiConfig`); `0` disables pruning.
 pub const DEFAULT_WEBHOOK_DELIVERY_RETENTION_DAYS: i64 = 14;
 
 /// How often the background pruner runs. Slow on purpose: pruning is a
 /// housekeeping task, not a latency-sensitive path.
 const WEBHOOK_DELIVERY_PRUNE_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(10 * 60);
-
-/// Resolve the configured retention window. Returns `None` when pruning is
-/// disabled (`WEBHOOK_DELIVERY_RETENTION_DAYS=0`).
-fn webhook_delivery_retention_days() -> Option<i64> {
-    let days = std::env::var("WEBHOOK_DELIVERY_RETENTION_DAYS")
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(DEFAULT_WEBHOOK_DELIVERY_RETENTION_DAYS);
-    if days <= 0 {
-        None
-    } else {
-        Some(days)
-    }
-}
 
 /// Delete delivered/failed `webhook_deliveries` rows older than `retention_days`
 /// in batches. `pending` rows are never touched. Returns the number of rows
@@ -76,11 +76,11 @@ pub async fn prune_webhook_deliveries(pool: &PgPool, retention_days: i64) -> Res
 /// Spawn the slow background loop that prunes old webhook deliveries. The
 /// webhooks service owns `webhook_deliveries`, so pruning lives here rather
 /// than in the indexer.
-pub fn spawn_webhook_delivery_pruner(pool: PgPool) {
-    let Some(retention_days) = webhook_delivery_retention_days() else {
+pub fn spawn_webhook_delivery_pruner(pool: PgPool, retention_days: i64) {
+    if retention_days <= 0 {
         tracing::info!("webhook delivery pruning disabled (WEBHOOK_DELIVERY_RETENTION_DAYS=0)");
         return;
-    };
+    }
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(WEBHOOK_DELIVERY_PRUNE_INTERVAL);
         // Skip the immediate first tick so startup isn't blocked on a big delete.
@@ -96,15 +96,22 @@ pub fn spawn_webhook_delivery_pruner(pool: PgPool) {
     });
 }
 
+/// Log a webhook lifecycle event to the audit log.
+///
+/// `key_hash_prefix` is the caller's key hash (or a fallback string); it is
+/// truncated to 8 characters, matching the audit log convention used elsewhere.
 async fn log_webhook_action(
     pool: &PgPool,
+    key_hash_prefix: &str,
     action_type: &str,
     resource_id: &str,
 ) {
+    let prefix = key_hash_prefix.chars().take(8).collect::<String>();
     if let Err(e) = sqlx::query(
         "INSERT INTO audit_log (key_hash_prefix, route, http_method, status_code, action_type, resource_id)
-         VALUES ('webhook', '/webhooks', 'MUTATION', 200, $1, $2)"
+         VALUES ($1, '/webhooks', 'MUTATION', 200, $2, $3)"
     )
+    .bind(&prefix)
     .bind(action_type)
     .bind(resource_id)
     .execute(pool)
@@ -131,11 +138,11 @@ pub struct CreateWebhook {
 
 #[derive(Deserialize)]
 pub struct UpdateWebhook {
-    /// Toggle active/paused state of the subscription
+    /// Toggle active/paused state of the subscription.
     active: Option<bool>,
-    /// Update contract filter
+    /// Update contract filter.
     contract_id: Option<String>,
-    /// Update event name filter
+    /// Update event name filter.
     event_name: Option<String>,
 }
 
@@ -162,20 +169,10 @@ fn random_secret() -> String {
 
 pub async fn create_webhook(
     State(state): State<AppState>,
+    // CallerKeyHash may be absent for anonymous callers (when REQUIRE_API_KEY=false).
+    caller: Option<Extension<CallerKeyHash>>,
     Json(body): Json<CreateWebhook>,
 ) -> ApiResult<Json<CreatedWebhook>> {
-    if state.webhook_max_subscriptions > 0 {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_subscriptions")
-            .fetch_one(&state.pool)
-            .await?;
-        if count as usize >= state.webhook_max_subscriptions {
-            return Err(ApiError::bad_request(format!(
-                "maximum webhook subscriptions limit reached ({})",
-                state.webhook_max_subscriptions
-            )));
-        }
-    }
-
     url_validation::validate_webhook_url(&body.url)
         .map_err(|e| ApiError::bad_request(format!("invalid webhook url: {}", e)))?;
 
@@ -191,20 +188,55 @@ pub async fn create_webhook(
              use contract_id to watch one contract, or omit it to watch all",
         ));
     }
+
+    // #424: validate contract_id and event_name on creation.
+    if let Some(ref cid) = body.contract_id {
+        validate_contract_id(cid)?;
+    }
+    if let Some(ref en) = body.event_name {
+        validate_event_name(en)?;
+    }
+
     let secret = random_secret();
 
-    let starting_seq = if let Some(ref since) = body.since {
-        calculate_starting_seq(&state.pool, since).await?
+    // #423: when `since` is given, set up per-subscription backfill.
+    //
+    // `backfill_start` is the seq *before* the first event we want to
+    // backfill; `starting_seq` becomes the current global max (the watermark
+    // at which the live stream takes over once the backfill completes).
+    let (starting_seq, backfill_seq): (i64, Option<i64>) = if let Some(ref since) = body.since {
+        let backfill_start = calculate_starting_seq(&state.pool, since).await?;
+        let global_max: i64 =
+            sqlx::query_scalar("SELECT COALESCE(max(seq), 0) FROM events")
+                .fetch_one(&state.pool)
+                .await?;
+        // Only arm the backfill if there are actually events in the window.
+        if backfill_start < global_max {
+            (global_max, Some(backfill_start))
+        } else {
+            (global_max, None)
+        }
     } else {
-        0
+        (0, None)
     };
 
-    let encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY")
-        .unwrap_or_else(|_| "default-key-for-testing".to_string());
+    // Read once at startup (#441); an unset key keeps the legacy test fallback
+    // and is warned about in `main`.
+    let encryption_key = state
+        .config
+        .webhook_encryption_key
+        .as_deref()
+        .unwrap_or("default-key-for-testing");
+
+    // Set owner_key_hash from the authenticated caller (#421). Anonymous callers
+    // (no API key) create subscriptions with NULL owner, which are only accessible
+    // to admin keys.
+    let owner_key_hash: Option<String> = caller.map(|ext| ext.0.0.clone());
 
     let sub: WebhookSubscription = sqlx::query_as(
-        "INSERT INTO webhook_subscriptions (url, kind, contract_id, event_name, encrypted_secret, starting_seq)
-         VALUES ($1, $2, $3, $4, pgp_sym_encrypt($5, $6), $7)
+        "INSERT INTO webhook_subscriptions
+             (url, kind, contract_id, event_name, encrypted_secret, starting_seq, owner_key_hash)
+         VALUES ($1, $2, $3, $4, pgp_sym_encrypt($5, $6), $7, $8)
          RETURNING id, url, kind, contract_id, event_name, active, created_at",
     )
     .bind(&body.url)
@@ -212,12 +244,14 @@ pub async fn create_webhook(
     .bind(&body.contract_id)
     .bind(&body.event_name)
     .bind(&secret)
-    .bind(&encryption_key)
+    .bind(encryption_key)
     .bind(starting_seq)
+    .bind(&owner_key_hash)
     .fetch_one(&state.pool)
     .await?;
 
-    log_webhook_action(&state.pool, "webhook_create", &sub.id.to_string()).await;
+    let key_prefix = owner_key_hash.as_deref().unwrap_or("anon");
+    log_webhook_action(&state.pool, key_prefix, "webhook_create", &sub.id.to_string()).await;
 
     // Return the secret in the response (this is the only time it's exposed).
     Ok(Json(CreatedWebhook {
@@ -226,11 +260,48 @@ pub async fn create_webhook(
     }))
 }
 
+/// Hard cap on `last N` backfill to prevent runaway queries.
+const MAX_BACKFILL_COUNT: i64 = 100_000;
+
+/// Validate a `contract_id` string as a Soroban contract address (C-strkey).
+fn validate_contract_id(id: &str) -> Result<(), ApiError> {
+    if lumenqraph_core::xdr::is_valid_contract_id(id) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(format!(
+            "invalid contract_id `{id}`; expected a Soroban contract address (C… strkey)"
+        )))
+    }
+}
+
+/// Validate an `event_name` as a Soroban symbol (≤32 chars, `[a-zA-Z0-9_]`).
+fn validate_event_name(name: &str) -> Result<(), ApiError> {
+    if name.is_empty() {
+        return Err(ApiError::bad_request("event_name must not be empty"));
+    }
+    if name.len() > 32 {
+        return Err(ApiError::bad_request(
+            "event_name must be ≤32 characters (Soroban symbol limit)",
+        ));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(ApiError::bad_request(
+            "event_name must contain only ASCII letters, digits, and underscores",
+        ));
+    }
+    Ok(())
+}
+
 async fn calculate_starting_seq(pool: &sqlx::PgPool, since: &str) -> ApiResult<i64> {
     if since.starts_with("last ") {
         let count_str = since.strip_prefix("last ").unwrap_or("0");
         let count: i64 = count_str.parse()
             .map_err(|_| ApiError::bad_request("invalid 'last N' format; expected 'last <number>'"))?;
+        if count > MAX_BACKFILL_COUNT {
+            return Err(ApiError::bad_request(format!(
+                "since 'last N' exceeds maximum allowed backfill count ({MAX_BACKFILL_COUNT})"
+            )));
+        }
         let current_max: i64 = sqlx::query_scalar("SELECT COALESCE(max(seq), 0) FROM events")
             .fetch_one(pool)
             .await?;

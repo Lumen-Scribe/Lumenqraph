@@ -5,8 +5,11 @@
 mod auth;
 mod call_cache;
 mod concurrency_limit;
+mod config;
 mod error;
+mod extract;
 mod graphql;
+mod key_cache;
 mod metrics;
 mod metrics_middleware;
 mod openapi;
@@ -37,26 +40,23 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use call_cache::CallCache;
 use concurrency_limit::ConcurrencyLimiter;
+use config::{ApiConfig, DbConfig};
+use key_cache::KeyCache;
 use rate_limit::RateLimiter;
 use read_cost_limit::ReadCostLimitConfig;
 use state::{AppState, BuildInfo};
 
-async fn connect_with_retry(database_url: &str, max_retries: u32) -> anyhow::Result<sqlx::PgPool> {
+async fn connect_with_retry(database_url: &str, db: &DbConfig) -> anyhow::Result<sqlx::PgPool> {
+    let max_retries = db.connect_retries;
     let mut attempt = 0;
     let mut retry_delay = Duration::from_secs(1);
     let max_delay = Duration::from_secs(30);
     loop {
         match PgPoolOptions::new()
-            .max_connections(env_parse("DATABASE_MAX_CONNECTIONS", 10u32))
-            .min_connections(env_parse("DATABASE_MIN_CONNECTIONS", 1u32))
-            .acquire_timeout(Duration::from_secs(env_parse(
-                "DATABASE_ACQUIRE_TIMEOUT_SECS",
-                30u64,
-            )))
-            .idle_timeout(Duration::from_secs(env_parse(
-                "DATABASE_IDLE_TIMEOUT_SECS",
-                600u64,
-            )))
+            .max_connections(db.max_connections)
+            .min_connections(db.min_connections)
+            .acquire_timeout(Duration::from_secs(db.acquire_timeout_secs))
+            .idle_timeout(Duration::from_secs(db.idle_timeout_secs))
             .connect(database_url)
             .await
         {
@@ -85,20 +85,6 @@ async fn connect_with_retry(database_url: &str, max_retries: u32) -> anyhow::Res
     }
 }
 
-fn env_bool(key: &str, default: bool) -> bool {
-    std::env::var(key)
-        .ok()
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(default)
-}
-
-fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
 fn version_string() -> String {
     format!(
         "lumenqraph-api {}\ncommit: {}\nbuilt: {}",
@@ -108,10 +94,8 @@ fn version_string() -> String {
     )
 }
 
-fn build_cors_layer() -> tower_http::cors::CorsLayer {
+fn build_cors_layer(origins_str: &str) -> tower_http::cors::CorsLayer {
     use tower_http::cors::CorsLayer;
-
-    let origins_str = std::env::var("CORS_ALLOWED_ORIGINS").unwrap_or_else(|_| String::new());
 
     if origins_str == "*" {
         info!("CORS: allowing all origins (permissive mode)");
@@ -197,8 +181,17 @@ async fn main() -> anyhow::Result<()> {
         .with(fmt::layer())
         .init();
 
-    let database_url = std::env::var("DATABASE_URL").context("missing DATABASE_URL")?;
-    
+    // Parse every setting once, up front: an invalid value exits here with a
+    // message naming the variable instead of silently becoming the default.
+    let config = Arc::new(ApiConfig::from_env()?);
+    info!(config = ?config, "effective configuration");
+    if config.webhook_encryption_key.is_none() {
+        tracing::warn!(
+            "WEBHOOK_ENCRYPTION_KEY is not set; webhook secrets are encrypted with an \
+             insecure built-in test key. Set it (openssl rand -hex 32) in production."
+        );
+    }
+
     // Validate CONTRACT_IDS at startup so a misconfigured address is caught
     // immediately rather than silently ignored or causing runtime errors.
     lumenqraph_core::parse_contract_ids(
@@ -206,18 +199,11 @@ async fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let bind_addr = std::env::var("API_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
-    let rpc_url = std::env::var("RPC_URL")
-        .unwrap_or_else(|_| "https://soroban-testnet.stellar.org".to_string());
-    let rpc_timeout_secs: u64 = env_parse("RPC_TIMEOUT_SECS", 30u64);
-    let request_timeout_secs: u64 = env_parse("API_REQUEST_TIMEOUT_SECS", 60u64);
-
-    let max_connect_retries = env_parse("DATABASE_CONNECT_RETRIES", 30u32);
-    let pool = connect_with_retry(&database_url, max_connect_retries).await?;
+    let pool = connect_with_retry(&config.database_url, &config.db).await?;
 
     let call_cache = Arc::new(CallCache::new(
-        env_parse("CALL_CACHE_MAX_ENTRIES", 1000usize),
-        env_parse("CALL_CACHE_TTL_SECS", 5u64),
+        config.call_cache_max_entries,
+        config.call_cache_ttl_secs,
     ));
 
     let build_info = Arc::new(BuildInfo {
@@ -232,15 +218,181 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState {
         pool,
-        require_auth: env_bool("REQUIRE_API_KEY", false),
-        anon_rate_limit: env_parse("ANON_RATE_LIMIT_PER_MIN", 60),
+        require_auth: config.require_auth,
+        anon_rate_limit: config.anon_rate_limit,
         limiter: Arc::new(RateLimiter::new()),
         http_requests: Arc::new(AtomicU64::new(0)),
-        rpc: rpc::RpcClient::new(rpc_url, rpc_timeout_secs),
+        rpc: rpc::RpcClient::new(config.rpc_url.clone(), config.rpc_timeout_secs),
         specs: Arc::new(specs::SpecCache::new()),
-        mounts: Arc::new(routes::proxy::mounts_from_env()),
+        mounts: Arc::new(config.mounts.clone()),
         rpc_limiter: Arc::new(RateLimiter::new()),
-        rpc_require_auth: env_bool("RPC_REQUIRE_API_KEY", false),
-        rpc_anon_rate_limit: env_
+        rpc_require_auth: config.rpc_require_auth,
+        rpc_anon_rate_limit: config.rpc_anon_rate_limit,
+        metrics: Arc::new(metrics_middleware::MetricsCollector::new()),
+        call_cache,
+        build_info,
+        concurrency_limiter: Arc::new(ConcurrencyLimiter::new()),
+        max_concurrent_per_ip: config.max_concurrent_per_ip,
+        read_cost_limit_config: ReadCostLimitConfig {
+            max_request_size: config.read_max_request_size,
+            max_args_size: config.read_max_args_size,
+        },
+        readyz_lag_threshold: config.readyz_lag_threshold,
+        readyz_max_age_secs: config.readyz_max_age_secs,
+        health_max_lag_ledgers: config.health_max_lag_ledgers,
+        health_max_stale_secs: config.health_max_stale_secs,
+        metrics_require_auth: config.metrics_require_auth,
+        proxy_limiter: Arc::new(RateLimiter::new()),
+        config: Arc::clone(&config),
+        key_cache: Arc::new(KeyCache::new(2000)),
+        ip_config: auth::IpConfig::from_env(),
+        audit_tx: None,
+        audit_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+    };
 
-/* … truncated 6677 chars — edit only what you need near the top … */
+    let bind_addr = config.bind_addr.clone();
+    let max_body_bytes = config.max_body_bytes;
+    let request_timeout_secs = config.request_timeout_secs;
+    info!(max_body_bytes, "enforcing request body size limit");
+    info!(request_timeout_secs, "enforcing request timeout");
+
+    let app = routes::router(state)
+        .layer(DefaultBodyLimit::max(max_body_bytes as usize))
+        .layer(TimeoutLayer::new(Duration::from_secs(request_timeout_secs)))
+        .layer(CompressionLayer::new())
+        .layer(TraceLayer::new_for_http())
+        .layer(build_cors_layer(&config.cors_allowed_origins));
+
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
+        .await
+        .with_context(|| format!("failed to bind {bind_addr}"))?;
+    info!(addr = %bind_addr, "lumenqraph api listening");
+
+    let shutdown_timeout_secs = config.shutdown_timeout_secs;
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(shutdown_timeout_secs));
+
+    // Wrap the graceful shutdown in a hard timeout so a slow or stuck client
+    // cannot keep the process alive indefinitely during a rolling restart.
+    match tokio::time::timeout(
+        Duration::from_secs(shutdown_timeout_secs),
+        server,
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            info!(
+                timeout_secs = shutdown_timeout_secs,
+                "shutdown timeout reached; forcing exit"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn shutdown_signal(shutdown_timeout_secs: u64) {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    info!(
+        "shutdown signal received; draining in-flight requests (up to {}s)",
+        shutdown_timeout_secs
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    /// #219 — CONTRACT_IDS startup validation in lumenqraph-api.
+    ///
+    /// The API calls `lumenqraph_core::parse_contract_ids` at startup and
+    /// propagates the error, refusing to proceed. These tests exercise the same
+    /// validation logic directly, without needing a live Postgres or bind
+    /// address, to ensure the guard never silently regresses.
+    mod contract_ids_startup_validation {
+        #[test]
+        fn rejects_g_strkey_account_address() {
+            // A G… strkey is a Stellar account, not a Soroban contract.
+            let raw = "GAIH3ULLFQ4DGSECF2AR555KZ4KNDGEKN4AFI4SU2M7B43MGK3BEJD4";
+            let err = lumenqraph_core::parse_contract_ids(raw).unwrap_err();
+            assert!(
+                err.contains("invalid CONTRACT_ID"),
+                "error should mention invalid CONTRACT_ID: {err}"
+            );
+            assert!(
+                err.contains("GAIH3ULLFQ4DGSECF2AR555KZ4KNDGEKN4AFI4SU2M7B43MGK3BEJD4"),
+                "error should quote the bad id: {err}"
+            );
+        }
+
+        #[test]
+        fn rejects_garbage_string() {
+            let raw = "not-a-contract-id";
+            let err = lumenqraph_core::parse_contract_ids(raw).unwrap_err();
+            assert!(
+                err.contains("invalid CONTRACT_ID"),
+                "garbage string should be rejected: {err}"
+            );
+        }
+
+        #[test]
+        fn rejects_too_many_contract_ids() {
+            // getEvents supports at most 25 IDs; the parser enforces this.
+            // Build 26 syntactically valid-looking (but fake) C-strkey placeholders
+            // by using the same test id repeated — the count check fires before
+            // strkey validation so any 26 non-empty tokens trigger it.
+            // Use a real C-strkey so each individual ID passes strkey validation.
+            let single = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+            let raw = std::iter::repeat(single).take(26).collect::<Vec<_>>().join(",");
+            let err = lumenqraph_core::parse_contract_ids(&raw).unwrap_err();
+            assert!(
+                err.contains("26"),
+                "error should mention the count 26: {err}"
+            );
+        }
+
+        #[test]
+        fn accepts_empty_string() {
+            // Empty CONTRACT_IDS means "index all" — must not be an error.
+            let ids = lumenqraph_core::parse_contract_ids("").unwrap();
+            assert!(ids.is_empty(), "empty string should yield zero IDs");
+        }
+
+        #[test]
+        fn accepts_valid_c_strkey() {
+            let raw = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+            let ids = lumenqraph_core::parse_contract_ids(raw).unwrap();
+            assert_eq!(ids.len(), 1);
+            assert_eq!(ids[0], raw);
+        }
+
+        #[test]
+        fn mixed_valid_and_invalid_is_rejected() {
+            let raw = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC,GAIH3ULLFQ4DGSECF2AR555KZ4KNDGEKN4AFI4SU2M7B43MGK3BEJD4";
+            let err = lumenqraph_core::parse_contract_ids(raw).unwrap_err();
+            assert!(
+                err.contains("invalid CONTRACT_ID"),
+                "a G-strkey mixed with a valid C-strkey should be rejected: {err}"
+            );
+        }
+    }
+}

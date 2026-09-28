@@ -16,16 +16,14 @@ pub mod swaps;
 pub mod transfers;
 pub mod webhooks;
 
-use std::sync::Arc;
-
 use async_graphql::http::GraphiQLSource;
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
-use axum::extract::Request;
+use axum::extract::{Request, State};
 use axum::http::{header, HeaderValue};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse};
 use axum::Json;
-use axum::routing::{any, delete, get, patch, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{middleware, Extension, Router};
 use serde_json::json;
 use tower::Layer;
@@ -33,7 +31,8 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::auth::{
-    auth_and_rate_limit, concurrency_limit, rpc_auth_and_rate_limit, webhook_auth_and_rate_limit,
+    auth_and_rate_limit, concurrency_limit, proxy_rate_limit, rpc_auth_and_rate_limit,
+    webhook_auth_and_rate_limit, webhook_manage_auth_and_rate_limit,
 };
 use crate::graphql::{self, AppSchema};
 use crate::metrics;
@@ -46,13 +45,8 @@ async fn graphql_handler(schema: Extension<AppSchema>, req: GraphQLRequest) -> G
 }
 
 /// Serve the GraphiQL in-browser IDE, pointed at `/graphql`.
-async fn graphiql() -> impl IntoResponse {
-    let introspection_enabled = std::env::var("GRAPHQL_INTROSPECTION_ENABLED")
-        .ok()
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
-
-    if !introspection_enabled {
+async fn graphiql(State(state): State<AppState>) -> impl IntoResponse {
+    if !state.config.graphql.introspection_enabled {
         return (
             axum::http::StatusCode::NOT_FOUND,
             Json(json!({
@@ -66,7 +60,7 @@ async fn graphiql() -> impl IntoResponse {
 }
 
 pub fn router(state: AppState) -> Router {
-    let schema = graphql::build_schema(state.pool.clone());
+    let schema = graphql::build_schema(state.pool.clone(), &state.config.graphql);
 
     // Public, unauthenticated observability and documentation endpoints.
     let public = Router::new()
@@ -161,15 +155,6 @@ pub fn router(state: AppState) -> Router {
             "/transactions/:tx_hash/events",
             get(events::transaction_events),
         )
-        .route(
-            "/webhooks",
-            get(webhooks::list_webhooks),
-        )
-        .route("/webhooks/:id", delete(webhooks::delete_webhook).patch(webhooks::update_webhook))
-        .route("/webhooks/:id/deliveries", get(webhooks::list_webhook_deliveries))
-        .route("/webhooks/:id/redrive", post(webhooks::redrive_webhook))
-        .route("/webhooks/:id/reenable", post(webhooks::reenable_webhook))
-        .route("/webhooks/:id/rotate-secret", post(webhooks::rotate_webhook_secret))
         // GraphQL: POST executes queries, GET serves the GraphiQL IDE. Behind
         // the same auth + rate-limit middleware as the REST data routes.
         .route("/graphql", post(graphql_handler).get(graphiql))
@@ -177,6 +162,30 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_and_rate_limit,
+        ));
+
+    // Webhook management routes: GET /webhooks, DELETE/PATCH /webhooks/:id,
+    // and related sub-routes. These ALWAYS require a valid API key regardless
+    // of REQUIRE_API_KEY (#420 — anonymous callers must not be able to list,
+    // modify, or delete webhook subscriptions).
+    let webhook_manage_routes = Router::new()
+        .route(
+            "/webhooks",
+            get(webhooks::list_webhooks),
+        )
+        .route("/webhooks/:id", get(webhooks::get_webhook).delete(webhooks::delete_webhook).patch(webhooks::update_webhook))
+        .route("/webhooks/:id/deliveries", get(webhooks::list_webhook_deliveries))
+        .route("/webhooks/:id/redrive", post(webhooks::redrive_webhook))
+        .route("/webhooks/:id/reenable", post(webhooks::reenable_webhook))
+        .route("/webhooks/:id/rotate-secret", post(webhooks::rotate_webhook_secret))
+        .route("/webhooks/:id/test", post(webhooks::test_webhook))
+        // GraphQL: POST executes queries, GET serves the GraphiQL IDE. Behind
+        // the same auth + rate-limit middleware as the REST data routes.
+        .route("/graphql", post(graphql_handler).get(graphiql))
+        .layer(Extension(schema))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            webhook_manage_auth_and_rate_limit,
         ));
 
     // Webhook creation route with separate, lower rate limiting (prevents subscription spam).
@@ -193,6 +202,7 @@ pub fn router(state: AppState) -> Router {
         .merge(protected)
         .merge(rpc_routes)
         .merge(webhook_create_routes)
+        .merge(webhook_manage_routes)
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -204,43 +214,29 @@ pub fn router(state: AppState) -> Router {
         }))
         .layer(middleware::from_fn(request_id::request_id_middleware));
 
-    // Sibling instances under a path prefix (see `proxy`). Registered outside
-    // the auth middleware: each upstream enforces its own policy.
+    // Sibling instances under a path prefix (see `proxy`). Each upstream
+    // still enforces its own auth, but mounted routes get this instance's
+    // per-IP concurrency cap and a per-IP rate limit too, so a single noisy
+    // client can't monopolise the proxy (#442). The last layer added runs
+    // first: concurrency cap, then rate limit.
     if !state.mounts.is_empty() {
-        // Never follow redirects: a 3xx from the upstream is relayed to the
-        // caller as-is instead of letting the upstream steer this server into
-        // an arbitrary (possibly internal) address (#447).
-        let client = Arc::new(
-            reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("build proxy http client"),
-        );
-        for (name, upstream) in state.mounts.iter() {
-            let (client, upstream, prefix) = (
-                Arc::clone(&client),
-                Arc::new(upstream.clone()),
-                Arc::new(format!("/{name}")),
-            );
-            let handler = move |req: Request| {
-                proxy::proxy(
-                    Arc::clone(&client),
-                    Arc::clone(&upstream),
-                    Arc::clone(&prefix),
-                    req,
-                )
-            };
-            app = app
-                .route(&format!("/{name}"), any(handler.clone()))
-                .route(&format!("/{name}/*rest"), any(handler));
-        }
+        let mounts = proxy::mount_router(&state.mounts, &state.config.proxy)
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                proxy_rate_limit,
+            ))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                concurrency_limit,
+            ));
+        app = app.merge(mounts);
     }
 
     // Serve the static explorer UI at the same origin as the API (so it needs
     // no CORS and no configured API base). Falls back to it for any unmatched
     // path; `/` resolves to explorer/index.html. Dir is configurable so the
     // container image can point at wherever the assets are COPYed.
-    let explorer_dir = std::env::var("EXPLORER_DIR").unwrap_or_else(|_| "explorer".to_string());
+    let explorer_dir = state.config.explorer_dir.clone();
     if std::path::Path::new(&explorer_dir).is_dir() {
         // `no-cache` means "revalidate before using", not "don't cache":
         // ServeDir serves Last-Modified, so an unchanged explorer costs a 304 —

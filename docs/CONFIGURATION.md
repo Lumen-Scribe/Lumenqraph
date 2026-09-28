@@ -284,7 +284,7 @@ The API service serves indexed data over HTTP, with rate limiting and optional A
 | **Example** | `true` |
 | **Valid Range** | `true` \| `false` |
 | **Services** | API |
-| **Tradeoff** | **Proxy-behind Setup** vs **Security**: When ON, uses `X-Forwarded-For` header to identify client IP (necessary when behind nginx/HAProxy). When OFF, uses connection source IP. **Only enable if behind a trusted proxy**; otherwise attackers can forge IPs and bypass rate limits. Recommended: `true` if behind reverse proxy, `false` otherwise |
+| **Tradeoff** | **Proxy-behind Setup** vs **Security**: When ON, uses the **right-most** `X-Forwarded-For` entry (the one appended by the proxy in front of this instance) to identify the client IP — i.e. exactly one trusted hop. Necessary when behind nginx/HAProxy or when this instance is mounted by a sibling via `INSTANCE_MOUNTS`. When OFF, uses connection source IP. **Only enable if behind a trusted proxy**; otherwise attackers can forge IPs and bypass rate limits. Recommended: `true` if behind reverse proxy, `false` otherwise |
 
 ### CORS
 
@@ -336,6 +336,45 @@ The API service serves indexed data over HTTP, with rate limiting and optional A
 | **Valid Range** | Any valid byte size |
 | **Services** | API |
 | **Tradeoff** | **Memory** vs **Flexibility**: Larger limit = accept larger payloads (e.g., GraphQL queries). Smaller = prevent memory exhaustion. Typical: 1–10MB |
+
+### Instance Mounts (Proxy)
+
+These apply only when `INSTANCE_MOUNTS` is set (see [MULTI_NETWORK.md](MULTI_NETWORK.md)).
+
+#### `PROXY_CONNECT_TIMEOUT_SECS`
+| Property | Value |
+|----------|-------|
+| **Default** | 5 |
+| **Services** | API |
+| **Tradeoff** | TCP connect timeout to a mounted upstream. An unreachable upstream returns `502`. |
+
+#### `PROXY_TIMEOUT_SECS`
+| Property | Value |
+|----------|-------|
+| **Default** | 30 |
+| **Services** | API |
+| **Tradeoff** | Total per-request timeout to a mounted upstream. A hung upstream returns `504` once it elapses. |
+
+#### `PROXY_POOL_MAX_IDLE_PER_HOST`
+| Property | Value |
+|----------|-------|
+| **Default** | 32 |
+| **Services** | API |
+| **Tradeoff** | Max idle pooled connections kept per mounted upstream. |
+
+#### `PROXY_MAX_RESPONSE_BYTES`
+| Property | Value |
+|----------|-------|
+| **Default** | 10485760 (10 MiB) |
+| **Services** | API |
+| **Tradeoff** | Max upstream response body size. Larger responses return `502`. |
+
+#### `PROXY_RATE_LIMIT_PER_MIN`
+| Property | Value |
+|----------|-------|
+| **Default** | 600 |
+| **Services** | API |
+| **Tradeoff** | Per-client-IP requests/min across all mounted routes, enforced by this instance before forwarding. `0` disables. The upstream still applies its own auth and limits. |
 
 ---
 
@@ -531,9 +570,16 @@ RUST_LOG=info,lumenqraph_indexer=warn,lumenqraph_api=warn,lumenqraph_webhooks=wa
 
 ## Configuration Validation
 
-Lumenqraph validates configuration at startup. Examples of validation errors:
+Lumenqraph validates configuration at startup. The API and webhooks services
+parse every setting once; a present but invalid numeric or boolean value
+(e.g. `ANON_RATE_LIMIT_PER_MIN=6O`, `API_MAX_BODY_BYTES=1MB`,
+`REQUIRE_API_KEY=ture`) stops the service with an error naming the variable
+instead of silently using the default. Booleans accept
+`1/true/yes/on` and `0/false/no/off`. The effective configuration (secrets
+redacted) is logged at startup. Examples of validation errors:
 
 ```
+❌ invalid ANON_RATE_LIMIT_PER_MIN="6O": invalid digit found in string
 ❌ DATABASE_URL is required
 ❌ RPC_URL is required
 ❌ invalid CONTRACT_ID C1234: expected a C… strkey

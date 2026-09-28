@@ -15,6 +15,33 @@
 /// log noise.
 pub const MAX_SIMULATION_ERROR_LEN: usize = 256;
 
+/// Parse a contract error code out of a Soroban simulation error string.
+///
+/// Soroban reports contract errors in the form `Error(Contract, #N)` inside
+/// the simulation error text. This extracts the numeric code `N` so the API
+/// can look it up in the contract's error-enum spec and return a named error
+/// rather than a bare number.
+///
+/// Returns `Some(code)` when the error text contains a recognisable contract
+/// error pattern, `None` otherwise (host-level or other errors).
+pub fn parse_contract_error_code(error_text: &str) -> Option<u32> {
+    // The canonical form emitted by Soroban is `Error(Contract, #N)`.
+    // We look for that pattern with some flexibility for whitespace.
+    let text = error_text;
+
+    // Find "Error(Contract" (case-sensitive, as emitted by the host).
+    let start = text.find("Error(Contract")?;
+    let after = &text[start + "Error(Contract".len()..];
+
+    // Consume optional whitespace and a comma, then "#".
+    let after = after.trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+    let after = after.strip_prefix('#')?;
+
+    // Parse the decimal number up to the first non-digit.
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u32>().ok()
+}
+
 /// Normalise and bound an upstream simulation error message for client display.
 ///
 /// The transformation is deliberately lossy and conservative:
