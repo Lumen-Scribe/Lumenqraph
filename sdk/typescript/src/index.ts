@@ -1,3 +1,5 @@
+import type { components } from "../generated/api.js";
+
 /**
  * Lumenqraph TypeScript SDK — a typed client over the Lumenqraph REST + GraphQL
  * API. Zero runtime dependencies: it uses the platform `fetch` (Node 18+ or the
@@ -109,12 +111,7 @@ export interface ContractsResponse {
  * Uniform keyset-paginated envelope returned by every REST list endpoint.
  * Pass `next_cursor` as `after` to fetch the next page.
  */
-export interface ListPage<T> {
-  data: T[];
-  has_more: boolean;
-  /** Pass as `after` on the next call. `null` on the last page. */
-  next_cursor: string | null;
-}
+export type ListPage<T> = components["schemas"]["PageMeta"] & { data: T[] };
 
 export type EventsResponse = ListPage<EventRecord>;
 
@@ -250,6 +247,28 @@ export interface UpdateWebhookOptions {
   url?: string;
   subscriptions?: string[];
   active?: boolean;
+}
+
+export interface RedriveWebhookOptions extends RequestOptions {
+  since?: string;
+}
+
+export interface RotateWebhookSecretOptions extends RequestOptions {
+  graceSeconds?: number;
+}
+
+export interface RedriveWebhookResponse {
+  redriven: number;
+}
+
+export interface ReenableWebhookResponse {
+  reenabled: true;
+}
+
+export interface RotatedWebhookSecret {
+  id: string;
+  secret: string;
+  previous_secret_expires_at: string;
 }
 
 /** A Relay-style page returned by the GraphQL cursor connections. */
@@ -629,6 +648,36 @@ export class LumenqraphClient {
     }, opts.signal);
   }
 
+  /** Reset failed webhook deliveries to pending, optionally from a timestamp. */
+  redriveWebhook(
+    id: string,
+    opts: RedriveWebhookOptions = {},
+  ): Promise<RedriveWebhookResponse> {
+    return this.post(
+      `/webhooks/${enc(id)}/redrive`,
+      undefined,
+      opts.signal,
+      { since: opts.since },
+    );
+  }
+
+  /** Clear an auto-disable and reactivate a webhook subscription. */
+  reenableWebhook(id: string, opts: RequestOptions = {}): Promise<ReenableWebhookResponse> {
+    return this.post(`/webhooks/${enc(id)}/reenable`, undefined, opts.signal);
+  }
+
+  /** Rotate a webhook signing secret, retaining the previous one for a grace period. */
+  rotateWebhookSecret(
+    id: string,
+    opts: RotateWebhookSecretOptions = {},
+  ): Promise<RotatedWebhookSecret> {
+    return this.post(
+      `/webhooks/${enc(id)}/rotate-secret`,
+      opts.graceSeconds === undefined ? undefined : { grace_seconds: opts.graceSeconds },
+      opts.signal,
+    );
+  }
+
   /** List delivery attempts for a webhook, newest first (cursor via `after`). */
   listDeliveries(
     id: string,
@@ -894,8 +943,17 @@ export class LumenqraphClient {
     return this.request<T>(url.toString(), { method: "GET" }, signal);
   }
 
-  private post<T = Json>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
-    return this.request<T>(this.baseUrl + path, {
+  private post<T = Json>(
+    path: string,
+    body: unknown,
+    signal?: AbortSignal,
+    query: Record<string, unknown> = {},
+  ): Promise<T> {
+    const url = new URL(this.baseUrl + path);
+    for (const [key, value] of Object.entries(query)) {
+      if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+    }
+    return this.request<T>(url.toString(), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),

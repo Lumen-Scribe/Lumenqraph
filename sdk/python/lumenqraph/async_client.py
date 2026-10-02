@@ -338,6 +338,25 @@ class AsyncLumenqraphClient:
             ),
         )
 
+    async def redrive_webhook(
+        self, webhook_id: str, since: Optional[str] = None
+    ) -> Dict[str, int]:
+        """Reset failed webhook deliveries to pending, optionally from a timestamp."""
+        return await self._request(
+            "POST", f"/webhooks/{webhook_id}/redrive", {"since": since}
+        )
+
+    async def reenable_webhook(self, webhook_id: str) -> Dict[str, bool]:
+        """Clear an auto-disable and reactivate a webhook subscription."""
+        return await self._post(f"/webhooks/{webhook_id}/reenable")
+
+    async def rotate_webhook_secret(
+        self, webhook_id: str, grace_seconds: Optional[int] = None
+    ) -> Dict[str, str]:
+        """Rotate a webhook secret and return its grace-period expiry."""
+        body = {"grace_seconds": grace_seconds} if grace_seconds is not None else None
+        return await self._post(f"/webhooks/{webhook_id}/rotate-secret", body)
+
     async def list_functions(self, contract_id: str) -> Dict[str, Any]:
         """Get a contract's callable view functions and their typed signatures."""
         return await self._get(f"/contracts/{contract_id}/functions")

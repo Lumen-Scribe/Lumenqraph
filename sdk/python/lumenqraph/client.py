@@ -321,6 +321,22 @@ class LumenqraphClient:
             limit, offset, after,
             {"include_summary": "true" if include_summary else None}))
 
+    def redrive_webhook(self, webhook_id: str,
+                        since: Optional[str] = None) -> Dict[str, int]:
+        """Reset failed webhook deliveries to pending, optionally from a timestamp."""
+        return self._make_request("POST", f"/webhooks/{webhook_id}/redrive",
+                                  {"since": since})
+
+    def reenable_webhook(self, webhook_id: str) -> Dict[str, bool]:
+        """Clear an auto-disable and reactivate a webhook subscription."""
+        return self._post(f"/webhooks/{webhook_id}/reenable")
+
+    def rotate_webhook_secret(self, webhook_id: str,
+                              grace_seconds: Optional[int] = None) -> Dict[str, str]:
+        """Rotate a webhook secret and return its grace-period expiry."""
+        body = {"grace_seconds": grace_seconds} if grace_seconds is not None else None
+        return self._post(f"/webhooks/{webhook_id}/rotate-secret", body)
+
     def _paginate(self, path: str, query: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
         """Follow ``next_cursor`` until ``has_more`` is false."""
         after: Optional[str] = None

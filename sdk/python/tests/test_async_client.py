@@ -104,6 +104,41 @@ class TestAsyncClientPagination(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(events), 1)
 
 
+class TestAsyncWebhookLifecycle(unittest.IsolatedAsyncioTestCase):
+    """Webhook lifecycle methods issue the expected async requests."""
+
+    async def test_webhook_lifecycle_calls(self):
+        calls = []
+
+        async def mock_request(method, path, query=None, body=None):
+            calls.append((method, path, query, body))
+            if path.endswith("/redrive"):
+                return {"redriven": 1}
+            if path.endswith("/reenable"):
+                return {"reenabled": True}
+            return {
+                "id": "wh-1",
+                "secret": "new-secret",
+                "previous_secret_expires_at": "2026-01-02T00:00:00Z",
+            }
+
+        client = AsyncLumenqraphClient(base_url="http://test")
+        with patch.object(client, "_request", side_effect=mock_request):
+            self.assertEqual(
+                await client.redrive_webhook("wh-1", "2026-01-01T00:00:00Z"),
+                {"redriven": 1},
+            )
+            self.assertEqual(await client.reenable_webhook("wh-1"), {"reenabled": True})
+            rotated = await client.rotate_webhook_secret("wh-1", 60)
+
+        self.assertEqual(rotated["secret"], "new-secret")
+        self.assertEqual(calls[0], (
+            "POST", "/webhooks/wh-1/redrive", {"since": "2026-01-01T00:00:00Z"}, None
+        ))
+        self.assertEqual(calls[1][1], "/webhooks/wh-1/reenable")
+        self.assertEqual(calls[2][3], {"grace_seconds": 60})
+
+
 class TestAsyncClientErrors(unittest.IsolatedAsyncioTestCase):
     """Verify error propagation from the underlying sync request."""
 
