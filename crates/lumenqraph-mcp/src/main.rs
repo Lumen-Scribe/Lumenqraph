@@ -45,6 +45,7 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025
 pub struct State {
     pub pool: PgPool,
     pub rpc: RpcClient,
+    pub rpc_limiter: rpc::RpcRateLimiter,
     pub auth_token: Option<String>,
 }
 
@@ -64,6 +65,11 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(30);
+    let rpc_rate_limit_per_min: usize = std::env::var("MCP_RPC_RATE_LIMIT_PER_MIN")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(60);
+    let auth_token = std::env::var("MCP_AUTH_TOKEN").ok();
 
     // Validate CONTRACT_IDS at startup so a misconfigured address is caught
     // immediately rather than silently ignored.
@@ -81,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
     let state = State {
         pool,
         rpc: RpcClient::new(rpc_url, rpc_timeout_secs),
+        rpc_limiter: rpc::RpcRateLimiter::new(rpc_rate_limit_per_min),
         auth_token,
     };
 
@@ -308,10 +315,14 @@ async fn handle_tools_call(state: &State, id: Option<Value>, msg: &Value) -> Val
 
 fn tool_content(payload: &Value, is_error: bool) -> Value {
     let text = serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string());
-    json!({
+    let mut out = json!({
         "content": [ { "type": "text", "text": text } ],
         "isError": is_error,
-    })
+    });
+    if !payload.is_null() {
+        out["structuredContent"] = payload.clone();
+    }
+    out
 }
 
 fn result_response(id: Option<Value>, result: Value) -> Value {
@@ -365,6 +376,10 @@ mod tests {
                 "get_contract_state",
                 "get_contract_data",
                 "query_events",
+                "get_event",
+                "get_transaction_events",
+                "get_contract_stats",
+                "list_contract_functions",
                 "call_contract",
                 "simulate_call",
                 "query_transfers",
@@ -377,7 +392,11 @@ mod tests {
         for t in defs.as_array().unwrap() {
             assert_eq!(
                 t["inputSchema"]["type"], "object",
-                "each tool needs a schema"
+                "each tool needs an input schema"
+            );
+            assert_eq!(
+                t["outputSchema"]["type"], "object",
+                "each tool needs an output schema"
             );
             assert!(!t["description"].as_str().unwrap().is_empty());
         }
@@ -388,6 +407,7 @@ mod tests {
         let ok = tool_content(&json!({ "x": 1 }), false);
         assert_eq!(ok["isError"], false);
         assert_eq!(ok["content"][0]["type"], "text");
+        assert_eq!(ok["structuredContent"]["x"], 1);
         assert_eq!(tool_content(&json!({}), true)["isError"], true);
     }
 
@@ -415,6 +435,7 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
         };
         let resp = handle(&state, msg, true).await;
@@ -429,6 +450,7 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
         };
         let msg = json!({ "jsonrpc": "2.0", "id": 1, "method": "unknown/method" });
@@ -445,6 +467,7 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
         };
         let msg = json!({ "jsonrpc": "2.0", "id": 42, "method": "ping" });
@@ -463,6 +486,7 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: Some("secret123".to_string()),
         };
         let msg = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} });
@@ -483,6 +507,7 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: Some("secret123".to_string()),
         };
         let msg = json!({
@@ -504,13 +529,14 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
         };
         let msg = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
         let (resp, _) = handle(&state, msg, true).await.unwrap();
         assert_eq!(resp["id"], 2);
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 13, "all thirteen tools must be declared");
+        assert_eq!(tools.len(), 17, "all declared MCP tools must be present");
         for tool in tools {
             // Every tool must have a non-empty name, description, and an object schema.
             assert!(!tool["name"].as_str().unwrap_or("").is_empty());
@@ -535,6 +561,7 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
         };
         let msg = json!({
@@ -611,6 +638,7 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
         };
         let msg = json!({
@@ -660,6 +688,7 @@ mod tests {
         State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
         }
     }
@@ -741,6 +770,8 @@ mod protocol_tests {
         State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            rpc_limiter: rpc::RpcRateLimiter::new(60),
+            auth_token: None,
         }
     }
 

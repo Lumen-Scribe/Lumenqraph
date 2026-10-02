@@ -1,9 +1,39 @@
 //! Minimal Soroban RPC client: just `simulateTransaction`, for the
 //! `call_contract` tool's read-only view calls.
 
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
+
+#[derive(Clone, Default)]
+pub struct RpcRateLimiter {
+    limit_per_min: usize,
+    recent: Arc<Mutex<VecDeque<Instant>>>,
+}
+
+impl RpcRateLimiter {
+    pub fn new(limit_per_min: usize) -> Self {
+        Self {
+            limit_per_min: limit_per_min.max(1),
+            recent: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    pub fn try_consume(&self) -> bool {
+        let mut recent: MutexGuard<'_, VecDeque<Instant>> = self.recent.lock().unwrap();
+        let now = Instant::now();
+        recent.retain(|ts| now.duration_since(*ts) < Duration::from_secs(60));
+
+        if recent.len() >= self.limit_per_min {
+            return false;
+        }
+
+        recent.push_back(now);
+        true
+    }
+}
 
 #[derive(Clone)]
 pub struct RpcClient {
