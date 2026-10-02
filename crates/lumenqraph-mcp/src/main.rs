@@ -20,6 +20,14 @@ mod rpc;
 mod tools;
 
 use anyhow::Context;
+use axum::{
+    body::Body,
+    extract::State as AxumState,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -31,6 +39,7 @@ use rpc::RpcClient;
 
 /// Latest MCP protocol revision we default to when a client sends none.
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 
 #[derive(Clone)]
 pub struct State {
@@ -68,11 +77,16 @@ async fn main() -> anyhow::Result<()> {
         .connect(&database_url)
         .await
         .context("failed to connect to Postgres")?;
+    let auth_token = std::env::var("MCP_AUTH_TOKEN").ok();
     let state = State {
         pool,
         rpc: RpcClient::new(rpc_url, rpc_timeout_secs),
         auth_token,
     };
+
+    if let Ok(http_bind) = std::env::var("MCP_HTTP_BIND") {
+        return serve_http(state, http_bind).await;
+    }
 
     info!("lumenqraph MCP server ready (stdio)");
     serve(state).await
@@ -81,6 +95,50 @@ async fn main() -> anyhow::Result<()> {
 /// The stdio JSON-RPC loop: read a message per line, dispatch, write responses.
 async fn serve(state: State) -> anyhow::Result<()> {
     serve_io(state, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+async fn serve_http(state: State, bind: String) -> anyhow::Result<()> {
+    let app = Router::new()
+        .route("/mcp", post(handle_http_request))
+        .route("/healthz", get(|| async { "ok" }))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    info!(bind = %bind, "lumenqraph MCP server ready (streamable HTTP)");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn handle_http_request(
+    AxumState(state): AxumState<State>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid JSON-RPC body").into_response(),
+    };
+
+    let mut msg: Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid JSON body").into_response(),
+    };
+
+    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        msg["authorization"] = Value::String(auth.to_string());
+    }
+
+    let authenticated = state.auth_token.as_ref().map_or(true, |token| {
+        msg.get("authorization")
+            .and_then(Value::as_str)
+            .map(|value| value.strip_prefix("Bearer ").unwrap_or(value).trim() == token)
+            .unwrap_or(false)
+    });
+
+    match handle(&state, msg, authenticated).await {
+        Some((resp, _)) => Json(resp).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
 }
 
 /// Protocol loop over any `AsyncRead` / `AsyncWrite` pair (stdin/stdout in
@@ -104,7 +162,11 @@ where
                 continue;
             }
         };
-        if let Some(response) = handle(&state, msg).await {
+        let authenticated = state
+            .auth_token
+            .as_ref()
+            .map_or(true, |token| check_auth(&msg, token));
+        if let Some((response, _)) = handle(&state, msg, authenticated).await {
             write_to(&mut out, &response).await?;
         }
     }
@@ -207,11 +269,16 @@ async fn handle(state: &State, msg: Value, authenticated: bool) -> Option<(Value
 }
 
 fn initialize_result(msg: &Value) -> Value {
-    let protocol_version = msg
+    let requested = msg
         .get("params")
         .and_then(|p| p.get("protocolVersion"))
         .and_then(Value::as_str)
         .unwrap_or(DEFAULT_PROTOCOL_VERSION);
+    let protocol_version = if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) {
+        requested
+    } else {
+        SUPPORTED_PROTOCOL_VERSIONS.last().copied().unwrap_or(DEFAULT_PROTOCOL_VERSION)
+    };
     json!({
         "protocolVersion": protocol_version,
         "capabilities": { "tools": {} },
@@ -260,10 +327,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn initialize_echoes_client_protocol_version() {
-        let req = json!({ "params": { "protocolVersion": "2025-06-18" } });
-        assert_eq!(initialize_result(&req)["protocolVersion"], "2025-06-18");
-        // Falls back when the client omits it.
+    fn initialize_negotiates_supported_protocol_versions() {
+        let supported = json!({ "params": { "protocolVersion": "2025-06-18" } });
+        assert_eq!(initialize_result(&supported)["protocolVersion"], "2025-06-18");
+
+        let unsupported = json!({ "params": { "protocolVersion": "2027-01-01" } });
+        assert_eq!(initialize_result(&unsupported)["protocolVersion"], "2025-06-18");
+
         assert_eq!(
             initialize_result(&json!({}))["protocolVersion"],
             DEFAULT_PROTOCOL_VERSION

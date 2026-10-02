@@ -219,11 +219,19 @@ pub struct WebhookSubscription {
     /// What this subscription fires on: `"event"` (an indexed contract event) or
     /// `"upgrade"` (the contract's on-chain interface changed).
     pub kind: WebhookSubscriptionKind,
-    /// Filter: only events from this contract (None = any).
+    /// Legacy single-contract filter retained for compatibility.
     pub contract_id: Option<String>,
-    /// Filter: only events with this name (None = any). Ignored by `upgrade`
-    /// subscriptions, which aren't scoped to an event.
+    /// Legacy single-event filter retained for compatibility.
     pub event_name: Option<String>,
+    /// New multi-contract filter: empty means "all contracts".
+    #[serde(default)]
+    pub contract_ids: Option<Vec<String>>,
+    /// New multi-event filter: empty means "all events".
+    #[serde(default)]
+    pub event_names: Option<Vec<String>>,
+    /// Structured JSON filter applied against enriched payloads and decoded topics.
+    #[serde(default)]
+    pub filter: Option<Value>,
     pub active: bool,
     pub created_at: DateTime<Utc>,
 }
