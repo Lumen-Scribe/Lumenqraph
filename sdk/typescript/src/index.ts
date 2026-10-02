@@ -514,6 +514,86 @@ export class LumenqraphClient {
     }, opts.signal);
   }
 
+  /** Stream new contract events, reconnecting from the last received event. */
+  async *streamEvents(
+    contractId: string,
+    opts: { eventName?: string; cursor?: string | number; signal?: AbortSignal } = {},
+  ): AsyncGenerator<EventRecord> {
+    const params = new URLSearchParams();
+    if (opts.eventName) params.set("event_name", opts.eventName);
+
+    let lastEventId: string | undefined;
+    if (opts.cursor !== undefined) {
+      const cursor = String(opts.cursor);
+      const compositeCursor = /^(\d+):(.*)$/.exec(cursor);
+      if (compositeCursor) {
+        params.set("cursor", compositeCursor[1]!);
+        params.set("cursor_event_id", compositeCursor[2]!);
+        lastEventId = cursor;
+      } else {
+        params.set("cursor", cursor);
+      }
+    }
+
+    const query = params.toString();
+    const url = `${this.baseUrl}/contracts/${enc(contractId)}/events/stream${query ? `?${query}` : ""}`;
+    let attempt = 0;
+
+    while (!opts.signal?.aborted) {
+      try {
+        const headers = new Headers({ accept: "text/event-stream" });
+        if (this.apiKey) headers.set("x-api-key", this.apiKey);
+        if (lastEventId) headers.set("last-event-id", lastEventId);
+
+        const response = await this.doFetch(url, {
+          headers,
+          signal: opts.signal,
+        });
+
+        if (!response.ok) {
+          const text = await response.text();
+          const body = text ? safeJson(text) : null;
+          if (RETRYABLE_STATUSES.has(response.status)) {
+            await sleepWithSignal(streamRetryDelay(attempt), opts.signal);
+            attempt++;
+            continue;
+          }
+          const message =
+            (body as { error?: string } | null)?.error ??
+            `${response.status} ${response.statusText}`;
+          throw new LumenqraphError(message, response.status, body ?? text);
+        }
+
+        if (!response.body) throw new Error("SSE response has no body");
+
+        for await (const frame of parseSseFrames(response.body)) {
+          if (frame.id !== undefined) lastEventId = frame.id || undefined;
+          if (frame.data === undefined) continue;
+
+          const payload = JSON.parse(frame.data) as { data?: EventRecord } | EventRecord;
+          const event =
+            typeof payload === "object" && payload !== null && "data" in payload
+              ? payload.data
+              : payload;
+          if (event) {
+            yield event as EventRecord;
+          }
+        }
+
+        if (opts.signal?.aborted) throw abortError();
+        await sleepWithSignal(streamRetryDelay(attempt), opts.signal);
+        attempt++;
+      } catch (error) {
+        if (opts.signal?.aborted) throw abortError();
+        if (error instanceof LumenqraphError) throw error;
+        await sleepWithSignal(streamRetryDelay(attempt), opts.signal);
+        attempt++;
+      }
+    }
+
+    throw abortError();
+  }
+
   /** Fetch a single event by its unique ID. */
   getEvent(eventId: string, opts: RequestOptions = {}): Promise<EventRecord> {
     return this.get(`/events/${enc(eventId)}`, {}, opts.signal);
@@ -1269,6 +1349,111 @@ function retryAfterMs(res: Response): number | undefined {
   }
 
   return undefined;
+}
+
+interface SseFrame {
+  id?: string;
+  data?: string;
+}
+
+async function* parseSseFrames(
+  body: ReadableStream<Uint8Array>,
+): AsyncGenerator<SseFrame> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let data: string[] = [];
+  let eventId: string | undefined;
+  let lastEventId: string | undefined;
+  let complete = false;
+
+  const processLine = (line: string): SseFrame | undefined => {
+    if (!line) {
+      if (eventId !== undefined) lastEventId = eventId;
+      const frame = data.length > 0 || eventId !== undefined
+        ? { id: lastEventId, data: data.length > 0 ? data.join("\n") : undefined }
+        : undefined;
+      data = [];
+      eventId = undefined;
+      return frame;
+    }
+
+    if (line.startsWith(":")) return undefined;
+    const colon = line.indexOf(":");
+    const field = colon < 0 ? line : line.slice(0, colon);
+    let value = colon < 0 ? "" : line.slice(colon + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+
+    if (field === "data") data.push(value);
+    if (field === "id" && !value.includes("\0")) eventId = value;
+    return undefined;
+  };
+
+  try {
+    for (;;) {
+      const result = await reader.read();
+      if (result.done) {
+        complete = true;
+        buffer += decoder.decode();
+      } else {
+        buffer += decoder.decode(result.value, { stream: true });
+      }
+
+      let start = 0;
+      for (let index = 0; index < buffer.length; index++) {
+        const character = buffer[index];
+        if (character !== "\n" && character !== "\r") continue;
+        if (character === "\r" && index === buffer.length - 1 && !complete) break;
+
+        const frame = processLine(buffer.slice(start, index));
+        if (frame) yield frame;
+        if (character === "\r" && buffer[index + 1] === "\n") index++;
+        start = index + 1;
+      }
+      buffer = buffer.slice(start);
+
+      if (complete) {
+        if (buffer) {
+          const frame = processLine(buffer);
+          if (frame) yield frame;
+        }
+        const frame = processLine("");
+        if (frame) yield frame;
+        return;
+      }
+    }
+  } finally {
+    if (!complete) await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+}
+
+function streamRetryDelay(attempt: number): number {
+  return Math.min(DEFAULT_MAX_DELAY_MS, DEFAULT_BASE_DELAY_MS * 2 ** Math.min(attempt, 16));
+}
+
+function sleepWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(abortError());
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(abortError());
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
+}
+
+function abortError(): Error {
+  const error = new Error("The operation was aborted");
+  error.name = "AbortError";
+  return error;
 }
 
 function sleep(ms: number): Promise<void> {
