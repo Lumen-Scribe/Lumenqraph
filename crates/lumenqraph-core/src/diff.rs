@@ -250,6 +250,172 @@ impl SpecDiff {
     }
 }
 
+/// Diff the event sections of two interfaces.
+///
+/// Events are compared by rendered signature (name, param names/types, param
+/// locations, and data format). A changed signature is normally
+/// [`Severity::Breaking`] — moving a param from topic to data, retyping it, or
+/// switching the body layout all break consumers. The one exception is adding
+/// new fields to a map-format event's data block: decoders that read only the
+/// named fields they know still work, so that is
+/// [`Severity::PotentiallyBreaking`].
+fn diff_events(old: &ContractSpec, new: &ContractSpec) -> SectionDiff {
+    let old_sigs = event_sigs(old);
+    let new_sigs = event_sigs(new);
+    let mut diff = diff_section(&old_sigs, &new_sigs);
+
+    // Reclassify map-format events that only gained data fields as
+    // potentially-breaking rather than breaking.
+    let mut still_changed = Vec::new();
+    for item in diff.changed.drain(..) {
+        if let (Some(before), Some(after)) = (find_event(old, &item.name), find_event(new, &item.name))
+        {
+            if let Some(description) = map_event_added_fields(before, after) {
+                diff.potentially_breaking.push(PotentiallyBreakingItem {
+                    name: item.name,
+                    from: item.from,
+                    to: item.to,
+                    severity: Severity::PotentiallyBreaking,
+                    description,
+                });
+                continue;
+            }
+        }
+        still_changed.push(item);
+    }
+    diff.changed = still_changed;
+    diff
+}
+
+fn find_event<'a>(
+    spec: &'a ContractSpec,
+    name: &str,
+) -> Option<&'a crate::spec::EventSpec> {
+    spec.events.iter().find(|e| e.name == name)
+}
+
+/// If `new` is `old` with only extra data-located params appended (and both are
+/// map-format events), return a description of the added fields. Otherwise
+/// return `None`, meaning the change is not a pure additive field addition.
+fn map_event_added_fields(
+    old: &crate::spec::EventSpec,
+    new: &crate::spec::EventSpec,
+) -> Option<String> {
+    if old.data_format != new.data_format {
+        return None;
+    }
+    // Only map-format events have named data fields that can be added safely.
+    if !format!("{}", new.data_format).eq_ignore_ascii_case("map") {
+        return None;
+    }
+    if new.params.len() <= old.params.len() {
+        return None;
+    }
+    // Every old param must be present, unchanged, at the same index.
+    for (o, n) in old.params.iter().zip(new.params.iter()) {
+        if o.name != n.name || o.type_name != n.type_name || o.location != n.location {
+            return None;
+        }
+    }
+    // The extra params must all be data-located.
+    let added: Vec<&str> = new.params[old.params.len()..]
+        .iter()
+        .map(|p| {
+            if !format!("{}", p.location).eq_ignore_ascii_case("data") {
+                return "";
+            }
+            p.name.as_str()
+        })
+        .collect();
+    if added.iter().any(|n| n.is_empty()) {
+        return None;
+    }
+    Some(format!("added field(s) {}", added.join(", ")))
+}
+
+/// Diff the user-defined type sections of two interfaces: structs, unions,
+/// regular enums, and error enums all share one namespace.
+///
+/// Removed types and changed signatures (including renumbered enum/error
+/// discriminants) are [`Severity::Breaking`]. Adding cases to an existing union
+/// or enum is [`Severity::PotentiallyBreaking`] (exhaustive decoders break).
+/// New types are [`Severity::Additive`].
+fn diff_types(old: &ContractSpec, new: &ContractSpec) -> SectionDiff {
+    let old_sigs = type_sigs(old);
+    let new_sigs = type_sigs(new);
+    let mut diff = diff_section(&old_sigs, &new_sigs);
+
+    // Reclassify changes that only added cases to an existing union/enum as
+    // potentially-breaking rather than breaking.
+    let mut still_changed = Vec::new();
+    for item in diff.changed.drain(..) {
+        if let Some(description) = added_cases_only(old, new, &item.name) {
+            diff.potentially_breaking.push(PotentiallyBreakingItem {
+                name: item.name,
+                from: item.from,
+                to: item.to,
+                severity: Severity::PotentiallyBreaking,
+                description,
+            });
+            continue;
+        }
+        still_changed.push(item);
+    }
+    diff.changed = still_changed;
+    diff
+}
+
+/// If the only difference between the old and new type named `name` is that
+/// cases were appended to a union or enum (existing cases unchanged), return a
+/// description of the added cases. Otherwise `None`.
+fn added_cases_only(old: &ContractSpec, new: &ContractSpec, name: &str) -> Option<String> {
+    // Union: existing cases unchanged, new cases appended.
+    if let (Some(o), Some(n)) = (
+        old.unions.iter().find(|u| u.name == name),
+        new.unions.iter().find(|u| u.name == name),
+    ) {
+        if n.cases.len() > o.cases.len() {
+            let same_prefix = o
+                .cases
+                .iter()
+                .zip(n.cases.iter())
+                .all(|(a, b)| a.name == b.name && a.type_names == b.type_names);
+            if same_prefix {
+                let added: Vec<&str> = n.cases[o.cases.len()..]
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect();
+                return Some(format!("added case(s) {}", added.join(", ")));
+            }
+        }
+        return None;
+    }
+
+    // Regular enum: existing cases unchanged, new cases appended.
+    if let (Some(o), Some(n)) = (
+        old.enums.iter().find(|e| e.name == name),
+        new.enums.iter().find(|e| e.name == name),
+    ) {
+        if n.cases.len() > o.cases.len() {
+            let same_prefix = o
+                .cases
+                .iter()
+                .zip(n.cases.iter())
+                .all(|(a, b)| a == b);
+            if same_prefix {
+                let added: Vec<&str> = n.cases[o.cases.len()..]
+                    .iter()
+                    .map(|(cname, _)| cname.as_str())
+                    .collect();
+                return Some(format!("added case(s) {}", added.join(", ")));
+            }
+        }
+        return None;
+    }
+
+    None
+}
+
 /// Compare two name-to-signature maps. Names are the identity: a name in both
 /// with a different signature is a *change*, not an add plus a remove.
 ///
@@ -1355,6 +1521,111 @@ mod tests {
         assert_eq!(d.events.removed.len(), 1);
         assert_eq!(d.events.added.len(), 1);
         assert_eq!(d.types.removed.len(), 1);
+    }
+
+    // ── #510/#511: single-category diffs and severity ─────────────────────────
+
+    /// A change that touches only an event must be reported in the events
+    /// section with the right severity, and nothing else.
+    #[test]
+    fn an_event_only_change_is_reported_with_correct_severity() {
+        let old = spec_of(&[
+            func("balance", &[], Some(ScSpecTypeDef::I128)),
+            event(
+                "transfer",
+                &[(
+                    "amount",
+                    ScSpecTypeDef::I128,
+                    ScSpecEventParamLocationV0::Data,
+                )],
+            ),
+        ]);
+        // Retype the event param — breaking.
+        let new = spec_of(&[
+            func("balance", &[], Some(ScSpecTypeDef::I128)),
+            event(
+                "transfer",
+                &[(
+                    "amount",
+                    ScSpecTypeDef::U128,
+                    ScSpecEventParamLocationV0::Data,
+                )],
+            ),
+        ]);
+        let d = SpecDiff::between(&old, &new);
+        assert!(d.functions.is_empty(), "functions must be untouched");
+        assert!(d.types.is_empty(), "types must be untouched");
+        assert_eq!(d.events.changed.len(), 1);
+        assert_eq!(d.events.changed[0].severity, Severity::Breaking);
+        assert!(d.breaking);
+        assert_eq!(d.max_severity, Severity::Breaking);
+    }
+
+    /// A change that touches only a UDT must be reported in the types section.
+    #[test]
+    fn a_udt_only_change_is_reported_with_correct_severity() {
+        use stellar_xdr::curr::{ScSpecUdtStructFieldV0, ScSpecUdtStructV0};
+
+        let make = |ty: ScSpecTypeDef| {
+            ScSpecEntry::UdtStructV0(ScSpecUdtStructV0 {
+                doc: "".try_into().unwrap(),
+                lib: "".try_into().unwrap(),
+                name: "Position".try_into().unwrap(),
+                fields: vec![ScSpecUdtStructFieldV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "amount".try_into().unwrap(),
+                    type_: ty,
+                }]
+                .try_into()
+                .unwrap(),
+            })
+        };
+
+        let old = spec_of(&[make(ScSpecTypeDef::I128)]);
+        let new = spec_of(&[make(ScSpecTypeDef::U128)]);
+        let d = SpecDiff::between(&old, &new);
+        assert!(d.functions.is_empty(), "functions must be untouched");
+        assert!(d.events.is_empty(), "events must be untouched");
+        assert_eq!(d.types.changed.len(), 1);
+        assert_eq!(d.types.changed[0].severity, Severity::Breaking);
+        assert!(d.breaking);
+        assert_eq!(d.max_severity, Severity::Breaking);
+    }
+
+    /// A change that touches only an error enum must be reported in the types
+    /// section with the right severity.
+    #[test]
+    fn an_error_enum_only_change_is_reported_with_correct_severity() {
+        use stellar_xdr::curr::{ScSpecUdtErrorEnumCaseV0, ScSpecUdtErrorEnumV0};
+
+        let make = |cases: &[(&str, u32)]| {
+            ScSpecEntry::UdtErrorEnumV0(ScSpecUdtErrorEnumV0 {
+                doc: "".try_into().unwrap(),
+                lib: "".try_into().unwrap(),
+                name: "ContractError".try_into().unwrap(),
+                cases: cases
+                    .iter()
+                    .map(|(n, v)| ScSpecUdtErrorEnumCaseV0 {
+                        doc: "".try_into().unwrap(),
+                        name: (*n).try_into().unwrap(),
+                        value: *v,
+                    })
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap(),
+            })
+        };
+
+        // Renumbering an error case is breaking.
+        let old = spec_of(&[make(&[("InsufficientBalance", 1), ("Unauthorized", 2)])]);
+        let new = spec_of(&[make(&[("InsufficientBalance", 1), ("Unauthorized", 3)])]);
+        let d = SpecDiff::between(&old, &new);
+        assert!(d.functions.is_empty(), "functions must be untouched");
+        assert!(d.events.is_empty(), "events must be untouched");
+        assert_eq!(d.types.changed.len(), 1);
+        assert_eq!(d.types.changed[0].severity, Severity::Breaking);
+        assert!(d.breaking);
+        assert_eq!(d.max_severity, Severity::Breaking);
     }
 
     // ── #403: error enum diffing ──────────────────────────────────────────────

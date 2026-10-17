@@ -197,8 +197,8 @@ jobs:
   # `python -m build` produces an sdist and a wheel from sdk/python, and
   # `twine check` verifies the package metadata (including the LICENSE file
   # referenced by pyproject.toml) is valid for upload.
-  python-sdk:
-    name: Python SDK (3.12)
+  python-sdk-build:
+    name: Python SDK Build (3.12)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -210,6 +210,15 @@ jobs:
         run: pip install build twine
       - name: Build sdist and wheel
         working-directory: sdk/python
+        run: python -m build
+      - name: Check package metadata
+        working-directory: sdk/python
+        run: twine check dist/*
+
+  # Lint, type-check and test the Python SDK across supported interpreters.
+  python-sdk-test:
+    name: Python SDK Test (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         python-version: ["3.8", "3.12"]
@@ -219,11 +228,28 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install package and dev dependencies
+        working-directory: sdk/python
         run: pip install -e ".[dev]"
       - name: Type-check (mypy)
+        working-directory: sdk/python
         run: mypy lumenqraph
       - name: Test
+        working-directory: sdk/python
         run: pytest -v
+
+  # Issue #528: PyYAML silently keeps the last of duplicate mapping keys, so a
+  # broken workflow (duplicate `steps:`, a step with no `run:`, undefined
+  # `steps.*` references) loads fine locally but is rejected by GitHub. Run
+  # actionlint to catch those before the workflow is pushed.
+  actionlint:
+    name: Workflow Lint (actionlint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Run actionlint
+        uses: docker://rhysd/actionlint:1.7.7@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9
+        with:
+          args: -color
 
   security-audit:
     name: Security Audit (cargo-audit)

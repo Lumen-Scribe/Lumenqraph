@@ -71,6 +71,14 @@ a write conflict on `webhook_deliveries` during migration `0008`.
 `BALANCE_KEY_DURABILITY`, `DATABASE_MAX_CONNECTIONS`, `DATABASE_MIN_CONNECTIONS`,
 `DATABASE_ACQUIRE_TIMEOUT_SECS`, `DATABASE_IDLE_TIMEOUT_SECS`.
 
+### Changed
+- **MSRV raised to Rust 1.85 (#532).** `Cargo.lock` now pins `zeroize 1.9.0`,
+  `uuid 1.23.4` and `proptest 1.11.0`, all of which require Rust 1.85
+  (`zeroize` also uses edition 2024). `rust-version` in `Cargo.toml`,
+  `rust-toolchain.toml` and the Docker builder image now all agree on 1.85,
+  so local builds, the MSRV CI job and the Docker image compile the lockfile.
+  Contributors on an older toolchain must upgrade (`rustup update 1.85`).
+
 ### Added
 - Keyset cursor pagination for REST `/events` and `/transfers` endpoints
 - Trailing re-scan mechanism for shallow reorg detection

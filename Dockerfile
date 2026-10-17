@@ -7,6 +7,9 @@
 # recompiles the workspace crates. BuildKit cache mounts keep the cargo
 # registry/git caches warm across builds (see cache-from/cache-to in CI).
 
+# The base image only needs to be new enough for rustup to install the pinned
+# channel from rust-toolchain.toml (currently 1.85); the floating `rust:1-slim`
+# tag satisfies that, and the builder below selects the exact pinned toolchain.
 FROM rust:1-slim@sha256:17d1ba895198f9934c6314ec5346a0d5115372f3243390c3d731e242f35c2f27 AS chef
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config \
