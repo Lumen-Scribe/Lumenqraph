@@ -50,6 +50,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: msrv
+      # Issue #523: fail fast with a clear message when the workspace
+      # manifest itself is broken, before any compilation starts.
+      - name: Validate workspace manifest
+        run: cargo metadata --format-version 1 >/dev/null
       - name: Build on MSRV
         run: cargo build --workspace --all-targets
       - name: Check on MSRV
