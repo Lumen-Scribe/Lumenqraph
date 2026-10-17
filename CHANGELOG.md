@@ -121,6 +121,94 @@ a write conflict on `webhook_deliveries` during migration `0008`.
   `_u256_hex` key must switch to reading the string value directly.
   ([#409](https://github.com/Lumen-Scribe/Lumenqraph/issues/409))
 
+### Summary of merged work since 0.1.0
+
+About 110 pull requests have merged since the `0.1.0` section was written
+(no release has been tagged yet; see [#542](https://github.com/Lumen-Scribe/Lumenqraph/issues/542)).
+Grouped by area, with the main PRs for each. Features marked *experimental*
+are incomplete on `main`; see the README roadmap and
+[docs/KNOWN_GAPS.md](docs/KNOWN_GAPS.md).
+
+- **Ingestion and indexer:** batch inserts and pool tuning (#167); resumable,
+  streaming backfill (#315, #319); configurable RPC timeout and per-call retry
+  with jitter (#173); leader lock, maintenance-command locking and CLI parsing
+  (#171, #484); ledger timestamp validation and parse-error tracking (#313,
+  #512); missed-ledger-range tracking (#479); multi-RPC failover via `RPC_URLS`
+  (#512); configurable per-key state templates (#169); token-transfer `kind`
+  (`mint`/`burn`/`clawback`) and numeric amounts (#186, #189, #320).
+- **Decoding and specs:** XDR recursion limit, Protocol 23 address types,
+  `SCV_ERROR` and 256-bit decoding (#504, #505); event-prefix matching, named
+  contract errors and severity levels (#502, #510, #511); spec caching,
+  validation and re-enrichment (#183, #311); parameter reordering detected as
+  a breaking change (#341); SAC detection and unsupported-type errors (#184,
+  #328).
+- **API:** keyset pagination on every list endpoint (#498); transaction and
+  single-event lookups, time-series stats and SDK generation endpoints (#161,
+  #479, #496); `POST /contracts/:id/refresh` (#333); interface-history pagination
+  (#343); CORS allowlist, body limits, request IDs and hardened shutdown
+  (#311, #319, #328, #495, #496); contract-ID extractor, typed config and a
+  hardened multi-network proxy (#499); SSE event streaming (*experimental*,
+  #161, #495, #497); materialized swap/NFT/liquidity endpoints (*experimental*, no
+  writer yet, #172).
+- **Security and rate limiting:** security hardening (#101, #310, #312,
+  #334); IP-based anonymous limits, separate RPC-route limits, per-IP
+  concurrency caps and an LRU key cache (#305, #506); token-bucket and sharded
+  rate limiters (#498); Redis rate-limit backend (*experimental*, #307);
+  audit log (#309, #485); credential redaction in logs (#327, #334).
+- **Webhooks:** delivery enhancements and atomic enqueue (#156, #182);
+  encrypted secrets at rest and plaintext-secret removal (#189, #307, #308,
+  #481, #485); SSRF protection and no redirects (#498, #500); auto-disable,
+  tri-state `PATCH`, re-enable, `GET /webhooks/:id`, delivery details and test
+  endpoint (#500, #501, #506); timestamped `t=…,v1=…` signatures, versioned
+  envelopes and atomic delivery claiming (#503); topic/param filters (#515);
+  delivery pruning (#485).
+- **MCP server:** auth, event tools, structured output and protocol
+  negotiation (#186, #334, #515, #516); integration guide (#185).
+- **SDKs:** TypeScript SDK retries, codegen types, webhook verification,
+  upgrade-watch endpoints, webhook lifecycle, analytics and authenticated SSE
+  (#165, #317, #324, #513, #514); Python SDK (#300) and PyPI publishing (#483).
+- **Database:** contract summaries with batched triggers (#314, #485); GIN
+  index, enum constraints and redundant-index cleanup (#481); migration
+  renumbering and per-test schema isolation (#483). Duplicate versions have
+  since reappeared ([#535](https://github.com/Lumen-Scribe/Lumenqraph/issues/535)).
+- **Operations and observability:** Grafana dashboard and Prometheus alerts
+  (#158); queue-depth, enrichment and call-cache metrics (#311, #316,
+  #324); build info in `/health` (#340); seed data and scripts (#171, #335,
+  #342); Render and Fly configs (#321).
+- **CI and tooling:** coverage, Dependabot, Docker/GHCR, npm and PyPI
+  publishing (#164, #174, #181, #483); action SHA pinning (#480); scheduled
+  E2E test (#164); OpenAPI drift check (#314).
+- **Documentation:** README/API drift fixes, upgrade guide, migration
+  workflow, multi-network, webhooks, schema and security docs (#168, #170,
+  #306, #322, #339).
+
+### Added (CI and process)
+- **#475 — Migration lock-safety lint.** CI lints new and changed migrations
+  with [squawk](https://squawkhq.com) (`migration-lint` job,
+  `.squawk.toml`, `scripts/lint_migrations.sh`, `make migrations-lint`) and
+  fails on table-locking DDL such as non-concurrent index builds and
+  constraints without `NOT VALID`; `-- squawk-ignore <rule>` opts out.
+  `docs/MIGRATIONS.md` documents lock-safe patterns, the `-- no-transaction`
+  convention for concurrent indexes, and how to pre-build the indexes from
+  `0010`/`0016` before upgrading a populated instance.
+  ([#475](https://github.com/Lumen-Scribe/Lumenqraph/issues/475))
+- **#476 — Definition of done.** `CONTRIBUTING.md` requires a behaviour-level
+  test, green CI and updated docs before an issue is closed, and the PR
+  template has a "Test proving the fix" field. `docs/KNOWN_GAPS.md` links each
+  closed-but-unfixed issue to its open tracking issue.
+  ([#476](https://github.com/Lumen-Scribe/Lumenqraph/issues/476))
+
+### Fixed (CI and docs)
+- **#488 — Scheduled E2E test never ran.** It pinned
+  `docker/setup-buildx-action` to a SHA that doesn't exist, so every run failed
+  at job setup. It now uses the verified v4 pin, with a timeout long enough for
+  a cold release build. ([#488](https://github.com/Lumen-Scribe/Lumenqraph/issues/488))
+- **#477 — README roadmap and features match the code.** The roadmap is split
+  into shipped, experimental and planned, with tracking issues; the Features
+  table covers webhooks signing, SSE, stats, the audit log, the Python SDK and
+  monitoring; and Known limitations are current.
+  ([#477](https://github.com/Lumen-Scribe/Lumenqraph/issues/477))
+
 ## [0.1.0] - Initial Release
 
 ### Migration notes

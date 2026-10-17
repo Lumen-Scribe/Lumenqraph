@@ -33,6 +33,44 @@ jobs:
             exit 1
           fi
 
+  # Issue #475: lint new or changed migrations with squawk so table-locking
+  # DDL (non-concurrent index builds, constraints without NOT VALID, column
+  # rewrites, …) can't reach `main` unreviewed. Intentional cases opt out with
+  # a `-- squawk-ignore <rule>` comment. See docs/MIGRATIONS.md.
+  migration-lint:
+    name: Migration Lock-Safety Lint
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    env:
+      SQUAWK_VERSION: "2.67.0"
+      SQUAWK_SHA256: "03efe0e666b63bf33e2493693ee0aa9dbed07cbdcd20f7a8292245c1da9d790a"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Install squawk
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/squawk" \
+            "https://github.com/sbdchd/squawk/releases/download/v${SQUAWK_VERSION}/squawk-linux-x64"
+          echo "${SQUAWK_SHA256}  $RUNNER_TEMP/squawk" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/squawk"
+          "$RUNNER_TEMP/squawk" --version
+      - name: Lint changed migrations
+        env:
+          SQUAWK: ${{ runner.temp }}/squawk
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="origin/$BASE_REF"
+          elif [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            base="$BEFORE_SHA"
+          else
+            base="HEAD~1"
+          fi
+          bash scripts/lint_migrations.sh "$base"
+
   # Verify MSRV declared in Cargo.toml
   msrv-check:
     name: MSRV Check

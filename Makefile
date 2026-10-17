@@ -1,4 +1,4 @@
-.PHONY: help db db-down seed build test test-db test-smoke fmt lint indexer api webhooks backfill up down mcp sdk-ts sdk-py openapi-check deny audit dashboards-check ci
+.PHONY: help db db-down seed build test test-db test-smoke fmt lint indexer api webhooks backfill up down mcp sdk-ts sdk-py openapi-check deny audit dashboards-check migrations-lint ci
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -81,6 +81,9 @@ audit: ## Run cargo-audit for known vulnerabilities
 
 dashboards-check: ## Validate dashboard metric definitions
 	python3 scripts/validate_dashboards.py
+
+migrations-lint: ## Lint migrations changed vs origin/main for lock-unsafe DDL (needs squawk)
+	bash scripts/lint_migrations.sh
 
 ci: fmt lint test sdk-ts sdk-py openapi-check deny ## Run the same checks as CI (minus network-dependent E2E)
 

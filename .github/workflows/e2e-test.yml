@@ -16,12 +16,18 @@ jobs:
   e2e-test:
     name: Full Stack E2E Test
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # A cold `docker compose up --build` compiles the whole workspace in
+    # release mode (no layer cache on a fresh runner), which alone takes
+    # longer than the old 15-minute budget.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      # #488: the previous pin (885d146…, "v3") does not exist upstream, so the
+      # job failed at "Set up job" on every run. Use the same verified v4 pin
+      # as docker.yml and docker-publish.yml.
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@885d1462b5b1c5ae1b325e8c8ce65d60825e4ee8 # v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Generate webhook encryption key
         run: |
