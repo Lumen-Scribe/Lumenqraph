@@ -152,8 +152,9 @@ git clone https://github.com/Lumen-Scribe/Lumenqraph.git
 cd Lumenqraph
 cp .env.example .env                 # defaults target Stellar testnet
 
-docker compose up -d                 # local Postgres
-cargo run -p lumenqraph-indexer      # polls RPC + auto-applies migrations
+docker compose up -d                 # local Postgres (bound to 127.0.0.1)
+cargo run -p lumenqraph-indexer -- migrate   # apply database migrations
+cargo run -p lumenqraph-indexer      # polls RPC (separate shell)
 cargo run -p lumenqraph-api          # REST API on :8080 (separate shell)
 cargo run -p lumenqraph-webhooks     # optional: webhook delivery (separate shell)
 ```
@@ -171,6 +172,8 @@ curl localhost:8080/metrics
 To run the entire stack (Postgres + all three services) in Docker:
 
 ```bash
+export POSTGRES_PASSWORD=$(openssl rand -hex 16)      # required
+export WEBHOOK_ENCRYPTION_KEY=$(openssl rand -hex 32)
 docker compose -f docker-compose.full.yml up --build
 ```
 

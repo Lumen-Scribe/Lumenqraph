@@ -1,9 +1,21 @@
 # Full local stack: Postgres + all three services, built from the Dockerfile.
 # For dev with only Postgres, use docker-compose.yml instead.
 #
-# IMPORTANT: Set WEBHOOK_ENCRYPTION_KEY in your environment before starting:
+# IMPORTANT: Set POSTGRES_PASSWORD and WEBHOOK_ENCRYPTION_KEY in your
+# environment (or in .env next to this file) before starting:
+#   export POSTGRES_PASSWORD=$(openssl rand -hex 16)
 #   export WEBHOOK_ENCRYPTION_KEY=$(openssl rand -hex 32)
 #   docker compose -f docker-compose.full.yml up --build
+# POSTGRES_PASSWORD is embedded in the services' DATABASE_URL, so keep it
+# URL-safe (hex is). Compose refuses to start without it.
+#
+# Postgres is published on 127.0.0.1 only, so psql works from this host but
+# the database is never reachable from other machines. Docker's published ports
+# bypass host firewalls such as ufw — do not change this to "5432:5432" on a
+# server. The services talk to Postgres over the compose network.
+#
+# Migrations run once in the `migrate` service; the other services start only
+# after it exits successfully, and refuse to start if the schema is behind.
 #
 # Optional: set GIT_COMMIT and BUILD_TIME for accurate /health build info:
 #   export GIT_COMMIT=$(git rev-parse --short HEAD)
@@ -14,10 +26,10 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: lumenqraph
-      POSTGRES_PASSWORD: lumenqraph
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
       POSTGRES_DB: lumenqraph
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -26,6 +38,23 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
+
+  # One-shot schema step: applies migrations, then exits. Every other service
+  # waits for it to complete successfully.
+  migrate:
+    build:
+      context: .
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-}
+        BUILD_TIME: ${BUILD_TIME:-}
+    command: ["lumenqraph-indexer", "migrate"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://lumenqraph:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/lumenqraph
+      RUST_LOG: ${RUST_LOG:-info}
 
   indexer:
     build:
@@ -36,10 +65,11 @@ services:
     command: ["lumenqraph-indexer"]
     restart: unless-stopped
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
-      DATABASE_URL: postgres://lumenqraph:lumenqraph@postgres:5432/lumenqraph
+      DATABASE_URL: postgres://lumenqraph:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/lumenqraph
+      SKIP_MIGRATIONS: "true"
       RPC_URL: ${RPC_URL:-https://soroban-testnet.stellar.org}
       CONTRACT_IDS: ${CONTRACT_IDS:-}
       POLL_INTERVAL_SECS: ${POLL_INTERVAL_SECS:-5}
@@ -54,12 +84,12 @@ services:
     command: ["lumenqraph-api"]
     restart: unless-stopped
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     ports:
       - "8080:8080"
     environment:
-      DATABASE_URL: postgres://lumenqraph:lumenqraph@postgres:5432/lumenqraph
+      DATABASE_URL: postgres://lumenqraph:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/lumenqraph
       API_BIND_ADDR: 0.0.0.0:8080
       REQUIRE_API_KEY: ${REQUIRE_API_KEY:-false}
       ANON_RATE_LIMIT_PER_MIN: ${ANON_RATE_LIMIT_PER_MIN:-60}
@@ -81,10 +111,10 @@ services:
     command: ["lumenqraph-webhooks"]
     restart: unless-stopped
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
-      DATABASE_URL: postgres://lumenqraph:lumenqraph@postgres:5432/lumenqraph
+      DATABASE_URL: postgres://lumenqraph:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/lumenqraph
       WEBHOOK_ENCRYPTION_KEY: ${WEBHOOK_ENCRYPTION_KEY}
       RUST_LOG: ${RUST_LOG:-info}
 

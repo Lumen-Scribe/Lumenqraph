@@ -201,6 +201,17 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = connect_with_retry(&config.database_url, &config.db).await?;
 
+    // Migrations are applied by `lumenqraph-indexer migrate`, not here. Refuse
+    // to serve against a schema older than this binary instead of answering
+    // with 500s for missing tables (#473).
+    match lumenqraph_core::schema::check(&pool).await? {
+        lumenqraph_core::schema::SchemaStatus::Current => {}
+        lumenqraph_core::schema::SchemaStatus::Ahead { unknown_versions } => tracing::warn!(
+            ?unknown_versions,
+            "database schema is newer than this binary (rolling upgrade in progress?)"
+        ),
+    }
+
     let call_cache = Arc::new(CallCache::new(
         config.call_cache_max_entries,
         config.call_cache_ttl_secs,

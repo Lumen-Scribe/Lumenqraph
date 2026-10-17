@@ -4,16 +4,22 @@
 # IMPORTANT: Set WEBHOOK_ENCRYPTION_KEY in your environment before starting services.
 # Generate with: openssl rand -hex 32
 # The API and webhooks services will refuse to start without this variable.
+#
+# Postgres is published on 127.0.0.1 only. Docker's published ports bypass host
+# firewalls such as ufw, so never publish it on all interfaces on a server.
+# The password defaults to `lumenqraph` for local development only; set
+# POSTGRES_PASSWORD (and update DATABASE_URL to match) anywhere else. It only
+# takes effect when the data directory is first initialised.
 services:
   postgres:
     image: postgres:16-alpine
     container_name: lumenqraph-postgres
     environment:
       POSTGRES_USER: lumenqraph
-      POSTGRES_PASSWORD: lumenqraph
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lumenqraph}
       POSTGRES_DB: lumenqraph
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - ./.pgdata:/var/lib/postgresql/data
     healthcheck:

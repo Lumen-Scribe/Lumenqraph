@@ -23,9 +23,11 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@885d1462b5b1c5ae1b325e8c8ce65d60825e4ee8 # v3
 
-      - name: Generate webhook encryption key
+      - name: Generate webhook encryption key and Postgres password
         run: |
           echo "WEBHOOK_ENCRYPTION_KEY=$(openssl rand -hex 32)" >> $GITHUB_ENV
+          # docker-compose.full.yml requires an operator-supplied password.
+          echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)" >> $GITHUB_ENV
 
       - name: Check testnet reachability
         id: testnet

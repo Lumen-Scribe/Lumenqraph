@@ -57,6 +57,16 @@ Breaking changes will be documented in the changelog with migration guidance whe
 - **GraphQL introspection and GraphiQL are off by default.** Set
   `GRAPHQL_INTROSPECTION_ENABLED=true` in non-production environments if needed.
 
+- **Migrations are an explicit step (#473).** Run `lumenqraph-indexer migrate`
+  before starting services; compose (`migrate` init service), `fly.toml`
+  (`release_command`) and `scripts/run-all-in-one.sh` do this already. The
+  API, webhooks and MCP server now refuse to start if the schema is behind
+  their build. Databases set up only with `scripts/setup_db.sh` must be
+  migrated once with `lumenqraph-indexer migrate`.
+
+- **`docker-compose.full.yml` requires `POSTGRES_PASSWORD` (#472)** and, like
+  `docker-compose.yml`, publishes Postgres on `127.0.0.1` only.
+
 **Database migrations applied:** `0010` through `0021` (run automatically by
 the indexer on startup). Stop the webhooks service before deploying to avoid
 a write conflict on `webhook_deliveries` during migration `0008`.
@@ -72,6 +82,13 @@ a write conflict on `webhook_deliveries` during migration `0008`.
 `DATABASE_ACQUIRE_TIMEOUT_SECS`, `DATABASE_IDLE_TIMEOUT_SECS`.
 
 ### Added
+- `lumenqraph-indexer migrate` and a startup schema-compatibility check in
+  every service (#473).
+- `scripts/check_env_example.py`, run in CI, fails when the code reads an
+  environment variable that `.env.example` doesn't document (#471).
+- Demo dataset (`make seed`, #93), a Postgres advisory-lock guard against
+  concurrent indexers (#94), config range clamping at startup (#95) and strkey
+  edge-case tests (#96).
 - Keyset cursor pagination for REST `/events` and `/transfers` endpoints
 - Trailing re-scan mechanism for shallow reorg detection
 - Contract summaries table to cache contract statistics for faster queries

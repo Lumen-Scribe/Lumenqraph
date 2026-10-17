@@ -11,6 +11,7 @@ Please report security vulnerabilities responsibly by following our [Security Po
 ```bash
 cp .env.example .env
 docker compose up -d          # Postgres
+cargo run -p lumenqraph-indexer -- migrate
 cargo run -p lumenqraph-indexer
 cargo run -p lumenqraph-api
 ```

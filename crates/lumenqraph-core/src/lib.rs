@@ -17,6 +17,7 @@ pub mod error;
 pub mod models;
 pub mod read;
 pub mod sanitize;
+pub mod schema;
 pub mod spec;
 pub mod url_validation;
 pub mod webhook;

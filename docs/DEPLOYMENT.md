@@ -6,22 +6,51 @@ Run three long-lived processes against one Postgres:
 
 | Process | Command | Notes |
 | --- | --- | --- |
-| Indexer | `lumenqraph-indexer` | Must run 24/7 — a sleeping poller falls behind the chain. Applies migrations on startup. |
+| Migrate | `lumenqraph-indexer migrate` | One-shot, before every deploy. Applies pending migrations under an advisory lock, then exits. Needs only `DATABASE_URL`. |
+| Indexer | `lumenqraph-indexer` | Must run 24/7 — a sleeping poller falls behind the chain. |
 | API | `lumenqraph-api` | Stateless; scale horizontally behind a load balancer. |
 | Webhooks | `lumenqraph-webhooks` | Single instance is fine; delivery is idempotent per (subscription, event). |
 
-Only the indexer applies migrations (on startup, via `sqlx::migrate!`). Deploy
-so the indexer starts first, or run `scripts/setup_db.sh` for an
-API/webhooks-only deploy. The **API also serves the static explorer UI** at `/`
+Migrations are an explicit step: run `lumenqraph-indexer migrate` before the
+services start (or roll). The bundled configs already do this — compose runs it
+as the `migrate` init service, `fly.toml` as the `release_command`, and
+`scripts/run-all-in-one.sh` (Render) before starting anything; on a paid Render
+plan you can use `preDeployCommand: lumenqraph-indexer migrate` instead.
+
+Every service checks the schema at startup against the migrations it was built
+with. The API, webhooks and MCP server never migrate: they **refuse to start**
+if the database is missing migrations (with an error naming them), and log a
+warning if it has newer ones (a rolling upgrade in progress). The indexer still
+applies pending migrations itself for local development unless
+`SKIP_MIGRATIONS=true`, which the bundled configs set.
+
+The **API also serves the static explorer UI** at `/`
 (same origin — no CORS, no configured API base); point `EXPLORER_DIR` at the
 assets (the Docker image ships them at `/app/explorer`).
 
 ## Docker
 
 ```bash
+export POSTGRES_PASSWORD=$(openssl rand -hex 16)
+export WEBHOOK_ENCRYPTION_KEY=$(openssl rand -hex 32)
 docker compose -f docker-compose.full.yml up --build -d
 ```
 One image holds all three binaries; each service overrides `command:`.
+
+`POSTGRES_PASSWORD` is required — compose refuses to start without it — and is
+embedded in the services' `DATABASE_URL`, so keep it URL-safe (hex is). It is
+applied only when the `pgdata` volume is first created; changing it later means
+`ALTER USER lumenqraph PASSWORD …` inside Postgres as well.
+
+### Postgres network exposure
+
+Both compose files publish Postgres on **`127.0.0.1:5432` only**, so `psql`
+works from the host but nothing else can reach it. Don't change this to
+`"5432:5432"` on a server: Docker publishes ports through its own iptables
+rules, which **bypass host firewalls such as ufw**, so the database would be
+reachable from the internet. The services reach Postgres over the compose
+network and don't need the port published at all — remove the `ports:` entry
+entirely if you never connect from the host.
 
 ### Postgres data volume
 

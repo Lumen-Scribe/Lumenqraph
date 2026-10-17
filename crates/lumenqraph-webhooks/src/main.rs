@@ -77,6 +77,16 @@ async fn main() -> anyhow::Result<()> {
     info!(config = ?config, "effective configuration");
     let pool = connect_with_retry(&config).await?;
 
+    // Migrations are applied by `lumenqraph-indexer migrate`, not here. Refuse
+    // to start against a schema older than this binary (#473).
+    match lumenqraph_core::schema::check(&pool).await? {
+        lumenqraph_core::schema::SchemaStatus::Current => {}
+        lumenqraph_core::schema::SchemaStatus::Ahead { unknown_versions } => tracing::warn!(
+            ?unknown_versions,
+            "database schema is newer than this binary (rolling upgrade in progress?)"
+        ),
+    }
+
     // Redirects are never followed (SSRF guard, see `build_delivery_client`).
     let http = dispatcher::build_delivery_client(config.connect_timeout(), config.total_timeout())?;
 
