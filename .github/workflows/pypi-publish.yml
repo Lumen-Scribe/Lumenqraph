@@ -3,7 +3,7 @@ name: Publish Python SDK to PyPI
 on:
   push:
     tags:
-      - "v*"
+      - "sdk-py-v*"
   release:
     types: [published]
 
@@ -39,7 +39,7 @@ jobs:
           else
             TAG="${GITHUB_REF_NAME}"
           fi
-          VERSION="${TAG#v}"
+          VERSION="${TAG#sdk-py-v}"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "prerelease=$([[ "$VERSION" == *-* ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"

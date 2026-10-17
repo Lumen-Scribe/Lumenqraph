@@ -66,11 +66,13 @@ services:
       WEBHOOK_ENCRYPTION_KEY: ${WEBHOOK_ENCRYPTION_KEY}
       RUST_LOG: ${RUST_LOG:-info}
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
+      # The runtime image does not include curl (see #469); use wget from the
+      # base image instead. Exits non-zero on any non-2xx response.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/health || exit 1"]
+      interval: 10s
       timeout: 5s
-      retries: 3
-      start_period: 10s
+      retries: 10
+      start_period: 30s
 
   webhooks:
     build:

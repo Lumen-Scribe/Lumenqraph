@@ -139,6 +139,75 @@ To update schema objects like triggers (`contract_summaries`), edit the relevant
 - Keep raw base64 alongside any decoded representation; decoding is best-effort
   and must never break ingestion.
 
+## Releases
+
+Lumenqraph uses **per-artifact SemVer versioning**. Each publishable artifact is
+versioned and tagged independently so that, for example, an SDK bug fix can ship
+without a server release:
+
+| Artifact | Version source | Tag format | Publish workflow |
+| --- | --- | --- | --- |
+| Server (Rust workspace, Docker image) | `Cargo.toml` (`[workspace.package] version`) | `server-vX.Y.Z` | `.github/workflows/docker-publish.yml` |
+| TypeScript SDK (`@lumenqraph/sdk`) | `sdk/typescript/package.json` (`version`) | `sdk-ts-vX.Y.Z` | `.github/workflows/npm-publish.yml` |
+| Python SDK (`lumenqraph`) | `sdk/python/pyproject.toml` (`[project] version`) | `sdk-py-vX.Y.Z` | `.github/workflows/pypi-publish.yml` |
+
+Rules:
+
+- Versions follow [SemVer](https://semver.org/). Breaking changes bump the major
+  version (or the minor version while an artifact is still `0.x`).
+- A tag must match the version declared in the artifact's manifest. The publish
+  workflows verify this and fail the job on a mismatch, so a tag can never
+  publish a version that disagrees with it.
+- Tags are created from `main` only, after CI is green.
+- Each release gets a `CHANGELOG.md` entry describing user-visible changes and
+  any security fixes (see [SECURITY.md](SECURITY.md) for the advisory policy).
+
+### Bumping a version
+
+1. Update the version in the artifact's manifest:
+   - Server: `version` under `[workspace.package]` in `Cargo.toml`, then run
+     `cargo update -w` so `Cargo.lock` picks up the new workspace versions.
+   - TypeScript SDK: `version` in `sdk/typescript/package.json`.
+   - Python SDK: `version` under `[project]` in `sdk/python/pyproject.toml`.
+2. Add a `CHANGELOG.md` section for the new version.
+3. Open a PR, get it merged to `main`, and wait for CI to pass.
+4. Tag the merge commit and push the tag:
+
+   ```bash
+   git checkout main && git pull
+   git tag server-v0.1.0      # or sdk-ts-v0.1.0 / sdk-py-v0.1.0
+   git push origin server-v0.1.0
+   ```
+
+5. The matching publish workflow builds and pushes the artifact (GHCR image,
+   npm package, or PyPI package). Watch the run in the Actions tab.
+
+### Cutting the first release (0.1.0)
+
+All artifacts currently sit at `0.1.0` and no tag has been cut yet. The first
+release is made once `main` is green and the critical bugs in the release
+tracking issue are fixed:
+
+1. Confirm `make ci` and the full CI workflow pass on `main`.
+2. Confirm `CHANGELOG.md` has a `0.1.0` section for each artifact being released.
+3. Push the tags for the artifacts you are releasing, e.g.:
+
+   ```bash
+   git tag server-v0.1.0 sdk-ts-v0.1.0 sdk-py-v0.1.0
+   git push origin server-v0.1.0 sdk-ts-v0.1.0 sdk-py-v0.1.0
+   ```
+
+4. Verify the GHCR image, npm package and PyPI package are published with
+   versions matching their tags, and create the corresponding GitHub releases.
+
+### Automation
+
+We intend to automate CHANGELOG entries and version bumps with
+[release-please](https://github.com/googleapis/release-please) (or
+[changesets](https://github.com/changesets/changesets) for the TypeScript SDK),
+driven by Conventional Commit messages. Until that lands, bump versions and edit
+`CHANGELOG.md` by hand as described above.
+
 ## Minimum Supported Rust Version (MSRV)
 
 The Minimum Supported Rust Version (MSRV) for Lumenqraph is **1.84**.
