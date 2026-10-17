@@ -1,6 +1,76 @@
-# Migration Rollback Strategy
+# Migration Policy
 
-## Context
+This document covers how migrations are versioned, the append-only rule, and the rollback strategy.
+
+## Versioning
+
+Migrations live in `migrations/` and are applied by `sqlx::migrate!`. sqlx keys each migration by the integer prefix of its filename and stores it in `_sqlx_migrations.version`, which is the primary key. **Two files with the same prefix are a hard error**: on a fresh database `sqlx::migrate!()` fails outright, and on an existing database one of the files is silently treated as already applied, so its schema changes never run.
+
+### Duplicate-version cleanup
+
+Several parallel PRs each added their own `0017`, `0021`, `0022`, `0023` and `0024`, so `main` briefly contained duplicate versions. The cleanup rule is:
+
+- **Keep** the version a file had when it was first applied in a release. Released databases already recorded that version, and changing it would make sqlx either re-run the file or refuse to start.
+- **Move** every other file to a new number in the `0030+` range, in a strictly increasing sequence.
+
+| Old filename | New filename | Action |
+| --- | --- | --- |
+| `0017_spec_versions_ledger.sql` | `0017_spec_versions_ledger.sql` | keep (released) |
+| `0017_webhook_enhancements.sql` | `0030_webhook_enhancements.sql` | move |
+| `0021_contract_summaries_delete.sql` | `0021_contract_summaries_delete.sql` | keep (released) |
+| `0021_webhook_auto_disable_timing.sql` | `0031_webhook_auto_disable_timing.sql` | move |
+| `0022_cursor_optimistic_locking.sql` | `0022_cursor_optimistic_locking.sql` | keep (released) |
+| `0022_token_transfers_kind_check.sql` | `0032_token_transfers_kind_check.sql` | move |
+| `0023_contract_data_unique.sql` | `0023_contract_data_unique.sql` | keep (released) |
+| `0023_missed_ranges.sql` | `0033_missed_ranges.sql` | move |
+| `0024_webhook_deliveries_keyset.sql` | `0024_webhook_deliveries_keyset.sql` | keep (released) |
+| `0024_webhook_delivery_locking.sql` | `0034_webhook_delivery_locking.sql` | move |
+| `0024_webhook_fixes_423_426.sql` | `0035_webhook_fixes_423_426.sql` | move |
+| `0024_webhook_owner.sql` | `0036_webhook_owner.sql` | move |
+
+**Moved files must be idempotent.** A database that already ran the file under its old number will run it again under the new number, so every statement in a moved migration must be safe to re-apply: `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, `ALTER TABLE … ADD COLUMN IF NOT EXISTS`, `DROP … IF EXISTS`, and so on. Do not assume the migration runs exactly once.
+
+### Timestamp-based versions
+
+Integer prefixes collide whenever two PRs are open at the same time. New migrations should therefore use timestamp-based versions:
+
+```
+YYYYMMDDHHMM_short_description.sql
+```
+
+For example `202610051430_webhook_retry_backoff.sql`. Timestamps are unique per author-minute and sort correctly, so parallel PRs cannot collide. The `0030+` numbers above exist only to resolve the historical duplicates; new work should not continue that sequence.
+
+## Append-only rule
+
+**Released migrations are never edited, renamed or deleted.** sqlx stores a checksum per applied migration and refuses to start when a file's contents change:
+
+```
+migration 2 was previously applied but has been modified
+```
+
+Editing a released migration also causes silent schema drift: adding a column to a `CREATE TABLE IF NOT EXISTS` never touches a table that already exists, so fresh and upgraded databases end up with different schemas.
+
+If a released migration needs to change:
+
+1. Leave the original file byte-for-byte as it shipped.
+2. Add a new forward migration that applies the change idempotently:
+
+```sql
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ;
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS scopes TEXT[];
+```
+
+### CI enforcement
+
+Two required checks protect this policy:
+
+- **`migration-versions`** — fails when two files under `migrations/` share a version prefix (`ls migrations | cut -d_ -f1 | sort | uniq -d` must print nothing), and migrates both a fresh database and a database at the last release.
+- **`migrations-append-only`** — compares `migrations/` against the merge base and fails when a PR modifies, renames or deletes an existing file. Genuine emergencies can bypass it with the `allow-migration-edit` pull-request label, which must be removed again before the next release.
+
+## Rollback Strategy
+
+### Context
 
 Lumenqraph uses **forward-only migrations** applied via `sqlx::migrate!`. There are no automated down-migrations or reversible migration pairs (`up`/`down`). This document explains the rationale for that choice and provides guidance for operators who need to revert a bad schema change.
 

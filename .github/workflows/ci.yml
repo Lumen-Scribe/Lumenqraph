@@ -19,11 +19,20 @@ jobs:
   # `_sqlx_migrations.version` is the primary key, so two files sharing a
   # numeric prefix cannot both be recorded. Fail fast if any duplicate
   # version prefix exists in migrations/.
+  #
+  # Issue #536: migrations are append-only. sqlx stores a checksum per applied
+  # migration and refuses to run when a file's contents change, so editing,
+  # renaming or deleting a released migration breaks every existing database.
+  # Compare against the PR merge base and reject any M/R/D entry unless the PR
+  # carries the `migrations-override` label (genuine emergencies only).
   migration-versions:
     name: Migration Version Uniqueness
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Full history so the merge base is available for the diff below.
+          fetch-depth: 0
       - name: Reject duplicate migration version prefixes
         run: |
           dups=$(ls migrations | cut -d_ -f1 | sort | uniq -d)
@@ -32,6 +41,81 @@ jobs:
             echo "$dups"
             exit 1
           fi
+      - name: Reject modifications to existing migrations (append-only)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          OVERRIDE_LABEL: migrations-override
+        run: |
+          if [ -z "$BASE_SHA" ]; then
+            echo "::error::No merge base SHA available; cannot verify append-only migrations."
+            exit 1
+          fi
+          # Fetch the base commit in case the checkout did not include it.
+          git fetch --no-tags origin "$BASE_SHA" || true
+          changed=$(git diff --name-status "$BASE_SHA"...HEAD -- migrations/ || true)
+          echo "Changes under migrations/ since $BASE_SHA:"
+          echo "${changed:-<none>}"
+          # Only additions (A) are allowed; M (modified), R (renamed),
+          # D (deleted), C (copied) and T (type change) all break checksums.
+          bad=$(echo "$changed" | awk 'NF && $1 !~ /^A/ {print}')
+          if [ -z "$bad" ]; then
+            echo "All migration changes are additions. OK."
+            exit 0
+          fi
+          labels='${{ toJSON(github.event.pull_request.labels.*.name) }}'
+          if echo "$labels" | grep -q "\"$OVERRIDE_LABEL\""; then
+            echo "::warning::Existing migrations were modified but the '$OVERRIDE_LABEL' label is present; allowing."
+            exit 0
+          fi
+          echo "::error::Existing migrations must not be modified, renamed or deleted."
+          echo "Move the change into a new forward migration instead."
+          echo "Add the '$OVERRIDE_LABEL' label only for genuine emergencies."
+          echo "$bad"
+          exit 1
+
+  # Issue #535/#536: prove that a fresh database migrates cleanly from zero.
+  # Runs every migration in migrations/ against an empty Postgres service, so a
+  # duplicate version or a broken forward migration fails here rather than at
+  # indexer boot on a user's machine.
+  migration-fresh-db:
+    name: Migration Fresh Database
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: lumenqraph
+          POSTGRES_PASSWORD: lumenqraph
+          POSTGRES_DB: lumenqraph
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U lumenqraph"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://lumenqraph:lumenqraph@localhost:5432/lumenqraph
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: migration-fresh-db
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features postgres
+      - name: Migrate a fresh database
+        run: cargo sqlx migrate run --database-url "$DATABASE_URL"
+      - name: Verify all migrations were recorded
+        run: |
+          count=$(cargo sqlx migrate info --database-url "$DATABASE_URL" | grep -c 'installed' || true)
+          echo "installed migrations: $count"
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No migrations were recorded on the fresh database."
+            exit 1
+          fi
+=======
 
   # Verify MSRV declared in Cargo.toml
   msrv-check:
@@ -55,28 +139,10 @@ jobs:
       - name: Check on MSRV
         run: cargo check --workspace --all-targets
 
-  # Issue #355: the Docker builder must compile with the same Rust version
-  # declared in rust-toolchain.toml, otherwise release images can be built with
-  # a different compiler than CI.  Build the image and assert the rustc version
-  # baked into it matches the pinned toolchain.
-  docker-toolchain-check:
-    name: Docker Toolchain Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Extract pinned toolchain from rust-toolchain.toml
-        id: toolchain
-        run: |
-          CHANNEL=$(grep -m1 'channel' rust-toolchain.toml | sed 's/.*"\(.*\)".*/\1/')
-          echo "channel=$CHANNEL" >> $GITHUB_OUTPUT
-      - name: Build Docker image
-        run: docker build -t lumenqraph-api:ci .
-      - name: Assert image rustc matches rust-toolchain.toml
-        run: |
-          IMAGE_RUSTC=$(docker run --rm lumenqraph-api:ci rustc --version)
-          echo "image rustc: $IMAGE_RUSTC"
-          echo "pinned channel: ${{ steps.toolchain.outputs.channel }}"
-          echo "$IMAGE_RUSTC" | grep -q "${{ steps.toolchain.outputs.channel }}"
+  # Issue #355: the Docker toolchain check lives in docker.yml, which builds
+  # the image once per PR. It reads /rustc-version.txt from the runtime image
+  # (the runtime stage has no rustc) and compares it against the channel pinned
+  # in rust-toolchain.toml. Do not duplicate it here.
 
   build-test:
     runs-on: ubuntu-latest

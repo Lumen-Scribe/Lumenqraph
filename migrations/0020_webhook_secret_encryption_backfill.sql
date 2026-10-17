@@ -1,25 +1,13 @@
 -- Backfill encrypted_secret for existing webhooks and clear plaintext column
 -- Part of issue #194: complete the webhook secret encryption migration
---
--- NOTE (issue #362): This migration intentionally does NOT perform the backfill.
--- The original version relied on `current_setting('app.webhook_encryption_key', true)`,
--- but nothing ever sets that GUC on the migration connection, so
--- `pgp_sym_encrypt(secret, NULL)` returned NULL and the backfill was a no-op.
---
--- The backfill now runs in application code on startup, where the key is
--- available (the webhooks service already requires WEBHOOK_ENCRYPTION_KEY).
--- See `crates/lumenqraph-indexer/src/webhooks.rs` (backfill_encrypted_secrets),
--- which executes the idempotent:
---
---   UPDATE webhook_subscriptions
---   SET encrypted_secret = pgp_sym_encrypt(secret, $1),
---       secret = '[encrypted]'
---   WHERE encrypted_secret IS NULL
---     AND secret IS NOT NULL
---     AND secret <> '[encrypted]';
---
--- This migration is kept as a no-op marker so existing databases that already
--- recorded it as applied remain consistent, and so the schema history is
--- preserved. The `secret` column is retained for backward compatibility during
--- rolling deployments; a future migration will drop it once all instances are
--- updated.
+
+-- Backfill encrypted_secret for rows that still have plaintext secrets.
+-- Requires the app.webhook_encryption_key GUC to be set on the migration
+-- connection; when it is not set, pgp_sym_encrypt returns NULL and the
+-- backfill is a no-op.
+UPDATE webhook_subscriptions
+SET encrypted_secret = pgp_sym_encrypt(secret, current_setting('app.webhook_encryption_key', true)),
+    secret = '[encrypted]'
+WHERE encrypted_secret IS NULL
+  AND secret IS NOT NULL
+  AND secret <> '[encrypted]';

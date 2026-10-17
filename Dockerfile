@@ -54,7 +54,8 @@ COPY --from=builder /app/target/release/lumenqraph-api /usr/local/bin/
 COPY --from=builder /app/target/release/lumenqraph-webhooks /usr/local/bin/
 COPY --from=builder /app/target/release/lumenqraph-mcp /usr/local/bin/
 # Record the rustc version used to build the binaries so it is observable
-# from the image (e.g. `docker run --rm <image> cat /rustc-version.txt`).
+# from the image (e.g. `docker run --rm --entrypoint cat <image> /rustc-version.txt`).
+# This is the source of truth for the toolchain check in docker.yml.
 COPY --from=builder /rustc-version.txt /rustc-version.txt
 # Static explorer UI, served same-origin by the API (EXPLORER_DIR=/app/explorer).
 COPY explorer /app/explorer
