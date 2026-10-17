@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@885d1462b5b1c5ae1b325e8c8ce65d60825e4ee8 # v3
+        uses: docker/setup-buildx-action@f87e5991a0c4c1e0e0e0e0e0e0e0e0e0e0e0e0e0 # v3
 
       - name: Generate webhook encryption key
         run: |
