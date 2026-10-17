@@ -14,6 +14,10 @@ env:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # Issue #361: sqlx keys migrations by integer version and
   # `_sqlx_migrations.version` is the primary key, so two files sharing a
@@ -22,6 +26,8 @@ jobs:
   migration-versions:
     name: Migration Version Uniqueness
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Reject duplicate migration version prefixes
@@ -37,6 +43,8 @@ jobs:
   msrv-check:
     name: MSRV Check
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Extract MSRV from Cargo.toml
@@ -62,6 +70,8 @@ jobs:
   docker-toolchain-check:
     name: Docker Toolchain Check
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Extract pinned toolchain from rust-toolchain.toml
@@ -80,6 +90,8 @@ jobs:
 
   build-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: github.event_name != 'schedule'
     services:
       postgres:
         image: postgres:16-alpine
@@ -111,33 +123,25 @@ jobs:
       - name: Check sensitive logging
         run: python3 scripts/check_sensitive_logging.py
       - name: Install sqlx-cli
-        run: cargo install sqlx-cli --no-default-features --features postgres
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172
+        with:
+          tool: sqlx-cli
       - name: Check sqlx metadata is up-to-date
         run: cargo sqlx prepare --database-url "$DATABASE_URL" --check
-      - name: Test
-        run: cargo test --workspace
-      # The tests above skip anything marked #[ignore], which is every test that
-      # needs a real database — retention pruning, contract-spec versioning, and
-      # webhook enqueue all live there. Run them explicitly against the service
-      # container above.
-      #
-      # Each test now provisions its own isolated Postgres schema (unique UUID
-      # name), so they are safe to run in parallel and cannot corrupt each other
-      # or any existing database.
-      - name: Test (Postgres-backed)
-        run: |
-          cargo test -p lumenqraph-indexer  -- --ignored --test-threads=1
-          cargo test -p lumenqraph-webhooks -- --ignored --test-threads=1
-          cargo test -p lumenqraph-api      -- --ignored --test-threads=1
-          cargo test -p lumenqraph-mcp      -- --ignored --test-threads=1
-      # The end-to-end smoke test is gated behind the `smoke-tests` feature so it
-      # never compiles into a plain `cargo test`. It uses a mock RPC (no live
-      # network); run it explicitly here where Postgres is available.
-      - name: Test (smoke, end-to-end)
-        run: cargo test -p lumenqraph-indexer --features smoke-tests smoke -- --ignored --test-threads=1
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172
-      - name: Collect coverage
+        with:
+          tool: cargo-llvm-cov
+      # Run the whole suite once under coverage instrumentation. The plain
+      # `cargo test` pass skips anything marked #[ignore], which is every test
+      # that needs a real database — retention pruning, contract-spec
+      # versioning, and webhook enqueue all live there — so the `--ignored`
+      # tests are run in the same coverage pass against the service container.
+      #
+      # Each test provisions its own isolated Postgres schema (unique UUID
+      # name), so they are safe to run in parallel and cannot corrupt each other
+      # or any existing database.
+      - name: Test with coverage
         run: |
           cargo llvm-cov clean --workspace
           cargo llvm-cov --workspace --no-report
@@ -145,6 +149,10 @@ jobs:
           cargo llvm-cov --no-report -p lumenqraph-webhooks -- --ignored --test-threads=1
           cargo llvm-cov --no-report -p lumenqraph-api      -- --ignored --test-threads=1
           cargo llvm-cov --no-report -p lumenqraph-mcp      -- --ignored --test-threads=1
+          # The end-to-end smoke test is gated behind the `smoke-tests` feature
+          # so it never compiles into a plain `cargo test`. It uses a mock RPC
+          # (no live network); run it here where Postgres is available.
+          cargo llvm-cov --no-report -p lumenqraph-indexer --features smoke-tests -- smoke --ignored --test-threads=1
           cargo llvm-cov report --lcov --output-path lcov.info
           cargo llvm-cov report --summary-only
       - name: Upload coverage to Codecov
@@ -169,6 +177,8 @@ jobs:
   openapi-drift:
     name: OpenAPI Drift Check
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
@@ -198,36 +208,79 @@ jobs:
   # `twine check` verifies the package metadata (including the LICENSE file
   # referenced by pyproject.toml) is valid for upload.
   python-sdk:
-    name: Python SDK (3.12)
+    name: Python SDK (${{ matrix.python-version }})
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
-      - name: Install build tooling
-        run: pip install build twine
-      - name: Build sdist and wheel
-        working-directory: sdk/python
+    timeout-minutes: 20
+    if: github.event_name != 'schedule'
     strategy:
       matrix:
         python-version: ["3.8", "3.12"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Install build tooling
+        run: pip install build twine
+      - name: Build sdist and wheel
+        working-directory: sdk/python
+        run: python -m build
+      - name: Check package metadata
+        working-directory: sdk/python
+        run: twine check dist/*
       - name: Install package and dev dependencies
+        working-directory: sdk/python
         run: pip install -e ".[dev]"
       - name: Type-check (mypy)
+        working-directory: sdk/python
         run: mypy lumenqraph
       - name: Test
+        working-directory: sdk/python
         run: pytest -v
+
+  # Issue #529: the TypeScript SDK lost its CI coverage in a merge. Keep the
+  # typecheck/build/lint/test/codegen gates here so npm-publish.yml can rely on
+  # them.
+  sdk-typescript:
+    name: TypeScript SDK (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event_name != 'schedule'
+    strategy:
+      matrix:
+        node-version: ["20", "22"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up Node
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+      - name: Install dependencies
+        working-directory: sdk/typescript
+        run: npm ci
+      - name: Typecheck
+        working-directory: sdk/typescript
+        run: npm run typecheck
+      - name: Build
+        working-directory: sdk/typescript
+        run: npm run build
+      - name: Lint
+        working-directory: sdk/typescript
+        run: npm run lint
+      - name: Test
+        working-directory: sdk/typescript
+        run: npm test
+      - name: Check generated code is up-to-date
+        working-directory: sdk/typescript
+        run: npm run codegen:check
 
   security-audit:
     name: Security Audit (cargo-audit)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
@@ -241,6 +294,24 @@ jobs:
   dashboard-metrics:
     name: Dashboard Metrics Validation
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Validate dashboard metrics
+        run: python3 scripts/validate_dashboard_metrics.py
+
+  # Issue #529: this job was accidentally merged into `dashboard-metrics`, so
+  # branch protection requiring `supply-chain-security` could never be
+  # satisfied. Keep the action-pinning lint and cargo-deny checks here.
+  supply-chain-security:
+    name: Supply Chain Security
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Ensure all GitHub Actions in .github/workflows are pinned to full commit SHAs
@@ -260,7 +331,9 @@ jobs:
       # committed deny.toml (0.16 removed several of them). Bump this together
       # with a deny.toml migration, not on its own.
       - name: Install cargo-deny
-        run: cargo install cargo-deny --version "^0.14" --locked
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172
+        with:
+          tool: cargo-deny@0.14
       # Advisories are blocking: a crate with a known RUSTSEC vulnerability now
       # fails the build, so a security patch in a transitive dependency is caught
       # here between the weekly Dependabot runs instead of sitting unnoticed.

@@ -14,6 +14,10 @@ on:
       - .dockerignore
       - .github/workflows/docker-publish.yml
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   REGISTRY: ghcr.io
   # Image name follows the convention ghcr.io/<owner>/<repo>
@@ -26,6 +30,7 @@ jobs:
   build-and-push:
     name: Build & push (${{ matrix.platform }})
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: write
@@ -132,6 +137,7 @@ jobs:
   merge:
     name: Merge multi-arch manifest
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: github.event_name != 'pull_request'
     needs: build-and-push
     permissions:
@@ -179,6 +185,20 @@ jobs:
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+          # Resolve the digest of the manifest we just pushed so the
+          # attestation step below has a subject to attest.
+          digest="$(
+            docker buildx imagetools inspect \
+              "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}" \
+              --format '{{json .Manifest}}' | jq -r .digest
+          )"
+          if [ -z "$digest" ] || [ "$digest" = "null" ]; then
+            echo "::error::Failed to resolve manifest digest for ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}"
+            exit 1
+          fi
+          echo "Resolved manifest digest: $digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Inspect final image
         run: |
