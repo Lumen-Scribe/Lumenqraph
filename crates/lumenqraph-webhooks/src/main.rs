@@ -57,6 +57,15 @@ async fn connect_with_retry(config: &Config) -> anyhow::Result<sqlx::PgPool> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
+
+    // healthcheck: probe the metrics server's /health and exit 0/1 (#469).
+    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+        let bind = std::env::var("WEBHOOKS_METRICS_BIND_ADDR")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "127.0.0.1:9091".to_string());
+        lumenqraph_core::healthcheck::run_and_exit(&bind, "/health");
+    }
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(fmt::layer())

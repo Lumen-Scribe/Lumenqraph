@@ -52,6 +52,19 @@ pub struct State {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
+
+    // healthcheck: probe /healthz of the streamable-HTTP transport and exit
+    // 0/1 (#469). Only meaningful when MCP_HTTP_BIND is set; a stdio server
+    // has no listener to probe.
+    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+        match std::env::var("MCP_HTTP_BIND") {
+            Ok(bind) => lumenqraph_core::healthcheck::run_and_exit(&bind, "/healthz"),
+            Err(_) => {
+                eprintln!("healthcheck failed: MCP_HTTP_BIND is not set (stdio mode has no HTTP listener)");
+                std::process::exit(1);
+            }
+        }
+    }
     // IMPORTANT: log to stderr — stdout is the JSON-RPC channel.
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))

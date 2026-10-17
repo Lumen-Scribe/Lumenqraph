@@ -1,5 +1,14 @@
-# Full local stack: Postgres + all three services, built from the Dockerfile.
+# Full local stack: Postgres + the four service binaries (indexer, api,
+# webhooks, mcp), all built from the one Dockerfile image.
 # For dev with only Postgres, use docker-compose.yml instead.
+#
+# The MCP server is opt-in (profile `mcp`): MCP clients usually spawn it
+# locally over stdio, so the default stack starts indexer + api + webhooks.
+# To also run MCP over streamable HTTP on :8090:
+#   docker compose -f docker-compose.full.yml --profile mcp up --build
+#
+# Every service's healthcheck uses the binary's built-in `healthcheck`
+# subcommand, so the runtime image needs no curl/wget.
 #
 # IMPORTANT: Set WEBHOOK_ENCRYPTION_KEY in your environment before starting:
 #   export WEBHOOK_ENCRYPTION_KEY=$(openssl rand -hex 32)
@@ -43,7 +52,16 @@ services:
       RPC_URL: ${RPC_URL:-https://soroban-testnet.stellar.org}
       CONTRACT_IDS: ${CONTRACT_IDS:-}
       POLL_INTERVAL_SECS: ${POLL_INTERVAL_SECS:-5}
+      INDEXER_HTTP_BIND_ADDR: 0.0.0.0:9090
       RUST_LOG: ${RUST_LOG:-info}
+    healthcheck:
+      # /health returns 503 until the cursor is initialised and while the
+      # indexer lags, so allow a generous start period for the first sync.
+      test: ["CMD", "lumenqraph-indexer", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
 
   api:
     build:
@@ -66,7 +84,7 @@ services:
       WEBHOOK_ENCRYPTION_KEY: ${WEBHOOK_ENCRYPTION_KEY}
       RUST_LOG: ${RUST_LOG:-info}
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD", "lumenqraph-api", "healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -86,7 +104,45 @@ services:
     environment:
       DATABASE_URL: postgres://lumenqraph:lumenqraph@postgres:5432/lumenqraph
       WEBHOOK_ENCRYPTION_KEY: ${WEBHOOK_ENCRYPTION_KEY}
+      WEBHOOKS_METRICS_BIND_ADDR: 127.0.0.1:9091
       RUST_LOG: ${RUST_LOG:-info}
+    healthcheck:
+      test: ["CMD", "lumenqraph-webhooks", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Optional: enable with `--profile mcp`. Reads the same Postgres as the API
+  # and calls Soroban RPC for live reads; served over streamable HTTP here
+  # (POST /mcp, GET /healthz) since a container has no stdio client.
+  mcp:
+    profiles: ["mcp"]
+    build:
+      context: .
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-}
+        BUILD_TIME: ${BUILD_TIME:-}
+    command: ["lumenqraph-mcp"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8090:8090"
+    environment:
+      DATABASE_URL: postgres://lumenqraph:lumenqraph@postgres:5432/lumenqraph
+      RPC_URL: ${RPC_URL:-https://soroban-testnet.stellar.org}
+      MCP_HTTP_BIND: 0.0.0.0:8090
+      # Passed through only when set in your shell; unset means no auth.
+      MCP_AUTH_TOKEN:
+      RUST_LOG: ${RUST_LOG:-info}
+    healthcheck:
+      test: ["CMD", "lumenqraph-mcp", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 volumes:
   pgdata:

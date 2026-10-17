@@ -124,6 +124,8 @@ enum Command {
     },
     /// Run database migrations and exit.
     Migrate,
+    /// Probe this instance's /health endpoint and exit 0 (healthy) or 1.
+    Healthcheck,
 }
 
 /// Parse the optional `backfill` ledger argument.
@@ -319,6 +321,14 @@ async fn run_migrations(pool: &sqlx::PgPool) -> anyhow::Result<()> {
 async fn main() -> anyhow::Result<()> {
     // Load .env if present (development convenience; no-op in production).
     let _ = dotenvy::dotenv();
+
+    // healthcheck: probe our own /health on localhost and exit 0/1 (#469).
+    // Runs before config/DB setup so it needs nothing but the HTTP server.
+    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+        let bind = std::env::var("INDEXER_HTTP_BIND_ADDR")
+            .unwrap_or_else(|_| "0.0.0.0:9090".to_string());
+        lumenqraph_core::healthcheck::run_and_exit(&bind, "/health");
+    }
 
     tracing_subscriber::registry()
         .with(fmt::layer())

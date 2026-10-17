@@ -161,6 +161,14 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // healthcheck: probe our own /health on localhost and exit 0/1 (#469).
+    // Used by the Dockerfile HEALTHCHECK and compose; needs no curl.
+    if args.get(1).map(|s| s.as_str()) == Some("healthcheck") {
+        let _ = dotenvy::dotenv();
+        let bind = std::env::var("API_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
+        lumenqraph_core::healthcheck::run_and_exit(&bind, "/health");
+    }
+
     // --print-openapi: dump the generated OpenAPI 3.1 spec as JSON to stdout
     // and exit.  Used by the CI drift check to compare against the committed
     // openapi.yaml without starting the full server or connecting to Postgres.

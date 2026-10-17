@@ -2,13 +2,15 @@
 
 ## Processes
 
-Run three long-lived processes against one Postgres:
+Run three long-lived processes against one Postgres, plus the optional MCP
+server (the fourth service binary):
 
 | Process | Command | Notes |
 | --- | --- | --- |
 | Indexer | `lumenqraph-indexer` | Must run 24/7 — a sleeping poller falls behind the chain. Applies migrations on startup. |
 | API | `lumenqraph-api` | Stateless; scale horizontally behind a load balancer. |
 | Webhooks | `lumenqraph-webhooks` | Single instance is fine; delivery is idempotent per (subscription, event). |
+| MCP (optional) | `lumenqraph-mcp` | Usually spawned locally by an MCP client over stdio; set `MCP_HTTP_BIND` to serve streamable HTTP. Read-only over Postgres, calls RPC for simulations. |
 
 Only the indexer applies migrations (on startup, via `sqlx::migrate!`). Deploy
 so the indexer starts first, or run `scripts/setup_db.sh` for an
@@ -21,7 +23,20 @@ assets (the Docker image ships them at `/app/explorer`).
 ```bash
 docker compose -f docker-compose.full.yml up --build -d
 ```
-One image holds all three binaries; each service overrides `command:`.
+One image holds all four service binaries (indexer, api, webhooks, mcp); each
+service overrides `command:`. The MCP server is behind the `mcp` profile
+(`--profile mcp`) since it is normally run locally over stdio.
+
+Healthchecks use each binary's built-in `healthcheck` subcommand (e.g.
+`lumenqraph-api healthcheck`), which GETs the service's own health endpoint on
+localhost and exits 0/1, so the slim runtime image needs no `curl`/`wget`:
+
+| Service | Probe | Endpoint (bind env var) |
+| --- | --- | --- |
+| api | `lumenqraph-api healthcheck` | `/health` (`API_BIND_ADDR`, default `0.0.0.0:8080`) |
+| indexer | `lumenqraph-indexer healthcheck` | `/health` (`INDEXER_HTTP_BIND_ADDR`, default `0.0.0.0:9090`) |
+| webhooks | `lumenqraph-webhooks healthcheck` | `/health` (`WEBHOOKS_METRICS_BIND_ADDR`, default `127.0.0.1:9091`) |
+| mcp | `lumenqraph-mcp healthcheck` | `/healthz` (`MCP_HTTP_BIND`; HTTP mode only) |
 
 ### Postgres data volume
 
@@ -289,7 +304,7 @@ below are per-service):
 **Sizing guidance for managed tiers**
 
 Managed databases have hard connection caps (Neon free: 25, Supabase free: 60,
-Render free Postgres: 25). Running all three services plus the managed pooler
+Render free Postgres: 25). Running the indexer, API and webhooks (plus MCP, if deployed) and the managed pooler
 counts against the same cap. A safe starting point for free tiers:
 
 ```
@@ -480,7 +495,7 @@ restore. This is the recommended primary recovery path.
 
 ### Option A — restore from a Postgres backup (preferred)
 
-1. Stop all three services (or scale them to zero) so nothing writes during the
+1. Stop all services (indexer, api, webhooks, and mcp if deployed; or scale them to zero) so nothing writes during the
    restore.
 2. Restore the dump into a fresh database:
    ```bash

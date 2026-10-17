@@ -90,6 +90,22 @@ a write conflict on `webhook_deliveries` during migration `0008`.
 - Graceful shutdown handling (SIGTERM) for Docker/Kubernetes deployments
 - Jitter to webhook retry backoff to prevent thundering herd
 - Token-bucket rate limiter to prevent boundary bursts
+- **#469 — Built-in `healthcheck` subcommand** on every service binary
+  (`lumenqraph-api healthcheck`, `-indexer`, `-webhooks`, `-mcp`): GETs the
+  service's own health endpoint on localhost and exits 0/1. The Dockerfile
+  gains a `HEALTHCHECK`, and `docker-compose.full.yml` uses it for every
+  service, so health no longer depends on `curl`, which the runtime image
+  does not ship. ([#469](https://github.com/Lumen-Scribe/Lumenqraph/issues/469))
+- **#470 — Optional `mcp` service in `docker-compose.full.yml`** (profile
+  `mcp`, streamable HTTP on `:8090`); README, ARCHITECTURE and DEPLOYMENT now
+  agree on four service binaries, and the architecture diagrams include MCP.
+  ([#470](https://github.com/Lumen-Scribe/Lumenqraph/issues/470))
+- **#467 — Python SDK parity with the API and the TypeScript SDK:** webhook
+  create/list/update/delete, interface history and diff, single-event and
+  transaction-event lookups, stats, contract refresh, generated SDK download,
+  SSE event streaming, GraphQL event paging, and pydantic models generated
+  from `openapi.yaml` (`lumenqraph.models`) with a CI drift check.
+  ([#467](https://github.com/Lumen-Scribe/Lumenqraph/issues/467))
 
 ### Fixed
 - `START_LEDGER` now clamped to RPC retention window on fresh start
@@ -106,6 +122,17 @@ a write conflict on `webhook_deliveries` during migration `0008`.
   fall back to `_xdr` without misaligning the cursor — fixing downstream
   corruption when these addresses appeared inside a vec or map.
   ([#407](https://github.com/Lumen-Scribe/Lumenqraph/issues/407))
+
+### Changed
+- **#468 — Python SDK requires Python 3.10+** (3.8 and 3.9 are end-of-life).
+  CI tests 3.10–3.14, runs `mypy --strict`, and now covers the sync client.
+  ([#468](https://github.com/Lumen-Scribe/Lumenqraph/issues/468))
+- **#467 — Python SDK signature fixes:** `list_transfers` requires
+  `contract_id` (there is no global `/transfers` route), `list_contracts`
+  takes `limit`/`after` (cursor) instead of `offset`, and `redrive_webhook`
+  sends `since` as a query parameter, as the API expects. The unused `httpx`
+  dependency was dropped.
+  ([#467](https://github.com/Lumen-Scribe/Lumenqraph/issues/467))
 
 ### Changed (JSON shape — review before upgrading)
 - **#408 — `SCV_ERROR` now decodes to `{"error":{"type":…,"code":…}}`** instead

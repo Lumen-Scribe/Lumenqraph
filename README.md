@@ -120,17 +120,21 @@ Lumenqraph is ideal for developers seeking **complete ownership of their data** 
 
 ## Architecture
 
-Lumenqraph is a Rust workspace of four service binaries sharing one core library. The services coordinate only through Postgres, so each can scale, restart, and fail independently — API traffic can never stall ingestion, and a decode bug can't take down the read path.
+Lumenqraph is a Rust workspace of four service binaries (indexer, api, webhooks, mcp) plus a shared core library. The services coordinate only through Postgres, so each can scale, restart, and fail independently — API traffic can never stall ingestion, and a decode bug can't take down the read path.
 
 ```
   Soroban RPC ──poll getEvents──▶ ┌───────────┐ ──write──▶ ┌────────────┐ ◀──read── ┌─────────┐ ──REST──▶ dApps
-                                  │  indexer  │            │  Postgres  │           │   api   │
-                                  └───────────┘            └────────────┘           └─────────┘
-                                                                 ▲
-                                                          read   │  write
-                                                            ┌────────────┐
-                                                            │  webhooks  │ ──signed POST──▶ subscribers
-                                                            └────────────┘
+       ▲                          │  indexer  │            │  Postgres  │           │   api   │
+       │                          └───────────┘            └────────────┘           └─────────┘
+       │                                                    ▲          ▲
+       │                                             read   │  write   │ read
+       │                                       ┌────────────┐   ┌────────────┐
+       │                                       │  webhooks  │   │    mcp     │ ◀──stdio / HTTP── AI agents
+       │                                       └────────────┘   └────────────┘
+       │                                             │                │
+       │                                     signed POST ▼            │
+       │                                         subscribers          │
+       └──────────────── simulate / read calls ───────────────────────┘
 ```
 
 | Crate | Role |
@@ -168,10 +172,16 @@ curl 'localhost:8080/contracts/<CONTRACT_ID>/transfers?limit=5'
 curl localhost:8080/metrics
 ```
 
-To run the entire stack (Postgres + all three services) in Docker:
+To run the entire stack (Postgres + indexer, api and webhooks) in Docker:
 
 ```bash
 docker compose -f docker-compose.full.yml up --build
+```
+
+The MCP server is opt-in, because MCP clients usually launch it locally over stdio. Add `--profile mcp` to also run it over streamable HTTP on `:8090`:
+
+```bash
+docker compose -f docker-compose.full.yml --profile mcp up --build
 ```
 
 Common tasks are wrapped in the [`Makefile`](Makefile) — run `make help`.
@@ -667,13 +677,14 @@ See [docs/MULTI_NETWORK.md](docs/MULTI_NETWORK.md) for detailed configuration, d
 
 ## Running in production
 
-Run three long-lived processes against one Postgres. Only the indexer applies migrations.
+Run three long-lived processes against one Postgres, plus the optional MCP server (fourth binary) for AI-agent access. Only the indexer applies migrations.
 
 | Process | Notes |
 | --- | --- |
 | `lumenqraph-indexer` | Must run **24/7** — a sleeping poller falls behind the chain. |
 | `lumenqraph-api` | Stateless; scale horizontally behind a load balancer. |
 | `lumenqraph-webhooks` | A single instance suffices; delivery is idempotent per (subscription, event). |
+| `lumenqraph-mcp` | Optional. Usually spawned locally by an MCP client over stdio; set `MCP_HTTP_BIND` to serve it over HTTP instead. |
 
 Scrape `GET /metrics` and alert on `lumenqraph_indexer_lag_ledgers` climbing. For managed Postgres, point `DATABASE_URL` at Neon or Supabase. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for scaling notes (RPC providers, Redis-backed rate limiting, caching).
 
@@ -690,13 +701,14 @@ Lumenqraph/
 │   ├── lumenqraph-webhooks/   # subscription matching + signed delivery
 │   └── lumenqraph-mcp/        # Model Context Protocol server for AI agents
 ├── sdk/typescript/            # @lumenqraph/sdk — typed REST + GraphQL client
+├── sdk/python/                # lumenqraph — Python REST + GraphQL client
 ├── migrations/                # ordered sqlx SQL migrations
 ├── docs/                      # ARCHITECTURE, API, DEPLOYMENT
 ├── explorer/                  # zero-build explorer + self-host dashboard
 ├── scripts/                   # gen_api_key, backfill, setup_db
 ├── Dockerfile                 # multi-stage build (all four binaries)
 ├── docker-compose.yml         # local Postgres for dev
-├── docker-compose.full.yml    # full stack
+├── docker-compose.full.yml    # full stack (mcp behind the `mcp` profile)
 ├── fly.toml                   # Fly.io deploy (3 process groups)
 └── Makefile                   # common tasks (make help)
 ```
