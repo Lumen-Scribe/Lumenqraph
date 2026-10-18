@@ -29,17 +29,37 @@ use axum::{
     Json, Router,
 };
 use serde_json::{json, Value};
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use std::str::FromStr;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::info;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use rpc::RpcClient;
 
 /// Latest MCP protocol revision we default to when a client sends none.
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
+
+fn db_setting<T: FromStr>(service_key: &str, common_key: &str, default: T) -> anyhow::Result<T>
+where
+    T::Err: std::fmt::Display,
+{
+    let key = if std::env::var(service_key)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        service_key
+    } else {
+        common_key
+    };
+    match std::env::var(key) {
+        Ok(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse()
+            .map_err(|error| anyhow::anyhow!("invalid {key}={value:?}: {error}")),
+        _ => Ok(default),
+    }
+}
 
 #[derive(Clone)]
 pub struct State {
@@ -53,10 +73,7 @@ pub struct State {
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
     // IMPORTANT: log to stderr — stdout is the JSON-RPC channel.
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(fmt::layer().with_writer(std::io::stderr))
-        .init();
+    lumenqraph_core::telemetry::init_tracing_stderr();
 
     let database_url = std::env::var("DATABASE_URL").context("missing DATABASE_URL")?;
     let rpc_url = std::env::var("RPC_URL")
@@ -78,12 +95,14 @@ async fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
-        .await
-        .context("failed to connect to Postgres")?;
-    let auth_token = std::env::var("MCP_AUTH_TOKEN").ok();
+    let db = lumenqraph_core::db::DbConfig {
+        max_connections: db_setting("MCP_DATABASE_MAX_CONNECTIONS", "DATABASE_MAX_CONNECTIONS", 5u32)?,
+        min_connections: db_setting("MCP_DATABASE_MIN_CONNECTIONS", "DATABASE_MIN_CONNECTIONS", 0u32)?,
+        acquire_timeout_secs: db_setting("MCP_DATABASE_ACQUIRE_TIMEOUT_SECS", "DATABASE_ACQUIRE_TIMEOUT_SECS", 30u64)?,
+        idle_timeout_secs: db_setting("MCP_DATABASE_IDLE_TIMEOUT_SECS", "DATABASE_IDLE_TIMEOUT_SECS", 600u64)?,
+        connect_retries: db_setting("MCP_DATABASE_CONNECT_RETRIES", "DATABASE_CONNECT_RETRIES", 30u32)?,
+    };
+    let pool = lumenqraph_core::db::connect_with_retry(&database_url, &db).await?;
     let state = State {
         pool,
         rpc: RpcClient::new(rpc_url, rpc_timeout_secs),

@@ -565,3 +565,22 @@ Watermark behaviour on a rebuilt database:
 - Subscribers must treat redelivered events as duplicates regardless — HMAC
   signature verification plus idempotent handling on their side is the contract
   (see [docs/WEBHOOKS.md](WEBHOOKS.md)).
+
+### Database connection budget
+
+All services use the shared `lumenqraph_core::db::DbConfig` retrying pool. Set
+common `DATABASE_*` values once; a service-specific `INDEXER_DATABASE_*` (or
+`MCP_DATABASE_*`) override takes precedence.
+
+| Service | Default max connections | Override |
+|---|---:|---|
+| Indexer | 10 | `INDEXER_DATABASE_MAX_CONNECTIONS` |
+| API | 10 | `DATABASE_MAX_CONNECTIONS` |
+| MCP | 5 | `MCP_DATABASE_MAX_CONNECTIONS` |
+| Webhooks | 5 | `DATABASE_MAX_CONNECTIONS` |
+| **Total budget** | **30** | Keep below the Postgres role/server limit |
+
+The initial connection uses exponential backoff (1–30 seconds) and the common
+`DATABASE_CONNECT_RETRIES` setting. Size the sum of all service pools below the
+Postgres `max_connections` budget, leaving headroom for migrations, psql, and
+administrative connections.

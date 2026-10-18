@@ -10,16 +10,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::Context;
-
-/// Postgres pool settings.
-#[derive(Debug, Clone)]
-pub struct DbConfig {
-    pub max_connections: u32,
-    pub min_connections: u32,
-    pub acquire_timeout_secs: u64,
-    pub idle_timeout_secs: u64,
-    pub connect_retries: u32,
-}
+pub use lumenqraph_core::db::DbConfig;
 
 /// GraphQL schema limits.
 #[derive(Debug, Clone)]
@@ -299,7 +290,8 @@ impl fmt::Debug for ApiConfig {
 }
 
 /// Mask the password in `scheme://user:pass@host/...`.
-fn redact_url(url: &str) -> String {
+fn redact_url(url: &str) -> String { lumenqraph_core::redact_url(url) }
+/*
     if let Some(scheme_end) = url.find("://") {
         let after_scheme = &url[scheme_end + 3..];
         if let Some(at_idx) = after_scheme.find('@') {
@@ -312,6 +304,7 @@ fn redact_url(url: &str) -> String {
     url.to_string()
 }
 
+*/
 fn is_set(key: &str) -> bool {
     std::env::var(key).map(|v| !v.trim().is_empty()).unwrap_or(false)
 }
@@ -393,7 +386,7 @@ mod tests {
     fn debug_output_redacts_secrets() {
         assert_eq!(
             redact_url("postgres://user:hunter2@db:5432/x"),
-            "postgres://user:[REDACTED]@db:5432/x"
+            "postgres://db:5432"
         );
         assert_eq!(redact_url("https://rpc.example"), "https://rpc.example");
     }

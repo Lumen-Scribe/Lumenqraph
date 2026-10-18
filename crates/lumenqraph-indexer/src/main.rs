@@ -48,9 +48,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use sqlx::postgres::PgPoolOptions;
 use tracing::info;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use config::Config;
 use deep_backfill::{GalexieSource, HistoricalSource};
@@ -236,7 +234,7 @@ impl LeaderLock {
     }
 
     info!(
-        rpc = %config.rpc_url,
+        rpc_host = %rpc.active_endpoint_host(),
         contracts = ?config.contract_ids,
         poll_secs = config.poll_interval_secs,
         "starting lumenqraph indexer (live)"
@@ -320,22 +318,18 @@ async fn main() -> anyhow::Result<()> {
     // Load .env if present (development convenience; no-op in production).
     let _ = dotenvy::dotenv();
 
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(EnvFilter::from_default_env())
-        .init();
+    lumenqraph_core::telemetry::init_tracing();
 
     let config = Config::from_env().context("failed to load config")?;
 
-    let pool = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&config.database_url)
-        .await
-        .context("failed to connect to Postgres")?;
+    let db = Config::db_config()?;
+    let pool = lumenqraph_core::db::connect_with_retry(&config.database_url, &db).await?;
 
     // Build the RPC client with all configured endpoints (#398).
     // RPC_URLS takes precedence over RPC_URL; both are parsed by Config::from_env.
     let rpc = RpcClient::with_urls(config.rpc_urls.clone(), config.rpc_timeout_secs);
+    let network_passphrase = rpc.validate_network_passphrases().await?;
+    info!(%network_passphrase, endpoints = config.rpc_urls.len(), "validated RPC network identity");
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -394,7 +388,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!(
-        rpc = %config.rpc_url,
+        rpc_host = %rpc.active_endpoint_host(),
         rpc_endpoints = config.rpc_urls.len(),
         contracts = ?config.contract_ids,
         poll_secs = config.poll_interval_secs,

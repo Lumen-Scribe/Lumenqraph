@@ -61,6 +61,8 @@ pub struct RpcClient {
     /// failover). Stored separately from `failover.active_idx` so that
     /// `active_endpoint_host()` never needs to acquire the mutex on a hot path.
     active_url_idx: AtomicUsize,
+    /// Network passphrase pinned during startup and checked before failover.
+    network_passphrase: Mutex<Option<String>>,
 }
 
 /// Identifies the sending binary's actual release to RPC operators who key off
@@ -237,6 +239,12 @@ struct LatestLedgerResult {
     sequence: i64,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkResult {
+    network_passphrase: String,
+}
+
 // ---- getEvents ----
 
 #[derive(Serialize)]
@@ -361,6 +369,7 @@ impl RpcClient {
             calls_failed_32001: AtomicU64::new(0),
             failover_count: AtomicU64::new(0),
             active_url_idx: AtomicUsize::new(0),
+            network_passphrase: Mutex::new(None),
         }
     }
 
@@ -369,6 +378,37 @@ impl RpcClient {
     pub fn active_endpoint_host(&self) -> String {
         let idx = self.active_url_idx.load(Ordering::Relaxed);
         host_of(self.urls.get(idx).unwrap_or(&self.urls[0]))
+    }
+
+    /// Fetch `getNetwork` from every configured endpoint and pin the common
+    /// passphrase. A disagreement is a startup error, never a silent failover.
+    pub async fn validate_network_passphrases(&self) -> anyhow::Result<String> {
+        let mut expected: Option<String> = None;
+        for url in &self.urls {
+            let req = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getNetwork", "params": {} });
+            let response = self.http.post(url).header(reqwest::header::CONTENT_TYPE, "application/json").header(reqwest::header::USER_AGENT, USER_AGENT).json(&req).send().await
+                .with_context(|| format!("getNetwork request failed for RPC host {}", host_of(url)))?
+                .error_for_status().with_context(|| format!("getNetwork failed for RPC host {}", host_of(url)))?;
+            let rpc: RpcResponse<NetworkResult> = response.json().await.with_context(|| format!("getNetwork response decode failed for RPC host {}", host_of(url)))?;
+            let passphrase = rpc.result.ok_or_else(|| anyhow!("getNetwork returned no result for RPC host {}", host_of(url)))?.network_passphrase;
+            if let Some(ref prior) = expected {
+                if prior != &passphrase { anyhow::bail!("RPC network mismatch: endpoint {} returned a different network passphrase", host_of(url)); }
+            } else { expected = Some(passphrase); }
+        }
+        let passphrase = expected.expect("at least one RPC URL is required");
+        *self.network_passphrase.lock().unwrap() = Some(passphrase.clone());
+        Ok(passphrase)
+    }
+
+    async fn check_endpoint_network(&self, idx: usize) -> anyhow::Result<()> {
+        let expected = self.network_passphrase.lock().unwrap().clone();
+        let Some(expected) = expected else { return Ok(()); };
+        let url = self.url_at(idx).to_string();
+        let req = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getNetwork", "params": {} });
+        let rpc: RpcResponse<NetworkResult> = self.http.post(&url).header(reqwest::header::CONTENT_TYPE, "application/json").header(reqwest::header::USER_AGENT, USER_AGENT).json(&req).send().await?.error_for_status()?.json().await?;
+        let actual = rpc.result.ok_or_else(|| anyhow!("getNetwork returned no result for RPC host {}", host_of(&url)))?.network_passphrase;
+        if actual != expected { anyhow::bail!("RPC failover network mismatch at {}", host_of(&url)); }
+        Ok(())
     }
 
     /// Return the URL at `idx` (clamped to the list length).
@@ -493,6 +533,12 @@ impl RpcClient {
                 state.active_idx
             };
             let url = self.url_at(url_idx).to_string();
+
+            // Never send application traffic to a failover endpoint until its
+            // network identity has been re-checked.
+            if url_idx != 0 {
+                self.check_endpoint_network(url_idx).await?;
+            }
 
             for attempt in 0..MAX_ATTEMPTS_PER_URL {
                 self.calls_made.fetch_add(1, Ordering::Relaxed);

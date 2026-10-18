@@ -31,127 +31,19 @@ use anyhow::Context;
 use axum::extract::DefaultBodyLimit;
 use axum::http;
 use axum::middleware;
-use sqlx::postgres::PgPoolOptions;
 use tower_http::compression::CompressionLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use call_cache::CallCache;
 use concurrency_limit::ConcurrencyLimiter;
-use config::{ApiConfig, DbConfig};
+use config::ApiConfig;
 use key_cache::KeyCache;
 use rate_limit::RateLimiter;
 use read_cost_limit::ReadCostLimitConfig;
 use state::{AppState, BuildInfo};
 
-async fn connect_with_retry(database_url: &str, db: &DbConfig) -> anyhow::Result<sqlx::PgPool> {
-    let max_retries = db.connect_retries;
-    let mut attempt = 0;
-    let mut retry_delay = Duration::from_secs(1);
-    let max_delay = Duration::from_secs(30);
-    loop {
-        match PgPoolOptions::new()
-            .max_connections(db.max_connections)
-            .min_connections(db.min_connections)
-            .acquire_timeout(Duration::from_secs(db.acquire_timeout_secs))
-            .idle_timeout(Duration::from_secs(db.idle_timeout_secs))
-            .connect(database_url)
-            .await
-        {
-            Ok(pool) => {
-                if attempt > 0 {
-                    info!(attempt, "successfully connected to Postgres after retries");
-                }
-                return Ok(pool);
-            }
-            Err(e) if attempt < max_retries => {
-                attempt += 1;
-                tracing::warn!(
-                    error = %e,
-                    attempt,
-                    max_retries,
-                    retry_delay_secs = retry_delay.as_secs(),
-                    "failed to connect to Postgres, retrying…"
-                );
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = (retry_delay * 2).min(max_delay);
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!("failed to connect to Postgres after {max_retries} retries: {e}"));
-            }
-        }
-    }
-}
-
-fn version_string() -> String {
-    format!(
-        "lumenqraph-api {}\ncommit: {}\nbuilt: {}",
-        env!("CARGO_PKG_VERSION"),
-        option_env!("LUMENQRAPH_GIT_SHA").unwrap_or("unknown"),
-        option_env!("LUMENQRAPH_BUILD_TIME").unwrap_or("unknown"),
-    )
-}
-
-fn build_cors_layer(origins_str: &str) -> tower_http::cors::CorsLayer {
-    use tower_http::cors::CorsLayer;
-
-    if origins_str == "*" {
-        info!("CORS: allowing all origins (permissive mode)");
-        CorsLayer::permissive()
-    } else if origins_str.is_empty() {
-        info!("CORS: no allowed origins configured; browsers will enforce same-origin policy by default");
-        // Return a minimal CorsLayer with no allowed origins configured.
-        // This means no CORS headers will be added, preserving the current behavior.
-        CorsLayer::new()
-    } else {
-        info!("CORS: allowing specific origins");
-        let origins: Vec<&str> = origins_str
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        let mut cors = CorsLayer::new()
-            .allow_methods([
-                axum::http::Method::GET,
-                axum::http::Method::POST,
-                axum::http::Method::PATCH,
-                axum::http::Method::OPTIONS,
-                axum::http::Method::DELETE,
-            ])
-            .allow_headers([
-                axum::http::header::CONTENT_TYPE,
-                axum::http::header::AUTHORIZATION,
-                axum::http::header::IF_NONE_MATCH,
-                http::HeaderName::from_static("x-api-key"),
-                http::HeaderName::from_static("x-request-id"),
-            ])
-            .expose_headers([
-                http::HeaderName::from_static("x-request-id"),
-                http::HeaderName::from_static("retry-after"),
-                http::HeaderName::from_static("x-ratelimit-limit"),
-                http::HeaderName::from_static("x-ratelimit-remaining"),
-                http::HeaderName::from_static("etag"),
-                http::HeaderName::from_static("deprecation"),
-                http::HeaderName::from_static("link"),
-            ])
-            .max_age(Duration::from_secs(600));
-
-        for origin_str in origins {
-            match origin_str.parse::<http::HeaderValue>() {
-                Ok(origin) => {
-                    cors = cors.allow_origin(origin);
-                }
-                Err(_) => {
-                    info!(origin = origin_str, "invalid origin in CORS_ALLOWED_ORIGINS, skipping");
-                }
-            }
-        }
-        cors
-    }
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -176,10 +68,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let _ = dotenvy::dotenv();
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(fmt::layer())
-        .init();
+    lumenqraph_core::telemetry::init_tracing();
 
     // Parse every setting once, up front: an invalid value exits here with a
     // message naming the variable instead of silently becoming the default.
@@ -199,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let pool = connect_with_retry(&config.database_url, &config.db).await?;
+    let pool = lumenqraph_core::db::connect_with_retry(&config.database_url, &config.db).await?;
 
     let call_cache = Arc::new(CallCache::new(
         config.call_cache_max_entries,

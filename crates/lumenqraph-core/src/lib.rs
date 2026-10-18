@@ -8,6 +8,7 @@
 
 pub mod codegen;
 pub mod crypto;
+pub mod db;
 /// Helpers for isolated-schema Postgres tests. Gated so it compiles only when
 /// running tests (the `uuid` dep is always present in the workspace).
 #[cfg(any(test, feature = "db-test"))]
@@ -18,12 +19,14 @@ pub mod models;
 pub mod read;
 pub mod sanitize;
 pub mod spec;
+pub mod telemetry;
 pub mod url_validation;
 pub mod webhook;
 pub mod xdr;
 
 pub use diff::SpecDiff;
 pub use error::{Error, Result};
+pub use telemetry::redact_url;
 pub use models::{
     ApiKey,
     AmmSwap,

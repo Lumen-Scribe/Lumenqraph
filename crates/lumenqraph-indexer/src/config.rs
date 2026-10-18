@@ -4,21 +4,9 @@ use anyhow::Context;
 use serde::Deserialize;
 
 use crate::keys::{parse_durability, KeyTemplate};
+pub use lumenqraph_core::db::DbConfig;
 
-pub fn redact_database_url(url: &str) -> String {
-    if let Some(scheme_end) = url.find("://") {
-        let after_scheme = &url[scheme_end + 3..];
-        if let Some(at_idx) = after_scheme.find('@') {
-            let user_pass = &after_scheme[..at_idx];
-            if let Some(colon_idx) = user_pass.find(':') {
-                let user = &user_pass[..colon_idx];
-                let rest = &after_scheme[at_idx..];
-                return format!("{}://{}:[REDACTED]{}", &url[..scheme_end], user, rest);
-            }
-        }
-    }
-    url.to_string()
-}
+pub fn redact_database_url(url: &str) -> String { lumenqraph_core::redact_url(url) }
 
 #[derive(Clone)]
 pub struct Config {
@@ -62,8 +50,8 @@ impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
             .field("database_url", &redact_database_url(&self.database_url))
-            .field("rpc_url", &self.rpc_url)
-            .field("rpc_urls", &self.rpc_urls)
+            .field("rpc_url", &lumenqraph_core::redact_url(&self.rpc_url))
+            .field("rpc_urls", &self.rpc_urls.iter().map(|u| lumenqraph_core::redact_url(u)).collect::<Vec<_>>())
             .field("contract_ids", &self.contract_ids)
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("page_size", &self.page_size)
@@ -86,6 +74,49 @@ impl std::fmt::Debug for Config {
 }
 
 impl Config {
+    pub fn db_config() -> anyhow::Result<DbConfig> {
+        let max_connections = clamp_with_warning(
+            "INDEXER_DATABASE_MAX_CONNECTIONS",
+            env_parse_override("INDEXER_DATABASE_MAX_CONNECTIONS", "DATABASE_MAX_CONNECTIONS", 10u32)?,
+            1,
+            u32::MAX,
+        );
+        let min_connections = env_parse_override(
+            "INDEXER_DATABASE_MIN_CONNECTIONS",
+            "DATABASE_MIN_CONNECTIONS",
+            0u32,
+        )?;
+        let min_connections = if min_connections > max_connections {
+            tracing::warn!(
+                requested_min = min_connections,
+                max = max_connections,
+                "indexer database minimum exceeds maximum; clamping to maximum"
+            );
+            max_connections
+        } else {
+            min_connections
+        };
+        Ok(DbConfig {
+            max_connections,
+            min_connections,
+            acquire_timeout_secs: env_parse_override(
+                "INDEXER_DATABASE_ACQUIRE_TIMEOUT_SECS",
+                "DATABASE_ACQUIRE_TIMEOUT_SECS",
+                30u64,
+            )?,
+            idle_timeout_secs: env_parse_override(
+                "INDEXER_DATABASE_IDLE_TIMEOUT_SECS",
+                "DATABASE_IDLE_TIMEOUT_SECS",
+                600u64,
+            )?,
+            connect_retries: env_parse_override(
+                "INDEXER_DATABASE_CONNECT_RETRIES",
+                "DATABASE_CONNECT_RETRIES",
+                30u32,
+            )?,
+        })
+    }
+
     pub fn from_env() -> anyhow::Result<Self> {
         let contract_ids: Vec<String> = lumenqraph_core::parse_contract_ids(
             &std::env::var("CONTRACT_IDS").unwrap_or_default(),
@@ -102,9 +133,6 @@ impl Config {
         let rpc_timeout_secs = env_parse("RPC_TIMEOUT_SECS", 30u64)?;
         let spec_cache_max_entries = env_parse("SPEC_CACHE_MAX_ENTRIES", 2000usize)?;
         let spec_fetch_concurrency = env_parse("SPEC_FETCH_CONCURRENCY", 4usize)?;
-        let database_max_connections = env_parse("DATABASE_MAX_CONNECTIONS", 10u32)?;
-        let database_min_connections = env_parse("DATABASE_MIN_CONNECTIONS", 0u32)?;
-
         // Validate and clamp PAGE_SIZE to RPC documented bounds (1–10000).
         let page_size = clamp_with_warning("PAGE_SIZE", page_size, 1, 10000);
 
@@ -158,20 +186,6 @@ impl Config {
 
         // Validate SPEC_FETCH_CONCURRENCY minimum (must be at least 1).
         let spec_fetch_concurrency = clamp_with_warning("SPEC_FETCH_CONCURRENCY", spec_fetch_concurrency, 1, usize::MAX);
-
-        // Validate DATABASE_MAX_CONNECTIONS minimum (must be at least 1).
-        let database_max_connections = clamp_with_warning("DATABASE_MAX_CONNECTIONS", database_max_connections, 1, u32::MAX);
-
-        // Validate DATABASE_MIN_CONNECTIONS (must be <= max).
-        if database_min_connections > database_max_connections {
-            tracing::warn!(
-                requested_min = database_min_connections,
-                max = database_max_connections,
-                clamped_min = database_max_connections,
-                "DATABASE_MIN_CONNECTIONS cannot exceed DATABASE_MAX_CONNECTIONS; clamping to max"
-            );
-        }
-        let database_min_connections = database_min_connections.min(database_max_connections);
 
         // Parse ENRICHMENT_WARN_THRESHOLD (0.0-1.0, default 0.5).
         let enrichment_warn_threshold: f64 = env_parse("ENRICHMENT_WARN_THRESHOLD", 0.5)?;
@@ -340,6 +354,25 @@ where
             .map_err(|e| anyhow::anyhow!("invalid {key}: {e}")),
         _ => Ok(default),
     }
+}
+
+fn env_parse_override<T: std::str::FromStr>(
+    service_key: &str,
+    common_key: &str,
+    default: T,
+) -> anyhow::Result<T>
+where
+    T::Err: std::fmt::Display,
+{
+    let key = if std::env::var(service_key)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        service_key
+    } else {
+        common_key
+    };
+    env_parse(key, default)
 }
 
 #[cfg(test)]

@@ -3,20 +3,7 @@
 use anyhow::Context;
 use std::time::Duration;
 
-pub fn redact_database_url(url: &str) -> String {
-    if let Some(scheme_end) = url.find("://") {
-        let after_scheme = &url[scheme_end + 3..];
-        if let Some(at_idx) = after_scheme.find('@') {
-            let user_pass = &after_scheme[..at_idx];
-            if let Some(colon_idx) = user_pass.find(':') {
-                let user = &user_pass[..colon_idx];
-                let rest = &after_scheme[at_idx..];
-                return format!("{}://{}:[REDACTED]{}", &url[..scheme_end], user, rest);
-            }
-        }
-    }
-    url.to_string()
-}
+pub fn redact_database_url(url: &str) -> String { lumenqraph_core::redact_url(url) }
 
 #[derive(Clone)]
 pub struct Config {
