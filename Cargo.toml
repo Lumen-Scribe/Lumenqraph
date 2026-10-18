@@ -11,9 +11,15 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.84"
+rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/Lumen-Scribe/Lumenqraph"
+
+# Resolver v3 MSRV-aware version selection: `cargo update` will prefer
+# dependency versions compatible with `rust-version` instead of always picking
+# the newest release. Requires Cargo >= 1.84.
+[resolver]
+incompatible-rust-versions = "fallback"
 
 # Shared dependency versions — pinned once, referenced by each crate with
 # `<dep>.workspace = true` so the indexer (writer) and api (reader) never drift.
@@ -77,6 +83,9 @@ stellar-xdr = { version = "23", default-features = false, features = [
 # lumenqraph-core can use it directly in the hot XDR decode path (#413).
 stellar-strkey = "0.0.13"
 lru = "0.12"
+# CLI parsing for the indexer. Held to 4.5.x: newer clap releases need a
+# newer Rust than the workspace `rust-version` (1.84).
+clap = { version = "~4.5", features = ["derive"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 
 [profile.release]

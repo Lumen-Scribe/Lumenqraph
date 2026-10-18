@@ -1,14 +1,19 @@
 name: SDK – Publish to npm
 
-# Triggers on every semver tag that matches v*.*.*.
+# Triggers on every SDK-specific semver tag that matches sdk-ts-v*.*.*.
 # The tag should be cut after the SDK version in package.json is bumped.
+# See the release policy in CONTRIBUTING.md.
 #
 # Provenance:  --provenance requires id-token: write and publishes a signed
 #              SLSA attestation alongside the tarball on the npm registry.
 on:
   push:
     tags:
-      - "v*.*.*"
+      - "sdk-ts-v*.*.*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -17,6 +22,7 @@ jobs:
   publish:
     name: Build & publish @lumenqraph/sdk
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       # Required for npm provenance signing (OIDC token)
@@ -65,14 +71,28 @@ jobs:
       - name: Build
         run: npm run build
 
+      # ── Verify the package version matches the tag ────────────────────────────
+      # sdk-ts-v1.2.3 → package.json "version" must be 1.2.3
+      - name: Verify package version matches tag
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#sdk-ts-v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          echo "Tag version:     $TAG_VERSION"
+          echo "Package version: $PKG_VERSION"
+          if [[ "$TAG_VERSION" != "$PKG_VERSION" ]]; then
+            echo "::error::Tag version ($TAG_VERSION) does not match package.json version ($PKG_VERSION)"
+            exit 1
+          fi
+
       # ── Derive the correct dist-tag from the tag name ─────────────────────────
-      # v1.2.3      → latest
-      # v1.2.3-rc.1 → next   (pre-release versions)
+      # sdk-ts-v1.2.3      → latest
+      # sdk-ts-v1.2.3-rc.1 → next   (pre-release versions)
       - name: Resolve dist-tag
         id: dist_tag
         shell: bash
         run: |
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${GITHUB_REF_NAME#sdk-ts-v}"
           if [[ "$TAG" =~ -[a-zA-Z] ]]; then
             echo "tag=next" >> "$GITHUB_OUTPUT"
           else

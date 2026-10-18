@@ -1,19 +1,24 @@
 name: Publish Python SDK to PyPI
 
 on:
-  push:
-    tags:
-      - "v*"
   release:
     types: [published]
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     name: Build wheel and sdist
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      version: ${{ steps.version.outputs.version }}
     defaults:
       run:
         working-directory: sdk/python
@@ -39,7 +44,7 @@ jobs:
           else
             TAG="${GITHUB_REF_NAME}"
           fi
-          VERSION="${TAG#v}"
+          VERSION="${TAG#sdk-py-v}"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "prerelease=$([[ "$VERSION" == *-* ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
@@ -56,6 +61,11 @@ jobs:
       - name: Build wheel and sdist
         run: python -m build
 
+      - name: Check distribution metadata
+        run: |
+          python -m pip install --upgrade twine
+          twine check dist/*
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -67,6 +77,7 @@ jobs:
     needs: build
     if: needs.build.outputs.prerelease == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment:
       name: testpypi
       url: https://test.pypi.org/p/lumenqraph
@@ -89,6 +100,7 @@ jobs:
     needs: build
     if: needs.build.outputs.prerelease == 'false'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment:
       name: pypi
       url: https://pypi.org/p/lumenqraph

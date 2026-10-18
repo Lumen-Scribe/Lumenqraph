@@ -10,6 +10,9 @@ Synchronous example::
     for event in lq.paginate_events(contracts["data"][0]["contract_id"]):
         print(event["event_name"], event.get("enriched") or event.get("decoded_value"))
 
+Typed response models generated from ``openapi.yaml`` are available in
+:mod:`lumenqraph.models`, e.g. ``models.EventsPage.model_validate(page)``.
+
 Async example::
 
     import asyncio
@@ -24,13 +27,14 @@ Async example::
     asyncio.run(main())
 """
 
+from . import models
+from .async_client import AsyncLumenqraphClient
 from .client import (
+    ClientOptions,
     LumenqraphClient,
     LumenqraphError,
-    ClientOptions,
     RetryOptions,
 )
-from .async_client import AsyncLumenqraphClient
 from .webhook import verify_webhook_signature
 
 __all__ = [
@@ -39,6 +43,7 @@ __all__ = [
     "LumenqraphError",
     "ClientOptions",
     "RetryOptions",
+    "models",
     "verify_webhook_signature",
 ]
 

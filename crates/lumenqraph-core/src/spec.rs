@@ -35,9 +35,17 @@ pub struct ContractSpec {
     /// Error enums from `UdtErrorEnumV0` entries. These map numeric contract
     /// error codes to human-readable names and doc strings.
     pub error_enums: Vec<UdtErrorEnum>,
+    /// Error enums in the shape the interface JSON and diff consume: each
+    /// entry is a name plus its `(case_name, code)` pairs. Populated from the
+    /// same `UdtErrorEnumV0` entries as `error_enums`.
+    pub errors: Vec<UdtErrorEnum>,
     /// event name -> index into `events`, for O(1) enrichment lookups.
     #[serde(skip)]
     events_by_name: HashMap<String, usize>,
+    /// prefix-topic tuple -> index into `events`, so events that share
+    /// `topic[0]` but differ in later topics resolve independently (#402).
+    #[serde(skip)]
+    events_by_prefix: HashMap<Vec<String>, usize>,
     /// function name -> index into `functions`, so the read layer resolves a
     /// function to encode without scanning the whole interface.
     #[serde(skip)]
@@ -274,6 +282,7 @@ impl ContractSpec {
             && self.unions.is_empty()
             && self.enums.is_empty()
             && self.error_enums.is_empty()
+            && self.errors.is_empty()
     }
 
     fn reindex(&mut self) {
@@ -476,9 +485,9 @@ impl ContractSpec {
             }
             // Error enums carry numeric codes → names, used by the read layer
             // to map `Error(Contract, #N)` to the declared case name.
-            ScSpecEntry::UdtErrorEnumV0(e) => self.error_enums.push(UdtErrorEnum {
-                name: string_of(&e.name),
-                cases: e
+            ScSpecEntry::UdtErrorEnumV0(e) => {
+                let name = string_of(&e.name);
+                let cases: Vec<ErrorCase> = e
                     .cases
                     .iter()
                     .map(|c| ErrorCase {
@@ -486,8 +495,15 @@ impl ContractSpec {
                         code: c.value,
                         doc: string_of(&c.doc),
                     })
-                    .collect(),
-            }),
+                    .collect();
+                self.error_enums.push(UdtErrorEnum {
+                    name: name.clone(),
+                    cases: cases.clone(),
+                });
+                // Mirror into `errors`, the shape the interface JSON and diff
+                // consume (name + cases).
+                self.errors.push(UdtErrorEnum { name, cases });
+            }
         }
     }
 
@@ -1848,8 +1864,10 @@ mod tests {
             assert_eq!(spec.errors.len(), 1);
             assert_eq!(spec.errors[0].name, "ContractError");
             assert_eq!(spec.errors[0].cases.len(), 2);
-            assert_eq!(spec.errors[0].cases[0], ("InsufficientBalance".to_string(), 1));
-            assert_eq!(spec.errors[0].cases[1], ("Unauthorized".to_string(), 2));
+            assert_eq!(spec.errors[0].cases[0].name, "InsufficientBalance");
+            assert_eq!(spec.errors[0].cases[0].code, 1);
+            assert_eq!(spec.errors[0].cases[1].name, "Unauthorized");
+            assert_eq!(spec.errors[0].cases[1].code, 2);
         }
 
         #[test]

@@ -24,7 +24,12 @@ services:
     dockerfilePath: ./Dockerfile
     dockerContext: .
     # Overrides the image's default CMD (api only) to run indexer + api together.
+    # run-all-in-one.sh applies migrations (`lumenqraph-indexer migrate`) before
+    # starting anything, because the free plan has no pre-deploy step.
     dockerCommand: run-all-in-one.sh
+    # On a paid instance type, run migrations as a pre-deploy step instead, so a
+    # failed migration aborts the deploy before the running service is replaced:
+    # preDeployCommand: lumenqraph-indexer migrate
     healthCheckPath: /health
 
     envVars:

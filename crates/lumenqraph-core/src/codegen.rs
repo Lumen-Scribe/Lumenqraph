@@ -194,6 +194,7 @@ impl Gen<'_> {
         self.spec.structs.iter().any(|s| s.name == name)
             || self.spec.unions.iter().any(|u| u.name == name)
             || self.spec.enums.iter().any(|e| e.name == name)
+            || self.spec.errors.iter().any(|e| e.name == name)
     }
 
     /// Map a spec type to TypeScript. `pos` only matters for the handful of
@@ -330,8 +331,10 @@ impl Gen<'_> {
         }
 
         // Error enums (#[contracterror]): numeric codes with human-readable names.
-        // Exported as a const enum so callers can match on `ContractError.InsufficientBalance`
-        // and the numeric value is still available.
+        // Exported as a regular `enum` (not `const enum`, which `isolatedModules`
+        // and `--verbatimModuleSyntax` reject) so callers can match on
+        // `ContractError.InsufficientBalance` and the numeric value is still
+        // available at runtime.
         for e in &spec.errors {
             let cases: Vec<String> = e
                 .cases
@@ -345,7 +348,7 @@ impl Gen<'_> {
             };
             let _ = write!(
                 out,
-                "\n/** {doc} */\nexport const enum {} {{\n{}\n}}\n",
+                "\n/** {doc} */\nexport enum {} {{\n{}\n}}\n",
                 e.name,
                 cases.join("\n"),
             );
@@ -1432,15 +1435,24 @@ mod tests {
         }
 
         #[test]
-        fn typescript_emits_const_enum_for_error_enum() {
+        fn typescript_emits_enum_for_error_enum() {
             let s = spec(&[error_enum_entry()]);
             let ts = typescript_client(C, &s);
             assert!(
-                ts.contains("export const enum ContractError"),
-                "should emit const enum: {ts}"
+                ts.contains("export enum ContractError"),
+                "should emit enum: {ts}"
             );
             assert!(ts.contains("InsufficientBalance = 1,"));
             assert!(ts.contains("Unauthorized = 2,"));
+        }
+
+        #[test]
+        fn typescript_error_enum_does_not_collide_with_udts() {
+            // A UDT named like a scalar alias must not shadow the error enum.
+            let s = spec(&[error_enum_entry()]);
+            let ts = typescript_client(C, &s);
+            assert!(ts.contains("export enum ContractError"));
+            assert!(!ts.contains("export const enum"));
         }
 
         #[test]

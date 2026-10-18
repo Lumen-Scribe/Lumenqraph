@@ -13,6 +13,12 @@ primary_region = "iad"
 [build]
   dockerfile = "Dockerfile"
 
+# Apply migrations once per deploy, in a temporary machine, before any process
+# group is updated. A failed migration aborts the deploy. The services only
+# verify the schema at startup and refuse to run against an older one.
+[deploy]
+  release_command = "lumenqraph-indexer migrate"
+
 # Three long-running services from the one image. The indexer and webhooks are
 # workers (no inbound service); the api serves HTTP + the explorer UI.
 [processes]
@@ -35,6 +41,8 @@ primary_region = "iad"
   # skipped + logged. Raise it only with a retaining/paid RPC (see DEPLOYMENT.md).
   MAX_CATCHUP_LEDGERS = "120"
   EXPLORER_DIR = "/app/explorer"
+  # Migrations are applied by the release_command above.
+  SKIP_MIGRATIONS = "true"
 
 # HTTP is served only by the `api` process group. The indexer must run 24/7
 # (a sleeping poller falls behind the chain), so machines are never auto-stopped.

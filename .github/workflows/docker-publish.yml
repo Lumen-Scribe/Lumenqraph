@@ -7,12 +7,18 @@ name: Docker – Build & Publish to GHCR
 on:
   push:
     tags:
-      - "v*.*.*"
+      # Server releases are tagged `server-v*` so they are decoupled from the
+      # SDK releases (`sdk-ts-v*`, `sdk-py-v*`). See CONTRIBUTING.md.
+      - "server-v*.*.*"
   pull_request:
     paths:
       - Dockerfile
       - .dockerignore
       - .github/workflows/docker-publish.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   REGISTRY: ghcr.io
@@ -26,6 +32,7 @@ jobs:
   build-and-push:
     name: Build & push (${{ matrix.platform }})
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: write
@@ -62,10 +69,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # ── Compute the real build timestamp ────────────────────────────────────
+      # `github.event.repository.updated_at` is the time the repository
+      # metadata last changed (e.g. a description edit), not the build time.
+      # Use the current UTC time so /health.build_time is accurate.
+      - name: Compute build time
+        id: buildtime
+        run: echo "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       # ── Derive tags + labels from Git metadata ───────────────────────────────
-      # On a tag push this produces:
-      #   ghcr.io/<owner>/<repo>:v1.2.3
+      # On a `server-v1.2.3` tag push this produces:
       #   ghcr.io/<owner>/<repo>:1.2.3
+      #   ghcr.io/<owner>/<repo>:1.2
+      #   ghcr.io/<owner>/<repo>:1
       #   ghcr.io/<owner>/<repo>:latest
       - name: Extract Docker metadata
         id: meta
@@ -73,14 +89,15 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=semver,pattern={{version}},value=${{ github.ref_name }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ github.ref_name }}
+            type=semver,pattern={{major}},value=${{ github.ref_name }}
             type=ref,event=pr
           labels: |
             org.opencontainers.image.title=Lumenqraph
-            org.opencontainers.image.description=Soroban event-indexer with REST, GraphQL, WebSocket and MCP APIs
+            org.opencontainers.image.description=Soroban event-indexer with REST, GraphQL, SSE and MCP APIs
             org.opencontainers.image.vendor=Lumen-Scribe
+            org.opencontainers.image.created=${{ steps.buildtime.outputs.time }}
 
       # ── Build (and push on tag events) ──────────────────────────────────────
       # Each platform leg pushes to a per-platform manifest and produces a
@@ -107,7 +124,7 @@ jobs:
             }}
           build-args: |
             GIT_COMMIT=${{ github.sha }}
-            BUILD_TIME=${{ github.event.repository.updated_at }}
+            BUILD_TIME=${{ steps.buildtime.outputs.time }}
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
 
@@ -132,6 +149,7 @@ jobs:
   merge:
     name: Merge multi-arch manifest
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: github.event_name != 'pull_request'
     needs: build-and-push
     permissions:
@@ -164,12 +182,12 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=semver,pattern={{version}},value=${{ github.ref_name }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ github.ref_name }}
+            type=semver,pattern={{major}},value=${{ github.ref_name }}
           labels: |
             org.opencontainers.image.title=Lumenqraph
-            org.opencontainers.image.description=Soroban event-indexer with REST, GraphQL, WebSocket and MCP APIs
+            org.opencontainers.image.description=Soroban event-indexer with REST, GraphQL, SSE and MCP APIs
             org.opencontainers.image.vendor=Lumen-Scribe
 
       - name: Create and push multi-arch manifest
@@ -179,6 +197,20 @@ jobs:
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+          # Resolve the digest of the manifest we just pushed so the
+          # attestation step below has a subject to attest.
+          digest="$(
+            docker buildx imagetools inspect \
+              "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}" \
+              --format '{{json .Manifest}}' | jq -r .digest
+          )"
+          if [ -z "$digest" ] || [ "$digest" = "null" ]; then
+            echo "::error::Failed to resolve manifest digest for ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}"
+            exit 1
+          fi
+          echo "Resolved manifest digest: $digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Inspect final image
         run: |

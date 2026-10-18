@@ -161,6 +161,14 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // healthcheck: probe our own /health on localhost and exit 0/1 (#469).
+    // Used by the Dockerfile HEALTHCHECK and compose; needs no curl.
+    if args.get(1).map(|s| s.as_str()) == Some("healthcheck") {
+        let _ = dotenvy::dotenv();
+        let bind = std::env::var("API_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
+        lumenqraph_core::healthcheck::run_and_exit(&bind, "/health");
+    }
+
     // --print-openapi: dump the generated OpenAPI 3.1 spec as JSON to stdout
     // and exit.  Used by the CI drift check to compare against the committed
     // openapi.yaml without starting the full server or connecting to Postgres.
@@ -200,6 +208,17 @@ async fn main() -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let pool = connect_with_retry(&config.database_url, &config.db).await?;
+
+    // Migrations are applied by `lumenqraph-indexer migrate`, not here. Refuse
+    // to serve against a schema older than this binary instead of answering
+    // with 500s for missing tables (#473).
+    match lumenqraph_core::schema::check(&pool).await? {
+        lumenqraph_core::schema::SchemaStatus::Current => {}
+        lumenqraph_core::schema::SchemaStatus::Ahead { unknown_versions } => tracing::warn!(
+            ?unknown_versions,
+            "database schema is newer than this binary (rolling upgrade in progress?)"
+        ),
+    }
 
     let call_cache = Arc::new(CallCache::new(
         config.call_cache_max_entries,
