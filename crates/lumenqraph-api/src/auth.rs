@@ -148,21 +148,23 @@ pub fn extract_client_ip(headers: &HeaderMap, socket_addr: Option<SocketAddr>, c
 
 /// Perform a key lookup, consulting the in-process LRU cache first (#430).
 ///
-/// Returns `Ok((identity, limit, is_authenticated))` on success, or an
-/// `ApiError` that should be returned to the caller directly.
+/// Returns `Ok((identity, limit, is_authenticated, key_hash_opt))` on success,
+/// or an `ApiError` that should be returned to the caller directly. The key
+/// hash is `Some` only for authenticated callers, so handlers can record the
+/// owner of created resources (#421).
 async fn resolve_key(
     state: &AppState,
     key: &str,
     route: &str,
     method: &str,
-) -> Result<(String, i32, bool), ApiError> {
+) -> Result<(String, i32, bool, Option<String>), ApiError> {
     let hash = hash_key(key);
 
     // --- Cache look-up (#430) ---
     if let Some(cached) = state.key_cache.get(&hash) {
         return match cached {
             CachedKey::Valid { rate_limit_per_min } => {
-                Ok((format!("key:{hash}"), rate_limit_per_min, true))
+                Ok((format!("key:{hash}"), rate_limit_per_min, true, Some(hash)))
             }
             CachedKey::Revoked => {
                 log_audit_event(&state.pool, &hash, route, method, 401).await;
@@ -186,7 +188,7 @@ async fn resolve_key(
     match row {
         Some((false, limit)) => {
             state.key_cache.insert_valid(&hash, limit);
-            Ok((format!("key:{hash}"), limit, true))
+            Ok((format!("key:{hash}"), limit, true, Some(hash)))
         }
         Some((true, _)) => {
             state.key_cache.insert_revoked(&hash);
@@ -264,14 +266,14 @@ pub async fn auth_and_rate_limit(
     let uri = req.uri().to_string();
     let route = uri.split('?').next().unwrap_or("").to_string();
 
-    let (identity, limit, is_authenticated) = match extract_key(&headers) {
+    let (identity, limit, is_authenticated, _key_hash_opt) = match extract_key(&headers) {
         Some(key) => resolve_key(&state, &key, &route, &method).await?,
         None => {
             if state.require_auth {
                 return Err(ApiError::unauthorized("missing API key"));
             }
             let client_ip = extract_client_ip(&headers, Some(socket_addr), &state.ip_config);
-            (format!("anon:{client_ip}"), state.anon_rate_limit, false)
+            (format!("anon:{client_ip}"), state.anon_rate_limit, false, None)
         }
     };
 
@@ -316,7 +318,7 @@ pub async fn rpc_auth_and_rate_limit(
     let uri = req.uri().to_string();
     let route = uri.split('?').next().unwrap_or("").to_string();
 
-    let (identity, limit, is_authenticated) = match extract_key(&headers) {
+    let (identity, limit, is_authenticated, _key_hash_opt) = match extract_key(&headers) {
         Some(key) => resolve_key(&state, &key, &route, &method).await?,
         None => {
             if state.rpc_require_auth {
@@ -326,7 +328,7 @@ pub async fn rpc_auth_and_rate_limit(
             }
             // #429: key per-IP so each client has an independent budget.
             let client_ip = extract_client_ip(&headers, Some(socket_addr), &state.ip_config);
-            (format!("anon:{client_ip}"), state.rpc_anon_rate_limit, false)
+            (format!("anon:{client_ip}"), state.rpc_anon_rate_limit, false, None)
         }
     };
 
@@ -353,7 +355,6 @@ pub async fn rpc_auth_and_rate_limit(
 }
 
 /// Middleware for webhook subscription creation (POST /webhooks).
-/// Middleware for webhook subscription creation (POST /webhooks).
 /// Uses a separate rate limiter with a lower limit for anonymous callers
 /// to prevent unbounded subscription creation.
 ///
@@ -372,14 +373,14 @@ pub async fn webhook_auth_and_rate_limit(
     let uri = req.uri().to_string();
     let route = uri.split('?').next().unwrap_or("").to_string();
 
-    let (identity, limit, is_authenticated) = match extract_key(&headers) {
+    let (identity, limit, is_authenticated, key_hash_opt) = match extract_key(&headers) {
         Some(key) => resolve_key(&state, &key, &route, &method).await?,
         None => {
             if state.require_auth {
                 return Err(ApiError::unauthorized("missing API key"));
             }
             let client_ip = extract_client_ip(&headers, Some(socket_addr), &state.ip_config);
-            (format!("anon:{client_ip}"), state.webhook_anon_rate_limit, false)
+            (format!("anon:{client_ip}"), state.webhook_anon_rate_limit, false, None)
         }
     };
 
@@ -394,8 +395,10 @@ pub async fn webhook_auth_and_rate_limit(
 
     // Inject the authenticated caller's key hash so create_webhook can set
     // owner_key_hash on the new subscription (#421).
-    if let Some(hash) = key_hash_opt {
-        req.extensions_mut().insert(CallerKeyHash(hash));
+    if is_authenticated {
+        if let Some(hash) = key_hash_opt {
+            req.extensions_mut().insert(CallerKeyHash(hash));
+        }
     }
 
     let response = next.run(req).await;
@@ -971,6 +974,64 @@ mod integration_tests {
         assert_eq!(res.status(), 429);
         let body: serde_json::Value = res.json().await.unwrap();
         assert!(body.get("error").is_some(), "429 must have error envelope");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn authenticated_webhook_create_stores_owner_key_hash() {
+        let pool = db_pool().await;
+        insert_api_key(&pool, "owner-key", false).await;
+        let base = spawn_server(make_state(pool.clone(), true, 60)).await;
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("{base}/webhooks"))
+            .header("x-api-key", "owner-key")
+            .json(&serde_json::json!({
+                "url": "https://example.com/hook",
+                "events": ["contract_call"]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            res.status().is_success(),
+            "authenticated create must succeed, got {}",
+            res.status()
+        );
+        let owner: Option<String> =
+            sqlx::query_scalar("SELECT owner_key_hash FROM webhook_subscriptions")
+                .fetch_one(&pool)
+                .await
+                .expect("fetch owner_key_hash");
+        assert_eq!(owner.as_deref(), Some(hash_key("owner-key").as_str()));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn anonymous_webhook_create_stores_null_owner_key_hash() {
+        let pool = db_pool().await;
+        let base = spawn_server(make_state(pool.clone(), false, 60)).await;
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("{base}/webhooks"))
+            .json(&serde_json::json!({
+                "url": "https://example.com/anon-hook",
+                "events": ["contract_call"]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            res.status().is_success(),
+            "anonymous create must succeed when auth is not required, got {}",
+            res.status()
+        );
+        let owner: Option<String> =
+            sqlx::query_scalar("SELECT owner_key_hash FROM webhook_subscriptions")
+                .fetch_one(&pool)
+                .await
+                .expect("fetch owner_key_hash");
+        assert_eq!(owner, None);
     }
 
     #[tokio::test]

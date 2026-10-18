@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use url::Url;
 use uuid::Uuid;
@@ -439,6 +440,18 @@ pub async fn deliver(
     http: &reqwest::Client,
     config: &Config,
 ) -> anyhow::Result<(u64, u64)> {
+    deliver_with_shutdown(pool, http, config, &CancellationToken::new()).await
+}
+
+pub async fn deliver_with_shutdown(
+    pool: &PgPool,
+    http: &reqwest::Client,
+    config: &Config,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<(u64, u64)> {
+    if shutdown.is_cancelled() {
+        return Ok((0, 0));
+    }
     let deliveries = fetch_due(pool, config.batch_size, &config.encryption_key).await?;
     if deliveries.is_empty() {
         return Ok((0, 0));

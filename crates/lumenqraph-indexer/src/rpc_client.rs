@@ -237,6 +237,13 @@ struct LatestLedgerResult {
     sequence: i64,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcHealth {
+    pub oldest_ledger: i64,
+    pub latest_ledger: i64,
+}
+
 // ---- getEvents ----
 
 #[derive(Serialize)]
@@ -599,6 +606,11 @@ impl RpcClient {
     pub async fn get_latest_ledger(&self) -> anyhow::Result<i64> {
         let r: LatestLedgerResult = self.call("getLatestLedger", serde_json::json!({})).await?;
         Ok(r.sequence)
+    }
+
+    /// Return the provider's currently retained ledger window.
+    pub async fn get_health(&self) -> anyhow::Result<RpcHealth> {
+        self.call("getHealth", serde_json::json!({})).await
     }
 
     /// Fetch a page of events. Pass `start_ledger` on the first page of a scan,

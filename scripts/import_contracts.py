@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Import a list of Soroban contract ids from Stellar.Expert and optionally import into Lumenqraph.
+"""Import a list of Soroban contract ids from Stellar.Expert.
 
 Stellar.Expert already tracks every deployed contract; this pulls a batch of
 them so Lumenqraph can index them. Prints a comma-separated list suitable for
 the indexer's CONTRACT_IDS env var.
+
+Lumenqraph discovers contracts from the events it indexes, so there is nothing
+to POST here: seeding an instance is a matter of putting the printed ids in its
+CONTRACT_IDS and starting it.
 
 Note on ordering: the `/explorer/<net>/contract` endpoint only orders by
 contract id (ascending or descending) — it exposes no "by rating/activity"
@@ -12,20 +16,25 @@ default), which keeps only contracts that have actually emitted events (the
 data an event indexer can show). Pages are scanned in `--order` id-order until
 `--limit` such contracts are collected.
 
+Note on `CONTRACT_IDS`: `parse_contract_ids` in `lumenqraph-core` accepts at
+most 25 ids per instance (getEvents takes 5 filters x 5 ids). When `--limit`
+asks for more than that, the ids are printed as several comma-separated lines,
+one group of at most 25 per line, so each line can be handed to a different
+indexer instance.
+
 Usage:
   python3 scripts/import_contracts.py [--network public|testnet]
                                       [--order desc|asc]
                                       [--limit N]
                                       [--include-empty]
-                                      [--api-url <url>]
 
 Examples:
   # 20 mainnet contracts that have emitted events (good for a demo):
   python3 scripts/import_contracts.py --network public --limit 20
   # include contracts with zero events too:
   python3 scripts/import_contracts.py --include-empty --limit 20
-  # import into local Lumenqraph instance:
-  python3 scripts/import_contracts.py --api-url http://localhost:8080 --limit 20
+  # 60 contracts: prints three lines of 25, 25 and 10 ids, one per instance:
+  python3 scripts/import_contracts.py --limit 60
 """
 import argparse
 import json
@@ -34,7 +43,6 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from typing import Optional
 
 API = "https://api.stellar.expert/explorer"
 
@@ -56,6 +64,10 @@ REQUEST_TIMEOUT_SECS = 30
 
 # Contract ID format validation: Stellar contract IDs start with 'C' followed by alphanumeric
 CONTRACT_ID_PATTERN = re.compile(r"^C[A-Z2-7]{55}$")
+
+# Mirrors `MAX_CONTRACT_IDS` in `lumenqraph-core/src/xdr.rs`: a single instance's
+# CONTRACT_IDS may hold at most 25 ids (5 getEvents filters x 5 ids each).
+MAX_IDS_PER_GROUP = 25
 
 
 def validate_contract_id(contract_id: str) -> bool:
@@ -124,27 +136,9 @@ def fetch(network: str, order: str, limit: int, active_only: bool) -> list[dict]
     return out[:limit]
 
 
-def import_to_lumenqraph(api_url: str, contract_ids: list[str]) -> tuple[int, list[str]]:
-    """Import contract IDs into Lumenqraph API. Returns (success_count, failed_ids)."""
-    failed_ids = []
-    for contract_id in contract_ids:
-        if not validate_contract_id(contract_id):
-            print(f"invalid contract ID format: {contract_id}", file=sys.stderr)
-            failed_ids.append(contract_id)
-            continue
-
-        url = f"{api_url}/contracts/{contract_id}"
-        try:
-            req = urllib.request.Request(url, method="POST", headers={"content-type": "application/json"})
-            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECS) as resp:
-                if resp.status not in (200, 201, 204):
-                    print(f"failed to import {contract_id}: HTTP {resp.status}", file=sys.stderr)
-                    failed_ids.append(contract_id)
-        except Exception as e:
-            print(f"failed to import {contract_id}: {e}", file=sys.stderr)
-            failed_ids.append(contract_id)
-
-    return len(contract_ids) - len(failed_ids), failed_ids
+def group_ids(contract_ids: list[str], size: int = MAX_IDS_PER_GROUP) -> list[list[str]]:
+    """Split ids into groups that each fit one instance's CONTRACT_IDS."""
+    return [contract_ids[i : i + size] for i in range(0, len(contract_ids), size)]
 
 
 def main() -> int:
@@ -162,12 +156,6 @@ def main() -> int:
         action="store_true",
         help="also include contracts with zero events (default: active only)",
     )
-    ap.add_argument(
-        "--api-url",
-        type=str,
-        default=None,
-        help="if provided, import fetched contracts into this Lumenqraph API URL",
-    )
     args = ap.parse_args()
 
     try:
@@ -180,7 +168,19 @@ def main() -> int:
         print("no contracts returned", file=sys.stderr)
         return 1
 
-    ids = [r["contract"] for r in records]
+    # Keep only well-formed C-strkeys: `parse_contract_ids` rejects the whole
+    # CONTRACT_IDS value over a single bad entry, so never emit one.
+    ids = []
+    for r in records:
+        cid = r["contract"]
+        if not validate_contract_id(cid):
+            print(f"skipping malformed contract id {cid!r}", file=sys.stderr)
+            continue
+        ids.append(cid)
+    if not ids:
+        print("no usable contract ids returned", file=sys.stderr)
+        return 1
+
     total_events = sum(r.get("events") or 0 for r in records)
     scope = "all" if args.include_empty else "active"
     print(
@@ -189,16 +189,18 @@ def main() -> int:
         file=sys.stderr,
     )
 
-    # Import to Lumenqraph if API URL provided
-    if args.api_url:
-        success_count, failed_ids = import_to_lumenqraph(args.api_url, ids)
-        print(f"imported {success_count}/{len(ids)} contracts to {args.api_url}", file=sys.stderr)
-        if failed_ids:
-            print(f"failed imports: {', '.join(failed_ids)}", file=sys.stderr)
-            return 1
-    else:
-        # Output CSV list to stdout for use in env vars
-        print(",".join(ids))
+    groups = group_ids(ids)
+    if len(groups) > 1:
+        print(
+            f"note: {len(ids)} ids exceed the {MAX_IDS_PER_GROUP}-id CONTRACT_IDS "
+            f"cap, so they are printed as {len(groups)} groups of at most "
+            f"{MAX_IDS_PER_GROUP}, one per indexer instance",
+            file=sys.stderr,
+        )
+
+    # One comma-separated line per group, each a valid CONTRACT_IDS value.
+    for group in groups:
+        print(",".join(group))
 
     return 0
 

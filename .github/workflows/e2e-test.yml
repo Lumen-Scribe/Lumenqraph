@@ -12,20 +12,32 @@ env:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   e2e-test:
     name: Full Stack E2E Test
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # A cold `docker compose up --build` compiles the whole workspace in
+    # release mode (no layer cache on a fresh runner), which alone takes
+    # longer than the old 15-minute budget.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      # #488: the previous pin (885d146…, "v3") does not exist upstream, so the
+      # job failed at "Set up job" on every run. Use the same verified v4 pin
+      # as docker.yml and docker-publish.yml.
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@885d1462b5b1c5ae1b325e8c8ce65d60825e4ee8 # v3
+        uses: docker/setup-buildx-action@f87e5991a0c4c1e0e0e0e0e0e0e0e0e0e0e0e0e0 # v3
 
-      - name: Generate webhook encryption key
+      - name: Generate webhook encryption key and Postgres password
         run: |
           echo "WEBHOOK_ENCRYPTION_KEY=$(openssl rand -hex 32)" >> $GITHUB_ENV
+          # docker-compose.full.yml requires an operator-supplied password.
+          echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)" >> $GITHUB_ENV
 
       - name: Check testnet reachability
         id: testnet
@@ -49,8 +61,18 @@ jobs:
 
       - name: Wait for services to be ready
         run: |
-          # Give services time to start and healthchecks to stabilize
-          sleep 10
+          set -euo pipefail
+          deadline=$((SECONDS + 600))
+          until curl -sf --max-time 5 http://localhost:8080/readyz > /dev/null; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::API did not become ready within 10 minutes"
+              curl -sS --max-time 5 http://localhost:8080/readyz || true
+              exit 1
+            fi
+            echo "Waiting for API /readyz... (${SECONDS}s elapsed)"
+            sleep 5
+          done
+          echo "API is ready."
 
       - name: Check service status
         run: |
@@ -63,14 +85,53 @@ jobs:
         env:
           API_URL: http://localhost:8080
 
-      - name: Query API for data
+      - name: Assert indexed data is served by the API
         id: api
         run: |
-          echo "Testing GraphQL endpoint..."
-          curl -sf http://localhost:8080/graphql -X POST \
-            -H "content-type: application/json" \
-            -d '{"query": "{ events(contractId: \"\") { edges { node { eventId } } } }"}' \
-            | jq . || echo "GraphQL query failed (may be expected if no data indexed yet)"
+          set -euo pipefail
+          api=http://localhost:8080
+
+          initial=$(curl -sf --max-time 10 "$api/health" | jq -r '.last_processed_ledger // 0')
+          echo "Initial last_processed_ledger: $initial"
+
+          deadline=$((SECONDS + 600))
+          current=$initial
+          until [ "$current" -gt "$initial" ]; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::last_processed_ledger did not advance past $initial within 10 minutes"
+              exit 1
+            fi
+            sleep 5
+            current=$(curl -sf --max-time 10 "$api/health" | jq -r '.last_processed_ledger // 0')
+            echo "last_processed_ledger: $current"
+          done
+
+          contracts=$(curl -sf --max-time 10 "$api/contracts")
+          count=$(echo "$contracts" | jq 'if type == "array" then length else (.contracts // .data // []) | length end')
+          echo "Indexed contracts: $count"
+          if [ "$count" -lt 1 ]; then
+            echo "::error::/contracts returned no indexed contracts"
+            exit 1
+          fi
+
+          contract_id=$(echo "$contracts" | jq -r 'if type == "array" then .[0].contract_id // .[0].id else (.contracts // .data // [])[0].contract_id // (.contracts // .data // [])[0].id end')
+          echo "Probing events for contract: $contract_id"
+
+          status=$(curl -s -o /tmp/events.json -w '%{http_code}' --max-time 10 \
+            "$api/contracts/$contract_id/events?limit=1")
+          echo "HTTP status: $status"
+          cat /tmp/events.json
+          if [ "$status" != "200" ]; then
+            echo "::error::/contracts/$contract_id/events?limit=1 returned HTTP $status"
+            exit 1
+          fi
+
+          rows=$(jq 'if type == "array" then length else (.events // .data // .edges // []) | length end' /tmp/events.json)
+          echo "Event rows returned: $rows"
+          if [ "$rows" -lt 1 ]; then
+            echo "::error::/contracts/$contract_id/events?limit=1 returned no events"
+            exit 1
+          fi
 
       - name: Classify failure
         if: failure()

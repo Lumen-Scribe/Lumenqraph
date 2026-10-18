@@ -31,7 +31,9 @@ class TestAsyncClientUrlBuilding(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(captured["method"], "GET")
         self.assertEqual(captured["path"], "/contracts")
-        self.assertEqual(captured["query"], {"limit": 200, "offset": 0})
+        # /contracts is cursor-paginated; unset params are dropped when the
+        # URL is built.
+        self.assertEqual(captured["query"], {"limit": None, "after": None})
 
     async def test_list_events_with_event_name(self):
         captured: Dict[str, Any] = {}

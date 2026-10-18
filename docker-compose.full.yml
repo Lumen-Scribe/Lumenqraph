@@ -1,9 +1,22 @@
-# Full local stack: Postgres + all three services, built from the Dockerfile.
+# Full local stack: Postgres + the four service binaries (indexer, api,
+# webhooks, mcp), all built from the one Dockerfile image.
 # For dev with only Postgres, use docker-compose.yml instead.
 #
-# IMPORTANT: Set WEBHOOK_ENCRYPTION_KEY in your environment before starting:
+# IMPORTANT: Set POSTGRES_PASSWORD and WEBHOOK_ENCRYPTION_KEY in your
+# environment (or in .env next to this file) before starting:
+#   export POSTGRES_PASSWORD=$(openssl rand -hex 16)
 #   export WEBHOOK_ENCRYPTION_KEY=$(openssl rand -hex 32)
 #   docker compose -f docker-compose.full.yml up --build
+# POSTGRES_PASSWORD is embedded in the services' DATABASE_URL, so keep it
+# URL-safe (hex is). Compose refuses to start without it.
+#
+# Postgres is published on 127.0.0.1 only, so psql works from this host but
+# the database is never reachable from other machines. Docker's published ports
+# bypass host firewalls such as ufw — do not change this to "5432:5432" on a
+# server. The services talk to Postgres over the compose network.
+#
+# Migrations run once in the `migrate` service; the other services start only
+# after it exits successfully, and refuse to start if the schema is behind.
 #
 # Optional: set GIT_COMMIT and BUILD_TIME for accurate /health build info:
 #   export GIT_COMMIT=$(git rev-parse --short HEAD)
@@ -14,10 +27,10 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: lumenqraph
-      POSTGRES_PASSWORD: lumenqraph
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
       POSTGRES_DB: lumenqraph
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -26,6 +39,23 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
+
+  # One-shot schema step: applies migrations, then exits. Every other service
+  # waits for it to complete successfully.
+  migrate:
+    build:
+      context: .
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-}
+        BUILD_TIME: ${BUILD_TIME:-}
+    command: ["lumenqraph-indexer", "migrate"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://lumenqraph:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/lumenqraph
+      RUST_LOG: ${RUST_LOG:-info}
 
   indexer:
     build:
@@ -36,14 +66,24 @@ services:
     command: ["lumenqraph-indexer"]
     restart: unless-stopped
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
-      DATABASE_URL: postgres://lumenqraph:lumenqraph@postgres:5432/lumenqraph
+      DATABASE_URL: postgres://lumenqraph:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/lumenqraph
+      SKIP_MIGRATIONS: "true"
       RPC_URL: ${RPC_URL:-https://soroban-testnet.stellar.org}
       CONTRACT_IDS: ${CONTRACT_IDS:-}
       POLL_INTERVAL_SECS: ${POLL_INTERVAL_SECS:-5}
+      INDEXER_HTTP_BIND_ADDR: 0.0.0.0:9090
       RUST_LOG: ${RUST_LOG:-info}
+    healthcheck:
+      # /health returns 503 until the cursor is initialised and while the
+      # indexer lags, so allow a generous start period for the first sync.
+      test: ["CMD", "lumenqraph-indexer", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
 
   api:
     build:
@@ -54,23 +94,25 @@ services:
     command: ["lumenqraph-api"]
     restart: unless-stopped
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     ports:
       - "8080:8080"
     environment:
-      DATABASE_URL: postgres://lumenqraph:lumenqraph@postgres:5432/lumenqraph
+      DATABASE_URL: postgres://lumenqraph:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/lumenqraph
       API_BIND_ADDR: 0.0.0.0:8080
       REQUIRE_API_KEY: ${REQUIRE_API_KEY:-false}
       ANON_RATE_LIMIT_PER_MIN: ${ANON_RATE_LIMIT_PER_MIN:-60}
       WEBHOOK_ENCRYPTION_KEY: ${WEBHOOK_ENCRYPTION_KEY}
       RUST_LOG: ${RUST_LOG:-info}
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
+      # The runtime image does not include curl (see #469); use wget from the
+      # base image instead. Exits non-zero on any non-2xx response.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/health || exit 1"]
+      interval: 10s
       timeout: 5s
-      retries: 3
-      start_period: 10s
+      retries: 10
+      start_period: 30s
 
   webhooks:
     build:
@@ -81,12 +123,50 @@ services:
     command: ["lumenqraph-webhooks"]
     restart: unless-stopped
     depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://lumenqraph:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/lumenqraph
+      WEBHOOK_ENCRYPTION_KEY: ${WEBHOOK_ENCRYPTION_KEY}
+      WEBHOOKS_METRICS_BIND_ADDR: 127.0.0.1:9091
+      RUST_LOG: ${RUST_LOG:-info}
+    healthcheck:
+      test: ["CMD", "lumenqraph-webhooks", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Optional: enable with `--profile mcp`. Reads the same Postgres as the API
+  # and calls Soroban RPC for live reads; served over streamable HTTP here
+  # (POST /mcp, GET /healthz) since a container has no stdio client.
+  mcp:
+    profiles: ["mcp"]
+    build:
+      context: .
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-}
+        BUILD_TIME: ${BUILD_TIME:-}
+    command: ["lumenqraph-mcp"]
+    restart: unless-stopped
+    depends_on:
       postgres:
         condition: service_healthy
+    ports:
+      - "8090:8090"
     environment:
       DATABASE_URL: postgres://lumenqraph:lumenqraph@postgres:5432/lumenqraph
-      WEBHOOK_ENCRYPTION_KEY: ${WEBHOOK_ENCRYPTION_KEY}
+      RPC_URL: ${RPC_URL:-https://soroban-testnet.stellar.org}
+      MCP_HTTP_BIND: 0.0.0.0:8090
+      # Passed through only when set in your shell; unset means no auth.
+      MCP_AUTH_TOKEN:
       RUST_LOG: ${RUST_LOG:-info}
+    healthcheck:
+      test: ["CMD", "lumenqraph-mcp", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 volumes:
   pgdata:

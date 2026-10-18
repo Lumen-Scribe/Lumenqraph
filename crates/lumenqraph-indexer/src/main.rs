@@ -31,8 +31,8 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use config::Config;
 use deep_backfill::{GalexieSource, HistoricalSource};
-use lumenqraph_core::ContractSpec;
 use rpc_client::RpcClient;
+use reenrich::ReenrichOptions;
 
 const INDEXER_LOCK_ID: i64 = 0x6c756d656e717261;
 const MIGRATION_LOCK_ID: i64 = 0x6c756d656e717262;
@@ -48,7 +48,6 @@ struct Cli {
     command: Option<Command>,
 }
 
-#[derive(Subcommand)]
 enum Command {
     /// Live tail (the default).
     Run,
@@ -200,15 +199,24 @@ async fn inspect(rpc: &RpcClient, contract_id: &str) -> anyhow::Result<()> {
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
     tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(fmt::layer())
-        .with(EnvFilter::from_default_env())
         .init();
 
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Run);
     let config = Config::from_env().context("failed to load config")?;
     let pool = PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(config.database_max_connections)
+        .min_connections(config.database_min_connections)
+        .acquire_timeout(Duration::from_secs(env_parse_u64(
+            "DATABASE_ACQUIRE_TIMEOUT_SECS",
+            30,
+        )))
+        .idle_timeout(Duration::from_secs(env_parse_u64(
+            "DATABASE_IDLE_TIMEOUT_SECS",
+            600,
+        )))
         .connect(&config.database_url)
         .await
         .context("failed to connect to Postgres")?;
