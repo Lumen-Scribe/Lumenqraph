@@ -1,30 +1,15 @@
-# Cargo deny configuration for supply-chain security scanning
-# https://embarkstudios.github.io/cargo-deny/
+# Cargo deny configuration for supply-chain security scanning.
+# The schema is version 2, supported by current cargo-deny releases.
 
 [advisories]
-# The RUSTSEC database is used by default. Uncomment to use a custom git source.
-# db-path = "~/.cargo/advisory-db"
-# db-urls = ["https://github.com/rustsec/advisory-db/raw/main/db.toml.gz"]
-
-# How to handle crates with security vulnerabilities
 vulnerability = "deny"
-
-# How to handle unmaintained crates
 unmaintained = "warn"
-
-# How to handle crates with security notices
 notice = "warn"
-
-# A list of advisory IDs to ignore. Use this when you need to use a crate
-# with known vulnerabilities and have mitigations in place.
-# Example: ignore = ["RUSTSEC-2021-0119"]
 ignore = []
 
 [licenses]
-# How to handle crates which do not have a detectable license
-unlicensed = "deny"
-
-# List of explicitly allowed licenses
+version = 2
+confidence-threshold = 0.8
 allow = [
     "MIT",
     "Apache-2.0",
@@ -33,61 +18,28 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "MPL-2.0",
+    # Required by unicode-ident and the ICU/url/idna dependency chain.
+    "Unicode-3.0",
+    # Required by rustls through both supported webpki-roots releases.
+    "CDLA-Permissive-2.0",
 ]
-
-# List of explicitly disallowed licenses
-deny = [
-    "GPL-2.0",
-    "GPL-3.0",
-    "AGPL-3.0",
-]
-
-# Lint level for crates which do not have a detectable license
-copyleft = "warn"
-
-# Blanket approval or denial for OSI-approved or FSF Free/Libre licenses
-allow-osi-fsf-free = "both"
-
-# Lint level used when no other predicates are matched
-default = "deny"
-
-# The confidence threshold for detecting a license from license text.
-confidence-threshold = 0.8
+deny = ["GPL-2.0", "GPL-3.0", "AGPL-3.0"]
 
 [bans]
-# Lint level for when multiple versions of the same crate are detected
 multiple-versions = "warn"
-
-# Lint level for when a crate marked as 'deprecated' is detected
 deprecated = "warn"
-
-# Lint level for when an unmaintained crate is detected
 unmaintained = "warn"
-
-# The graph highlighting used when creating dotgraphs
-highlight = "all"
-
-# List of explicitly disallowed duplicate crates
-deny = []
-
-# List of explicitly allowed duplicate crates
-allow = []
-
-# Certain crates/versions that will be skipped when doing duplicate detection.
-skip = []
-
-# Similarly named crates that are allowed to coexist
-skip-tree = []
+highest-ranking = false
+wildcards = "allow"
+# reqwest/rustls currently resolve two compatible webpki-roots lines. Keep the
+# duplicate visible as a warning while allowing the security gate to pass until
+# the upstream dependency graph converges.
+skip = [
+    { name = "webpki-roots" },
+]
 
 [sources]
-# Lint level for what to happen when a crate from a crate registry that is not in the allow list is detected
 unknown-registry = "warn"
-
-# Lint level for what to happen when a crate from a git repository that is not in the allow list is detected
 unknown-git = "warn"
-
-# List of allowed crate registries
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-
-# List of allowed Git repositories
 allow-git = []

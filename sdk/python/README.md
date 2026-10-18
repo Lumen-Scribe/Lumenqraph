@@ -1,6 +1,6 @@
 # Lumenqraph Python SDK
 
-A typed Python client over the Lumenqraph REST + GraphQL API, with zero external dependencies.
+A typed Python client over the Lumenqraph REST + GraphQL API. HTTP uses only the standard library; `pydantic` backs the optional generated models.
 
 ## Installation
 
@@ -34,34 +34,70 @@ for event in lq.paginate_events(contracts['data'][0]['contract_id']):
 
 ## Features
 
-### REST API Methods
+### API coverage
 
-- **Contracts**
-  - `list_contracts(limit, offset)` - Get all contracts with pagination
-  - `get_interface(contract_id, version)` - Get a contract's decoded interface
-  - `get_state(contract_id, limit)` - Get contract state snapshots
-  - `get_data(contract_id, label, limit)` - Get contract per-key data
-  - `get_data_key(contract_id, key_hash, limit)` - Get a specific key's history
+Every REST resource the API serves is covered by both clients. Method names are
+the snake_case form of the [TypeScript SDK](../typescript)'s; the async client
+(`AsyncLumenqraphClient`) has the same methods as coroutines, and its
+`paginate_*` methods return async iterators.
 
-- **Events**
-  - `list_events(contract_id, limit, offset, event_name, after)` - Get contract events
-  - `paginate_events(contract_id, event_name)` - Iterate through all events (cursor pagination)
+| Resource | Endpoint | Python method | TypeScript |
+| --- | --- | --- | --- |
+| Health | `GET /health` | `health()` | `health` |
+| Liveness / readiness | `GET /livez`, `GET /readyz` | `livez()`, `readyz()` | — |
+| Contracts | `GET /contracts` | `list_contracts(limit, after)`, `paginate_contracts()` | `listContracts` |
+| Interface | `GET /contracts/{id}/interface` | `get_interface(id, version)` | `getInterface`, `getInterfaceAtVersion` |
+| Interface history | `GET /contracts/{id}/interface/history` | `get_interface_history(id, limit, after)` | `getInterfaceHistory` |
+| Interface diff | `GET /contracts/{id}/interface/diff` | `get_interface_diff(id, from_version, to_version)` | `getInterfaceDiff` |
+| Refresh interface | `POST /contracts/{id}/refresh` | `refresh_contract(id)` | — |
+| Generated SDK | `GET /contracts/{id}/sdk` | `generate_sdk(id, lang, version)` | `generateSdk` |
+| Stats | `GET /contracts/{id}/stats` | `get_stats(id, bucket, resolution, window, group_by, …)` | `getStats` |
+| Instance state | `GET /contracts/{id}/state` | `get_state(id, limit)` | `getState` |
+| Per-key data | `GET /contracts/{id}/data` | `get_data(id, label, limit)` | `getData` |
+| Per-key history | `GET /contracts/{id}/data/{key_hash}` | `get_data_key(id, key_hash, limit)` | `getDataKey` |
+| Events | `GET /contracts/{id}/events` | `list_events(id, …filters)`, `paginate_events(id, …)` | `listEvents`, `paginateEventsRest` |
+| Event stream (SSE) | `GET /contracts/{id}/events/stream` | `stream_events(id, event_name, cursor)` *(sync client)* | `streamEvents` |
+| Single event | `GET /events/{event_id}` | `get_event(event_id)` | `getEvent` |
+| Transaction events | `GET /transactions/{tx_hash}/events` | `get_transaction_events(tx_hash, limit)` | `getTransactionEvents` |
+| Transfers | `GET /contracts/{id}/transfers` | `list_transfers(id, …)`, `paginate_transfers(id, …)` | `listTransfers`, `paginateTransfers` |
+| Swaps | `GET /contracts/{id}/swaps` | `list_swaps(id, …)`, `paginate_swaps(id, …)` | `listSwaps`, `paginateSwaps` |
+| NFTs | `GET /contracts/{id}/nfts` | `list_nft_events(id, …)`, `paginate_nft_events(id, …)` | `listNftEvents`, `paginateNftEvents` |
+| Liquidity | `GET /contracts/{id}/liquidity` | `list_liquidity_events(id, …)`, `paginate_liquidity_events(id, …)` | `listLiquidityEvents`, `paginateLiquidityEvents` |
+| Functions | `GET /contracts/{id}/functions` | `list_functions(id)` | `listFunctions` |
+| Call | `POST /contracts/{id}/call` | `call(id, function, args, source_account)` | `call` |
+| Simulate | `POST /contracts/{id}/simulate` | `simulate(id, function, args, source_account)` | `simulate` |
+| Create webhook | `POST /webhooks` | `create_webhook(url, kind, contract_id(s), event_name(s), filter, since)` | `createWebhook` |
+| List webhooks | `GET /webhooks` | `list_webhooks()` | `listWebhooks` |
+| Update webhook | `PATCH /webhooks/{id}` | `update_webhook(id, active, …filters)` | `updateWebhook` |
+| Delete webhook | `DELETE /webhooks/{id}` | `delete_webhook(id)` | `deleteWebhook` |
+| Deliveries | `GET /webhooks/{id}/deliveries` | `list_deliveries(id, …, include_summary)`, `paginate_deliveries(id)` | `listDeliveries`, `paginateDeliveries` |
+| Redrive | `POST /webhooks/{id}/redrive` | `redrive_webhook(id, since)` | `redriveWebhook` |
+| Re-enable | `POST /webhooks/{id}/reenable` | `reenable_webhook(id)` | `reenableWebhook` |
+| Rotate secret | `POST /webhooks/{id}/rotate-secret` | `rotate_webhook_secret(id, grace_seconds)` | `rotateWebhookSecret` |
+| GraphQL | `POST /graphql` | `graphql(query, variables)`, `events_page(id, …)`, `paginate_events_graphql(id, …)` | `graphql`, `eventsPage`, `paginateEvents` |
+| Webhook signatures | — | `verify_webhook_signature(body, header, secret)` | `verifyWebhook` |
 
-- **Transfers**
-  - `list_transfers(contract_id, limit, offset)` - Get SEP-41 transfers
+Transfers, swaps, NFTs and liquidity are per-contract resources, so
+`contract_id` is a required argument for each of them.
 
-- **Webhooks**
-    - `redrive_webhook(webhook_id, since)` - Retry failed deliveries
-    - `reenable_webhook(webhook_id)` - Reactivate an auto-disabled subscription
-    - `rotate_webhook_secret(webhook_id, grace_seconds)` - Rotate its signing secret
+### Typed models
 
-- **Read / Simulate**
-  - `call(contract_id, function, args, source_account)` - Invoke a view function
-  - `simulate(contract_id, function, args, source_account)` - Dry-run a call
+`lumenqraph.models` contains pydantic v2 models generated from the repository's
+[`openapi.yaml`](../../openapi.yaml) (`Contract`, `EventRecord`, `EventsPage`,
+`WebhookSubscription`, `DeliveriesPage`, …). The clients return plain dicts, and
+you can validate a response when you want typed access:
 
-- **Utilities**
-  - `list_functions(contract_id)` - Get callable functions
-  - `health()` - Check API health
+```python
+from lumenqraph import LumenqraphClient, models
+
+lq = LumenqraphClient(base_url="http://localhost:8080")
+page = models.EventsPage.model_validate(lq.list_events("CABC..."))
+for event in page.data:
+    print(event.ledger, event.event_name)
+```
+
+Do not edit `models.py` by hand; regenerate it (see [Development](#development)).
+CI fails when it drifts from `openapi.yaml`.
 
 ### Pagination
 
@@ -72,15 +108,18 @@ The SDK supports cursor-based pagination for efficient paging through large resu
 for event in lq.paginate_events(contract_id):
     print(event)
 
-# Manual pagination with offset
-response = lq.list_events(contract_id, limit=100, offset=0)
-events = response['data']
-has_more = response['has_more']
+# Manual cursor pagination
+response = lq.list_events(contract_id, limit=100)
+while True:
+    handle(response["data"])
+    if not response["has_more"]:
+        break
+    response = lq.list_events(contract_id, limit=100, after=response["next_cursor"])
 ```
 
 ### Retry Policy
 
-The client automatically retries requests with exponential backoff for transient failures:
+The client retries 429/502/503/504 responses and network errors with exponential backoff, honouring `Retry-After` on 429:
 
 ```python
 lq = LumenqraphClient(
@@ -102,7 +141,7 @@ Verify incoming webhook signatures for security:
 from lumenqraph import verify_webhook_signature
 
 def handle_webhook(request):
-    signature = request.headers.get('X-Webhook-Signature')
+    signature = request.headers.get('X-Lumenqraph-Signature')
     body = request.get_data(as_text=True)
     secret = "your-webhook-secret"
 
@@ -118,12 +157,10 @@ def handle_webhook(request):
 
 The SDK is fully typed for IDE autocompletion and type checking:
 
-```python
-from lumenqraph import LumenqraphClient, EventRecord
-
-lq = LumenqraphClient(base_url="http://localhost:8080")
-events: dict = lq.list_events("CABC...")
-```
+The package ships a `py.typed` marker and is checked with `mypy --strict` in CI.
+Responses are typed as `dict[str, Any]`; use `lumenqraph.models` for validated,
+attribute-style access. `call`/`simulate`, `get_state` and `get_data` on the sync
+client return small dataclasses (`CallResult`, `ContractState`, `ContractData`).
 
 ## Error Handling
 
@@ -173,7 +210,7 @@ print(f"Functions: {interface['interface']['functions']}")
 
 # Call a view function
 result = lq.call("CABC...", function="get_balance", args=["GXYZ..."])
-print(f"Balance: {result['result']}")
+print(f"Balance: {result.result}")
 ```
 
 ### Simulate a transaction
@@ -184,16 +221,28 @@ simulation = lq.simulate(
     function="transfer",
     args=["from", "to", "1000"]
 )
-print(f"Events: {simulation['events']}")
-print(f"Cost: {simulation['min_resource_fee']} stroops")
+print(f"Events: {simulation.events}")
+print(f"Cost: {simulation.min_resource_fee} stroops")
 ```
 
 ## Development
 
-### Running Tests
+Supported Python versions: 3.10 – 3.14.
+
+### Running Tests and Type Checks
 
 ```bash
+pip install -e ".[dev]"
 python -m pytest tests/
+mypy --strict lumenqraph
+```
+
+### Regenerating the models
+
+```bash
+pip install -e ".[codegen]"
+python scripts/codegen.py          # rewrite lumenqraph/models.py from ../../openapi.yaml
+python scripts/codegen.py --check  # what CI runs: fail if models.py is stale
 ```
 
 ### Building the Package

@@ -4,10 +4,12 @@
 //! Responds to Ctrl-C / SIGTERM for a clean shutdown.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use lumenqraph_core::NewEvent;
 use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
@@ -26,6 +28,11 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 /// Backfill and fresh-start clamping use this value. Note: MAX_CATCHUP_LEDGERS
 /// (in config) is a separate, more conservative limit for live polling performance.
 const MAX_LOOKBACK_LEDGERS: i64 = 120_000; // ~7 days at ~5s/ledger (SDF public RPC)
+static RPC_OLDEST_LEDGER: AtomicI64 = AtomicI64::new(0);
+
+pub fn rpc_oldest_ledger() -> i64 {
+    RPC_OLDEST_LEDGER.load(Ordering::Relaxed)
+}
 
 /// The RPC retention window shared with backfill for fresh-start clamping.
 pub fn max_lookback() -> i64 {
@@ -36,17 +43,19 @@ pub async fn run(pool: PgPool, rpc: RpcClient, config: Config, specs: Arc<SpecCa
     let base_interval = Duration::from_secs(config.poll_interval_secs.max(1));
     let degraded_interval = Duration::from_secs(config.degraded_poll_interval_secs.max(1));
     let mut backoff = base_interval;
-    // One spec cache for the process lifetime: each contract's interface is
-    // fetched and parsed once, then reused to enrich every event.
-    let specs = SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
+    // The caller owns the process-wide cache shared with the HTTP metrics and
+    // health listener. Never shadow this injected instance: doing so causes
+    // duplicate WASM fetches and makes the exported cache metric misleading.
     // None => prune on the first cycle that reaches the tip, so a deployment
     // that switches retention on starts reclaiming immediately.
     let mut last_prune: Option<Instant> = None;
     // Circuit-breaker state: count consecutive poll failures.
     let mut consecutive_errors: u32 = 0;
+    let shutdown = CancellationToken::new();
+    tokio::spawn(wait_for_shutdown(shutdown.clone()));
 
     loop {
-        let sleep_for = match poll_once(&pool, &rpc, &config, &specs).await {
+        let sleep_for = match poll_once(&pool, &rpc, &config, &specs, &shutdown).await {
             Ok(processed_to) => {
                 // Success: reset both the backoff and the circuit-breaker counter.
                 if consecutive_errors > 0 {
@@ -132,7 +141,7 @@ pub async fn run(pool: PgPool, rpc: RpcClient, config: Config, specs: Arc<SpecCa
 
         tokio::select! {
             _ = tokio::time::sleep(sleep_for) => {}
-            _ = shutdown_signal() => {
+            _ = shutdown.cancelled() => {
                 info!("shutdown signal received; stopping poller");
                 return Ok(());
             }
@@ -146,10 +155,28 @@ async fn poll_once(
     rpc: &RpcClient,
     config: &Config,
     specs: &SpecCache,
+    shutdown: &CancellationToken,
 ) -> anyhow::Result<Option<i64>> {
     use tracing::Instrument as _;
 
     let latest = rpc.get_latest_ledger().await?;
+    let oldest_available = match rpc.get_health().await {
+        Ok(health) if health.oldest_ledger > 0 => {
+            RPC_OLDEST_LEDGER.store(health.oldest_ledger, Ordering::Relaxed);
+            health.oldest_ledger.max(1)
+        }
+        Err(error) => {
+            let fallback = (latest - MAX_LOOKBACK_LEDGERS).max(1);
+            warn!(%error, fallback, "getHealth failed; using fallback RPC retention window");
+            RPC_OLDEST_LEDGER.store(fallback, Ordering::Relaxed);
+            fallback
+        }
+        Ok(_) => {
+            let fallback = (latest - MAX_LOOKBACK_LEDGERS).max(1);
+            RPC_OLDEST_LEDGER.store(fallback, Ordering::Relaxed);
+            fallback
+        }
+    };
 
     // Wrap the rest of the cycle in a span so all log lines — including those
     // from spawned tasks (spec fetches, state/key snapshots) — carry a shared
@@ -179,7 +206,6 @@ async fn poll_once(
     // Clamp to RPC retention window on fresh start.
     // If the configured START_LEDGER is older than what the RPC serves,
     // clamp to the oldest available ledger to avoid RPC rejection errors.
-    let oldest_available = latest - MAX_LOOKBACK_LEDGERS;
     if start < oldest_available {
         warn!(
             requested = start,
@@ -187,6 +213,9 @@ async fn poll_once(
             reason = "start ledger is older than RPC retention window (~7 days)",
             "fresh-start ledger clamped to earliest servable ledger"
         );
+        if oldest_available > start {
+            record_missed_range_classified(pool, start, oldest_available - 1, "retention-window skip", false).await?;
+        }
         start = oldest_available;
     }
 
@@ -200,6 +229,9 @@ async fn poll_once(
              (gap unrecoverable via public RPC — use a retaining/paid RPC or a \
              datalake backfill for gapless history, or raise MAX_CATCHUP_LEDGERS)"
         );
+        if clamped > start {
+            record_missed_range_classified(pool, start, clamped - 1, "catch-up skip", true).await?;
+        }
         start = clamped;
     }
 
@@ -207,7 +239,11 @@ async fn poll_once(
     // we know both endpoints after clamping.
     cycle_span_for_record.record("from", start);
 
-    let (inserted, enrichment) = fetch_and_store(pool, rpc, config, specs, start, latest).await?;
+    let (inserted, enrichment) = fetch_and_store_with_shutdown(pool, rpc, config, specs, start, latest, shutdown).await?;
+
+    if shutdown.is_cancelled() {
+        return Ok(Some(latest));
+    }
 
     // Check enrichment coverage and warn if it drops significantly
     if enrichment.enriched_count > 0 || enrichment.not_enriched_count > 0 {
@@ -238,7 +274,7 @@ async fn poll_once(
     if config.reorg_overlap_ledgers > 0 && latest > config.reorg_overlap_ledgers {
         let reorg_start = latest - config.reorg_overlap_ledgers;
         reorg_updated =
-            fetch_and_upsert(pool, rpc, config, specs, reorg_start, latest).await?;
+            fetch_and_upsert(pool, rpc, config, specs, reorg_start, latest, shutdown).await?;
         if reorg_updated > 0 {
             debug!(
                 reorg_updated,
@@ -291,11 +327,22 @@ pub async fn fetch_and_store(
     start: i64,
     tip: i64,
 ) -> anyhow::Result<(u64, EnrichmentMetrics)> {
+    fetch_and_store_with_shutdown(pool, rpc, config, specs, start, tip, &CancellationToken::new()).await
+}
+
+async fn fetch_and_store_with_shutdown(
+    pool: &PgPool,
+    rpc: &RpcClient,
+    config: &Config,
+    specs: &SpecCache,
+    start: i64,
+    tip: i64,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<(u64, EnrichmentMetrics)> {
     let mut cursor_token: Option<String> = None;
     let mut total_inserted = 0u64;
     let mut enriched_count = 0u64;
     let mut not_enriched_count = 0u64;
-    let mut ts_parse_errors = 0u64; // #399
     let mut ts_parse_errors = 0u64; // #399
     let mut page_count = 0usize;
     let mut last_seen_ledger = start;
@@ -315,6 +362,9 @@ pub async fn fetch_and_store(
         Vec<(usize, Vec<String>)>,
     > = std::collections::HashMap::new();
     loop {
+        if shutdown.is_cancelled() {
+            return Ok((total_inserted, EnrichmentMetrics { enriched_count, not_enriched_count }));
+        }
         let page = match rpc
             .get_events(
                 Some(start),
@@ -398,9 +448,6 @@ pub async fn fetch_and_store(
         if ts_parse_errors > 0 {
             let _ = cursor::track_timestamp_parse_error(pool, ts_parse_errors).await;
         }
-        if ts_parse_errors > 0 {
-            let _ = cursor::track_timestamp_parse_error(pool, ts_parse_errors).await;
-        }
     }
 
     // Read each tracked contract's instance entry. With an explicit CONTRACT_IDS
@@ -472,13 +519,24 @@ pub async fn record_missed_range(
     to_ledger: i64,
     reason: &str,
 ) -> anyhow::Result<()> {
+    record_missed_range_classified(pool, from_ledger, to_ledger, reason, true).await
+}
+
+pub async fn record_missed_range_classified(
+    pool: &PgPool,
+    from_ledger: i64,
+    to_ledger: i64,
+    reason: &str,
+    recoverable: bool,
+) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO missed_ranges (from_ledger, to_ledger, reason, detected_at) \
-         VALUES ($1, $2, $3, NOW())",
+        "INSERT INTO missed_ranges (from_ledger, to_ledger, reason, detected_at, recoverable) \
+         VALUES ($1, $2, $3, NOW(), $4)",
     )
     .bind(from_ledger)
     .bind(to_ledger)
     .bind(reason)
+    .bind(recoverable)
     .execute(pool)
     .await?;
     Ok(())
@@ -499,7 +557,8 @@ pub async fn recover_gaps(
     }
 
     let unrecovered: Vec<MissedRange> = sqlx::query_as(
-        "SELECT id, from_ledger, to_ledger FROM missed_ranges WHERE recovered_at IS NULL ORDER BY from_ledger ASC",
+        "SELECT id, from_ledger, to_ledger FROM missed_ranges
+         WHERE recovered_at IS NULL AND recoverable = TRUE ORDER BY from_ledger ASC",
     )
     .fetch_all(pool)
     .await?;
@@ -592,6 +651,7 @@ async fn fetch_and_upsert(
     specs: &SpecCache,
     start: i64,
     end: i64,
+    shutdown: &CancellationToken,
 ) -> anyhow::Result<u64> {
     let mut cursor_token: Option<String> = None;
     let mut total_updated = 0u64;
@@ -599,6 +659,9 @@ async fn fetch_and_upsert(
     let mut not_enriched_count = 0u64;
 
     loop {
+        if shutdown.is_cancelled() {
+            return Ok(total_updated);
+        }
         let page = rpc
             .get_events(
                 Some(start),
@@ -656,7 +719,7 @@ async fn fetch_and_upsert(
     Ok(total_updated)
 }
 
-async fn shutdown_signal() {
+async fn wait_for_shutdown(token: CancellationToken) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -675,6 +738,7 @@ async fn shutdown_signal() {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
+    token.cancel();
 }
 
 #[cfg(test)]

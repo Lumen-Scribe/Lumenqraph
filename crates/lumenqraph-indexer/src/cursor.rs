@@ -161,37 +161,6 @@ pub async fn set_consecutive_errors(pool: &PgPool, count: u32) -> anyhow::Result
     Ok(())
 }
 
-/// Increment the timestamp parse error counter (#399). Called once per event
-/// whose `ledgerClosedAt` field cannot be parsed as RFC 3339 or Unix seconds.
-pub async fn track_timestamp_parse_error(pool: &PgPool, count: u64) -> anyhow::Result<()> {
-    sqlx::query(
-        "INSERT INTO indexer_cursor (id, last_processed_ledger, timestamp_parse_errors_total, updated_at)
-         VALUES (1, 0, $1, now())
-         ON CONFLICT (id) DO UPDATE SET
-            timestamp_parse_errors_total = indexer_cursor.timestamp_parse_errors_total + $1,
-            updated_at                   = now()",
-    )
-    .bind(count as i64)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Increment the timestamp parse error counter (#399). Called once per event
-/// whose `ledgerClosedAt` field cannot be parsed as RFC 3339 or Unix seconds.
-pub async fn track_timestamp_parse_error(pool: &PgPool, count: u64) -> anyhow::Result<()> {
-    sqlx::query(
-        "INSERT INTO indexer_cursor (id, last_processed_ledger, timestamp_parse_errors_total, updated_at)
-         VALUES (1, 0, $1, now())
-         ON CONFLICT (id) DO UPDATE SET
-            timestamp_parse_errors_total = indexer_cursor.timestamp_parse_errors_total + $1,
-            updated_at                   = now()",
-    )
-    .bind(count as i64)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
 
 /// Increment the timestamp parse error counter (#399). Called once per event
 /// whose `ledgerClosedAt` field cannot be parsed as RFC 3339 or Unix seconds.

@@ -1,28 +1,4 @@
-//! Lumenqraph indexer — an always-on process that tails Soroban RPC and writes
-//! decoded events into Postgres. It talks to nothing but the RPC and its own DB.
-//!
-//! Usage:
-//!   lumenqraph-indexer                    # live tail (default)
-//!   lumenqraph-indexer backfill [LEDGER]  # one-shot catch-up within RPC window (~7 days) then exit
-//!   lumenqraph-indexer deep-backfill [OPTIONS]  # gapless history from a data-lake export (#84)
-//!   lumenqraph-indexer recover-gaps       # replay all recorded missed ranges (#295)
-//!   lumenqraph-indexer reenrich          # re-enrich historical events with newly-available specs
-//!   lumenqraph-indexer inspect <CONTRACT> # print a contract's on-chain interface
-//!
-//! deep-backfill options:
-//!   --from <LEDGER>   Start ledger (required)
-//!   --to   <LEDGER>   End ledger   (default: max / run to EOF of input)
-//!   --source <TYPE>   Source type: galexie, horizon (default: galexie)
-//!   --input <PATH>    Input file(s); use '-' for stdin; may be repeated
-//!
-//! Concurrency model:
-//!   The live poller elects a single active instance via the leader advisory
-//!   lock (`INDEXER_LOCK_ID`). One-shot maintenance commands (`backfill`,
-//!   `reenrich`, `deep-backfill`) do NOT take the leader lock: their writes are
-//!   idempotent (`ON CONFLICT DO NOTHING`) and they never advance the live
-//!   cursor, so they can safely run alongside a live indexer. Migrations run
-//!   under a short, separate migration lock (`MIGRATION_LOCK_ID`) so they are
-//!   serialized without blocking on the leader lock.
+//! Lumenqraph indexer CLI and process orchestration.
 
 mod backfill;
 mod config;
@@ -38,12 +14,12 @@ mod rpc_client;
 mod specs;
 mod state;
 mod store;
-// The end-to-end smoke test is gated behind the `smoke-tests` feature (as well
-// as `#[ignore]`) so it is never compiled or run by a plain `cargo test`,
-// including in offline CI. See CONTRIBUTING.md → "Smoke tests".
+
 #[cfg(all(test, feature = "smoke-tests"))]
 mod smoke;
 
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -52,112 +28,63 @@ use tracing::info;
 
 use config::Config;
 use deep_backfill::{GalexieSource, HistoricalSource};
-use lumenqraph_core::ContractSpec;
 use rpc_client::RpcClient;
+use reenrich::ReenrichOptions;
 
-/// Postgres advisory lock id used to elect a single active indexer.
-const INDEXER_LOCK_ID: i64 = 0x6c756d656e717261; // "lumenqra" as i64
+const INDEXER_LOCK_ID: i64 = 0x6c756d656e717261;
+const MIGRATION_LOCK_ID: i64 = 0x6c756d656e717262;
 
-/// Postgres advisory lock id used to serialize migrations across processes.
-/// This is deliberately distinct from `INDEXER_LOCK_ID` so that running
-/// migrations never blocks on (or is blocked by) the live leader lock.
-const MIGRATION_LOCK_ID: i64 = 0x6c756d656e717262; // "lumenqrb" as i64
-
-/// Lumenqraph indexer — tails Soroban RPC and writes decoded events into Postgres.
 #[derive(Parser)]
 #[command(
     name = "lumenqraph-indexer",
     version,
-    about = "Lumenqraph indexer — tails Soroban RPC and writes decoded events into Postgres",
-    long_version = concat!(
-        env!("CARGO_PKG_VERSION"),
-        "\ncommit: ",
-        option_env!("LUMENQRAPH_GIT_SHA").unwrap_or("unknown"),
-        "\nbuilt: ",
-        option_env!("LUMENQRAPH_BUILD_TIME").unwrap_or("unknown"),
-    ),
+    about = "Lumenqraph indexer — tails Soroban RPC and writes decoded events into Postgres"
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 }
 
-#[derive(Subcommand)]
 enum Command {
-    /// Live tail (default when no subcommand is given).
+    /// Live tail (the default).
     Run,
-    /// One-shot catch-up within the RPC window (~7 days) then exit.
+    /// One-shot catch-up within the RPC retention window.
     Backfill {
-        /// Start ledger (defaults to the current cursor).
+        /// Start ledger; defaults to the persisted cursor or START_LEDGER.
         ledger: Option<u32>,
     },
-    /// Gapless history from a data-lake export (#84).
+    /// Gapless history from a data-lake or Horizon source.
     DeepBackfill {
-        /// Start ledger (required).
         #[arg(long)]
         from: u32,
-        /// End ledger (default: max / run to EOF of input).
         #[arg(long)]
         to: Option<u32>,
-        /// Source type: galexie (default: galexie).
         #[arg(long, default_value = "galexie")]
         source: String,
-        /// Input file(s); use '-' for stdin; may be repeated.
         #[arg(long = "input")]
         input: Vec<String>,
     },
-    /// Re-enrich historical events with newly-available specs.
+    /// Replay all recorded missed ranges.
+    RecoverGaps,
+    /// Re-enrich historical events with newly available specs.
     Reenrich {
-        /// Restrict re-enrichment to a single contract.
         #[arg(long)]
         contract: Option<String>,
-        /// Re-enrich even events that already have a spec.
         #[arg(long)]
         force: bool,
     },
     /// Print a contract's on-chain interface.
-    Inspect {
-        /// Contract id to inspect.
-        contract_id: String,
-    },
+    Inspect { contract_id: String },
     /// Run database migrations and exit.
     Migrate,
 }
 
-/// Parse the optional `backfill` ledger argument.
-///
-/// Returns `Ok(None)` when the argument is absent (caller falls back to
-/// `START_LEDGER`). Returns an error when the argument is present but is not a
-/// valid positive integer, so a typo like `51_000_000` or `5100000O` fails
-/// loudly instead of silently backfilling a different range.
-fn parse_backfill_ledger(arg: Option<&str>) -> anyhow::Result<Option<u32>> {
-    match arg {
-        None => Ok(None),
-        Some(raw) => match raw.parse::<u32>() {
-            Ok(ledger) if ledger > 0 => Ok(Some(ledger)),
-            _ => anyhow::bail!(
-                "invalid ledger \"{}\": expected a positive integer",
-                raw
-            ),
-        },
-    }
-}
-
-/// A leader lock held on a dedicated Postgres connection that is never
-/// returned to the pool. Advisory locks are session-scoped, so the lock lives
-/// exactly as long as this connection. If the connection drops (idle timeout,
-/// network blip, `pg_terminate_backend`), the lock is released by Postgres and
-/// the holder must stop polling so a standby can take over.
 struct LeaderLock {
-    conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
+    conn: Arc<Mutex<PgConnection>>,
 }
 
 impl LeaderLock {
-    /// Acquire the leader lock on a dedicated connection. If another instance
-    /// holds it, block until it is released (hot standby).
     async fn acquire(pool: &sqlx::PgPool) -> anyhow::Result<Self> {
-        // Detach a connection from the pool so it is never handed back while
-        // we hold the session-scoped advisory lock.
         let mut conn = pool
             .acquire()
             .await
@@ -243,42 +170,33 @@ impl LeaderLock {
         info!("acquiring indexer leader lock (id {})", INDEXER_LOCK_ID);
         let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
             .bind(INDEXER_LOCK_ID)
-            .fetch_one(&mut *conn)
+            .fetch_one(&mut conn)
             .await
             .context("failed to acquire advisory lock")?;
-
         if !acquired {
-            info!(
-                "another indexer instance holds the leader lock; \
-                 blocking until it releases (this instance will become a hot standby)"
-            );
+            info!("another indexer holds the leader lock; waiting for it to release");
             sqlx::query("SELECT pg_advisory_lock($1)")
                 .bind(INDEXER_LOCK_ID)
-                .execute(&mut *conn)
+                .execute(&mut conn)
                 .await
-                .context("failed to acquire advisory lock (blocking)")?;
+                .context("failed while waiting for leader lock")?;
         }
-
-        info!("indexer leader lock acquired; this instance is now active");
-        Ok(Self { conn })
+        info!("indexer leader lock acquired");
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
-    /// Spawn a task that pings the lock-holding connection periodically. If the
-    /// connection is lost, the task exits the process so the orchestrator can
-    /// restart it and a standby can take over. This makes leadership loss fail
-    /// fast instead of silently continuing to poll without the lock.
     fn spawn_keepalive(&self) {
-        let mut conn = self.conn.clone();
+        let conn = Arc::clone(&self.conn);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(30));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
-                if let Err(err) = sqlx::query("SELECT 1").execute(&mut *conn).await {
-                    tracing::error!(
-                        error = %err,
-                        "leader lock connection lost; stopping indexer to avoid split-brain"
-                    );
+                let mut conn = conn.lock().await;
+                if let Err(error) = sqlx::query("SELECT 1").execute(&mut *conn).await {
+                    tracing::error!(%error, "leader lock connection lost; stopping indexer");
                     std::process::exit(1);
                 }
             }
@@ -286,40 +204,80 @@ impl LeaderLock {
     }
 }
 
-/// Run migrations under a short, dedicated advisory lock so concurrent
-/// processes serialize migrations without contending on the leader lock.
-/// The lock is held on a dedicated connection for the duration of the run and
-/// released when that connection is dropped.
 async fn run_migrations(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     let mut conn = pool
         .acquire()
         .await
-        .context("failed to acquire dedicated connection for migration lock")?
+        .context("failed to acquire migration-lock connection")?
         .detach();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(MIGRATION_LOCK_ID)
+        .execute(&mut conn)
+        .await
+        .context("failed to acquire migration lock")?;
+    let result = sqlx::migrate!("../../migrations").run(&mut conn).await;
+    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(MIGRATION_LOCK_ID)
+        .execute(&mut conn)
+        .await;
+    result.context("database migrations failed")
+}
 
+async fn run_deep_backfill(
+    pool: sqlx::PgPool,
+    config: Config,
+    from: u32,
+    to: Option<u32>,
+    source_type: String,
+    input: Vec<String>,
+) -> anyhow::Result<()> {
     let source: Box<dyn HistoricalSource> = match source_type.as_str() {
-        "galexie" => Box::new(GalexieSource::new(inputs)),
+        "galexie" => Box::new(GalexieSource::new(
+            input.iter().map(PathBuf::from).collect(),
+        )),
         "horizon" => {
-            let base_url = inputs
+            let base_url = input
                 .first()
-                .and_then(|p| p.to_str())
-                .filter(|s| *s != "-")
+                .filter(|value| value.as_str() != "-")
+                .map(String::as_str)
                 .unwrap_or("https://horizon.stellar.org");
             Box::new(deep_backfill::HorizonSource::new(base_url))
         }
-        other => anyhow::bail!(
-            "unknown source type '{other}'; supported: galexie, horizon"
-        ),
+        other => anyhow::bail!("unknown source type '{other}'; supported: galexie, horizon"),
     };
+    deep_backfill::run(
+        pool,
+        config,
+        source,
+        i64::from(from),
+        to.map(i64::from),
+    )
+    .await
+}
 
+async fn inspect(rpc: &RpcClient, contract_id: &str) -> anyhow::Result<()> {
+    let (wasm_hash, wasm) = rpc
+        .get_contract_wasm(contract_id)
+        .await?
+        .context("no WASM found for contract")?;
+    match ContractSpec::from_wasm(&wasm) {
+        Some(parsed) => {
+            info!(%wasm_hash, complete = parsed.complete, "interface");
+            println!("{}", serde_json::to_string_pretty(&parsed.spec)?);
+        }
+        None => info!(%wasm_hash, "no contractspecv0 section found"),
+    }
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Load .env if present (development convenience; no-op in production).
     let _ = dotenvy::dotenv();
 
     lumenqraph_core::telemetry::init_tracing();
 
+    let cli = Cli::parse();
+    let command = cli.command.unwrap_or(Command::Run);
     let config = Config::from_env().context("failed to load config")?;
 
     let db = Config::db_config()?;
@@ -331,60 +289,42 @@ async fn main() -> anyhow::Result<()> {
     let network_passphrase = rpc.validate_network_passphrases().await?;
     info!(%network_passphrase, endpoints = config.rpc_urls.len(), "validated RPC network identity");
 
-    let args: Vec<String> = std::env::args().collect();
-
-    if args.get(1).map(String::as_str) == Some("migrate") {
-        info!("running migrations only");
-        sqlx::migrate!("../../migrations")
-            .run(&pool)
-            .await
-            .context("migrations failed")?;
-        return Ok(());
+    match &command {
+        Command::Migrate => return run_migrations(&pool).await,
+        Command::Inspect { contract_id } => return inspect(&rpc, contract_id).await,
+        _ => {}
     }
 
-    if args.get(1).map(String::as_str) == Some("inspect") {
-        let contract_id = args.get(2).context("inspect requires a contract id")?;
-        let (wasm_hash, wasm) = rpc
-            .get_contract_wasm(contract_id)
-            .await?
-            .context("no WASM found for contract")?;
-        match ContractSpec::from_wasm(&wasm) {
-            Some(parsed) => {
-                info!(wasm_hash, complete = parsed.complete, "interface");
-                println!("{}", serde_json::to_string_pretty(&parsed.spec).unwrap());
-            }
-            None => info!(wasm_hash, "no contractspecv0 section found"),
+    run_migrations(&pool).await?;
+    match command {
+        Command::Backfill { ledger } => {
+            backfill::run(pool, rpc, config, ledger.map(i64::from).unwrap_or(0)).await
         }
-        return Ok(());
-    }
-
-    // Acquire the leader lock and run migrations before dispatching.
-    let _lock = LeaderLock::acquire(&pool).await?;
-
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .context("failed to run migrations")?;
-
-    let specs = specs::SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
-
-    if args.get(1).map(String::as_str) == Some("reenrich") {
-        info!("running in reenrich mode");
-        return reenrich::run_reenrich(pool, rpc, config).await;
-    }
-
-    if args.get(1).map(String::as_str) == Some("backfill") {
-        let from = args
-            .get(2)
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(config.start_ledger);
-        info!(from, "running in backfill mode");
-        return backfill::run(pool, rpc, config, from).await;
-    }
-
-    if args.get(1).map(String::as_str) == Some("recover-gaps") {
-        info!("running in recover-gaps mode");
-        return poller::recover_gaps(&pool, &rpc, &config, &specs).await;
+        Command::DeepBackfill { from, to, source, input } => {
+            run_deep_backfill(pool, config, from, to, source, input).await
+        }
+        Command::RecoverGaps => {
+            let specs = specs::SpecCache::new(
+                config.spec_cache_max_entries,
+                config.spec_fetch_concurrency,
+            );
+            poller::recover_gaps(&pool, &rpc, &config, &specs).await
+        }
+        Command::Reenrich { .. } => reenrich::run_reenrich(pool, rpc, config).await,
+        Command::Run => {
+            let lock = LeaderLock::acquire(&pool).await?;
+            lock.spawn_keepalive();
+            let specs = Arc::new(specs::SpecCache::new(
+                config.spec_cache_max_entries,
+                config.spec_fetch_concurrency,
+            ));
+            let pool_for_http = Arc::new(pool.clone());
+            let bind_addr = std::env::var("INDEXER_HTTP_BIND_ADDR")
+                .unwrap_or_else(|_| "0.0.0.0:9090".to_string());
+            http::start_http_server(pool_for_http, Arc::clone(&specs), &bind_addr).await?;
+            poller::run(pool, rpc, config, specs).await
+        }
+        Command::Migrate | Command::Inspect { .. } => unreachable!(),
     }
 
     info!(

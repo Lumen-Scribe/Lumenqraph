@@ -73,6 +73,18 @@ pub enum ContractDataDurability {
     Temporary,
 }
 
+/// The durability of a contract data entry, mirroring the
+/// `contract_data.durability` CHECK constraint
+/// ("persistent" | "temporary" | "instance").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum ContractDurability {
+    Persistent,
+    Temporary,
+    Instance,
+}
+
 /// A decoded Soroban contract event, ready to be inserted.
 ///
 /// We keep both the raw base64 XDR (`topics`, `value` — lossless) and the

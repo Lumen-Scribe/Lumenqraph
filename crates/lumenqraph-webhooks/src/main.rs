@@ -33,6 +33,16 @@ async fn main() -> anyhow::Result<()> {
     let db = lumenqraph_core::db::DbConfig { max_connections: config.db_max_connections, min_connections: config.db_min_connections, acquire_timeout_secs: config.db_acquire_timeout_secs, idle_timeout_secs: config.db_idle_timeout_secs, connect_retries: config.db_connect_retries };
     let pool = lumenqraph_core::db::connect_with_retry(&config.database_url, &db).await?;
 
+    // Migrations are applied by `lumenqraph-indexer migrate`, not here. Refuse
+    // to start against a schema older than this binary (#473).
+    match lumenqraph_core::schema::check(&pool).await? {
+        lumenqraph_core::schema::SchemaStatus::Current => {}
+        lumenqraph_core::schema::SchemaStatus::Ahead { unknown_versions } => tracing::warn!(
+            ?unknown_versions,
+            "database schema is newer than this binary (rolling upgrade in progress?)"
+        ),
+    }
+
     // Redirects are never followed (SSRF guard, see `build_delivery_client`).
     let http = dispatcher::build_delivery_client(config.connect_timeout(), config.total_timeout())?;
 
@@ -41,12 +51,14 @@ async fn main() -> anyhow::Result<()> {
 
     info!(tick_secs = config.tick_secs, "starting lumenqraph webhooks");
     let interval = Duration::from_secs(config.tick_secs.max(1));
+    let shutdown = CancellationToken::new();
+    tokio::spawn(wait_for_shutdown(shutdown.clone()));
 
     loop {
         if let Err(e) = dispatcher::enqueue(&pool, config.batch_size).await {
             tracing::warn!(error = %e, "enqueue failed");
         }
-        if let Err(e) = dispatcher::deliver(&pool, &http, &config).await {
+        if let Err(e) = dispatcher::deliver_with_shutdown(&pool, &http, &config, &shutdown).await {
             tracing::warn!(error = %e, "deliver failed");
         }
         if let Err(e) = dispatcher::refresh_pending_gauge(&pool).await {
@@ -55,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
 
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
-            _ = shutdown_signal() => {
+            _ = shutdown.cancelled() => {
                 info!("shutdown signal received; stopping webhooks");
                 return Ok(());
             }
@@ -63,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn shutdown_signal() {
+async fn wait_for_shutdown(token: CancellationToken) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -81,6 +93,7 @@ async fn shutdown_signal() {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
+    token.cancel();
 }
 
 #[cfg(test)]

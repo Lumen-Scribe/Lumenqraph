@@ -647,6 +647,11 @@ impl RpcClient {
         Ok(r.sequence)
     }
 
+    /// Return the provider's currently retained ledger window.
+    pub async fn get_health(&self) -> anyhow::Result<RpcHealth> {
+        self.call("getHealth", serde_json::json!({})).await
+    }
+
     /// Fetch a page of events. Pass `start_ledger` on the first page of a scan,
     /// or `cursor` to continue a previous page (never both).
     ///

@@ -35,6 +35,7 @@ pub struct Config {
     pub rpc_timeout_secs: u64,
     pub enrichment_warn_threshold: f64,
     pub spec_cache_max_entries: usize,
+    pub spec_fetch_concurrency: usize,
     /// After this many consecutive poll failures the poller enters a degraded
     /// state: it sleeps for `degraded_poll_interval_secs` instead of the
     /// normal backoff and emits an ERROR-level log. The counter resets on the
@@ -300,6 +301,7 @@ impl Config {
             enrichment_warn_threshold,
             key_templates,
             spec_cache_max_entries,
+            spec_fetch_concurrency,
             max_consecutive_errors,
             degraded_poll_interval_secs,
         })

@@ -7,6 +7,9 @@
 # recompiles the workspace crates. BuildKit cache mounts keep the cargo
 # registry/git caches warm across builds (see cache-from/cache-to in CI).
 
+# The base image only needs to be new enough for rustup to install the pinned
+# channel from rust-toolchain.toml (currently 1.85); the floating `rust:1-slim`
+# tag satisfies that, and the builder below selects the exact pinned toolchain.
 FROM rust:1-slim@sha256:17d1ba895198f9934c6314ec5346a0d5115372f3243390c3d731e242f35c2f27 AS chef
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config \
@@ -54,7 +57,8 @@ COPY --from=builder /app/target/release/lumenqraph-api /usr/local/bin/
 COPY --from=builder /app/target/release/lumenqraph-webhooks /usr/local/bin/
 COPY --from=builder /app/target/release/lumenqraph-mcp /usr/local/bin/
 # Record the rustc version used to build the binaries so it is observable
-# from the image (e.g. `docker run --rm <image> cat /rustc-version.txt`).
+# from the image (e.g. `docker run --rm --entrypoint cat <image> /rustc-version.txt`).
+# This is the source of truth for the toolchain check in docker.yml.
 COPY --from=builder /rustc-version.txt /rustc-version.txt
 # Static explorer UI, served same-origin by the API (EXPLORER_DIR=/app/explorer).
 COPY explorer /app/explorer
@@ -68,5 +72,11 @@ RUN groupadd -r lumenqraph && useradd -r -g lumenqraph lumenqraph
 RUN chown -R lumenqraph:lumenqraph /app
 # Switch to non-root user
 USER lumenqraph
+# Health probe for the default (API) command. Each binary has a built-in
+# `healthcheck` subcommand that GETs its own health endpoint on localhost, so
+# no curl/wget is needed in the runtime image (#469). Compose overrides this
+# per service with the matching binary.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["lumenqraph-api", "healthcheck"]
 # Default to the API; override `command:` per service in compose.
 CMD ["lumenqraph-api"]
