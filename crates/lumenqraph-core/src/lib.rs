@@ -14,6 +14,7 @@ pub mod crypto;
 pub mod db_test;
 pub mod diff;
 pub mod error;
+pub mod healthcheck;
 pub mod models;
 pub mod read;
 pub mod sanitize;

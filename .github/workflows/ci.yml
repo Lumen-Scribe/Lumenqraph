@@ -33,6 +33,44 @@ jobs:
             exit 1
           fi
 
+  # Issue #475: lint new or changed migrations with squawk so table-locking
+  # DDL (non-concurrent index builds, constraints without NOT VALID, column
+  # rewrites, …) can't reach `main` unreviewed. Intentional cases opt out with
+  # a `-- squawk-ignore <rule>` comment. See docs/MIGRATIONS.md.
+  migration-lint:
+    name: Migration Lock-Safety Lint
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    env:
+      SQUAWK_VERSION: "2.67.0"
+      SQUAWK_SHA256: "03efe0e666b63bf33e2493693ee0aa9dbed07cbdcd20f7a8292245c1da9d790a"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Install squawk
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/squawk" \
+            "https://github.com/sbdchd/squawk/releases/download/v${SQUAWK_VERSION}/squawk-linux-x64"
+          echo "${SQUAWK_SHA256}  $RUNNER_TEMP/squawk" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/squawk"
+          "$RUNNER_TEMP/squawk" --version
+      - name: Lint changed migrations
+        env:
+          SQUAWK: ${{ runner.temp }}/squawk
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="origin/$BASE_REF"
+          elif [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            base="$BEFORE_SHA"
+          else
+            base="HEAD~1"
+          fi
+          bash scripts/lint_migrations.sh "$base"
+
   # Verify MSRV declared in Cargo.toml
   msrv-check:
     name: MSRV Check
@@ -200,8 +238,11 @@ jobs:
   # `twine check` verifies the package metadata (including the LICENSE file
   # referenced by pyproject.toml) is valid for upload.
   python-sdk:
-    name: Python SDK (3.12)
+    name: Python SDK build (3.12)
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/python
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Set up Python
@@ -211,10 +252,22 @@ jobs:
       - name: Install build tooling
         run: pip install build twine
       - name: Build sdist and wheel
-        working-directory: sdk/python
+        run: python -m build
+      - name: Check package metadata
+        run: twine check dist/*
+
+  # Issue #468: test and strictly type-check the Python SDK on every supported
+  # (non-EOL) Python version.
+  python-sdk-test:
+    name: Python SDK tests (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.8", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    defaults:
+      run:
+        working-directory: sdk/python
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -222,10 +275,44 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install package and dev dependencies
         run: pip install -e ".[dev]"
-      - name: Type-check (mypy)
-        run: mypy lumenqraph
+      - name: Type-check (mypy --strict)
+        run: mypy --strict lumenqraph
       - name: Test
         run: pytest -v
+
+  # Issue #467: lumenqraph/models.py is generated from openapi.yaml; fail if
+  # the committed module is stale (the Python counterpart of the TypeScript
+  # SDK's `codegen:check`).
+  python-sdk-codegen:
+    name: Python SDK models drift check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install code generator
+        run: pip install -e ".[codegen]"
+      - name: Check models.py against openapi.yaml
+        run: python scripts/codegen.py --check
+
+  # Issue #470: docs and compose must agree on the service count. The MCP
+  # server made it four binaries; catch stale "three services" wording.
+  docs-service-count:
+    name: Docs service-count check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Reject stale "three services" wording
+        run: |
+          if grep -rniE "(all )?three (service )?(binaries|services)" \
+               README.md docs/ARCHITECTURE.md docs/DEPLOYMENT.md Dockerfile docker-compose.full.yml; then
+            echo "::error::Docs mention three services; there are four (indexer, api, webhooks, mcp)."
+            exit 1
+          fi
 
   security-audit:
     name: Security Audit (cargo-audit)

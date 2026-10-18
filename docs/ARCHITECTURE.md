@@ -1,32 +1,37 @@
 # Architecture
 
-Lumenqraph is a Rust workspace of five crates: four service binaries plus a
-shared library.
+Lumenqraph is a Rust workspace of five crates: four service binaries
+(indexer, api, webhooks, mcp) plus a shared core library.
 
 ```
-                 ┌───────────────────────────────────────────┐
-                 │                lumenqraph-core             │
-                 │  models · XDR→JSON decode · strkey · errors│
-                 └───────────────────────────────────────────┘
-                     ▲              ▲          ▲              ▲
-                     │              │          │              │
-   Soroban RPC ──poll─┤   ┌─────────┴──┐ ┌────┴───────┐ ┌────┴────────┐
-  (getEvents)         │   │lumenqraph- │ │lumenqraph- │ │lumenqraph-  │
-        ┌─────────────┴─┐ │api         │ │webhooks    │ │mcp          │
-        │ lumenqraph-   │ │(Axum,      │ │(delivery)  │ │(read-only   │
-        │ indexer       │ │read+mgmt)  │ │            │ │MCP server)  │
-        │ (ingest+decode│ └─────────┬──┘ └────┬───────┘ └────┬────────┘
-        └───────┬───────┘           │         │             │
-                │  write            │ read    │ read/write  │ read
-                ▼                   ▼         ▼             ▼
-             ┌──────────────────── Postgres ─────────────────────┐
-             │ events · token_transfers · indexer_cursor         │
-             │ contract_spec_versions · contract_state           │
-             │ contract_data · contract_summaries                │
-             │ api_keys · webhook_subscriptions · deliveries     │
-             │ webhook_state                                     │
-             └───────────────────────────────────────────────────┘
+                ┌─────────────────────────────────────────────────────────┐
+                │                    lumenqraph-core                      │
+                │ models · XDR→JSON decode · strkey · spec · read encoder │
+                └─────────────────────────────────────────────────────────┘
+                     shared library, linked into every service binary
+
+  Soroban RPC ◀──────────┬────────────────┬─────────────────────────────────┐
+  (getEvents, simulate)  │ poll getEvents │ simulate (read layer)           │ simulate
+                   ┌─────┴──────┐   ┌─────┴──────┐   ┌────────────┐   ┌─────┴──────┐
+                   │ indexer    │   │ api        │   │ webhooks   │   │ mcp        │ ◀── AI agents
+                   │ ingest +   │   │ Axum REST/ │   │ match +    │   │ read-only  │    (stdio / HTTP)
+                   │ decode     │   │ GraphQL    │   │ signed POST│   │ MCP server │
+                   └─────┬──────┘   └─────┬──────┘   └─────┬──────┘   └─────┬──────┘
+                         │ write          │ read           │ read/write     │ read
+                         ▼                ▼                ▼                ▼
+             ┌──────────────────────────── Postgres ─────────────────────────────┐
+             │ events · token_transfers · indexer_cursor                         │
+             │ contract_spec_versions · contract_state                           │
+             │ contract_data · contract_summaries                                │
+             │ api_keys · webhook_subscriptions · deliveries                     │
+             │ webhook_state                                                     │
+             └───────────────────────────────────────────────────────────────────┘
 ```
+
+The indexer, the API's read layer and the MCP server talk to Soroban RPC; the
+webhooks dispatcher only talks to Postgres and subscriber endpoints. The MCP
+server is the fourth service binary: MCP clients usually spawn it locally over
+stdio, and `docker-compose.full.yml` runs it over HTTP behind the `mcp` profile.
 
 ## Why separate binaries
 
