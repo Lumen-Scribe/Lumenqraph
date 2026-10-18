@@ -1938,3 +1938,4 @@ mod validation_tests {
             "error should mention duplicate keys: {msg}"
         );
     }
+}

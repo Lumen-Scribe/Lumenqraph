@@ -1,0 +1,23 @@
+# Squawk (Postgres migration linter) configuration — see docs/MIGRATIONS.md
+# ("Writing lock-safe migrations") and scripts/lint_migrations.sh.
+#
+# Only rules about lock safety and destructive changes are enforced. The rules
+# excluded below are type-style preferences that say nothing about locking;
+# the existing schema doesn't follow them, so enforcing them would only add
+# noise to every new migration.
+pg_version = "16.0"
+
+excluded_rules = [
+    "prefer-bigint-over-int",
+    "prefer-bigint-over-smallint",
+    "prefer-identity",
+    "prefer-text-field",
+    "prefer-timestamptz",
+    # Most migrations use IF [NOT] EXISTS already; requiring it everywhere is a
+    # style choice, not a locking concern.
+    "prefer-robust-stmts",
+    # Alias that also excludes require-lock-timeout and
+    # require-statement-timeout. Timeouts are set by the operator at migrate
+    # time (see docs/MIGRATIONS.md) rather than repeated in every file.
+    "require-timeout-settings",
+]

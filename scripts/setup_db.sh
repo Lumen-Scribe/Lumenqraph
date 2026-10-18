@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# Apply migrations manually via psql. Normally the indexer applies them on
-# startup; use this for an API/webhooks-only deploy where no indexer runs.
+# Apply migrations manually via psql.
+#
+# Prefer `lumenqraph-indexer migrate` (or `make migrate`): it records each
+# migration in _sqlx_migrations, which every service checks at startup. This
+# script does NOT record them, so the API, webhooks and MCP server will refuse
+# to start against a database set up only with it. Keep it for inspecting or
+# hand-applying SQL.
 # Usage: DATABASE_URL=... ./scripts/setup_db.sh
 set -euo pipefail
 : "${DATABASE_URL:?set DATABASE_URL}"
