@@ -83,6 +83,9 @@ stellar-xdr = { version = "23", default-features = false, features = [
 # lumenqraph-core can use it directly in the hot XDR decode path (#413).
 stellar-strkey = "0.0.13"
 lru = "0.12"
+# CLI parsing for the indexer. Held to 4.5.x: newer clap releases need a
+# newer Rust than the workspace `rust-version` (1.84).
+clap = { version = "~4.5", features = ["derive"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 
 [profile.release]

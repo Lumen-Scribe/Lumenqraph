@@ -1,8 +1,9 @@
 """Async (asyncio) Lumenqraph API client.
 
 This module mirrors the surface of :class:`lumenqraph.client.LumenqraphClient`
-but uses :mod:`asyncio` and :class:`urllib.request` via a thread-pool executor
-(so no third-party dependency is needed) for all HTTP I/O.
+method for method, but every call is a coroutine. HTTP I/O uses the same
+zero-dependency :mod:`urllib` transport, dispatched to a thread-pool executor so
+the event loop is never blocked.
 
 For high-concurrency use-cases you may prefer to install ``aiohttp`` or
 ``httpx`` and wrap them instead — this implementation favours zero dependencies
@@ -22,22 +23,37 @@ Example::
     asyncio.run(main())
 """
 
-import asyncio
-import json
-import time
-import urllib.error
-import urllib.request
-from typing import Any, AsyncGenerator, Dict, Optional
-from urllib.parse import urlencode
+from __future__ import annotations
 
-from .client import LumenqraphError, RetryOptions, _page_query
+import asyncio
+import functools
+from collections.abc import AsyncIterator, Mapping
+from typing import Any, Literal
+
+from ._http import (
+    EVENTS_PAGE_QUERY,
+    LumenqraphError,
+    RetryOptions,
+    Transport,
+    build_headers,
+    build_url,
+    drop_none,
+    enc,
+    encode_json,
+    events_page_from_graphql,
+    graphql_data,
+    page_query,
+    resolve_retry,
+)
+from .client import JsonDict, SdkLang, WebhookKind, _call_body
+
+__all__ = ["AsyncLumenqraphClient", "LumenqraphError"]
 
 
 class AsyncLumenqraphClient:
     """Async Lumenqraph API client.
 
-    All methods are coroutines.  HTTP I/O is dispatched to a thread-pool
-    executor so the event loop is never blocked.
+    All methods are coroutines (``paginate_*`` return async iterators).
 
     The client can be used as an async context manager::
 
@@ -48,41 +64,28 @@ class AsyncLumenqraphClient:
     call :meth:`aclose` explicitly when done if you need deterministic cleanup.
     """
 
-    DEFAULT_MAX_RETRIES = 3
-    DEFAULT_BASE_DELAY_MS = 250
-    DEFAULT_MAX_DELAY_MS = 30_000
-    DEFAULT_TIMEOUT_MS = 10_000
-    RETRYABLE_STATUSES = {429, 502, 503, 504}
-
     def __init__(
         self,
         base_url: str,
-        api_key: Optional[str] = None,
-        retry: Optional[RetryOptions] = None,
+        api_key: str | None = None,
+        retry: RetryOptions | None = None,
     ) -> None:
         """Initialise the async Lumenqraph client.
 
         Args:
             base_url:  Base URL of the Lumenqraph API (e.g. ``http://localhost:8080``).
-            api_key:   Optional API key for authenticated requests.
+            api_key:   Optional API key, sent as ``x-api-key``.
             retry:     Optional retry / timeout policy.
         """
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
-        self._retry = self._merge_retry(retry or {})
+        self._retry = resolve_retry(retry)
+        self._transport = Transport(self._retry)
 
-    def _merge_retry(self, opts: RetryOptions) -> Dict[str, int]:
-        return {
-            "max_retries": opts.get("max_retries", self.DEFAULT_MAX_RETRIES),
-            "base_delay_ms": opts.get("base_delay_ms", self.DEFAULT_BASE_DELAY_MS),
-            "max_delay_ms": opts.get("max_delay_ms", self.DEFAULT_MAX_DELAY_MS),
-            "timeout_ms": opts.get("timeout_ms", self.DEFAULT_TIMEOUT_MS),
-        }
-
-    async def __aenter__(self) -> "AsyncLumenqraphClient":
+    async def __aenter__(self) -> AsyncLumenqraphClient:
         return self
 
-    async def __aexit__(self, *_: Any) -> None:
+    async def __aexit__(self, *_: object) -> None:
         await self.aclose()
 
     async def aclose(self) -> None:
@@ -90,362 +93,35 @@ class AsyncLumenqraphClient:
 
     # ---- Core request machinery ----
 
-    def _make_url(self, path: str, query: Optional[Dict[str, Any]] = None) -> str:
-        url = self.base_url + path
-        if query:
-            filtered = {k: v for k, v in query.items() if v is not None}
-            if filtered:
-                url = f"{url}?{urlencode(filtered)}"
-        return url
-
-    def _sync_request(
-        self,
-        method: str,
-        url: str,
-        body: Optional[bytes],
-        headers: Dict[str, str],
-        timeout: float,
-    ) -> Any:
-        """Blocking HTTP call — run in a thread-pool executor."""
-        req = urllib.request.Request(url, data=body, headers=headers, method=method)
-        attempt = 0
-        max_retries = self._retry["max_retries"]
-
-        while True:
-            try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    text = resp.read().decode("utf-8")
-                    return json.loads(text) if text else None
-            except urllib.error.HTTPError as exc:
-                status = exc.code
-                text = exc.read().decode("utf-8")
-                try:
-                    body_obj = json.loads(text)
-                except json.JSONDecodeError:
-                    body_obj = text
-
-                if status not in self.RETRYABLE_STATUSES or attempt >= max_retries:
-                    raise LumenqraphError(f"HTTP {status}: {text}", status, body_obj)
-
-                delay_s = min(
-                    self._retry["base_delay_ms"] * (2 ** attempt),
-                    self._retry["max_delay_ms"],
-                ) / 1000.0
-                time.sleep(delay_s)
-                attempt += 1
-
-            except urllib.error.URLError as exc:
-                if attempt >= max_retries:
-                    raise LumenqraphError(f"Network error: {exc}", 0, None)
-                delay_s = min(
-                    self._retry["base_delay_ms"] * (2 ** attempt),
-                    self._retry["max_delay_ms"],
-                ) / 1000.0
-                time.sleep(delay_s)
-                attempt += 1
-
     async def _request(
         self,
         method: str,
         path: str,
-        query: Optional[Dict[str, Any]] = None,
-        body: Optional[Dict[str, Any]] = None,
+        query: Mapping[str, Any] | None = None,
+        body: Any = None,
+        raw: bool = False,
     ) -> Any:
-        url = self._make_url(path, query)
-        headers: Dict[str, str] = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["x-api-key"] = self.api_key
-
-        encoded_body: Optional[bytes] = None
-        if body is not None:
-            encoded_body = json.dumps(body).encode("utf-8")
-
-        timeout = self._retry["timeout_ms"] / 1000.0
-
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None,
-            self._sync_request,
+        url = build_url(self.base_url, path, query)
+        accept = "text/plain, */*" if raw else "application/json"
+        send = functools.partial(
+            self._transport.send,
             method,
             url,
-            encoded_body,
-            headers,
-            timeout,
+            encode_json(body),
+            build_headers(self.api_key, accept),
+            raw,
         )
+        return await asyncio.get_running_loop().run_in_executor(None, send)
 
-    async def _get(self, path: str, query: Optional[Dict[str, Any]] = None) -> Any:
+    async def _get(self, path: str, query: Mapping[str, Any] | None = None) -> Any:
         return await self._request("GET", path, query)
 
-    async def _post(self, path: str, body: Optional[Dict[str, Any]] = None) -> Any:
-        return await self._request("POST", path, body=body)
+    async def _post(self, path: str, body: Any = None) -> Any:
+        return await self._request("POST", path, None, body)
 
-    # ---- Public API surface (mirrors LumenqraphClient) ----
-
-    async def health(self) -> Dict[str, Any]:
-        """Get health and indexing-lag report."""
-        return await self._get("/health")
-
-    async def list_contracts(
-        self, limit: int = 200, offset: int = 0
-    ) -> Dict[str, Any]:
-        """Get contracts with pagination."""
-        return await self._get("/contracts", {"limit": limit, "offset": offset})
-
-    async def get_interface(
-        self, contract_id: str, version: Optional[int] = None
-    ) -> Dict[str, Any]:
-        """Get a contract's decoded on-chain interface."""
-        query: Dict[str, Any] = {}
-        if version is not None:
-            query["version"] = version
-        return await self._get(f"/contracts/{contract_id}/interface", query)
-
-    async def get_state(
-        self, contract_id: str, limit: int = 1
-    ) -> Dict[str, Any]:
-        """Get versioned instance-storage snapshots, newest first."""
-        return await self._get(
-            f"/contracts/{contract_id}/state", {"limit": limit}
-        )
-
-    async def get_data(
-        self,
-        contract_id: str,
-        label: Optional[str] = None,
-        limit: int = 100,
-    ) -> Dict[str, Any]:
-        """Get latest value of every per-key entry."""
-        query: Dict[str, Any] = {"limit": limit}
-        if label:
-            query["label"] = label
-        return await self._get(f"/contracts/{contract_id}/data", query)
-
-    async def get_data_key(
-        self, contract_id: str, key_hash: str, limit: int = 50
-    ) -> Dict[str, Any]:
-        """Get version history of a single per-key entry."""
-        return await self._get(
-            f"/contracts/{contract_id}/data/{key_hash}", {"limit": limit}
-        )
-
-    async def list_events(
-        self,
-        contract_id: str,
-        limit: int = 50,
-        offset: int = 0,
-        event_name: Optional[str] = None,
-        after: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Get recent events for a contract, newest first."""
-        query: Dict[str, Any] = {"limit": limit}
-        if offset:
-            query["offset"] = offset
-        if event_name:
-            query["event_name"] = event_name
-        if after:
-            query["after"] = after
-        return await self._get(f"/contracts/{contract_id}/events", query)
-
-    async def list_transfers(
-        self,
-        contract_id: Optional[str] = None,
-        limit: int = 50,
-        offset: int = 0,
-        after: Optional[str] = None,
-        from_addr: Optional[str] = None,
-        to_addr: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Get materialized SEP-41 transfers, newest first (cursor-paginated)."""
-        path = f"/contracts/{contract_id}/transfers" if contract_id else "/transfers"
-        return await self._get(
-            path, _page_query(limit, offset, after, {"from": from_addr, "to": to_addr})
-        )
-
-    async def list_swaps(
-        self,
-        contract_id: str,
-        limit: int = 50,
-        offset: int = 0,
-        after: Optional[str] = None,
-        sender: Optional[str] = None,
-        sell_token: Optional[str] = None,
-        buy_token: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Get materialized AMM swaps, newest first (cursor-paginated)."""
-        return await self._get(
-            f"/contracts/{contract_id}/swaps",
-            _page_query(
-                limit,
-                offset,
-                after,
-                {"sender": sender, "sell_token": sell_token, "buy_token": buy_token},
-            ),
-        )
-
-    async def list_nft_events(
-        self,
-        contract_id: str,
-        limit: int = 50,
-        offset: int = 0,
-        after: Optional[str] = None,
-        kind: Optional[str] = None,
-        from_addr: Optional[str] = None,
-        to_addr: Optional[str] = None,
-        token_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Get materialized NFT events, newest first (cursor-paginated)."""
-        return await self._get(
-            f"/contracts/{contract_id}/nfts",
-            _page_query(
-                limit,
-                offset,
-                after,
-                {"kind": kind, "from": from_addr, "to": to_addr, "token_id": token_id},
-            ),
-        )
-
-    async def list_liquidity_events(
-        self,
-        contract_id: str,
-        limit: int = 50,
-        offset: int = 0,
-        after: Optional[str] = None,
-        kind: Optional[str] = None,
-        provider: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Get materialized liquidity events, newest first (cursor-paginated)."""
-        return await self._get(
-            f"/contracts/{contract_id}/liquidity",
-            _page_query(limit, offset, after, {"kind": kind, "provider": provider}),
-        )
-
-    async def list_deliveries(
-        self,
-        webhook_id: str,
-        limit: int = 50,
-        offset: int = 0,
-        after: Optional[str] = None,
-        include_summary: bool = False,
-    ) -> Dict[str, Any]:
-        """Get a webhook's delivery attempts, newest first (cursor-paginated)."""
-        return await self._get(
-            f"/webhooks/{webhook_id}/deliveries",
-            _page_query(
-                limit,
-                offset,
-                after,
-                {"include_summary": "true" if include_summary else None},
-            ),
-        )
-
-    async def redrive_webhook(
-        self, webhook_id: str, since: Optional[str] = None
-    ) -> Dict[str, int]:
-        """Reset failed webhook deliveries to pending, optionally from a timestamp."""
-        return await self._request(
-            "POST", f"/webhooks/{webhook_id}/redrive", {"since": since}
-        )
-
-    async def reenable_webhook(self, webhook_id: str) -> Dict[str, bool]:
-        """Clear an auto-disable and reactivate a webhook subscription."""
-        return await self._post(f"/webhooks/{webhook_id}/reenable")
-
-    async def rotate_webhook_secret(
-        self, webhook_id: str, grace_seconds: Optional[int] = None
-    ) -> Dict[str, str]:
-        """Rotate a webhook secret and return its grace-period expiry."""
-        body = {"grace_seconds": grace_seconds} if grace_seconds is not None else None
-        return await self._post(f"/webhooks/{webhook_id}/rotate-secret", body)
-
-    async def list_functions(self, contract_id: str) -> Dict[str, Any]:
-        """Get a contract's callable view functions and their typed signatures."""
-        return await self._get(f"/contracts/{contract_id}/functions")
-
-    async def call(
-        self,
-        contract_id: str,
-        function: str,
-        args: Optional[Any] = None,
-        source_account: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Invoke a view function read-only and get a typed result."""
-        return await self._post(
-            f"/contracts/{contract_id}/call",
-            {"function": function, "args": args, "source_account": source_account},
-        )
-
-    async def simulate(
-        self,
-        contract_id: str,
-        function: str,
-        args: Optional[Any] = None,
-        source_account: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Dry-run any call and preview its result, emitted events, and cost."""
-        return await self._post(
-            f"/contracts/{contract_id}/simulate",
-            {"function": function, "args": args, "source_account": source_account},
-        )
-
-    async def graphql(
-        self,
-        query: str,
-        variables: Optional[Dict[str, Any]] = None,
-    ) -> Any:
-        """Execute a raw GraphQL query against ``/graphql``."""
-        body = await self._post("/graphql", {"query": query, "variables": variables or {}})
-        errors = (body or {}).get("errors")
-        if errors:
-            messages = "; ".join(e.get("message", str(e)) for e in errors)
-            raise LumenqraphError(f"GraphQL error: {messages}", 200, errors)
-        return (body or {}).get("data")
-
-    async def paginate_events(
-        self,
-        contract_id: str,
-        event_name: Optional[str] = None,
-        page_size: int = 100,
-    ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Async generator over all events for a contract via cursor pagination.
-
-        Transparently fetches page after page until all events have been
-        yielded.
-
-        Args:
-            contract_id:  Contract to fetch events for.
-            event_name:   Optional event-name filter.
-            page_size:    Number of events to request per page (default 100).
-
-        Yields:
-            Event record dicts.
-
-        Example::
-
-            async for event in lq.paginate_events(contract_id, event_name="transfer"):
-                print(event["ledger"], event.get("enriched"))
-        """
-        cursor: Optional[str] = None
-        while True:
-            response = await self.list_events(
-                contract_id,
-                limit=page_size,
-                event_name=event_name,
-                after=cursor,
-            )
-            data = response.get("data", [])
-            for event in data:
-                yield event
-            if not response.get("has_more", False):
-                break
-            cursor = response.get("next_cursor")
-            if not cursor:
-                break
-
-    async def _paginate(
-        self, path: str, query: Dict[str, Any]
-    ) -> AsyncGenerator[Dict[str, Any], None]:
+    async def _paginate(self, path: str, query: Mapping[str, Any]) -> AsyncIterator[JsonDict]:
         """Follow ``next_cursor`` until ``has_more`` is false."""
-        after: Optional[str] = None
+        after: str | None = None
         while True:
             response = await self._get(path, {**query, "after": after})
             for item in response.get("data", []):
@@ -454,55 +130,439 @@ class AsyncLumenqraphClient:
             if not response.get("has_more", False) or not after:
                 break
 
-    def paginate_transfers(
+    # ---- Health ----
+
+    async def health(self) -> JsonDict:
+        """Get health and indexing-lag report."""
+        result: JsonDict = await self._get("/health")
+        return result
+
+    async def livez(self) -> Any:
+        """Liveness probe: the process is up."""
+        return await self._get("/livez")
+
+    async def readyz(self) -> Any:
+        """Readiness probe: the API can reach Postgres."""
+        return await self._get("/readyz")
+
+    # ---- Contracts & interfaces ----
+
+    async def list_contracts(self, limit: int | None = None, after: str | None = None) -> JsonDict:
+        """Contracts the indexer has seen (cursor via ``after``)."""
+        result: JsonDict = await self._get("/contracts", {"limit": limit, "after": after})
+        return result
+
+    def paginate_contracts(self, page_size: int = 100) -> AsyncIterator[JsonDict]:
+        """Every indexed contract via cursor pagination."""
+        return self._paginate("/contracts", {"limit": page_size})
+
+    async def get_interface(self, contract_id: str, version: int | None = None) -> JsonDict:
+        """A contract's decoded on-chain interface, optionally at a historical version."""
+        result: JsonDict = await self._get(
+            f"/contracts/{enc(contract_id)}/interface", {"version": version}
+        )
+        return result
+
+    async def get_interface_history(
+        self, contract_id: str, limit: int | None = None, after: str | None = None
+    ) -> JsonDict:
+        """The version history of a contract's interface, with semantic diffs."""
+        result: JsonDict = await self._get(
+            f"/contracts/{enc(contract_id)}/interface/history", {"limit": limit, "after": after}
+        )
+        return result
+
+    async def get_interface_diff(
+        self, contract_id: str, from_version: int | None = None, to_version: int | None = None
+    ) -> JsonDict:
+        """The semantic diff between two interface versions (defaults: previous → newest)."""
+        result: JsonDict = await self._get(
+            f"/contracts/{enc(contract_id)}/interface/diff", {"from": from_version, "to": to_version}
+        )
+        return result
+
+    async def refresh_contract(self, contract_id: str) -> JsonDict:
+        """Re-read a contract's on-chain interface now."""
+        result: JsonDict = await self._post(f"/contracts/{enc(contract_id)}/refresh")
+        return result
+
+    async def generate_sdk(
+        self, contract_id: str, lang: SdkLang | None = None, version: int | None = None
+    ) -> str:
+        """Generated client source code for a contract (``ts`` by default)."""
+        result: str = await self._request(
+            "GET", f"/contracts/{enc(contract_id)}/sdk", {"lang": lang, "version": version}, raw=True
+        )
+        return result
+
+    async def get_stats(
         self,
         contract_id: str,
-        page_size: int = 100,
-        from_addr: Optional[str] = None,
-        to_addr: Optional[str] = None,
-    ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Async generator over all of a contract's transfers via cursor pagination.
+        bucket: str | None = None,
+        resolution: str | None = None,
+        window: str | None = None,
+        group_by: str | None = None,
+        from_time: str | None = None,
+        to_time: str | None = None,
+        from_ledger: int | None = None,
+        to_ledger: int | None = None,
+    ) -> JsonDict:
+        """Time-bucketed event statistics for a contract."""
+        result: JsonDict = await self._get(f"/contracts/{enc(contract_id)}/stats", {
+            "bucket": bucket,
+            "resolution": resolution,
+            "window": window,
+            "group_by": group_by,
+            "from": from_time,
+            "to": to_time,
+            "from_ledger": from_ledger,
+            "to_ledger": to_ledger,
+        })
+        return result
 
-        Args:
-            contract_id:  Contract to scope the query to.
-            page_size:    Transfers per page (default 100).
+    # ---- State & data ----
 
-        Yields:
-            Transfer record dicts.
+    async def get_state(self, contract_id: str, limit: int = 1) -> JsonDict:
+        """Versioned instance-storage snapshots, newest first."""
+        result: JsonDict = await self._get(f"/contracts/{enc(contract_id)}/state", {"limit": limit})
+        return result
+
+    async def get_data(
+        self, contract_id: str, label: str | None = None, limit: int = 100
+    ) -> JsonDict:
+        """Latest value of every per-key entry."""
+        result: JsonDict = await self._get(
+            f"/contracts/{enc(contract_id)}/data", {"label": label, "limit": limit}
+        )
+        return result
+
+    async def get_data_key(self, contract_id: str, key_hash: str, limit: int = 50) -> JsonDict:
+        """Version history of a single per-key entry."""
+        result: JsonDict = await self._get(
+            f"/contracts/{enc(contract_id)}/data/{enc(key_hash)}", {"limit": limit}
+        )
+        return result
+
+    # ---- Events ----
+
+    async def list_events(
+        self,
+        contract_id: str,
+        limit: int = 50,
+        offset: int = 0,
+        event_name: str | None = None,
+        after: str | None = None,
+        from_ledger: int | None = None,
+        to_ledger: int | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        topic0: str | None = None,
+        topic1: str | None = None,
+        topic2: str | None = None,
+        topic3: str | None = None,
+        param: str | None = None,
+        successful_only: bool | None = None,
+    ) -> JsonDict:
+        """Recent events for a contract, newest first (cursor via ``after``)."""
+        result: JsonDict = await self._get(f"/contracts/{enc(contract_id)}/events", page_query(
+            limit, offset, after, {
+                "event_name": event_name,
+                "from_ledger": from_ledger,
+                "to_ledger": to_ledger,
+                "since": since,
+                "until": until,
+                "topic0": topic0,
+                "topic1": topic1,
+                "topic2": topic2,
+                "topic3": topic3,
+                "param": param,
+                "successful_only": successful_only,
+            }))
+        return result
+
+    def paginate_events(
+        self, contract_id: str, event_name: str | None = None, page_size: int = 100,
+        **filters: Any,
+    ) -> AsyncIterator[JsonDict]:
+        """All of a contract's events via REST cursor pagination.
+
+        Example::
+
+            async for event in lq.paginate_events(contract_id, event_name="transfer"):
+                print(event["ledger"], event.get("enriched"))
         """
         return self._paginate(
-            f"/contracts/{contract_id}/transfers",
+            f"/contracts/{enc(contract_id)}/events",
+            {"limit": page_size, "event_name": event_name, **filters},
+        )
+
+    async def get_event(self, event_id: str) -> JsonDict:
+        """A single event by its unique id."""
+        result: JsonDict = await self._get(f"/events/{enc(event_id)}")
+        return result
+
+    async def get_transaction_events(self, tx_hash: str, limit: int | None = None) -> JsonDict:
+        """All indexed events emitted by a transaction, in emission order."""
+        result: JsonDict = await self._get(
+            f"/transactions/{enc(tx_hash)}/events", {"limit": limit}
+        )
+        return result
+
+    # ---- Materialized projections ----
+
+    async def list_transfers(
+        self,
+        contract_id: str,
+        limit: int = 50,
+        offset: int = 0,
+        after: str | None = None,
+        from_addr: str | None = None,
+        to_addr: str | None = None,
+    ) -> JsonDict:
+        """Materialized SEP-41 transfers for a contract, newest first (cursor-paginated)."""
+        result: JsonDict = await self._get(
+            f"/contracts/{enc(contract_id)}/transfers",
+            page_query(limit, offset, after, {"from": from_addr, "to": to_addr}),
+        )
+        return result
+
+    async def list_swaps(
+        self,
+        contract_id: str,
+        limit: int = 50,
+        offset: int = 0,
+        after: str | None = None,
+        sender: str | None = None,
+        sell_token: str | None = None,
+        buy_token: str | None = None,
+    ) -> JsonDict:
+        """Materialized AMM swaps, newest first (cursor-paginated)."""
+        result: JsonDict = await self._get(
+            f"/contracts/{enc(contract_id)}/swaps",
+            page_query(limit, offset, after,
+                       {"sender": sender, "sell_token": sell_token, "buy_token": buy_token}),
+        )
+        return result
+
+    async def list_nft_events(
+        self,
+        contract_id: str,
+        limit: int = 50,
+        offset: int = 0,
+        after: str | None = None,
+        kind: Literal["mint", "transfer", "burn"] | None = None,
+        from_addr: str | None = None,
+        to_addr: str | None = None,
+        token_id: str | None = None,
+    ) -> JsonDict:
+        """Materialized NFT events, newest first (cursor-paginated)."""
+        result: JsonDict = await self._get(
+            f"/contracts/{enc(contract_id)}/nfts",
+            page_query(limit, offset, after,
+                       {"kind": kind, "from": from_addr, "to": to_addr, "token_id": token_id}),
+        )
+        return result
+
+    async def list_liquidity_events(
+        self,
+        contract_id: str,
+        limit: int = 50,
+        offset: int = 0,
+        after: str | None = None,
+        kind: Literal["add", "remove"] | None = None,
+        provider: str | None = None,
+    ) -> JsonDict:
+        """Materialized liquidity events, newest first (cursor-paginated)."""
+        result: JsonDict = await self._get(
+            f"/contracts/{enc(contract_id)}/liquidity",
+            page_query(limit, offset, after, {"kind": kind, "provider": provider}),
+        )
+        return result
+
+    def paginate_transfers(
+        self, contract_id: str, page_size: int = 100,
+        from_addr: str | None = None, to_addr: str | None = None,
+    ) -> AsyncIterator[JsonDict]:
+        """All of a contract's transfers via cursor pagination."""
+        return self._paginate(
+            f"/contracts/{enc(contract_id)}/transfers",
             {"limit": page_size, "from": from_addr, "to": to_addr},
         )
 
     def paginate_swaps(
-        self, contract_id: str, page_size: int = 100, **filters: Optional[str]
-    ) -> AsyncGenerator[Dict[str, Any], None]:
+        self, contract_id: str, page_size: int = 100, **filters: str | None
+    ) -> AsyncIterator[JsonDict]:
         """All AMM swaps for a contract (filters: sender, sell_token, buy_token)."""
-        return self._paginate(
-            f"/contracts/{contract_id}/swaps", {"limit": page_size, **filters}
-        )
+        return self._paginate(f"/contracts/{enc(contract_id)}/swaps", {"limit": page_size, **filters})
 
     def paginate_nft_events(
-        self, contract_id: str, page_size: int = 100, **filters: Optional[str]
-    ) -> AsyncGenerator[Dict[str, Any], None]:
+        self, contract_id: str, page_size: int = 100, **filters: str | None
+    ) -> AsyncIterator[JsonDict]:
         """All NFT events for a contract (filters: kind, from, to, token_id)."""
-        return self._paginate(
-            f"/contracts/{contract_id}/nfts", {"limit": page_size, **filters}
-        )
+        return self._paginate(f"/contracts/{enc(contract_id)}/nfts", {"limit": page_size, **filters})
 
     def paginate_liquidity_events(
-        self, contract_id: str, page_size: int = 100, **filters: Optional[str]
-    ) -> AsyncGenerator[Dict[str, Any], None]:
+        self, contract_id: str, page_size: int = 100, **filters: str | None
+    ) -> AsyncIterator[JsonDict]:
         """All liquidity events for a contract (filters: kind, provider)."""
         return self._paginate(
-            f"/contracts/{contract_id}/liquidity", {"limit": page_size, **filters}
+            f"/contracts/{enc(contract_id)}/liquidity", {"limit": page_size, **filters}
         )
 
-    def paginate_deliveries(
-        self, webhook_id: str, page_size: int = 100
-    ) -> AsyncGenerator[Dict[str, Any], None]:
-        """All delivery attempts of a webhook."""
-        return self._paginate(
-            f"/webhooks/{webhook_id}/deliveries", {"limit": page_size}
+    # ---- Read layer ----
+
+    async def list_functions(self, contract_id: str) -> JsonDict:
+        """A contract's callable view functions and their typed signatures."""
+        result: JsonDict = await self._get(f"/contracts/{enc(contract_id)}/functions")
+        return result
+
+    async def call(
+        self, contract_id: str, function: str, args: Any | None = None,
+        source_account: str | None = None,
+    ) -> JsonDict:
+        """Invoke a view function read-only and get a typed result."""
+        result: JsonDict = await self._post(
+            f"/contracts/{enc(contract_id)}/call", _call_body(function, args, source_account)
         )
+        return result
+
+    async def simulate(
+        self, contract_id: str, function: str, args: Any | None = None,
+        source_account: str | None = None,
+    ) -> JsonDict:
+        """Dry-run any call and preview its result, emitted events, and cost."""
+        result: JsonDict = await self._post(
+            f"/contracts/{enc(contract_id)}/simulate", _call_body(function, args, source_account)
+        )
+        return result
+
+    # ---- Webhooks ----
+
+    async def create_webhook(
+        self,
+        url: str,
+        kind: WebhookKind | None = None,
+        contract_id: str | None = None,
+        contract_ids: list[str] | None = None,
+        event_name: str | None = None,
+        event_names: list[str] | None = None,
+        filter: JsonDict | None = None,
+        since: str | int | None = None,
+    ) -> JsonDict:
+        """Create a webhook subscription. The response carries the one-time ``secret``."""
+        result: JsonDict = await self._post("/webhooks", drop_none({
+            "url": url,
+            "kind": kind,
+            "contract_id": contract_id,
+            "contract_ids": contract_ids,
+            "event_name": event_name,
+            "event_names": event_names,
+            "filter": filter,
+            "since": None if since is None else str(since),
+        }))
+        return result
+
+    async def list_webhooks(self) -> list[JsonDict]:
+        """List all webhook subscriptions."""
+        result: list[JsonDict] = await self._get("/webhooks")
+        return result
+
+    async def update_webhook(
+        self,
+        webhook_id: str,
+        active: bool | None = None,
+        contract_id: str | None = None,
+        contract_ids: list[str] | None = None,
+        event_name: str | None = None,
+        event_names: list[str] | None = None,
+        filter: JsonDict | None = None,
+    ) -> JsonDict:
+        """Pause/resume a subscription or change its filters (``PATCH``)."""
+        result: JsonDict = await self._request("PATCH", f"/webhooks/{enc(webhook_id)}", None, drop_none({
+            "active": active,
+            "contract_id": contract_id,
+            "contract_ids": contract_ids,
+            "event_name": event_name,
+            "event_names": event_names,
+            "filter": filter,
+        }))
+        return result
+
+    async def delete_webhook(self, webhook_id: str) -> Any:
+        """Delete a webhook subscription."""
+        return await self._request("DELETE", f"/webhooks/{enc(webhook_id)}")
+
+    async def list_deliveries(
+        self,
+        webhook_id: str,
+        limit: int = 50,
+        offset: int = 0,
+        after: str | None = None,
+        include_summary: bool = False,
+    ) -> JsonDict:
+        """A webhook's delivery attempts, newest first (cursor-paginated)."""
+        result: JsonDict = await self._get(
+            f"/webhooks/{enc(webhook_id)}/deliveries",
+            page_query(limit, offset, after,
+                       {"include_summary": True if include_summary else None}),
+        )
+        return result
+
+    def paginate_deliveries(self, webhook_id: str, page_size: int = 100) -> AsyncIterator[JsonDict]:
+        """All delivery attempts of a webhook."""
+        return self._paginate(f"/webhooks/{enc(webhook_id)}/deliveries", {"limit": page_size})
+
+    async def redrive_webhook(self, webhook_id: str, since: str | None = None) -> JsonDict:
+        """Reset failed deliveries to pending, optionally only those at/after ``since`` (RFC 3339)."""
+        result: JsonDict = await self._request(
+            "POST", f"/webhooks/{enc(webhook_id)}/redrive", {"since": since}, None
+        )
+        return result
+
+    async def reenable_webhook(self, webhook_id: str) -> JsonDict:
+        """Clear an auto-disable and reactivate a webhook subscription."""
+        result: JsonDict = await self._post(f"/webhooks/{enc(webhook_id)}/reenable")
+        return result
+
+    async def rotate_webhook_secret(
+        self, webhook_id: str, grace_seconds: int | None = None
+    ) -> JsonDict:
+        """Rotate a webhook secret; the old one stays valid for ``grace_seconds`` (default 24h)."""
+        body = {"grace_seconds": grace_seconds} if grace_seconds is not None else None
+        result: JsonDict = await self._post(f"/webhooks/{enc(webhook_id)}/rotate-secret", body)
+        return result
+
+    # ---- GraphQL ----
+
+    async def graphql(self, query: str, variables: Mapping[str, Any] | None = None) -> Any:
+        """Execute a raw GraphQL query against ``/graphql`` and return its ``data``."""
+        body = await self._post("/graphql", {"query": query, "variables": dict(variables or {})})
+        return graphql_data(body)
+
+    async def events_page(
+        self,
+        contract_id: str,
+        first: int = 50,
+        after: str | None = None,
+        event_name: str | None = None,
+    ) -> JsonDict:
+        """One cursor page of events via GraphQL: ``{nodes, end_cursor, has_next_page}``."""
+        data = await self.graphql(EVENTS_PAGE_QUERY, {
+            "id": contract_id, "name": event_name, "first": first, "after": after,
+        })
+        return events_page_from_graphql(data)
+
+    async def paginate_events_graphql(
+        self, contract_id: str, event_name: str | None = None, page_size: int = 100
+    ) -> AsyncIterator[JsonDict]:
+        """All of a contract's events via GraphQL cursor pagination."""
+        after: str | None = None
+        while True:
+            page = await self.events_page(
+                contract_id, first=page_size, after=after, event_name=event_name
+            )
+            for node in page["nodes"]:
+                yield node
+            after = page["end_cursor"]
+            if not page["has_next_page"] or not after:
+                break

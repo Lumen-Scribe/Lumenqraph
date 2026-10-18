@@ -6,14 +6,16 @@ one Lumenqraph release to another.
 
 **Always read this file before upgrading a running deployment.**
 
-The indexer applies database migrations automatically on startup via
-`sqlx::migrate!`. In most cases the upgrade procedure is:
+Migrations are applied by an explicit step, `lumenqraph-indexer migrate`, which
+the bundled compose, Fly and Render configs run before the services start. In
+most cases the upgrade procedure is:
 
 1. Read the relevant section below.
 2. Set any new required environment variables before restarting.
-3. Stop the old binaries.
-4. Deploy the new binaries — the indexer runs migrations first, then starts polling.
-5. Start the API and webhooks workers once the indexer is healthy (`/health`).
+3. Run `lumenqraph-indexer migrate` with the new image (automatic with the
+   bundled configs).
+4. Deploy the new binaries. Each service verifies the schema at startup and
+   refuses to start if migrations are missing.
 
 For a full deployment reference see [docs/DEPLOYMENT.md](DEPLOYMENT.md).
 
@@ -213,11 +215,12 @@ fly secrets set WEBHOOK_ENCRYPTION_KEY="<output from step 1>"
 # 3. Stop webhooks first (schema change on webhook_deliveries)
 fly scale count webhooks=0   # or docker stop / systemctl stop
 
-# 4. Deploy new binaries — the indexer runs all pending migrations on startup
+# 4. Deploy new binaries — the release_command / migrate service applies all
+#    pending migrations before any service starts
 fly deploy            # or docker compose up --build / cargo build --release
 
 # 5. Verify migrations ran
-fly logs -i <indexer-instance>   # look for "migrations applied"
+fly logs   # look for "database migrations complete" from the release machine
 # Or query directly:
 # SELECT version FROM _sqlx_migrations ORDER BY version;
 
@@ -268,13 +271,18 @@ All other variables have working defaults. See [Configuration](../README.md#conf
 ### How migrations work
 
 Lumenqraph uses [SQLx offline migrations](https://docs.rs/sqlx/latest/sqlx/macro.migrate.html).
-The indexer binary embeds and applies all migrations on startup before polling
-begins. Migration state is tracked in the `_sqlx_migrations` table.
+Every binary embeds all migrations. `lumenqraph-indexer migrate` applies them
+(under an advisory lock, so concurrent runs are safe) and exits; migration
+state is tracked in the `_sqlx_migrations` table. At startup each service
+compares that table with its embedded migrations: it refuses to start if any
+are missing, failed, or were changed after being applied, and warns if the
+database has migrations it doesn't know (a newer version already migrated).
 
 - Migrations are **forward-only**. There is no automatic rollback.
 - For a rollback strategy (point-in-time restore, manual revert scripts), see
   [docs/MIGRATIONS.md](MIGRATIONS.md).
-- If a migration fails mid-apply, the indexer will exit with a clear error.
+- If a migration fails mid-apply, `migrate` exits non-zero with a clear error
+  and the deploy stops there.
   Fix the root cause (usually a missing env var or connection issue), then
   restart — SQLx will resume from the failed migration.
 
@@ -282,12 +290,14 @@ begins. Migration state is tracked in the `_sqlx_migrations` table.
 
 Always upgrade in this order to avoid downtime:
 
-1. **Indexer** — runs migrations, resumes ingestion.
-2. **API** — once the indexer is healthy at `/health`.
-3. **Webhooks** — last, after schema migrations are confirmed complete.
+1. **Migrate** — `lumenqraph-indexer migrate` with the new image.
+2. **Indexer** — resumes ingestion.
+3. **API** — once the indexer is healthy at `/health`.
+4. **Webhooks** — last.
 
-For rolling deployments behind a load balancer, ensure the indexer has
-finished all migrations before routing traffic to the new API instances.
+Write migrations to be backwards compatible with the previous release, so old
+API instances keep working (with a "schema is newer" warning) while a rolling
+deploy replaces them.
 
 ### Checking which migrations have run
 

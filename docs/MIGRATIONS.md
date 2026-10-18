@@ -4,6 +4,8 @@
 
 Lumenqraph uses **forward-only migrations** applied via `sqlx::migrate!`. There are no automated down-migrations or reversible migration pairs (`up`/`down`). This document explains the rationale for that choice and provides guidance for operators who need to revert a bad schema change.
 
+For how to write new migrations that don't lock large tables, and how CI enforces it, see [Writing lock-safe migrations](#writing-lock-safe-migrations).
+
 ## Why Forward-Only?
 
 1. **Additive-by-design schema evolution**: Most migrations add new tables, columns, or indexes without modifying existing data paths. Removing a newly added column or index is always safe (the application ignores columns it doesn't query) — reverting such a migration is a no-op from the application's perspective.
@@ -61,10 +63,121 @@ This is the safest rollback scenario: the schema changed, but no production traf
 3. Deploy the previous application version.
 4. Resume services.
 
+## Writing lock-safe migrations
+
+`events` is by far the largest table, and `token_transfers` and `contract_data` grow with it. DDL that takes a strong lock on one of them blocks the indexer's writes (and can queue API reads behind it) for as long as the statement runs, which for an index build or a validating scan over millions of rows means minutes to hours. Every new migration must therefore be **lock-safe**, or explicitly justified.
+
+### The CI lint
+
+CI runs [squawk](https://squawkhq.com) over every migration a pull request adds or changes (the `migration-lint` job in `.github/workflows/ci.yml`, configured by [`.squawk.toml`](../.squawk.toml)). It fails on patterns such as:
+
+- `CREATE INDEX` / `DROP INDEX` without `CONCURRENTLY`
+- `ADD CONSTRAINT … CHECK/FOREIGN KEY` without `NOT VALID`
+- `ALTER COLUMN … TYPE` (a full table rewrite)
+- `SET NOT NULL`, adding a required column, renaming or dropping columns and tables
+- `CREATE INDEX CONCURRENTLY` inside a transaction (sqlx would fail at runtime)
+
+Run the same check locally (with [squawk installed](https://squawkhq.com/docs/)):
+
+```bash
+make migrations-lint                         # changed vs origin/main
+bash scripts/lint_migrations.sh <base-ref>   # changed vs another ref
+bash scripts/lint_migrations.sh -- migrations/0030_example.sql
+```
+
+**Intentional exceptions.** If a flagged statement is safe in context (for example, the table is new and empty in this same release, or is known to stay tiny), put a `squawk-ignore` comment directly above it, with the reason:
+
+```sql
+-- squawk-ignore constraint-missing-not-valid
+-- Safe: webhook_subscriptions is created in this release and is empty.
+ALTER TABLE webhook_subscriptions ADD CONSTRAINT chk_kind CHECK (kind IN ('event', 'upgrade'));
+```
+
+Reviewers should treat every `squawk-ignore` as a claim that needs justifying.
+
+### Safe patterns
+
+| Instead of | Write |
+| --- | --- |
+| `CREATE INDEX idx ON events (…)` | `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx ON events (…)` in its own `-- no-transaction` file (below) |
+| `DROP INDEX idx` | `DROP INDEX CONCURRENTLY IF EXISTS idx` in its own `-- no-transaction` file |
+| `ADD CONSTRAINT c CHECK (…)` | Migration N: `ADD CONSTRAINT c CHECK (…) NOT VALID` (brief lock, no scan). Migration N+1: `VALIDATE CONSTRAINT c` (scans under `SHARE UPDATE EXCLUSIVE`, so writes continue) |
+| `ADD CONSTRAINT … FOREIGN KEY` | Same two steps: `NOT VALID`, then `VALIDATE CONSTRAINT` |
+| `ALTER COLUMN x SET NOT NULL` | Add `CHECK (x IS NOT NULL) NOT VALID`, validate it, then `SET NOT NULL` (Postgres 12+ reuses the validated check and skips the scan), then drop the check |
+| `ALTER COLUMN x TYPE …` | Add a new column, backfill it in batches from application code or a maintenance command, switch reads over, then drop the old column in a later release |
+| `ADD COLUMN x … DEFAULT volatile_fn()` | Add the column without a default (or with a constant default, which is metadata-only on Postgres 11+), then backfill in batches |
+
+### Concurrent index migrations with sqlx
+
+`CREATE INDEX CONCURRENTLY` cannot run inside a transaction, and sqlx wraps every migration in one unless the file's **first line** is `-- no-transaction`. The convention is:
+
+1. **One concurrent statement per file.** Put nothing else in the file, so a failure can't leave the migration half-applied with other statements committed.
+2. **First line is exactly `-- no-transaction`.** The lint script reads this header to lint the file without assuming a transaction. A `CONCURRENTLY` statement in a file *without* the header fails the lint, because it would fail at runtime.
+3. **Always `IF NOT EXISTS` / `IF EXISTS`**, so a retried migration is idempotent.
+
+```sql
+-- no-transaction
+-- Speed up by-transaction lookups (#NNN). Built concurrently: events is large.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_example
+    ON events (contract_id, ledger DESC);
+```
+
+**If a concurrent build fails** (deadlock, cancellation, a unique violation), Postgres leaves an `INVALID` index behind, and `IF NOT EXISTS` will then silently skip it on retry. Check for and drop invalid indexes before re-running:
+
+```sql
+SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;
+DROP INDEX CONCURRENTLY IF EXISTS idx_events_example;
+```
+
+### Bounding lock waits during an upgrade
+
+Even a brief `ACCESS EXCLUSIVE` lock queues behind long-running queries, and every later query queues behind *it*. Before an upgrade on a busy instance, cap how long DDL may wait for a lock, so a blocked migration fails fast and can be retried, instead of stalling ingestion:
+
+```sql
+ALTER ROLE lumenqraph SET lock_timeout = '5s';   -- before starting the new indexer
+-- … upgrade; the indexer applies migrations on startup …
+ALTER ROLE lumenqraph RESET lock_timeout;        -- after migrations complete
+```
+
+### Historical migrations that lock large tables
+
+These released migrations predate the lint. They can't be edited (sqlx checksums applied migrations), so on a **populated** deployment, do the expensive work ahead of time:
+
+| Migration | What it does | Before upgrading a populated instance |
+| --- | --- | --- |
+| `0010_hot_query_indexes.sql` | Non-concurrent indexes on `events`, `token_transfers`, `contract_data`, `contract_spec_versions` | Pre-create them concurrently (below); the migration's `IF NOT EXISTS` then makes it a no-op |
+| `0016_tx_hash_index.sql` | Non-concurrent `idx_events_tx_hash` on `events` | Pre-create it concurrently (below) |
+| `0019_enriched_gin_index.sql` | Intended GIN index on `events.enriched` | Currently a no-op: `idx_events_enriched` already exists from `0004` (see #364, #476) |
+| `0022_token_transfers_kind_check.sql` | `ADD CONSTRAINT chk_transfer_kind CHECK …` validated immediately, scanning `token_transfers` under `ACCESS EXCLUSIVE` | Run in a maintenance window, or with `lock_timeout` set as above. First confirm it will succeed: `SELECT count(*) FROM token_transfers WHERE kind NOT IN ('transfer','mint','burn','clawback');` must return 0 |
+
+Pre-creating the `0010` and `0016` indexes (run each statement separately, outside a transaction, e.g. in `psql`):
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_contract_event_ledger
+    ON events (contract_id, event_name, ledger DESC, event_id DESC);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_transfers_contract_from_ledger
+    ON token_transfers (contract_id, from_addr, ledger DESC, event_id DESC);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_transfers_contract_to_ledger
+    ON token_transfers (contract_id, to_addr, ledger DESC, event_id DESC);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_transfers_contract_from_to_ledger
+    ON token_transfers (contract_id, from_addr, to_addr, ledger DESC, event_id DESC);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_contract_data_contract_label_ledger
+    ON contract_data (contract_id, label, ledger DESC);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_contract_spec_versions_contract
+    ON contract_spec_versions (contract_id);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_contract_spec_versions_contract_version_desc
+    ON contract_spec_versions (contract_id, version DESC);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_events_tx_hash
+    ON events (tx_hash, ledger ASC, event_id ASC);
+```
+
+Then check that none are `INVALID` (query above) before starting the new indexer.
+
 ## Migration Testing Checklist
 
 To minimize rollback risk, test new migrations on a staging environment:
 
+- [ ] `make migrations-lint` passes, or each `squawk-ignore` carries a justification.
 - [ ] Apply the migration on a copy of production data.
 - [ ] Verify the indexer can process events and the API can serve requests.
 - [ ] Run the application's integration tests against the new schema.

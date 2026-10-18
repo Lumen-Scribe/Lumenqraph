@@ -199,6 +199,39 @@ struct Cursor {
     event_id: String,
 }
 
+/// Per-connection state carried through the `stream::unfold` loop.
+struct StreamState {
+    state: AppState,
+    contract_id: String,
+    event_name: Option<String>,
+    cursor: Cursor,
+    buffer: VecDeque<StreamEvent>,
+    rx: broadcast::Receiver<BroadcastEvent>,
+    poll_secs: u64,
+    last_ledger: i64,
+}
+
+impl StreamState {
+    /// Advance the cursor to the given event.
+    fn advance(&mut self, event: &StreamEvent) {
+        self.cursor = Cursor {
+            ledger: event.ledger,
+            event_id: event.event_id.clone(),
+        };
+        self.last_ledger = event.ledger;
+    }
+
+    /// Build an SSE event with the `id:` field set for `Last-Event-ID` resume.
+    fn sse_event(event: &StreamEvent) -> Option<Event> {
+        let event_json = serde_json::to_string(event).ok()?;
+        Some(
+            Event::default()
+                .id(format!("{}:{}", event.ledger, event.event_id))
+                .data(event_json),
+        )
+    }
+}
+
 /// Parse a `Last-Event-ID` header value of the form `"<ledger>:<event_id>"`.
 fn parse_last_event_id(value: &str) -> Option<Cursor> {
     let (ledger, event_id) = value.split_once(':')?;
@@ -246,86 +279,124 @@ pub async fn stream_events(
         cursor_ledger = initial_cursor.ledger,
         cursor_event_id = %initial_cursor.event_id,
         poll_secs,
-        active_streams = active,
+        active_streams = active_streams(),
         "starting event stream"
     );
 
+    // Subscribe to the shared fan-out before constructing the stream so no
+    // events published after this point are missed.
+    let rx = state.event_fanout.subscribe();
+    let last_ledger = initial_cursor.ledger;
+
+    let initial = StreamState {
+        state,
+        contract_id,
+        event_name: q.event_name,
+        cursor: initial_cursor,
+        buffer: VecDeque::new(),
+        rx,
+        poll_secs,
+        last_ledger,
+    };
+
     // Create the stream. The unfold state carries a buffer of already-fetched
     // rows so a single DB query can serve up to its batch size of events.
-    let stream = stream::unfold(
-        (
-            state,
-            contract_id,
-            q.event_name,
-            initial_cursor,
-            VecDeque::<StreamEvent>::new(),
-        ),
-        move |(state, contract_id, event_name, mut cursor, mut buffer)| async move {
-            loop {
-                // Emit any buffered events before issuing another query.
-                if let Some(event) = buffer.pop_front() {
-                    cursor = Cursor {
-                        ledger: event.ledger,
-                        event_id: event.event_id.clone(),
-                    };
-                    let event_json = serde_json::to_string(&event).ok()?;
-                    let sse = Event::default()
-                        .id(format!("{}:{}", event.ledger, event.event_id))
-                        .data(event_json);
-                    return Some((
-                        Ok(sse),
-                        (state, contract_id, event_name, cursor, buffer),
-                    ));
-                }
+    let stream = stream::unfold(initial, move |mut st| async move {
+        loop {
+            // Emit any buffered events before issuing another query.
+            if let Some(event) = st.buffer.pop_front() {
+                st.advance(&event);
+                let sse = StreamState::sse_event(&event)?;
+                return Some((Ok(sse), st));
+            }
 
-                match fetch_new_events(&state, &contract_id, &event_name, &cursor).await {
-                    Ok(events) => {
-                        if events.is_empty() {
-                            // No new events, wait before polling again
-                            sleep(Duration::from_secs(poll_secs)).await;
-                        } else {
-                            buffer = VecDeque::from(events);
+            // Wait for a broadcast notification, with a polling timeout as a
+            // fallback when the listener is unavailable or the receiver lags.
+            match tokio::time::timeout(Duration::from_secs(st.poll_secs), st.rx.recv()).await {
+                Ok(Ok(broadcast_event)) => {
+                    // Filter the broadcast in memory by contract and event name.
+                    if broadcast_event.contract_id != st.contract_id {
+                        continue;
+                    }
+                    if let Some(ref name) = st.event_name {
+                        if broadcast_event.event_name.as_deref() != Some(name.as_str()) {
+                            continue;
                         }
                     }
-                    Err(e) => {
-                        tracing::error!(error = %e, "error fetching events");
-                        return Some((
-                            Ok(Event::default().comment(format!("error: {}", e))),
-                            (state, contract_id, event_name, cursor, buffer),
-                        ));
+                    let event = StreamEvent {
+                        ledger: broadcast_event.ledger,
+                        event_id: broadcast_event.event_id,
+                        data: broadcast_event.data,
+                    };
+                    // Skip events already delivered (resume / duplicate notify).
+                    if (event.ledger, event.event_id.as_str())
+                        <= (st.cursor.ledger, st.cursor.event_id.as_str())
+                    {
+                        continue;
                     }
-                    Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
-                        // Fell behind; fall through to polling to catch up.
-                    }
-                    Ok(Err(broadcast::error::RecvError::Closed)) => {
-                        return None;
-                    }
-                    Err(_elapsed) => {
-                        // Fallback: poll for new events.
-                        match fetch_new_events(&state, &contract_id, &event_name, last_ledger).await {
-                            Ok(events) => {
-                                for event in events {
-                                    let event_json = serde_json::to_string(&event).ok()?;
-                                    last_ledger = event.ledger;
-                                    return Some((
-                                        Ok(Event::default().data(event_json)),
-                                        (state.clone(), contract_id.clone(), event_name.clone(), last_ledger, rx, poll_secs),
-                                    ));
-                                }
+                    st.advance(&event);
+                    let sse = StreamState::sse_event(&event)?;
+                    return Some((Ok(sse), st));
+                }
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                    // Fell behind; fall through to polling to catch up.
+                    match fetch_new_events(
+                        &st.state,
+                        &st.contract_id,
+                        &st.event_name,
+                        &st.cursor,
+                    )
+                    .await
+                    {
+                        Ok(events) => {
+                            if events.is_empty() {
+                                sleep(Duration::from_secs(st.poll_secs)).await;
+                            } else {
+                                st.buffer = VecDeque::from(events);
                             }
-                            Err(e) => {
-                                tracing::error!(error = %e, "error fetching events");
-                                return Some((
-                                    Ok(Event::default().comment(format!("error: {}", e))),
-                                    (state.clone(), contract_id.clone(), event_name.clone(), last_ledger, rx, poll_secs),
-                                ));
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "error fetching events");
+                            return Some((
+                                Ok(Event::default().comment(format!("error: {}", e))),
+                                st,
+                            ));
+                        }
+                    }
+                }
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
+                    // The fan-out was dropped; end the stream.
+                    return None;
+                }
+                Err(_elapsed) => {
+                    // Fallback: poll for new events.
+                    match fetch_new_events(
+                        &st.state,
+                        &st.contract_id,
+                        &st.event_name,
+                        &st.cursor,
+                    )
+                    .await
+                    {
+                        Ok(events) => {
+                            if events.is_empty() {
+                                sleep(Duration::from_secs(st.poll_secs)).await;
+                            } else {
+                                st.buffer = VecDeque::from(events);
                             }
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "error fetching events");
+                            return Some((
+                                Ok(Event::default().comment(format!("error: {}", e))),
+                                st,
+                            ));
                         }
                     }
                 }
             }
-        },
-    );
+        }
+    });
 
     // Emit a keep-alive comment at least every 15 s so idle streams aren't
     // closed by proxies/load balancers with 60–100 s idle timeouts.
