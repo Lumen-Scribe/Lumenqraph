@@ -58,6 +58,25 @@ updates:
       - dependencies
       - typescript
 
+  # ── Explorer (npm) ──────────────────────────────────────────────────────────
+  # Covers esbuild, eslint and @playwright/test, which the explorer CI job
+  # exercises but which nothing else in the repo pins.
+  - package-ecosystem: npm
+    directory: /explorer
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: UTC
+    groups:
+      npm-dependencies:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - explorer
+
   # ── Python SDK (pip) ────────────────────────────────────────────────────────
   - package-ecosystem: pip
     directory: /sdk/python

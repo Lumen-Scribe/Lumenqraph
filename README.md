@@ -108,29 +108,38 @@ Lumenqraph is ideal for developers seeking **complete ownership of their data** 
 | 🤖 **MCP server (AI-agent access)** | A [Model Context Protocol](https://modelcontextprotocol.io) server that lets Claude (or any MCP agent) discover, query, and call any indexed Soroban contract — typed and self-describing, zero hand-written schema. |
 | 🗂️ **Contract state indexing** | Optional versioned snapshots of each contract's instance storage (admin, config, TVL, counters…), decoded to JSON — historical *state*, not just events. |
 | 👛 **Per-key state indexing** | Optional versioned snapshots of *individual* storage entries — e.g. each token holder's `Balance(Address)` — discovered from the contract's own events. Per-key history, not just the instance map. |
-| 💸 **Materialized token transfers** | SEP-41 `transfer` events projected into a queryable `from`/`to`/`amount` table. |
-| 🔌 **REST + GraphQL API** | Contracts, events (filterable), transfers, state, per-key data, health, and Prometheus metrics over REST — plus a GraphQL endpoint with Relay-style cursor pagination. |
-| 📦 **TypeScript SDK** | A typed, zero-dependency client (`@lumenqraph/sdk`) over the REST + GraphQL API, with a cursor-paginating async iterator. |
-| 📣 **Signed webhooks** | Register a URL + filter, receive HMAC-SHA256-signed event pushes with retries and exponential backoff. |
-| 🔑 **Auth & rate limiting** | SHA-256-hashed API keys with per-key request limits. |
-| 📊 **Observability** | Prometheus `/metrics` and a `/health` endpoint reporting chain-tip lag. |
-| ⏪ **Backfill mode** | One-shot historical catch-up (bounded by RPC retention). |
-| 🛡️ **Robust ingestion** | Idempotent, reorg-tolerant writes; graceful shutdown; automatic retry with backoff. |
-| 🐳 **Production-ready** | Dockerized, CI-gated (fmt + clippy + tests), fully documented. |
+| 💸 **Materialized token transfers** | SEP-41 `transfer`/`mint`/`burn`/`clawback` events projected into a queryable `from`/`to`/`amount`/`kind` table. Projection is keyed on the event name alone, so non-token contracts with same-named events can land here ([#600](https://github.com/Lumen-Scribe/Lumenqraph/issues/600)). |
+| 🧪 **Swaps, NFTs, liquidity** *(experimental)* | `/contracts/:id/swaps`, `/nfts` and `/liquidity` endpoints and tables exist, but **nothing populates them yet**, so they always return empty results ([#599](https://github.com/Lumen-Scribe/Lumenqraph/issues/599)). |
+| 🔌 **REST + GraphQL API** | Contracts, events (filterable), single events, by-transaction lookups, transfers, state, per-key data, health, and Prometheus metrics over REST, with uniform keyset (cursor) pagination, plus a GraphQL endpoint with Relay-style cursor pagination. |
+| 📈 **Contract stats** | `GET /contracts/:id/stats`: time-series event counts per contract over a window and resolution. |
+| 📡 **Live event streaming** *(experimental)* | `GET /contracts/:id/events/stream` Server-Sent Events with resume support. Currently broken on `main` ([#545](https://github.com/Lumen-Scribe/Lumenqraph/issues/545), [#569](https://github.com/Lumen-Scribe/Lumenqraph/issues/569)). |
+| 📦 **Client SDKs** | TypeScript (`@lumenqraph/sdk`, zero-dependency, cursor-paginating async iterators, webhook verification, SSE) and Python (`sdk/python`, sync + async clients). |
+| 📣 **Signed webhooks** | `event` and `upgrade` subscriptions with contract/event/topic filters. Deliveries are signed (`X-Lumenqraph-Signature: t=…,v1=…`, HMAC-SHA256 over timestamp + body), secrets are encrypted at rest, retries use exponential backoff, and failing endpoints auto-disable. Delivery history, redrive, re-enable and test endpoints. Secret rotation is experimental ([#564](https://github.com/Lumen-Scribe/Lumenqraph/issues/564)). |
+| 🔑 **Auth & rate limiting** | SHA-256-hashed API keys with per-key request limits, IP-based anonymous limits, tighter limits on RPC-backed routes, and per-IP concurrency caps. Keys are created with `scripts/gen_api_key.sh`; there is no key-management API yet ([#431](https://github.com/Lumen-Scribe/Lumenqraph/issues/431)). |
+| 🧾 **Audit log** | Authenticated requests and failed key attempts are recorded in the `audit_log` table ([#558](https://github.com/Lumen-Scribe/Lumenqraph/issues/558) tracks moving this off the request path). |
+| 📊 **Observability** | Prometheus `/metrics`, `/health` (chain-tip lag, unrecovered missed ledger ranges), `/livez` and `/readyz`, plus a Grafana dashboard and Prometheus alert rules in [`monitoring/`](monitoring/). |
+| ⏪ **Backfill & maintenance** | One-shot RPC backfill (bounded by RPC retention), `reenrich` to re-decode stored events, and `POST /contracts/:id/refresh` to force a spec re-fetch. `reenrich` is currently unreliable ([#597](https://github.com/Lumen-Scribe/Lumenqraph/issues/597)). |
+| 🗄️ **Deep historical backfill** *(experimental)* | `lumenqraph-indexer deep-backfill --source galexie` ingests history older than RPC retention from a Galexie / CDP export. Events are decoded but not enriched unless the contract's spec is already cached; the Horizon source doesn't work ([#598](https://github.com/Lumen-Scribe/Lumenqraph/issues/598)). See [docs/DEEP_BACKFILL.md](docs/DEEP_BACKFILL.md). |
+| 🛡️ **Robust ingestion** | Idempotent, reorg-tolerant writes; multi-RPC failover (`RPC_URLS`); missed-range tracking; graceful shutdown; automatic retry with backoff. |
+| 🐳 **Self-hostable** | Docker image with all four binaries, a full-stack compose file, and Fly.io / Render configs. |
 
 ## Architecture
 
-Lumenqraph is a Rust workspace of four service binaries sharing one core library. The services coordinate only through Postgres, so each can scale, restart, and fail independently — API traffic can never stall ingestion, and a decode bug can't take down the read path.
+Lumenqraph is a Rust workspace of four service binaries (indexer, api, webhooks, mcp) plus a shared core library. The services coordinate only through Postgres, so each can scale, restart, and fail independently — API traffic can never stall ingestion, and a decode bug can't take down the read path.
 
 ```
   Soroban RPC ──poll getEvents──▶ ┌───────────┐ ──write──▶ ┌────────────┐ ◀──read── ┌─────────┐ ──REST──▶ dApps
-                                  │  indexer  │            │  Postgres  │           │   api   │
-                                  └───────────┘            └────────────┘           └─────────┘
-                                                                 ▲
-                                                          read   │  write
-                                                            ┌────────────┐
-                                                            │  webhooks  │ ──signed POST──▶ subscribers
-                                                            └────────────┘
+       ▲                          │  indexer  │            │  Postgres  │           │   api   │
+       │                          └───────────┘            └────────────┘           └─────────┘
+       │                                                    ▲          ▲
+       │                                             read   │  write   │ read
+       │                                       ┌────────────┐   ┌────────────┐
+       │                                       │  webhooks  │   │    mcp     │ ◀──stdio / HTTP── AI agents
+       │                                       └────────────┘   └────────────┘
+       │                                             │                │
+       │                                     signed POST ▼            │
+       │                                         subscribers          │
+       └──────────────── simulate / read calls ───────────────────────┘
 ```
 
 | Crate | Role |
@@ -152,8 +161,9 @@ git clone https://github.com/Lumen-Scribe/Lumenqraph.git
 cd Lumenqraph
 cp .env.example .env                 # defaults target Stellar testnet
 
-docker compose up -d                 # local Postgres
-cargo run -p lumenqraph-indexer      # polls RPC + auto-applies migrations
+docker compose up -d                 # local Postgres (bound to 127.0.0.1)
+cargo run -p lumenqraph-indexer -- migrate   # apply database migrations
+cargo run -p lumenqraph-indexer      # polls RPC (separate shell)
 cargo run -p lumenqraph-api          # REST API on :8080 (separate shell)
 cargo run -p lumenqraph-webhooks     # optional: webhook delivery (separate shell)
 ```
@@ -168,10 +178,18 @@ curl 'localhost:8080/contracts/<CONTRACT_ID>/transfers?limit=5'
 curl localhost:8080/metrics
 ```
 
-To run the entire stack (Postgres + all three services) in Docker:
+To run the entire stack (Postgres + indexer, api and webhooks) in Docker:
 
 ```bash
+export POSTGRES_PASSWORD=$(openssl rand -hex 16)      # required
+export WEBHOOK_ENCRYPTION_KEY=$(openssl rand -hex 32)
 docker compose -f docker-compose.full.yml up --build
+```
+
+The MCP server is opt-in, because MCP clients usually launch it locally over stdio. Add `--profile mcp` to also run it over streamable HTTP on `:8090`:
+
+```bash
+docker compose -f docker-compose.full.yml --profile mcp up --build
 ```
 
 Common tasks are wrapped in the [`Makefile`](Makefile) — run `make help`.
@@ -667,13 +685,14 @@ See [docs/MULTI_NETWORK.md](docs/MULTI_NETWORK.md) for detailed configuration, d
 
 ## Running in production
 
-Run three long-lived processes against one Postgres. Only the indexer applies migrations.
+Run three long-lived processes against one Postgres, plus the optional MCP server (fourth binary) for AI-agent access. Only the indexer applies migrations.
 
 | Process | Notes |
 | --- | --- |
 | `lumenqraph-indexer` | Must run **24/7** — a sleeping poller falls behind the chain. |
 | `lumenqraph-api` | Stateless; scale horizontally behind a load balancer. |
 | `lumenqraph-webhooks` | A single instance suffices; delivery is idempotent per (subscription, event). |
+| `lumenqraph-mcp` | Optional. Usually spawned locally by an MCP client over stdio; set `MCP_HTTP_BIND` to serve it over HTTP instead. |
 
 Scrape `GET /metrics` and alert on `lumenqraph_indexer_lag_ledgers` climbing. For managed Postgres, point `DATABASE_URL` at Neon or Supabase. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for scaling notes (RPC providers, Redis-backed rate limiting, caching).
 
@@ -690,13 +709,14 @@ Lumenqraph/
 │   ├── lumenqraph-webhooks/   # subscription matching + signed delivery
 │   └── lumenqraph-mcp/        # Model Context Protocol server for AI agents
 ├── sdk/typescript/            # @lumenqraph/sdk — typed REST + GraphQL client
+├── sdk/python/                # lumenqraph — Python REST + GraphQL client
 ├── migrations/                # ordered sqlx SQL migrations
 ├── docs/                      # ARCHITECTURE, API, DEPLOYMENT
 ├── explorer/                  # zero-build explorer + self-host dashboard
 ├── scripts/                   # gen_api_key, backfill, setup_db
 ├── Dockerfile                 # multi-stage build (all four binaries)
 ├── docker-compose.yml         # local Postgres for dev
-├── docker-compose.full.yml    # full stack
+├── docker-compose.full.yml    # full stack (mcp behind the `mcp` profile)
 ├── fly.toml                   # Fly.io deploy (3 process groups)
 └── Makefile                   # common tasks (make help)
 ```
@@ -715,30 +735,57 @@ CI runs formatting, Clippy (warnings denied), tests, and a release build against
 
 ## Roadmap
 
+Each item is in one of three states. **Shipped** means the feature is on `main` and documented. **Experimental** means the code exists but is incomplete or known not to work yet; follow the linked issue before relying on it. **Planned** means not started.
+
+> **Heads-up:** `main` currently fails to compile and CI has not passed since late September ([#522](https://github.com/Lumen-Scribe/Lumenqraph/issues/522)). "Shipped" below describes what the code implements, not a released build. Closed issues that turned out not to be fixed are listed in [docs/KNOWN_GAPS.md](docs/KNOWN_GAPS.md).
+
+### Shipped
+
 - [x] Typed, self-describing decoding from each contract's on-chain interface (`contractspecv0`)
-- [x] Read layer: typed, read-only view-function calls via `simulateTransaction` (`eth_call` for Soroban)
+- [x] Read layer: typed, read-only view-function calls via `simulateTransaction` (`eth_call` for Soroban), including user-defined-type (struct/enum/union) and 256-bit-integer arguments
 - [x] Transaction preview: dry-run any call for its typed result, emitted events, and cost (Tenderly-style)
 - [x] MCP server: typed, self-describing Soroban access for AI agents (Model Context Protocol)
 - [x] Contract state indexing: versioned instance-storage snapshots + automatic spec refresh on upgrade
 - [x] State indexing: per-key persistent storage (e.g. individual balances), discovered from a token's own events
-- [x] GraphQL endpoint alongside REST; cursor-based pagination
-- [x] Client SDK: TypeScript (`sdk/typescript`)
-- [x] Read layer: user-defined-type (struct/enum/union) and 256-bit-integer arguments
+- [x] GraphQL endpoint alongside REST; uniform keyset (cursor) pagination
 - [x] Enrichment for user-defined struct/enum/union values (naming nested UDT values, not just event params)
 - [x] Contract upgrade watch: versioned interface history, semantic diffs, breaking-change detection, and `contract.upgraded` webhooks
 - [x] In-memory spec cache in the API (hash-validated, so an upgrade is never served stale)
-- [ ] Deep historical backfill via a captive-core / data-lake source (beyond RPC's ~7-day window)
-- [ ] Additional materialized verticals (AMM swaps, liquidity, NFT mints/transfers)
-- [ ] Redis-backed rate limiting and read caching for multi-instance deployments
-- [ ] Client SDK: Python
-- [ ] Grafana dashboards and alert rules
+- [x] Client SDKs: TypeScript (`sdk/typescript`) and Python (`sdk/python`)
+- [x] Signed webhooks with timestamped signatures, encrypted secrets, filters, auto-disable, redrive and test deliveries
+- [x] Per-contract time-series stats (`/contracts/:id/stats`)
+- [x] Audit log of authenticated API requests
+- [x] Multi-RPC failover and missed-ledger-range tracking
+- [x] Grafana dashboard and Prometheus alert rules ([`monitoring/`](monitoring/))
+
+### Experimental
+
+- [ ] Deep historical backfill beyond RPC retention: `deep-backfill` with a Galexie source works without enrichment; the Horizon source can't work ([#598](https://github.com/Lumen-Scribe/Lumenqraph/issues/598))
+- [ ] Materialized verticals (AMM swaps, liquidity, NFT mints/transfers): endpoints exist, nothing writes the tables ([#599](https://github.com/Lumen-Scribe/Lumenqraph/issues/599))
+- [ ] Live event streaming over SSE ([#545](https://github.com/Lumen-Scribe/Lumenqraph/issues/545), [#569](https://github.com/Lumen-Scribe/Lumenqraph/issues/569))
+- [ ] Redis-backed global rate limiting (`RATE_LIMIT_BACKEND=redis`): blocks the async runtime, fails open, and shares one key namespace across limiters ([#554](https://github.com/Lumen-Scribe/Lumenqraph/issues/554), [#555](https://github.com/Lumen-Scribe/Lumenqraph/issues/555))
+- [ ] Webhook secret rotation ([#564](https://github.com/Lumen-Scribe/Lumenqraph/issues/564)) and subscription backfill via `since` ([docs/KNOWN_GAPS.md](docs/KNOWN_GAPS.md))
+- [ ] Event re-enrichment (`reenrich`) ([#597](https://github.com/Lumen-Scribe/Lumenqraph/issues/597))
+
+### Planned
+
+- [ ] Admin API for API-key management: create, list, revoke, rotate ([#431](https://github.com/Lumen-Scribe/Lumenqraph/issues/431))
+- [ ] Read caching shared across API instances
+- [ ] RPC retention read from `getHealth` instead of hard-coded ([#595](https://github.com/Lumen-Scribe/Lumenqraph/issues/595))
+- [ ] First tagged release ([#542](https://github.com/Lumen-Scribe/Lumenqraph/issues/542))
 
 Contributions toward any of these are very welcome — see [Contributing](#contributing).
 
 ## Known limitations
 
-- **History is bounded by RPC retention (~7 days).** Deep backfill needs a captive-core / data-lake source (on the roadmap); `START_LEDGER` is clamped to the retention window.
-- **The rate limiter is per-instance** (in-memory). Running multiple API replicas means limits apply per replica — move the limiter to Redis for a global limit.
+- **`main` doesn't build right now.** Several merge-damaged files stop the workspace compiling ([#522](https://github.com/Lumen-Scribe/Lumenqraph/issues/522)). Until that's fixed, nothing on `main` is CI-verified.
+- **History is bounded by RPC retention (~7 days).** The indexer assumes 120,000 ledgers of retention rather than asking the RPC ([#595](https://github.com/Lumen-Scribe/Lumenqraph/issues/595)), and `START_LEDGER` is clamped to that window. Older history needs the experimental `deep-backfill` command.
+- **The rate limiter is per-instance (in-memory) by default.** With multiple API replicas, limits apply per replica. The Redis backend exists but isn't production-ready (see Roadmap).
+- **Run exactly one webhooks dispatcher.** Enqueueing, delivery and metrics run serially in one loop in a single process ([#621](https://github.com/Lumen-Scribe/Lumenqraph/issues/621)); scale it vertically, not horizontally.
+- **Only the indexer applies migrations.** The API and webhooks services assume the schema is current, so start (or upgrade) the indexer first ([#473](https://github.com/Lumen-Scribe/Lumenqraph/issues/473)). Some released migrations take long locks on large tables; see [docs/MIGRATIONS.md](docs/MIGRATIONS.md#historical-migrations-that-lock-large-tables) before upgrading a busy instance.
+- **Swap, NFT and liquidity endpoints always return empty results** until an indexer writer exists ([#599](https://github.com/Lumen-Scribe/Lumenqraph/issues/599)).
+- **`WEBHOOK_ENCRYPTION_KEY` must be set.** Without it the API falls back to a public test key ([#422](https://github.com/Lumen-Scribe/Lumenqraph/issues/422)).
+- **No API-key management API.** Mint keys with `scripts/gen_api_key.sh` ([#431](https://github.com/Lumen-Scribe/Lumenqraph/issues/431)).
 
 ## Contributing
 

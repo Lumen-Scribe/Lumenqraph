@@ -33,6 +33,44 @@ jobs:
             exit 1
           fi
 
+  # Issue #475: lint new or changed migrations with squawk so table-locking
+  # DDL (non-concurrent index builds, constraints without NOT VALID, column
+  # rewrites, …) can't reach `main` unreviewed. Intentional cases opt out with
+  # a `-- squawk-ignore <rule>` comment. See docs/MIGRATIONS.md.
+  migration-lint:
+    name: Migration Lock-Safety Lint
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    env:
+      SQUAWK_VERSION: "2.67.0"
+      SQUAWK_SHA256: "03efe0e666b63bf33e2493693ee0aa9dbed07cbdcd20f7a8292245c1da9d790a"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Install squawk
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/squawk" \
+            "https://github.com/sbdchd/squawk/releases/download/v${SQUAWK_VERSION}/squawk-linux-x64"
+          echo "${SQUAWK_SHA256}  $RUNNER_TEMP/squawk" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/squawk"
+          "$RUNNER_TEMP/squawk" --version
+      - name: Lint changed migrations
+        env:
+          SQUAWK: ${{ runner.temp }}/squawk
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="origin/$BASE_REF"
+          elif [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            base="$BEFORE_SHA"
+          else
+            base="HEAD~1"
+          fi
+          bash scripts/lint_migrations.sh "$base"
+
   # Verify MSRV declared in Cargo.toml
   msrv-check:
     name: MSRV Check
@@ -50,6 +88,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: msrv
+      # Issue #523: fail fast with a clear message when the workspace
+      # manifest itself is broken, before any compilation starts.
+      - name: Validate workspace manifest
+        run: cargo metadata --format-version 1 >/dev/null
       - name: Build on MSRV
         run: cargo build --workspace --all-targets
       - name: Check on MSRV
@@ -110,6 +152,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Check sensitive logging
         run: python3 scripts/check_sensitive_logging.py
+      - name: Check .env.example covers every env var
+        run: python3 scripts/check_env_example.py
       - name: Install sqlx-cli
         run: cargo install sqlx-cli --no-default-features --features postgres
       - name: Check sqlx metadata is up-to-date
@@ -148,7 +192,7 @@ jobs:
           cargo llvm-cov report --lcov --output-path lcov.info
           cargo llvm-cov report --summary-only
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@a99c28d3f0da835de33ff2feb2e15691c7b9641f # v7
+        uses: codecov/codecov-action@5a1091511ad55cbe89839c7260b706298ca349f7 # v5
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -201,6 +245,7 @@ jobs:
     name: Python SDK (${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
     steps:
@@ -230,6 +275,40 @@ jobs:
         working-directory: sdk/python
         run: twine check dist/*
 
+  # Issue #467: lumenqraph/models.py is generated from openapi.yaml; fail if
+  # the committed module is stale (the Python counterpart of the TypeScript
+  # SDK's `codegen:check`).
+  python-sdk-codegen:
+    name: Python SDK models drift check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install code generator
+        run: pip install -e ".[codegen]"
+      - name: Check models.py against openapi.yaml
+        run: python scripts/codegen.py --check
+
+  # Issue #470: docs and compose must agree on the service count. The MCP
+  # server made it four binaries; catch stale "three services" wording.
+  docs-service-count:
+    name: Docs service-count check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Reject stale "three services" wording
+        run: |
+          if grep -rniE "(all )?three (service )?(binaries|services)" \
+               README.md docs/ARCHITECTURE.md docs/DEPLOYMENT.md Dockerfile docker-compose.full.yml; then
+            echo "::error::Docs mention three services; there are four (indexer, api, webhooks, mcp)."
+            exit 1
+          fi
+
   security-audit:
     name: Security Audit (cargo-audit)
     runs-on: ubuntu-latest
@@ -238,9 +317,74 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
         with:
           toolchain: stable
-      - uses: rustsec/audit-check-action@6c8391537eae8e000a51e2e2eee5f4b58fda619b # v1
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Issue #530: actionlint does not verify that a pinned SHA actually exists.
+  # Resolve every `uses: owner/repo@sha` reference through the GitHub API and
+  # fail on a 404 so a bad pin (e.g. a typo'd or deleted commit) fails the PR
+  # instead of breaking the nightly E2E run.
+  action-sha-resolution:
+    name: Action SHA Resolution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Resolve every pinned action SHA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          status=0
+          # Extract owner/repo@sha from every `uses:` line in the workflows.
+          refs=$(grep -rhoE 'uses:[[:space:]]*[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}' .github/workflows \
+            | sed -E 's/uses:[[:space:]]*//' | sort -u)
+          if [ -z "$refs" ]; then
+            echo "No pinned action references found."
+            exit 0
+          fi
+          while IFS= read -r ref; do
+            repo="${ref%@*}"
+            sha="${ref##*@}"
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${repo}/commits/${sha}")
+            if [ "$code" = "200" ]; then
+              echo "OK   $ref"
+            else
+              echo "FAIL $ref (HTTP $code)"
+              status=1
+            fi
+          done <<< "$refs"
+          exit $status
+
+  # Issue #538: the explorer has lint, build and Playwright smoke tests that
+  # were never run in CI. Run them here so regressions (including XSS-relevant
+  # rendering changes) fail before merge.
+  explorer:
+    name: Explorer (lint, build, smoke)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: explorer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: explorer/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Build
+        run: npm run build
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+      - name: Test (Playwright smoke)
+        run: npm test
 
   # Validate Grafana dashboard metrics against metrics defined in Rust code
   dashboard-metrics:

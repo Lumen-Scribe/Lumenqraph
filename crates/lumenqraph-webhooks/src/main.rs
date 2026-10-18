@@ -57,6 +57,15 @@ async fn connect_with_retry(config: &Config) -> anyhow::Result<sqlx::PgPool> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
+
+    // healthcheck: probe the metrics server's /health and exit 0/1 (#469).
+    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+        let bind = std::env::var("WEBHOOKS_METRICS_BIND_ADDR")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "127.0.0.1:9091".to_string());
+        lumenqraph_core::healthcheck::run_and_exit(&bind, "/health");
+    }
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(fmt::layer())
@@ -76,6 +85,16 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env()?;
     info!(config = ?config, "effective configuration");
     let pool = connect_with_retry(&config).await?;
+
+    // Migrations are applied by `lumenqraph-indexer migrate`, not here. Refuse
+    // to start against a schema older than this binary (#473).
+    match lumenqraph_core::schema::check(&pool).await? {
+        lumenqraph_core::schema::SchemaStatus::Current => {}
+        lumenqraph_core::schema::SchemaStatus::Ahead { unknown_versions } => tracing::warn!(
+            ?unknown_versions,
+            "database schema is newer than this binary (rolling upgrade in progress?)"
+        ),
+    }
 
     // Redirects are never followed (SSRF guard, see `build_delivery_client`).
     let http = dispatcher::build_delivery_client(config.connect_timeout(), config.total_timeout())?;

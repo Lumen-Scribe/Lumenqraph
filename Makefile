@@ -1,4 +1,4 @@
-.PHONY: help db db-down seed build test test-db test-smoke fmt lint indexer api webhooks backfill up down mcp sdk-ts sdk-py openapi-check deny audit dashboards-check ci
+.PHONY: help db db-down migrate seed build test test-db test-smoke fmt lint indexer api webhooks backfill up down mcp sdk-ts sdk-py openapi-check deny audit dashboards-check env-check ci
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -9,6 +9,9 @@ db: ## Start local Postgres
 
 db-down: ## Stop local Postgres
 	docker compose down
+
+migrate: ## Apply database migrations and exit
+	cargo run -p lumenqraph-indexer -- migrate
 
 seed: ## Populate demo dataset for local exploration
 	@if [ -z "$$DATABASE_URL" ]; then \
@@ -82,7 +85,10 @@ audit: ## Run cargo-audit for known vulnerabilities
 dashboards-check: ## Validate dashboard metric definitions
 	python3 scripts/validate_dashboards.py
 
-ci: fmt lint test sdk-ts sdk-py openapi-check deny ## Run the same checks as CI (minus network-dependent E2E)
+env-check: ## Verify .env.example documents every env var the code reads
+	python3 scripts/check_env_example.py
+
+ci: fmt lint env-check test sdk-ts sdk-py openapi-check deny ## Run the same checks as CI (minus network-dependent E2E)
 
 up: ## Full stack in Docker
 	docker compose -f docker-compose.full.yml up --build -d

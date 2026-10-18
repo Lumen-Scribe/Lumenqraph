@@ -39,7 +39,10 @@
 //! | `ScvMap` (collisions/mixed keys) | array of `{"key":…,"val":…}` pair objects  |
 //! | `ScvAddress` (account)    | `G…` strkey (56 chars)                              |
 //! | `ScvAddress` (contract)   | `C…` strkey (56 chars)                              |
-//! | `ScvAddress` (other)      | `"_addr_type_<N>"` placeholder                      |
+//! | `ScvAddress` (muxed)      | `M…` strkey (69 chars)                              |
+//! | `ScvAddress` (claimable balance) | `B…` strkey                                  |
+//! | `ScvAddress` (liquidity pool)    | `L…` strkey                                  |
+//! | `ScvAddress` (unknown type) | whole value falls back to `{"_type":"unknown",…}` |
 //! | `ScvContractInstance` (19)| `{"_xdr_tag":19}` — payload consumed safely         |
 //! | `ScvLedgerKeyContractInstance` (20) | `{"_xdr_tag":20}` — no payload            |
 //! | `ScvLedgerKeyNonce` (21)  | `{"_xdr_tag":21}` — payload consumed safely         |
@@ -61,7 +64,8 @@
 
 use base64::Engine;
 use serde_json::{json, Map, Value};
-use stellar_strkey::{Contract, Ed25519PublicKey};
+use stellar_strkey::ed25519::{MuxedAccount, PublicKey as Ed25519PublicKey};
+use stellar_strkey::{ClaimableBalance, Contract, LiquidityPool};
 
 // ScValType discriminants (stable wire tags).
 const SCV_BOOL: u32 = 0;
@@ -109,7 +113,7 @@ pub fn decode_scval_base64(b64: &str) -> Value {
     match base64::engine::general_purpose::STANDARD.decode(b64) {
         Ok(bytes) => {
             let mut cur = Cursor::new(&bytes);
-            match cur.read_scval() {
+            match cur.read_scval(0) {
                 // #410: reject trailing bytes — they indicate a misaligned
                 // cursor that would corrupt siblings in a vec/map context.
                 Some(v) if cur.pos == cur.buf.len() => v,
@@ -128,7 +132,7 @@ pub fn decode_scval_base64(b64: &str) -> Value {
 /// value is already in memory as a typed Rust enum. Converting back to XDR and
 /// then base64 just to feed the byte-level decoder is wasted work.
 pub fn decode_scval(sv: &stellar_xdr::curr::ScVal) -> Value {
-    use stellar_xdr::curr::{ScAddress, ScVal};
+    use stellar_xdr::curr::ScVal;
     match sv {
         ScVal::Bool(b) => Value::Bool(*b),
         ScVal::Void => Value::Null,
@@ -392,7 +396,7 @@ impl<'a> Cursor<'a> {
             // fields so the cursor stays aligned, then fall back to an opaque
             // marker. The `read_contract_instance_payload` helper does just that.
             SCV_CONTRACT_INSTANCE => {
-                self.skip_contract_instance_payload()?;
+                self.skip_contract_instance_payload(depth)?;
                 json!({ "_xdr_tag": SCV_CONTRACT_INSTANCE })
             }
             // #410: tag 20 — ScvLedgerKeyContractInstance. No payload.
@@ -421,7 +425,7 @@ impl<'a> Cursor<'a> {
     ///     case TOKEN(1): (no payload)
     ///   }
     ///   storage: Option<ScMap>
-    fn skip_contract_instance_payload(&mut self) -> Option<()> {
+    fn skip_contract_instance_payload(&mut self, depth: u32) -> Option<()> {
         // Read the executable union discriminant.
         let exec_kind = self.u32()?;
         match exec_kind {
@@ -441,8 +445,8 @@ impl<'a> Cursor<'a> {
             // Consume each key/value pair by decoding them; this keeps the
             // cursor aligned even if the individual values are themselves complex.
             for _ in 0..len {
-                self.read_scval()?;
-                self.read_scval()?;
+                self.read_scval(depth + 1)?;
+                self.read_scval(depth + 1)?;
             }
         }
         Some(())
@@ -450,7 +454,10 @@ impl<'a> Cursor<'a> {
 
     /// #411: read a map and fall back to the `[{key,val}]` pair form when any
     /// key collision is detected, instead of silently dropping entries.
-    fn read_map(&mut self, len: usize) -> Option<Value> {
+    ///
+    /// `depth` is the nesting depth of the map's keys and values (the caller
+    /// passes its own depth + 1).
+    fn read_map(&mut self, len: usize, depth: u32) -> Option<Value> {
         let mut obj: Map<String, Value> = Map::new();
         let mut pairs: Vec<Value> = Vec::with_capacity(len);
         let mut all_stringy = true;
@@ -500,30 +507,30 @@ impl<'a> Cursor<'a> {
                 Some(Contract(payload).to_string())
             }
             SC_ADDRESS_MUXED_ACCOUNT => {
-                // MuxedAccountMed25519: id (u64, big-endian) + ed25519 key (32 bytes).
-                // Strkey M…: version byte (12<<3 = 0x60), then ed25519(32) + id(8).
+                // MuxedEd25519Account: id (u64, big-endian) + ed25519 key (32 bytes).
+                // #413: encoded as an M… strkey by stellar-strkey.
                 let id = self.u64()?;
-                let key = self.take(32)?;
-                let mut payload = [0u8; 40];
-                payload[..32].copy_from_slice(key);
-                payload[32..].copy_from_slice(&id.to_be_bytes());
-                Some(strkey(VERSION_MUXED, &payload))
+                let mut ed25519 = [0u8; 32];
+                ed25519.copy_from_slice(self.take(32)?);
+                Some(MuxedAccount { ed25519, id }.to_string())
             }
             SC_ADDRESS_CLAIMABLE_BALANCE => {
                 // ClaimableBalanceID: discriminant (u32) + 32-byte hash.
-                // Strkey B…: version byte (1<<3 = 0x08), then type byte (0) + hash(32).
-                let balance_type = self.u32()?;
-                let hash = self.take(32)?;
-                let mut payload = [0u8; 33];
-                payload[0] = balance_type as u8;
-                payload[1..].copy_from_slice(hash);
-                Some(strkey(VERSION_CLAIMABLE_BALANCE, &payload))
+                // Only V0 (0) exists; any other type is malformed input.
+                // #413: encoded as a B… strkey by stellar-strkey.
+                if self.u32()? != 0 {
+                    return None;
+                }
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(self.take(32)?);
+                Some(ClaimableBalance::V0(hash).to_string())
             }
             SC_ADDRESS_LIQUIDITY_POOL => {
                 // LiquidityPoolID: 32-byte pool hash.
-                // Strkey L…: version byte (11<<3 = 0x58), then hash(32).
-                let raw = self.take(32)?;
-                Some(strkey(VERSION_LIQUIDITY_POOL, raw))
+                // #413: encoded as an L… strkey by stellar-strkey.
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(self.take(32)?);
+                Some(LiquidityPool(hash).to_string())
             }
             // Truly unknown address type: return None so the whole ScVal falls
             // back to the _xdr representation rather than misaligning the cursor.
@@ -931,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn strkey_truncated_input() {
+    fn contract_id_strkey_truncated_input() {
         let valid = make_contract_strkey(&[0u8; 32]);
         assert!(!is_valid_contract_id(&valid[..10]), "truncated strkey rejected");
         assert!(!is_valid_contract_id(&valid[..30]), "truncated strkey rejected");
@@ -940,14 +947,14 @@ mod tests {
     }
 
     #[test]
-    fn strkey_overlength_input() {
+    fn contract_id_strkey_overlength_input() {
         let valid = make_contract_strkey(&[0u8; 32]);
         assert!(!is_valid_contract_id(&format!("{valid}A")), "overlength rejected");
         assert!(!is_valid_contract_id(&format!("{valid}AAAA")), "overlength rejected");
     }
 
     #[test]
-    fn strkey_wrong_version_byte() {
+    fn contract_id_strkey_wrong_version_byte() {
         let g_key = make_account_strkey(&[0u8; 32]);
         assert!(!is_valid_contract_id(&g_key), "G-strkey rejected as contract ID");
         assert_eq!(g_key.chars().next().unwrap(), 'G', "G-strkey starts with G");
@@ -958,7 +965,7 @@ mod tests {
     }
 
     #[test]
-    fn strkey_roundtrip_g_and_c() {
+    fn contract_id_strkey_roundtrip_g_and_c() {
         let g_key = make_account_strkey(&[1u8; 32]);
         assert_eq!(g_key.len(), 56, "G-strkey is 56 chars");
         assert!(g_key.starts_with('G'), "G-strkey starts with G");
@@ -970,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn strkey_invalid_base32_chars() {
+    fn contract_id_strkey_invalid_base32_chars() {
         let valid = make_contract_strkey(&[0u8; 32]);
 
         let mut invalid = valid.clone();

@@ -68,5 +68,11 @@ RUN groupadd -r lumenqraph && useradd -r -g lumenqraph lumenqraph
 RUN chown -R lumenqraph:lumenqraph /app
 # Switch to non-root user
 USER lumenqraph
+# Health probe for the default (API) command. Each binary has a built-in
+# `healthcheck` subcommand that GETs its own health endpoint on localhost, so
+# no curl/wget is needed in the runtime image (#469). Compose overrides this
+# per service with the matching binary.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["lumenqraph-api", "healthcheck"]
 # Default to the API; override `command:` per service in compose.
 CMD ["lumenqraph-api"]

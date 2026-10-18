@@ -11,6 +11,7 @@ Please report security vulnerabilities responsibly by following our [Security Po
 ```bash
 cp .env.example .env
 docker compose up -d          # Postgres
+cargo run -p lumenqraph-indexer -- migrate
 cargo run -p lumenqraph-indexer
 cargo run -p lumenqraph-api
 ```
@@ -108,6 +109,18 @@ export TEST_DATABASE_URL=postgres://user:password@host:port/dbname
 cargo test -p lumenqraph-indexer --features smoke-tests smoke -- --ignored --test-threads=1
 ```
 
+## Definition of done
+
+An issue is done when the behaviour it describes works on `main` and a test proves it, not when code that looks related has merged. Several issues were closed without that and turned out not to work (#476; see [docs/KNOWN_GAPS.md](docs/KNOWN_GAPS.md)). A PR that closes an issue must have:
+
+1. **A behaviour-level test that proves the fix.** It exercises the behaviour the issue describes, through the route, CLI command, job or migration a user would hit (for example, a Postgres-backed `#[ignore]` test that calls the endpoint and checks what it returns or writes). A unit test of a helper alone is not enough. Name the test in the PR's "Test proving the fix" field. The test should fail without the change.
+2. **Green CI.** Don't close an issue on the strength of a red or skipped run.
+3. **Updated docs.** README feature/roadmap entries, `docs/`, `openapi.yaml` and the CHANGELOG `[Unreleased]` section match the new behaviour. If the work is partial, say so, and leave or open a tracking issue rather than closing the original.
+
+Documentation-only and CI-only changes don't need a test, but say in the PR how the change was checked.
+
+Reviewers: before merging a PR that closes a bug issue, check that the named test exists and covers the reported behaviour.
+
 ## Database changes
 
 When modifying the schema or adding new tables/functions:
@@ -125,6 +138,8 @@ cargo run -p lumenqraph-indexer
 # 4. Regenerate .sqlx offline metadata after the migration succeeds
 cargo sqlx prepare --database-url "$DATABASE_URL"
 ```
+
+New migrations must be **lock-safe** on large tables (`events`, `token_transfers`, `contract_data`): build indexes `CONCURRENTLY` in their own `-- no-transaction` file, add constraints `NOT VALID` and validate them in a later migration, and avoid column type rewrites. CI lints new and changed migrations with squawk; run `make migrations-lint` locally. See [docs/MIGRATIONS.md](docs/MIGRATIONS.md#writing-lock-safe-migrations).
 
 After running migrations, you must commit `.sqlx/` metadata alongside your code changes. CI verifies this metadata is up-to-date; stale metadata fails the build.
 
