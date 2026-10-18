@@ -89,6 +89,11 @@ pub fn router(state: AppState) -> Router {
             "/contracts/:contract_id/simulate",
             post(read::simulate_call),
         )
+        // Re-fetches the WASM from RPC, so it shares the RPC rate limit.
+        .route(
+            "/contracts/:contract_id/refresh",
+            post(contracts::refresh_contract),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             rpc_auth_and_rate_limit,
@@ -108,10 +113,6 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/contracts/:contract_id/interface/diff",
             get(contracts::contract_interface_diff),
-        )
-        .route(
-            "/contracts/:contract_id/refresh",
-            post(contracts::refresh_contract),
         )
         .route(
             "/contracts/:contract_id/state",
