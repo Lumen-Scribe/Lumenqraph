@@ -167,9 +167,11 @@ mod tests {
     }
 
     fn test_config(rpc_url: impl Into<String>, page_size: u32) -> Config {
+        let rpc_url = rpc_url.into();
         Config {
             database_url: String::new(),
-            rpc_url: rpc_url.into(),
+            rpc_url: rpc_url.clone(),
+            rpc_urls: vec![rpc_url],
             contract_ids: vec![],
             poll_interval_secs: 5,
             page_size,
@@ -187,6 +189,7 @@ mod tests {
             enrichment_warn_threshold: 0.5,
             key_templates: vec![],
             spec_cache_max_entries: 2000,
+            spec_fetch_concurrency: 4,
         }
     }
 

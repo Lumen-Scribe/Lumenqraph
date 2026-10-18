@@ -10,17 +10,11 @@
 //! return `None` so the caller can decide the fallback — we never silently store
 //! `Utc::now()`.
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use lumenqraph_core::{xdr, ContractSpec, NewEvent};
-use tracing::{error, warn};
+use tracing::error;
 
 use crate::rpc_client::EventInfo;
-
-/// How far a `ledgerClosedAt` timestamp from the RPC may drift from wall-clock
-/// time before it is treated as implausible and clamped. A misbehaving or
-/// malicious RPC could otherwise report a time-travelled timestamp, which
-/// would corrupt time-range filters and time-series aggregation downstream.
-const TIMESTAMP_TOLERANCE: Duration = Duration::hours(1);
 
 /// Parse `ledgerClosedAt` from either RFC 3339 or Unix-epoch-seconds format.
 ///
@@ -47,27 +41,6 @@ pub fn parse_ledger_closed_at(raw: &str) -> Option<DateTime<Utc>> {
     None
 }
 
-/// Validate a parsed `ledger_closed_at` against wall-clock time, clamping
-/// (rather than rejecting) values outside the tolerance window. Clamping is
-/// preferred over rejection because dropping the event entirely would leave a
-/// gap in the index; a clamped timestamp is still close enough to be useful
-/// for time-range queries.
-fn validate_ledger_closed_at(raw: &str, parsed: DateTime<Utc>) -> DateTime<Utc> {
-    let now = Utc::now();
-    let lower = now - TIMESTAMP_TOLERANCE;
-    let upper = now + TIMESTAMP_TOLERANCE;
-
-    if parsed < lower {
-        warn!(raw, %parsed, %now, "ledger_closed_at is implausibly far in the past; clamping");
-        lower
-    } else if parsed > upper {
-        warn!(raw, %parsed, %now, "ledger_closed_at is implausibly far in the future; clamping");
-        upper
-    } else {
-        parsed
-    }
-}
-
 /// Convert an [`EventInfo`] from the RPC into a [`NewEvent`] ready for storage.
 ///
 /// Returns `None` when the `ledgerClosedAt` timestamp cannot be parsed — the
@@ -76,7 +49,9 @@ fn validate_ledger_closed_at(raw: &str, parsed: DateTime<Utc>) -> DateTime<Utc> 
 pub fn to_new_event(e: &EventInfo, spec: Option<&ContractSpec>) -> Option<NewEvent> {
     // Parse the timestamp. On failure, return None — never fall back to Utc::now().
     let parsed_ts = parse_ledger_closed_at(&e.ledger_closed_at)?;
-    let ledger_closed_at = validate_ledger_closed_at(&e.ledger_closed_at, parsed_ts);
+    // The ledger timestamp is authoritative. Backfill and catch-up routinely
+    // ingest ledgers older than wall-clock tolerance, so never clamp it.
+    let ledger_closed_at = parsed_ts;
 
     let decoded_topics = xdr::decode_topics(&e.topic);
     let decoded_value = xdr::decode_scval_base64(&e.value);
@@ -148,27 +123,4 @@ mod tests {
         assert!(parse_ledger_closed_at("2024-01-01").is_none());
     }
 
-    // ── validate_ledger_closed_at ─────────────────────────────────────────
-
-    #[test]
-    fn a_plausible_timestamp_passes_through_unchanged() {
-        let now = Utc::now();
-        assert_eq!(validate_ledger_closed_at("irrelevant", now), now);
-    }
-
-    #[test]
-    fn a_future_timestamp_is_clamped_to_the_upper_bound() {
-        let far_future = Utc::now() + Duration::hours(5);
-        let clamped = validate_ledger_closed_at("irrelevant", far_future);
-        assert!(clamped < far_future);
-        assert!(clamped <= Utc::now() + TIMESTAMP_TOLERANCE);
-    }
-
-    #[test]
-    fn a_past_timestamp_is_clamped_to_the_lower_bound() {
-        let far_past = Utc::now() - Duration::hours(5);
-        let clamped = validate_ledger_closed_at("irrelevant", far_past);
-        assert!(clamped > far_past);
-        assert!(clamped >= Utc::now() - TIMESTAMP_TOLERANCE);
-    }
 }

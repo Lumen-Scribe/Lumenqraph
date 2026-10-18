@@ -256,11 +256,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: cargo-deny
-      # Pinned to the 0.14 line: it still accepts the config keys in the
-      # committed deny.toml (0.16 removed several of them). Bump this together
-      # with a deny.toml migration, not on its own.
       - name: Install cargo-deny
-        run: cargo install cargo-deny --version "^0.14" --locked
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2
+        with:
+          tool: cargo-deny
       # Advisories are blocking: a crate with a known RUSTSEC vulnerability now
       # fails the build, so a security patch in a transitive dependency is caught
       # here between the weekly Dependabot runs instead of sitting unnoticed.

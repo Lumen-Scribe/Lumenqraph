@@ -60,6 +60,7 @@ const FETCH_ERROR_TTL: Duration = Duration::from_secs(60);
 pub struct SpecCache {
     inner: Mutex<LruCache<String, Cached>>,
     fetch_semaphore: Arc<Semaphore>,
+    cache_size: AtomicUsize,
 }
 
 impl SpecCache {
@@ -69,6 +70,7 @@ impl SpecCache {
                 std::num::NonZeroUsize::new(max_entries).expect("max_entries must be > 0"),
             )),
             fetch_semaphore: Arc::new(Semaphore::new(concurrency)),
+            cache_size: AtomicUsize::new(0),
         }
     }
 

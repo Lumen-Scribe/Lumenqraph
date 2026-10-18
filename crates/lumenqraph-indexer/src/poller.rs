@@ -36,9 +36,9 @@ pub async fn run(pool: PgPool, rpc: RpcClient, config: Config, specs: Arc<SpecCa
     let base_interval = Duration::from_secs(config.poll_interval_secs.max(1));
     let degraded_interval = Duration::from_secs(config.degraded_poll_interval_secs.max(1));
     let mut backoff = base_interval;
-    // One spec cache for the process lifetime: each contract's interface is
-    // fetched and parsed once, then reused to enrich every event.
-    let specs = SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
+    // The caller owns the process-wide cache shared with the HTTP metrics and
+    // health listener. Never shadow this injected instance: doing so causes
+    // duplicate WASM fetches and makes the exported cache metric misleading.
     // None => prune on the first cycle that reaches the tip, so a deployment
     // that switches retention on starts reclaiming immediately.
     let mut last_prune: Option<Instant> = None;
@@ -296,7 +296,6 @@ pub async fn fetch_and_store(
     let mut enriched_count = 0u64;
     let mut not_enriched_count = 0u64;
     let mut ts_parse_errors = 0u64; // #399
-    let mut ts_parse_errors = 0u64; // #399
     let mut page_count = 0usize;
     let mut last_seen_ledger = start;
     // Contracts seen this cycle, used to bound per-contract instance reads when
@@ -395,9 +394,6 @@ pub async fn fetch_and_store(
     // Record enrichment metrics for this cycle
     if enriched_count > 0 || not_enriched_count > 0 {
         cursor::track_enrichment(pool, enriched_count, not_enriched_count).await?;
-        if ts_parse_errors > 0 {
-            let _ = cursor::track_timestamp_parse_error(pool, ts_parse_errors).await;
-        }
         if ts_parse_errors > 0 {
             let _ = cursor::track_timestamp_parse_error(pool, ts_parse_errors).await;
         }
