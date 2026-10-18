@@ -23,6 +23,7 @@ mod specs;
 mod state;
 mod url_validation;
 
+use std::future::IntoFuture;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -178,22 +179,23 @@ async fn main() -> anyhow::Result<()> {
     info!(addr = %bind_addr, "lumenqraph api listening");
 
     let shutdown_timeout_secs = config.shutdown_timeout_secs;
+    let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
     let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(shutdown_timeout_secs));
+    .with_graceful_shutdown(async move {
+        shutdown_signal(shutdown_timeout_secs).await;
+        let _ = drain_started_tx.send(());
+    })
+    .into_future();
 
-    // Wrap the graceful shutdown in a hard timeout so a slow or stuck client
-    // cannot keep the process alive indefinitely during a rolling restart.
-    match tokio::time::timeout(
-        Duration::from_secs(shutdown_timeout_secs),
-        server,
-    )
-    .await
-    {
-        Ok(result) => result?,
-        Err(_) => {
+    // Bound the drain, not the server's lifetime: the hard deadline starts only
+    // once a shutdown signal has arrived. A slow or stuck client cannot keep the
+    // process alive during a rolling restart, and the API serves until signalled.
+    tokio::select! {
+        result = server => result?,
+        _ = force_exit_after_drain(drain_started_rx, shutdown_timeout_secs) => {
             info!(
                 timeout_secs = shutdown_timeout_secs,
                 "shutdown timeout reached; forcing exit"
@@ -201,6 +203,20 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Resolves `timeout_secs` after the shutdown signal, and never before it. If
+/// the server stops without a signal, the sender is dropped and this stays
+/// pending, so the server's own result is what `main` returns.
+async fn force_exit_after_drain(
+    drain_started: tokio::sync::oneshot::Receiver<()>,
+    timeout_secs: u64,
+) {
+    if drain_started.await.is_ok() {
+        tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
 }
 
 async fn shutdown_signal(shutdown_timeout_secs: u64) {
@@ -302,5 +318,30 @@ mod tests {
                 "a G-strkey mixed with a valid C-strkey should be rejected: {err}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_deadline {
+    use std::time::Duration;
+
+    use super::force_exit_after_drain;
+
+    /// The hard deadline must not run while the API is serving normally, or it
+    /// exits 30s after boot (the bug this guards against).
+    #[tokio::test]
+    async fn deadline_does_not_fire_without_a_shutdown_signal() {
+        let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let fired = tokio::time::timeout(Duration::from_millis(50), force_exit_after_drain(rx, 0)).await;
+        assert!(fired.is_err(), "deadline fired before any shutdown signal");
+    }
+
+    #[tokio::test]
+    async fn deadline_fires_once_the_signal_has_arrived() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), force_exit_after_drain(rx, 0))
+            .await
+            .expect("deadline should fire after the signal");
     }
 }
