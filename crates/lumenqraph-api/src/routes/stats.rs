@@ -69,35 +69,35 @@ fn parse_window(w: &str) -> Result<chrono::Duration, ApiError> {
     }
 }
 
+/// Maps a truncation alias to its SQL unit. `1M` means month and `1m` means
+/// minute, so `1M` is matched before the value is lowercased (#572).
+fn parse_trunc_alias(value: &str) -> Option<&'static str> {
+    if value == "1M" {
+        return Some("month");
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "1m" | "minute" | "min" => Some("minute"),
+        "1h" | "hour" => Some("hour"),
+        "1d" | "day" => Some("day"),
+        "1w" | "week" => Some("week"),
+        "month" => Some("month"),
+        _ => None,
+    }
+}
+
 fn parse_granularity(resolution: Option<&str>, bucket: &str) -> Result<Granularity, ApiError> {
-    if let Some(res) = resolution {
-        match res.to_ascii_lowercase().as_str() {
-            "1m" | "minute" | "min" => Ok(Granularity::Trunc("minute")),
-            "1h" | "hour" => Ok(Granularity::Trunc("hour")),
-            "1d" | "day" => Ok(Granularity::Trunc("day")),
-            "1w" | "week" => Ok(Granularity::Trunc("week")),
-            "1m" | "month" if res == "1M" || res.to_ascii_lowercase() == "month" => {
-                Ok(Granularity::Trunc("month"))
-            }
-            "ledger" => Ok(Granularity::Ledger),
-            _ => Err(ApiError::bad_request(
-                "Invalid resolution parameter: must be '1m', '1h', '1d', '1w', '1M' (or 'hour', 'day')",
-            )),
-        }
-    } else {
-        match bucket.to_ascii_lowercase().as_str() {
-            "hour" | "1h" => Ok(Granularity::Trunc("hour")),
-            "day" | "1d" => Ok(Granularity::Trunc("day")),
-            "minute" | "1m" => Ok(Granularity::Trunc("minute")),
-            "week" | "1w" => Ok(Granularity::Trunc("week")),
-            "month" | "1m" if bucket == "1M" || bucket.to_ascii_lowercase() == "month" => {
-                Ok(Granularity::Trunc("month"))
-            }
-            "ledger" => Ok(Granularity::Ledger),
-            _ => Err(ApiError::bad_request(
-                "Invalid bucket parameter: must be 'hour', 'day', or 'ledger'",
-            )),
-        }
+    let value = resolution.unwrap_or(bucket);
+    if value.eq_ignore_ascii_case("ledger") {
+        return Ok(Granularity::Ledger);
+    }
+    match parse_trunc_alias(value) {
+        Some(trunc) => Ok(Granularity::Trunc(trunc)),
+        None if resolution.is_some() => Err(ApiError::bad_request(
+            "Invalid resolution parameter: must be '1m', '1h', '1d', '1w', '1M', 'minute', 'hour', 'day', 'week', 'month', or 'ledger'",
+        )),
+        None => Err(ApiError::bad_request(
+            "Invalid bucket parameter: must be 'minute', 'hour', 'day', 'week', 'month', or 'ledger'",
+        )),
     }
 }
 
@@ -304,3 +304,54 @@ async fn query_stats_by_trunc(
    
 
 /* … truncated 4766 chars — edit only what you need near the top … */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trunc_of(result: Result<Granularity, ApiError>) -> Option<&'static str> {
+        match result {
+            Ok(Granularity::Trunc(trunc)) => Some(trunc),
+            _ => None,
+        }
+    }
+
+    /// #572 — `1M` is month and `1m` is minute; lowercasing must not merge them.
+    #[test]
+    fn resolution_1m_uppercase_is_month_and_lowercase_is_minute() {
+        assert_eq!(trunc_of(parse_granularity(Some("1M"), "day")), Some("month"));
+        assert_eq!(trunc_of(parse_granularity(Some("1m"), "day")), Some("minute"));
+    }
+
+    #[test]
+    fn resolution_aliases_map_to_their_units() {
+        assert_eq!(trunc_of(parse_granularity(Some("min"), "day")), Some("minute"));
+        assert_eq!(trunc_of(parse_granularity(Some("minute"), "day")), Some("minute"));
+        assert_eq!(trunc_of(parse_granularity(Some("1h"), "day")), Some("hour"));
+        assert_eq!(trunc_of(parse_granularity(Some("hour"), "day")), Some("hour"));
+        assert_eq!(trunc_of(parse_granularity(Some("1d"), "day")), Some("day"));
+        assert_eq!(trunc_of(parse_granularity(Some("day"), "day")), Some("day"));
+        assert_eq!(trunc_of(parse_granularity(Some("1w"), "day")), Some("week"));
+        assert_eq!(trunc_of(parse_granularity(Some("week"), "day")), Some("week"));
+        assert_eq!(trunc_of(parse_granularity(Some("month"), "day")), Some("month"));
+        assert_eq!(trunc_of(parse_granularity(Some("MONTH"), "day")), Some("month"));
+        assert!(matches!(
+            parse_granularity(Some("ledger"), "day"),
+            Ok(Granularity::Ledger)
+        ));
+    }
+
+    #[test]
+    fn bucket_1m_uppercase_is_month_and_lowercase_is_minute() {
+        assert_eq!(trunc_of(parse_granularity(None, "1M")), Some("month"));
+        assert_eq!(trunc_of(parse_granularity(None, "1m")), Some("minute"));
+        assert_eq!(trunc_of(parse_granularity(None, "minute")), Some("minute"));
+        assert_eq!(trunc_of(parse_granularity(None, "month")), Some("month"));
+    }
+
+    #[test]
+    fn unknown_values_are_rejected() {
+        assert!(parse_granularity(Some("2M"), "day").is_err());
+        assert!(parse_granularity(None, "fortnight").is_err());
+    }
+}
