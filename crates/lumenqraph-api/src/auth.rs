@@ -783,7 +783,7 @@ mod integration_tests {
             metrics_require_auth: false,
             proxy_limiter: Arc::new(RateLimiter::new()),
             config: Arc::new(crate::config::ApiConfig::test_default()),
-            key_cache: Arc::new(KeyCache::new(256)),
+            key_cache: Arc::new(KeyCache::new(256, std::time::Duration::from_secs(30), std::time::Duration::from_secs(5))),
             ip_config: IpConfig { trusted_proxy_hops: 0, platform_header: None },
             audit_tx: None,
             audit_dropped: Arc::new(AtomicU64::new(0)),

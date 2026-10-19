@@ -15,7 +15,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, Utc};
-use lumenqraph_core::{Contract, SpecDiff};
+use lumenqraph_core::{Contract, ContractSpec, SpecDiff};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::types::Json as SqlxJson;
@@ -726,6 +726,148 @@ pub async fn contract_data_key(
     })))
 }
 
+/// `POST /contracts/:id/refresh` — drop the cached interface and re-read the
+/// contract's WASM over Soroban RPC now. If the executable changed, the current
+/// interface is replaced and a new version is appended to the history.
+///
+/// The indexer's spec load does the same work, but this crate can't call it,
+/// so `record_spec_version` mirrors it. Mounted behind the RPC rate limiter.
+pub async fn refresh_contract(
+    State(state): State<AppState>,
+    ValidContractId(contract_id): ValidContractId,
+) -> ApiResult<Json<Value>> {
+    state.specs.invalidate(&contract_id);
+    state.call_cache.invalidate_contract(&contract_id);
+
+    let (wasm_hash, wasm, ledger) = state
+        .rpc
+        .get_contract_wasm(&contract_id)
+        .await
+        .map_err(|e| {
+            ApiError::Internal(anyhow::anyhow!("failed to fetch contract WASM from RPC: {e}"))
+        })?
+        .ok_or_else(|| {
+            ApiError::not_found(
+                "no deployed WASM for this contract (it may be a Stellar Asset Contract)",
+            )
+        })?;
+
+    let parsed = ContractSpec::from_wasm(&wasm).ok_or_else(|| {
+        ApiError::bad_request("contract has deployed WASM but no valid contractspecv0 section")
+    })?;
+    let (spec, complete) = (parsed.spec, parsed.complete);
+    let spec_section = lumenqraph_core::spec::spec_section_of(&wasm)
+        .map(hex::encode)
+        .unwrap_or_default();
+
+    sqlx::query(
+        "INSERT INTO contract_specs (contract_id, wasm_hash, interface, spec_section, has_events, spec_complete)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (contract_id) DO UPDATE
+           SET wasm_hash     = EXCLUDED.wasm_hash,
+               interface     = EXCLUDED.interface,
+               spec_section  = EXCLUDED.spec_section,
+               has_events    = EXCLUDED.has_events,
+               spec_complete = EXCLUDED.spec_complete,
+               fetched_at    = now()",
+    )
+    .bind(&contract_id)
+    .bind(&wasm_hash)
+    .bind(spec.to_interface_json())
+    .bind(&spec_section)
+    .bind(spec.has_events())
+    .bind(complete)
+    .execute(&state.pool)
+    .await?;
+
+    // The current interface is already stored, so a failed history write is
+    // logged rather than failing the refresh.
+    if let Err(e) = record_spec_version(
+        &state.pool,
+        &contract_id,
+        &wasm_hash,
+        &spec_section,
+        &spec,
+        complete,
+        ledger,
+    )
+    .await
+    {
+        tracing::warn!(contract_id = %contract_id, error = %e, "failed to record refreshed spec version");
+    }
+
+    Ok(Json(json!({
+        "contract_id": contract_id,
+        "has_events": spec.has_events(),
+        "fetched_at": Utc::now(),
+        "interface": spec.to_interface_json(),
+    })))
+}
+
+/// Append this interface to the contract's version history, unless it matches
+/// the newest stored version. The diff is skipped when the new spec is
+/// incomplete (#401), so a partial parse can't report removals that never
+/// happened.
+async fn record_spec_version(
+    pool: &sqlx::PgPool,
+    contract_id: &str,
+    wasm_hash: &str,
+    spec_section: &str,
+    spec: &ContractSpec,
+    complete: bool,
+    ledger: i64,
+) -> anyhow::Result<()> {
+    let previous: Option<(i32, String, String)> = sqlx::query_as(
+        "SELECT version, wasm_hash, spec_section FROM contract_spec_versions
+         WHERE contract_id = $1 ORDER BY version DESC LIMIT 1",
+    )
+    .bind(contract_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let (version, previous_hash, diff) = match previous {
+        Some((_, ref prev_hash, _)) if prev_hash == wasm_hash => return Ok(()),
+        Some((prev_version, prev_hash, prev_section)) => {
+            let diff = if complete {
+                diff_against(&prev_section, spec)
+            } else {
+                None
+            };
+            (prev_version + 1, Some(prev_hash), diff)
+        }
+        None => (1, None, None),
+    };
+
+    sqlx::query(
+        "INSERT INTO contract_spec_versions
+            (contract_id, version, wasm_hash, previous_wasm_hash, interface, spec_section, diff, breaking, ledger, spec_complete)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (contract_id, version) DO NOTHING",
+    )
+    .bind(contract_id)
+    .bind(version)
+    .bind(wasm_hash)
+    .bind(previous_hash)
+    .bind(spec.to_interface_json())
+    .bind(spec_section)
+    .bind(diff.as_ref().map(|d| d.to_json()))
+    .bind(diff.as_ref().is_some_and(|d| d.breaking))
+    .bind(ledger)
+    .bind(complete)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Diff against the stored raw section. `None` when that section can't be
+/// re-parsed: "upgraded, diff unavailable" is more honest than diffing against
+/// an empty interface.
+fn diff_against(previous_section: &str, new_spec: &ContractSpec) -> Option<SpecDiff> {
+    let bytes = hex::decode(previous_section).ok()?;
+    let previous = ContractSpec::from_spec_xdr(&bytes)?.spec;
+    Some(SpecDiff::between(&previous, new_spec))
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_history_cursor;
@@ -886,7 +1028,7 @@ mod tests {
                 metrics_require_auth: false,
                 proxy_limiter: Arc::new(RateLimiter::new()),
                 config: Arc::new(crate::config::ApiConfig::test_default()),
-                key_cache: Arc::new(crate::key_cache::KeyCache::new(256)),
+                key_cache: Arc::new(crate::key_cache::KeyCache::new(256, std::time::Duration::from_secs(30), std::time::Duration::from_secs(5))),
                 ip_config: crate::auth::IpConfig { trusted_proxy_hops: 0, platform_header: None },
                 audit_tx: None,
                 audit_dropped: Arc::new(AtomicU64::new(0)),

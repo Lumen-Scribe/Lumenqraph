@@ -10,24 +10,26 @@ path = "src/main.rs"
 
 [dependencies]
 lumenqraph-core.workspace = true
-tokio-util.workspace = true
-hmac.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
+tokio-stream = "0.1"
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 dotenvy.workspace = true
 sqlx.workspace = true
-axum.workspace = true
+axum = { version = "0.7", features = ["macros"] }
 tower.workspace = true
 tower-http.workspace = true
 async-graphql.workspace = true
 async-graphql-axum.workspace = true
 uuid.workspace = true
 sha2.workspace = true
+hmac.workspace = true
 hex.workspace = true
 reqwest.workspace = true
 url.workspace = true
@@ -44,4 +46,3 @@ stellar-xdr.workspace = true
 
 [dev-dependencies]
 tower.workspace = true
-proptest = "1"
