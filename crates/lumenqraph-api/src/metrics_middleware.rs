@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::Request;
+use axum::extract::{MatchedPath, Request};
 use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
@@ -50,6 +50,10 @@ impl LatencyHistogram {
     }
 }
 
+/// Route label for requests that matched no registered route. All of them
+/// share this one value, so probes of random paths cannot create series.
+pub const UNMATCHED_ROUTE: &str = "unmatched";
+
 /// Label set that identifies one histogram series.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HistogramKey {
@@ -73,22 +77,17 @@ impl MetricsCollector {
         }
     }
 
-    pub async fn middleware(
-        self,
-        req: Request,
-        next: Next,
-    ) -> Response {
+    /// Time the inner handler and record the result under the matched route
+    /// template (for example `/contracts/:contract_id/events`).
+    pub async fn middleware(self: Arc<Self>, req: Request, next: Next) -> Response {
         let method = req.method().clone();
-        let uri = req.uri().path().to_string();
+        let route = route_label(&req);
         let start = Instant::now();
 
         let response = next.run(req).await;
         let elapsed_ms = start.elapsed().as_millis() as u64;
-        let status = response.status();
 
-        let route_label = extract_route_template(&uri, &method);
-        self.record(&route_label, &method, status, elapsed_ms);
-
+        self.record(&route, &method, response.status(), elapsed_ms);
         response
     }
 
@@ -97,8 +96,8 @@ impl MetricsCollector {
     pub fn record(&self, route: &str, method: &Method, status: StatusCode, elapsed_ms: u64) {
         let counter_key = format!(
             "http_requests{{route=\"{}\",method=\"{}\",status=\"{}\"}}",
-            route,
-            method,
+            escape_label_value(route),
+            escape_label_value(method.as_str()),
             status.as_u16()
         );
         {
@@ -118,32 +117,30 @@ impl MetricsCollector {
     }
 }
 
-fn extract_route_template(path: &str, _method: &Method) -> String {
-    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+/// The matched route template for a request, or [`UNMATCHED_ROUTE`].
+///
+/// axum records `MatchedPath` on the request before the route's layers run,
+/// so this is the registered template rather than the raw path.
+fn route_label(req: &Request) -> String {
+    req.extensions()
+        .get::<MatchedPath>()
+        .map(|matched| matched.as_str().to_string())
+        .unwrap_or_else(|| UNMATCHED_ROUTE.to_string())
+}
 
-    let mut template = String::new();
-    for segment in segments {
-        template.push('/');
-        if is_uuid_like(segment) || is_numeric(segment) {
-            template.push_str("{id}");
-        } else {
-            template.push_str(segment);
+/// Escape a label value for the Prometheus text exposition format: backslash,
+/// double quote and line feed must be written as `\\`, `\"` and `\n`.
+pub fn escape_label_value(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
         }
     }
-
-    if template.is_empty() {
-        "/".to_string()
-    } else {
-        template
-    }
-}
-
-fn is_uuid_like(s: &str) -> bool {
-    s.len() == 36 && s.matches('-').count() == 4
-}
-
-fn is_numeric(s: &str) -> bool {
-    s.parse::<i64>().is_ok()
+    out
 }
 
 impl Default for MetricsCollector {
@@ -155,6 +152,85 @@ impl Default for MetricsCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use axum::middleware;
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    fn app(collector: Arc<MetricsCollector>) -> Router {
+        Router::new()
+            .route("/contracts/:contract_id/events", get(|| async { "ok" }))
+            .route("/health", get(|| async { "ok" }))
+            .layer(middleware::from_fn(move |req: Request, next: Next| {
+                collector.clone().middleware(req, next)
+            }))
+    }
+
+    async fn hit(router: &Router, path: &str) {
+        router
+            .clone()
+            .oneshot(HttpRequest::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+    }
+
+    fn routes_seen(collector: &MetricsCollector) -> Vec<String> {
+        let mut routes: Vec<String> = collector
+            .histogram_buckets
+            .read()
+            .keys()
+            .map(|k| k.route.clone())
+            .collect();
+        routes.sort();
+        routes.dedup();
+        routes
+    }
+
+    #[tokio::test]
+    async fn route_label_is_the_registered_template() {
+        let collector = Arc::new(MetricsCollector::new());
+        let router = app(collector.clone());
+
+        hit(&router, "/contracts/C1234/events").await;
+        hit(&router, "/contracts/C9999/events").await;
+
+        assert_eq!(routes_seen(&collector), vec!["/contracts/:contract_id/events"]);
+    }
+
+    #[tokio::test]
+    async fn unmatched_paths_share_one_label() {
+        let collector = Arc::new(MetricsCollector::new());
+        let router = app(collector.clone());
+
+        for i in 0..200 {
+            hit(&router, &format!("/probe/{i}/wp-admin.php")).await;
+        }
+
+        assert_eq!(routes_seen(&collector), vec![UNMATCHED_ROUTE]);
+    }
+
+    #[tokio::test]
+    async fn distinct_route_labels_are_bounded_by_registered_routes_plus_one() {
+        let collector = Arc::new(MetricsCollector::new());
+        let router = app(collector.clone());
+
+        for i in 0..300 {
+            hit(&router, &format!("/contracts/C{i}/events")).await;
+            hit(&router, &format!("/health?x={i}")).await;
+            hit(&router, &format!("/random/{i}")).await;
+        }
+
+        // Two registered routes plus the unmatched label.
+        assert!(routes_seen(&collector).len() <= 3);
+    }
+
+    #[test]
+    fn escape_label_value_escapes_exposition_metacharacters() {
+        assert_eq!(escape_label_value("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+        assert_eq!(escape_label_value("/contracts/:id"), "/contracts/:id");
+    }
 
     #[test]
     fn collector_memory_is_constant_over_one_million_requests() {
@@ -188,25 +264,5 @@ mod tests {
         assert_eq!(*cumulative.last().unwrap(), (10_000, 3));
         assert_eq!(h.count, 4);
         assert_eq!(h.sum_ms, 20_010);
-    }
-
-    #[test]
-    fn test_route_template_extraction() {
-        let cases = vec![
-            ("/", "/"),
-            ("/contracts", "/contracts"),
-            ("/contracts/C1", "/contracts/{id}"),
-            (
-                "/contracts/01234567-89ab-cdef-0123-456789abcdef/events",
-                "/contracts/{id}/events",
-            ),
-            ("/events/123", "/events/{id}"),
-            ("/webhooks/456/something", "/webhooks/{id}/something"),
-        ];
-
-        for (path, expected) in cases {
-            let result = extract_route_template(path, &Method::GET);
-            assert_eq!(result, expected, "path: {}", path);
-        }
     }
 }

@@ -8,6 +8,7 @@ use axum::http::header;
 use axum::response::IntoResponse;
 
 use crate::error::ApiResult;
+use crate::metrics_middleware::escape_label_value;
 use crate::state::AppState;
 
 pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
@@ -125,7 +126,11 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
     {
         let histograms = state.metrics.histogram_buckets.read();
         for (key, hist) in histograms.iter() {
-            let labels = format!("route=\"{}\",method=\"{}\"", key.route, key.method);
+            let labels = format!(
+                "route=\"{}\",method=\"{}\"",
+                escape_label_value(&key.route),
+                escape_label_value(&key.method)
+            );
             for (bound, cumulative) in hist.cumulative() {
                 body.push_str(&format!(
                     "lumenqraph_http_request_duration_ms_bucket{{{labels},le=\"{bound}\"}} {cumulative}\n"
