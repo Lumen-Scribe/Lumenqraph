@@ -231,6 +231,15 @@ fn is_view_heuristic(f: &FunctionSpec) -> bool {
     !is_void_output && !matches_mutating_prefix
 }
 
+/// Whether the named function passes [`is_view_heuristic`]. `None` when the
+/// spec declares no function with that name.
+pub fn is_view_function(spec: &ContractSpec, name: &str) -> Option<bool> {
+    spec.functions
+        .iter()
+        .find(|f| f.name == name)
+        .map(is_view_heuristic)
+}
+
 /// List a contract's callable functions (name, typed inputs, output type),
 /// derived from the raw spec section. Handy for a `/functions` endpoint.
 ///
