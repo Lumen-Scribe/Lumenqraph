@@ -13,8 +13,10 @@
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use futures::stream::{self, Stream};
+use axum::Extension;
+use futures::stream::{self, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -22,10 +24,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::time::{interval, sleep};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::error::ApiResult;
 use crate::extract::ValidContractId;
+use crate::request_id::RequestId;
 use crate::state::AppState;
 
 /// Maximum number of concurrent SSE streams allowed globally.
@@ -209,6 +213,7 @@ struct StreamState {
     rx: broadcast::Receiver<BroadcastEvent>,
     poll_secs: u64,
     last_ledger: i64,
+    request_id: String,
 }
 
 impl StreamState {
@@ -242,12 +247,33 @@ fn parse_last_event_id(value: &str) -> Option<Cursor> {
     })
 }
 
+/// Build the SSE `error` frame sent when a poll fails. It carries only a generic
+/// code and the request ID; driver error text is logged server-side and never
+/// reaches the client.
+fn error_frame_data(request_id: &str) -> String {
+    json!({ "code": "internal_error", "request_id": request_id }).to_string()
+}
+
+/// Log a failed poll, back off for one poll interval so a broken database is not
+/// retried in a hot loop, and return the sanitized error frame.
+async fn fetch_error_event(e: &crate::error::ApiError, request_id: &str, poll_secs: u64) -> Event {
+    tracing::error!(error = %e, request_id, "error fetching events");
+    sleep(Duration::from_secs(poll_secs)).await;
+    Event::default()
+        .event("error")
+        .data(error_frame_data(request_id))
+}
+
 pub async fn stream_events(
     State(state): State<AppState>,
     ValidContractId(contract_id): ValidContractId,
     Query(q): Query<StreamQuery>,
     headers: HeaderMap,
+    request_id: Option<Extension<RequestId>>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
+    let request_id = request_id
+        .map(|Extension(id)| id.0.to_string())
+        .unwrap_or_default();
     // Validate poll interval (min 1 second, max 60 seconds)
     let poll_secs = q.poll_interval.clamp(1, 60);
 
@@ -286,6 +312,7 @@ pub async fn stream_events(
     // Subscribe to the shared fan-out before constructing the stream so no
     // events published after this point are missed.
     let rx = state.event_fanout.subscribe();
+    let shutdown = state.shutdown.clone();
     let last_ledger = initial_cursor.ledger;
 
     let initial = StreamState {
@@ -297,6 +324,7 @@ pub async fn stream_events(
         rx,
         poll_secs,
         last_ledger,
+        request_id,
     };
 
     // Create the stream. The unfold state carries a buffer of already-fetched
@@ -356,11 +384,9 @@ pub async fn stream_events(
                             }
                         }
                         Err(e) => {
-                            tracing::error!(error = %e, "error fetching events");
-                            return Some((
-                                Ok(Event::default().comment(format!("error: {}", e))),
-                                st,
-                            ));
+                            let frame =
+                                fetch_error_event(&e, &st.request_id, st.poll_secs).await;
+                            return Some((Ok(frame), st));
                         }
                     }
                 }
@@ -386,11 +412,9 @@ pub async fn stream_events(
                             }
                         }
                         Err(e) => {
-                            tracing::error!(error = %e, "error fetching events");
-                            return Some((
-                                Ok(Event::default().comment(format!("error: {}", e))),
-                                st,
-                            ));
+                            let frame =
+                                fetch_error_event(&e, &st.request_id, st.poll_secs).await;
+                            return Some((Ok(frame), st));
                         }
                     }
                 }
@@ -398,10 +422,33 @@ pub async fn stream_events(
         }
     });
 
+    let stream = end_on_shutdown(stream, shutdown);
+
     // Emit a keep-alive comment at least every 15 s so idle streams aren't
     // closed by proxies/load balancers with 60–100 s idle timeouts.
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
+
+/// Ends an SSE stream once the server starts shutting down. A final
+/// `event: shutdown` frame is sent first so the client reconnects, with
+/// `Last-Event-ID`, to another instance. Without this, open streams keep
+/// graceful shutdown waiting until the hard timeout (#571).
+fn end_on_shutdown<S>(
+    events: S,
+    shutdown: CancellationToken,
+) -> impl Stream<Item = Result<Event, Infallible>>
+where
+    S: Stream<Item = Result<Event, Infallible>>,
+{
+    events
+        .take_until(async move { shutdown.cancelled().await })
+        .chain(stream::once(async {
+            Ok(Event::default()
+                .event("shutdown")
+                .data(json!({ "reason": "server_shutdown" }).to_string()))
+        }))
+}
+
 
 /// Resolve the current head of the event log for a contract, used as the
 /// starting cursor for a fresh stream with no resume position.
@@ -477,4 +524,44 @@ async fn fetch_new_events(
     }
 
     Ok(events)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #570 — SSE error frames must not leak driver or infrastructure error text.
+    #[test]
+    fn error_frame_carries_only_code_and_request_id() {
+        let data: serde_json::Value =
+            serde_json::from_str(&error_frame_data("req-123")).unwrap();
+        assert_eq!(data["code"], "internal_error");
+        assert_eq!(data["request_id"], "req-123");
+        assert_eq!(data.as_object().unwrap().len(), 2);
+    }
+
+    /// #571 — an open stream ends with a single shutdown frame once the token is
+    /// cancelled, instead of holding the server open.
+    #[tokio::test]
+    async fn stream_ends_with_one_shutdown_frame_when_cancelled() {
+        let shutdown = CancellationToken::new();
+        let open_stream = stream::pending::<Result<Event, Infallible>>();
+        let mut ended = Box::pin(end_on_shutdown(open_stream, shutdown.clone()));
+
+        shutdown.cancel();
+
+        let frames: Vec<_> = tokio::time::timeout(Duration::from_secs(1), ended.collect())
+            .await
+            .expect("stream should end promptly after cancellation");
+        assert_eq!(frames.len(), 1);
+    }
+
+    #[test]
+    fn error_frame_never_contains_driver_error_text() {
+        let driver_error = "connection to server at 10.0.3.4 failed: relation \"events\" does not exist";
+        let data = error_frame_data("req-456");
+        assert!(!data.contains("10.0.3.4"));
+        assert!(!data.contains("relation"));
+        assert!(!data.contains(driver_error));
+    }
 }

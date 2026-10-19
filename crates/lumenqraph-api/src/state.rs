@@ -104,3 +104,53 @@ pub struct AuditEvent {
     pub http_method: String,
     pub status_code: u16,
 }
+
+/// `AppState` for handler tests. The pool is supplied by the caller: a lazy
+/// pool for tests that must fail before any database access, or a real one
+/// for Postgres-backed tests.
+#[cfg(test)]
+pub fn test_state(pool: PgPool) -> AppState {
+    use std::sync::atomic::AtomicU64;
+
+    use crate::call_cache::CallCache;
+    use crate::concurrency_limit::ConcurrencyLimiter;
+    use crate::key_cache::KeyCache;
+    use crate::metrics_middleware::MetricsCollector;
+    use crate::read_cost_limit::ReadCostLimitConfig;
+
+    AppState {
+        pool,
+        require_auth: false,
+        anon_rate_limit: 1_000_000,
+        limiter: Arc::new(RateLimiter::new()),
+        http_requests: Arc::new(AtomicU64::new(0)),
+        rpc: RpcClient::new("http://127.0.0.1:0", 30),
+        specs: Arc::new(SpecCache::new()),
+        mounts: Arc::new(vec![]),
+        rpc_limiter: Arc::new(RateLimiter::new()),
+        rpc_require_auth: false,
+        rpc_anon_rate_limit: 1_000_000,
+        metrics: Arc::new(MetricsCollector::new()),
+        call_cache: Arc::new(CallCache::new(100, 5)),
+        build_info: Arc::new(BuildInfo {
+            version: "test".to_string(),
+            commit: "test".to_string(),
+            build_time: "test".to_string(),
+        }),
+        concurrency_limiter: Arc::new(ConcurrencyLimiter::new()),
+        max_concurrent_per_ip: 100,
+        read_cost_limit_config: ReadCostLimitConfig::default(),
+        readyz_lag_threshold: 100,
+        readyz_max_age_secs: 120,
+        health_max_lag_ledgers: 100,
+        health_max_stale_secs: 120,
+        metrics_require_auth: false,
+        proxy_limiter: Arc::new(RateLimiter::new()),
+        config: Arc::new(ApiConfig::test_default()),
+        key_cache: Arc::new(KeyCache::new(256)),
+        ip_config: IpConfig { trusted_proxy_hops: 0, platform_header: None },
+        audit_tx: None,
+        audit_dropped: Arc::new(AtomicU64::new(0)),
+        shutdown: CancellationToken::new(),
+    }
+}

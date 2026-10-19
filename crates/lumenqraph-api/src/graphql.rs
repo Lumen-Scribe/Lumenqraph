@@ -278,11 +278,12 @@ impl QueryRoot {
         #[graphql(desc = "Opaque cursor from a previous page's endCursor")] after: Option<String>,
     ) -> Result<ContractConnection> {
         let pool = ctx.data::<PgPool>()?;
-        let limit = pagination::clamp_limit(first, 20, 200);
-        let cursor = after.as_deref().map(decode_cursor).transpose()?;
+        let limit = first.unwrap_or(20).clamp(1, 200) as i64;
+        let cursor = pagination::decode_contract_cursor(after.as_deref())
+            .map_err(async_graphql::Error::new)?;
 
         let (after_ledger, after_contract_id) = match &cursor {
-            Some(c) => (Some(c.ledger), Some(c.id.as_str())),
+            Some((ledger, id)) => (Some(*ledger), Some(id.as_str())),
             None => (None, None),
         };
 
@@ -306,7 +307,10 @@ impl QueryRoot {
             .into_iter()
             .take(limit as usize)
             .map(|c| {
-                let cursor = pagination::encode_cursor(c.last_seen_ledger.unwrap_or(0), &c.contract_id);
+                let cursor = pagination::encode_contract_cursor(
+                    c.last_seen_ledger.unwrap_or(0),
+                    &c.contract_id,
+                );
                 ContractEdge {
                     cursor,
                     node: ContractStat::from(c),
@@ -353,6 +357,259 @@ impl QueryRoot {
         contract_id: String,
         event_name: Option<String>,
         #[graphql(desc = "Page size (1-200, default 20)")] first: Option<i32>,
-        #[graphql(desc = "Opaque cu
+        #[graphql(desc = "Opaque cursor from a previous page's endCursor")] after: Option<String>,
+    ) -> Result<EventConnection> {
+        let pool = ctx.data::<PgPool>()?;
+        let limit = first.unwrap_or(20).clamp(1, 200) as i64;
+        let (after_ledger, after_id) = match pagination::decode_cursor(after.as_deref())
+            .map_err(async_graphql::Error::new)?
+        {
+            Some((l, id)) => (Some(l), Some(id)),
+            None => (None, None),
+        };
+        // Fetch one extra row to determine hasNextPage.
+        let rows: Vec<EventRow> = sqlx::query_as(
+            "SELECT event_id, contract_id, ledger, ledger_closed_at, event_type,
+                    topics, decoded_topics, event_name, value, decoded_value,
+                    enriched, tx_hash, in_successful_call, paging_token, created_at
+             FROM events
+             WHERE contract_id = $1
+               AND ($2::text IS NULL OR event_name = $2)
+               AND ($3::bigint IS NULL OR ledger < $3 OR (ledger = $3 AND event_id < $4))
+             ORDER BY ledger DESC, event_id DESC
+             LIMIT $5",
+        )
+        .bind(&contract_id)
+        .bind(&event_name)
+        .bind(after_ledger)
+        .bind(after_id)
+        .bind(limit + 1)
+        .fetch_all(pool)
+        .await?;
 
-/* … truncated 9092 chars — edit only what you need near the top … */
+        Ok(build_event_connection(rows, limit))
+    }
+
+    /// Cursor-paginated token transfers, newest first. Optional filters by
+    /// contract and by the `from` / `to` address — mirroring the REST
+    /// `GET /contracts/:id/transfers` `?from=`/`?to=` query parameters.
+    async fn transfers(
+        &self,
+        ctx: &Context<'_>,
+        contract_id: Option<String>,
+        #[graphql(desc = "Only transfers sent from this address (G… / C… strkey)")]
+        from: Option<String>,
+        #[graphql(desc = "Only transfers received by this address (G… / C… strkey)")]
+        to: Option<String>,
+        #[graphql(desc = "Page size (1-200, default 20)")] first: Option<i32>,
+        after: Option<String>,
+    ) -> Result<TransferConnection> {
+        let pool = ctx.data::<PgPool>()?;
+        let limit = first.unwrap_or(20).clamp(1, 200) as i64;
+        let (after_ledger, after_id) = match pagination::decode_cursor(after.as_deref())
+            .map_err(async_graphql::Error::new)?
+        {
+            Some((l, id)) => (Some(l), Some(id)),
+            None => (None, None),
+        };
+        let rows: Vec<TokenTransfer> = sqlx::query_as(
+            "SELECT event_id, contract_id, from_addr, to_addr, amount, ledger, ledger_closed_at
+             FROM token_transfers
+             WHERE ($1::text IS NULL OR contract_id = $1)
+               AND ($2::text IS NULL OR from_addr = $2)
+               AND ($3::text IS NULL OR to_addr = $3)
+               AND ($4::bigint IS NULL OR ledger < $4 OR (ledger = $4 AND event_id < $5))
+             ORDER BY ledger DESC, event_id DESC
+             LIMIT $6",
+        )
+        .bind(&contract_id)
+        .bind(&from)
+        .bind(&to)
+        .bind(after_ledger)
+        .bind(after_id)
+        .bind(limit + 1)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(build_transfer_connection(rows, limit))
+    }
+
+    /// Versioned instance-storage snapshots for a contract, newest first.
+    async fn contract_state(
+        &self,
+        ctx: &Context<'_>,
+        contract_id: String,
+        #[graphql(desc = "How many versions (1-200, default 1)")] limit: Option<i32>,
+    ) -> Result<Vec<StateVersion>> {
+        let pool = ctx.data::<PgPool>()?;
+        let limit = limit.unwrap_or(1).clamp(1, 200) as i64;
+        let rows: Vec<(i64, SqlxJson<Value>, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT ledger, storage, captured_at FROM contract_state
+             WHERE contract_id = $1 ORDER BY ledger DESC LIMIT $2",
+        )
+        .bind(&contract_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(ledger, storage, captured_at)| StateVersion {
+                ledger,
+                storage: GqlJson(storage.0),
+                captured_at,
+            })
+            .collect())
+    }
+
+    /// Latest value of each per-key entry (e.g. holder balances) for a contract.
+    async fn contract_data(
+        &self,
+        ctx: &Context<'_>,
+        contract_id: String,
+        label: Option<String>,
+        #[graphql(desc = "Max keys (1-1000, default 100)")] limit: Option<i32>,
+    ) -> Result<Vec<DataKey>> {
+        let pool = ctx.data::<PgPool>()?;
+        let limit = limit.unwrap_or(100).clamp(1, 1000) as i64;
+        type Row = (
+            String,
+            SqlxJson<Value>,
+            String,
+            i64,
+            SqlxJson<Value>,
+            Option<String>,
+            DateTime<Utc>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT key_hash, key, durability, ledger, value, label, captured_at FROM (
+                 SELECT DISTINCT ON (key_hash)
+                        key_hash, key, durability, ledger, value, label, captured_at
+                 FROM contract_data
+                 WHERE contract_id = $1 AND ($2::text IS NULL OR label = $2)
+                 ORDER BY key_hash, ledger DESC
+             ) latest
+             ORDER BY ledger DESC LIMIT $3",
+        )
+        .bind(&contract_id)
+        .bind(&label)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(key_hash, key, durability, ledger, value, label, captured_at)| DataKey {
+                    key_hash,
+                    key: GqlJson(key.0),
+                    durability,
+                    ledger,
+                    value: GqlJson(value.0),
+                    label,
+                    captured_at,
+                },
+            )
+            .collect())
+    }
+}
+
+/// Turn `limit + 1` rows into a connection: the extra row (if present) means
+/// there's a next page; the last kept row's position becomes `endCursor`.
+fn build_event_connection(mut rows: Vec<EventRow>, limit: i64) -> EventConnection {
+    let has_next_page = rows.len() as i64 > limit;
+    if has_next_page {
+        rows.truncate(limit as usize);
+    }
+    let end_cursor = rows.last().map(|e| pagination::encode_cursor(e.ledger, &e.event_id));
+    let edges = rows
+        .into_iter()
+        .map(|e| EventEdge {
+            cursor: pagination::encode_cursor(e.ledger, &e.event_id),
+            node: Event::from(e),
+        })
+        .collect();
+    EventConnection {
+        edges,
+        page_info: PageInfo {
+            has_next_page,
+            end_cursor,
+        },
+    }
+}
+
+fn build_transfer_connection(mut rows: Vec<TokenTransfer>, limit: i64) -> TransferConnection {
+    let has_next_page = rows.len() as i64 > limit;
+    if has_next_page {
+        rows.truncate(limit as usize);
+    }
+    let end_cursor = rows.last().map(|t| pagination::encode_cursor(t.ledger, &t.event_id));
+    let edges = rows
+        .into_iter()
+        .map(|t| TransferEdge {
+            cursor: pagination::encode_cursor(t.ledger, &t.event_id),
+            node: Transfer::from(t),
+        })
+        .collect();
+    TransferConnection {
+        edges,
+        page_info: PageInfo {
+            has_next_page,
+            end_cursor,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+
+    #[test]
+    fn cursor_round_trips() {
+        let c = pagination::encode_cursor(42, "abc");
+        assert_eq!(
+            pagination::decode_cursor(Some(&c)),
+            Ok(Some((42, "abc".to_string())))
+        );
+    }
+
+    #[test]
+    fn absent_cursor_gives_none() {
+        assert_eq!(pagination::decode_cursor(None), Ok(None));
+    }
+
+    #[test]
+    fn bad_cursor_decodes_to_none() {
+        assert_eq!(decode_cursor(None), None);
+        assert_eq!(decode_cursor(Some("!!!not-base64!!!")), None);
+        // Valid base64 but wrong shape (no `|` separator).
+        let junk = base64::engine::general_purpose::STANDARD.encode("no-separator");
+        assert_eq!(decode_cursor(Some(&junk)), None);
+    }
+
+    #[test]
+    fn schema_exposes_the_expected_graph() {
+        // Building the schema (without a pool) validates the whole type graph
+        // and that every resolver is registered — a runtime check with no DB.
+        let sdl = Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
+            .finish()
+            .sdl();
+        for expected in [
+            "type Query",
+            "events(",
+            "transfers(",
+            "contractState(",
+            "contractData(",
+            "type EventConnection",
+            "type PageInfo",
+            "hasNextPage",
+            // The GraphQL `transfers` field must expose the same address filters
+            // as the REST endpoint (#285): `from` and `to`, both optional. The
+            // `Transfer` type's own fields are `fromAddr` / `toAddr`, so these
+            // substrings are unambiguous argument signatures.
+            "from: String",
+            "to: String",
+        ] {
+            assert!(sdl.contains(expected), "SDL missing {expected:?}");
+        }
+    }
+}

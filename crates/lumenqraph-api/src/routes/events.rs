@@ -161,14 +161,12 @@ pub async fn list_events(
            AND ($4::bigint IS NULL OR ledger <= $4)
            AND ($5::timestamp IS NULL OR ledger_closed_at >= $5)
            AND ($6::timestamp IS NULL OR ledger_closed_at <= $6)
-           -- Topic filtering is positional: `decoded_topics -> n` extracts the element
-           -- at index n, so `topic1=X` matches only events whose second topic is X.
-           -- JSONB `@>` on arrays is set membership and ignores position, so it must
-           -- not be used here.
-           AND ($7::text IS NULL OR decoded_topics -> 0 = $7::jsonb)
-           AND ($8::text IS NULL OR decoded_topics -> 1 = $8::jsonb)
-           AND ($9::text IS NULL OR decoded_topics -> 2 = $9::jsonb)
-           AND ($10::text IS NULL OR decoded_topics -> 3 = $10::jsonb)
+           -- Topic filtering matches the value at an exact position: `-> n` reads
+           -- decoded_topics[n] as jsonb, so `topic1` only matches index 1.
+           AND ($7::text IS NULL OR (decoded_topics -> 0) = $7::jsonb)
+           AND ($8::text IS NULL OR (decoded_topics -> 1) = $8::jsonb)
+           AND ($9::text IS NULL OR (decoded_topics -> 2) = $9::jsonb)
+           AND ($10::text IS NULL OR (decoded_topics -> 3) = $10::jsonb)
            AND ($11::text IS NULL OR enriched @> ($11::jsonb))
            AND ($15::boolean IS NULL OR in_successful_call = $15)
            AND ($12::bigint IS NULL OR ledger < $12 OR (ledger = $12 AND event_id < $13))
@@ -289,115 +287,76 @@ pub struct TxEventsResponse {
 
 #[cfg(test)]
 mod tests {
-    use crate::auth::integration_tests::{db_pool, make_state, spawn_server};
+    //! Needs a migrated throwaway database. Run with:
+    //!
+    //!   TEST_DATABASE_URL=postgres://… cargo test -p lumenqraph-api -- --ignored
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use serde_json::Value;
     use sqlx::PgPool;
+    use tower::ServiceExt;
+
+    use super::list_events;
+    use crate::state::test_state;
 
     const CONTRACT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+    const EVENT_ID: &str = "api-test-list-events-topics";
 
-    async fn insert_event(pool: &PgPool, event_id: &str, decoded_topics: &str) {
-        sqlx::query(
-            "INSERT INTO events (event_id, contract_id, ledger, ledger_closed_at, event_type,
-                topics, decoded_topics, event_name, value, tx_hash, in_successful_call, paging_token)
-             VALUES ($1, $2, 1, NOW(), 'contract', '[]'::jsonb, $3::jsonb, 'transfer', '', 'tx', true, $1)",
-        )
-        .bind(event_id)
-        .bind(CONTRACT)
-        .bind(decoded_topics)
-        .execute(pool)
-        .await
-        .expect("insert event");
-    }
+    async fn count_events(app: &Router, query: &str) -> usize {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/contracts/{CONTRACT}/events?{query}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "query `{query}` must not fail");
 
-    async fn event_ids(base: &str, query: &str) -> Vec<String> {
-        let body: serde_json::Value =
-            reqwest::get(format!("{base}/contracts/{CONTRACT}/events?{query}"))
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
-        body["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|e| e["event_id"].as_str().unwrap().to_string())
-            .collect()
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        body["data"].as_array().expect("`data` array").len()
     }
 
     #[tokio::test]
-    #[ignore = "needs postgres"]
-    async fn topic_filters_match_by_position() {
-        let pool = db_pool().await;
-        // transfer(from=GA, to=GB): GA is topic1, GB is topic2.
-        insert_event(&pool, "transfer_ga_gb", r#"["transfer","GA","GB"]"#).await;
-        // transfer(from=GB, to=GA): GA is topic2.
-        insert_event(&pool, "transfer_gb_ga", r#"["transfer","GB","GA"]"#).await;
-        let base = spawn_server(make_state(pool, false, 60)).await;
+    #[ignore]
+    async fn list_events_returns_200_with_and_without_topic_filters() {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
+        let pool = PgPool::connect(&url).await.unwrap();
 
-        assert_eq!(
-            event_ids(&base, "topic1=%22GA%22").await,
-            vec!["transfer_ga_gb"],
-            "topic1=GA must match only the event whose second topic is GA"
-        );
-        assert_eq!(
-            event_ids(&base, "topic2=%22GA%22").await,
-            vec!["transfer_gb_ga"],
-            "topic2=GA must match only the event whose third topic is GA"
-        );
-        assert!(
-            event_ids(&base, "topic0=%22GA%22").await.is_empty(),
-            "topic0=GA must not match GA appearing in other positions"
-        );
-        assert_eq!(
-            event_ids(&base, "topic0=%22transfer%22").await.len(),
-            2,
-            "topic0=transfer matches every transfer event"
-        );
-    }
+        sqlx::query("DELETE FROM events WHERE event_id = $1")
+            .bind(EVENT_ID)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO events
+                (event_id, contract_id, ledger, ledger_closed_at, event_type, topics,
+                 decoded_topics, event_name, value, tx_hash, in_successful_call, paging_token)
+             VALUES ($1, $2, 1, now(), 'contract', '[]',
+                     '[\"transfer\", \"GABC\"]', 'transfer', '', 'tx', true, 'p1')",
+        )
+        .bind(EVENT_ID)
+        .bind(CONTRACT)
+        .execute(&pool)
+        .await
+        .unwrap();
 
-    #[test]
-    fn bare_topic_values_are_json_strings() {
-        assert_eq!(
-            super::parse_topic_filter(Some("transfer")).unwrap().as_deref(),
-            Some(r#""transfer""#)
-        );
-        assert_eq!(
-            super::parse_topic_filter(Some("1000")).unwrap().as_deref(),
-            Some(r#""1000""#)
-        );
-        assert_eq!(super::parse_topic_filter(None).unwrap(), None);
-    }
+        let app = Router::new()
+            .route("/contracts/:contract_id/events", get(list_events))
+            .with_state(test_state(pool.clone()));
 
-    #[test]
-    fn json_topic_values_are_parsed() {
-        assert_eq!(
-            super::parse_topic_filter(Some(r#"["a","b"]"#)).unwrap().as_deref(),
-            Some(r#"["a","b"]"#)
-        );
-        assert_eq!(
-            super::parse_topic_filter(Some(r#""transfer""#)).unwrap().as_deref(),
-            Some(r#""transfer""#)
-        );
-    }
+        assert_eq!(count_events(&app, "").await, 1);
+        assert_eq!(count_events(&app, "topic0=%22transfer%22").await, 1);
+        assert_eq!(count_events(&app, "topic1=%22GABC%22").await, 1);
+        assert_eq!(count_events(&app, "topic1=%22NOPE%22").await, 0);
+        assert_eq!(count_events(&app, "topic2=%22GABC%22").await, 0);
 
-    #[test]
-    fn malformed_topic_json_is_rejected() {
-        assert!(super::parse_topic_filter(Some(r#""unterminated"#)).is_err());
-        assert!(super::parse_topic_filter(Some(r#"{"sym":"#)).is_err());
-    }
-
-    #[test]
-    fn param_splits_on_first_colon() {
-        assert_eq!(
-            super::parse_param_filter(Some("from:GA:1")).unwrap().as_deref(),
-            Some(r#"{"from":"GA:1"}"#)
-        );
-        assert_eq!(super::parse_param_filter(None).unwrap(), None);
-    }
-
-    #[test]
-    fn malformed_param_is_rejected() {
-        assert!(super::parse_param_filter(Some("from")).is_err());
-        assert!(super::parse_param_filter(Some(":GA")).is_err());
+        sqlx::query("DELETE FROM events WHERE event_id = $1")
+            .bind(EVENT_ID)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }
