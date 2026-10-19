@@ -124,6 +124,9 @@ async fn main() -> anyhow::Result<()> {
             .to_string(),
     });
 
+    // Audit events are queued and batch-inserted off the request path (#558).
+    let audit_tx = auth::spawn_audit_writer(pool.clone());
+
     let state = AppState {
         pool,
         require_auth: config.require_auth,
@@ -154,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
         config: Arc::clone(&config),
         key_cache: Arc::new(KeyCache::new(2000)),
         ip_config: auth::IpConfig::from_env(),
-        audit_tx: None,
+        audit_tx: Some(audit_tx),
         audit_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         shutdown: tokio_util::sync::CancellationToken::new(),
     };

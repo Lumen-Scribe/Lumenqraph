@@ -10,14 +10,16 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use chrono::{DateTime, Utc};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::error::{ApiError, ApiResult};
 use crate::key_cache::CachedKey;
-use crate::state::AppState;
+use crate::state::{AppState, AuditEvent};
 
 /// SHA-256 hex of an API key. Used both here and by the key-generation script.
 pub fn hash_key(key: &str) -> String {
@@ -146,84 +148,216 @@ pub fn extract_client_ip(headers: &HeaderMap, socket_addr: Option<SocketAddr>, c
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Scope granting read access to the data routes (#559).
+pub const SCOPE_READ: &str = "read";
+/// Scope granting access to the RPC-backed routes (`/call`, `/simulate`) (#559).
+pub const SCOPE_RPC: &str = "rpc";
+/// Scope granting webhook create, update, delete, rotate and redrive (#559).
+pub const SCOPE_WEBHOOKS_WRITE: &str = "webhooks:write";
+/// Scope satisfying every other scope check (#559).
+pub const SCOPE_ADMIN: &str = "admin";
+
+/// A key that passed revocation and expiry checks.
+struct ResolvedKey {
+    hash: String,
+    rate_limit_per_min: i32,
+    scopes: Vec<String>,
+}
+
+/// Resolve `key` and require `required` (or `admin`) in its scopes.
+///
+/// Returns `(identity, limit, is_authenticated, key_hash)`, the same shape the
+/// middlewares use for anonymous and authenticated callers alike. Handlers
+/// read the key hash to scope their queries to the owning key (#421, #561).
+async fn authenticate(
+    state: &AppState,
+    key: &str,
+    route: &str,
+    method: &str,
+    required: &str,
+) -> Result<(String, i32, bool, Option<String>), ApiError> {
+    let resolved = resolve_key(state, key, route, method).await?;
+    if !resolved.scopes.iter().any(|s| s == required || s == SCOPE_ADMIN) {
+        return Err(ApiError::insufficient_scope(required));
+    }
+    Ok((
+        format!("key:{}", resolved.hash),
+        resolved.rate_limit_per_min,
+        true,
+        Some(resolved.hash),
+    ))
+}
+
 /// Perform a key lookup, consulting the in-process LRU cache first (#430).
 ///
-/// Returns `Ok((identity, limit, is_authenticated, key_hash_opt))` on success,
-/// or an `ApiError` that should be returned to the caller directly. The key
-/// hash is `Some` only for authenticated callers, so handlers can record the
-/// owner of created resources (#421).
+/// Rejects revoked, unknown and expired keys (#559). Every route group goes
+/// through here, so the cache and revocation handling live in one place (#560).
 async fn resolve_key(
     state: &AppState,
     key: &str,
     route: &str,
     method: &str,
-) -> Result<(String, i32, bool, Option<String>), ApiError> {
+) -> Result<ResolvedKey, ApiError> {
     let hash = hash_key(key);
 
     // --- Cache look-up (#430) ---
     if let Some(cached) = state.key_cache.get(&hash) {
         return match cached {
-            CachedKey::Valid { rate_limit_per_min } => {
-                Ok((format!("key:{hash}"), rate_limit_per_min, true, Some(hash)))
+            CachedKey::Valid { rate_limit_per_min, scopes, expires_at } => {
+                accept_key(state, hash, rate_limit_per_min, scopes, expires_at, route, method).await
             }
             CachedKey::Revoked => {
-                log_audit_event(&state.pool, &hash, route, method, 401).await;
+                log_audit_event(&state, &hash, route, method, 401);
                 Err(ApiError::unauthorized("API key revoked"))
             }
             CachedKey::NotFound => {
-                log_audit_event(&state.pool, &hash, route, method, 401).await;
+                log_audit_event(&state, &hash, route, method, 401);
                 Err(ApiError::unauthorized("invalid API key"))
             }
         };
     }
 
     // --- DB look-up on cache miss (#430) ---
-    let row: Option<(bool, i32)> = sqlx::query_as(
-        "SELECT revoked, rate_limit_per_min FROM api_keys WHERE key_hash = $1",
+    let row: Option<(bool, i32, Vec<String>, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT revoked, rate_limit_per_min, scopes, expires_at FROM api_keys WHERE key_hash = $1",
     )
     .bind(&hash)
     .fetch_optional(&state.pool)
     .await?;
 
     match row {
-        Some((false, limit)) => {
-            state.key_cache.insert_valid(&hash, limit);
-            Ok((format!("key:{hash}"), limit, true, Some(hash)))
+        Some((false, limit, scopes, expires_at)) => {
+            state.key_cache.insert_valid(&hash, limit, scopes.clone(), expires_at);
+            accept_key(state, hash, limit, scopes, expires_at, route, method).await
         }
-        Some((true, _)) => {
+        Some((true, _, _, _)) => {
             state.key_cache.insert_revoked(&hash);
-            log_audit_event(&state.pool, &hash, route, method, 401).await;
+            log_audit_event(&state, &hash, route, method, 401);
             Err(ApiError::unauthorized("API key revoked"))
         }
         None => {
             state.key_cache.insert_not_found(&hash);
-            log_audit_event(&state.pool, &hash, route, method, 401).await;
+            log_audit_event(&state, &hash, route, method, 401);
             Err(ApiError::unauthorized("invalid API key"))
         }
     }
 }
 
-async fn log_audit_event(
-    pool: &PgPool,
+/// Final checks for a non-revoked key: expiry (#559), then `last_used_at`.
+async fn accept_key(
+    state: &AppState,
+    hash: String,
+    rate_limit_per_min: i32,
+    scopes: Vec<String>,
+    expires_at: Option<DateTime<Utc>>,
+    route: &str,
+    method: &str,
+) -> Result<ResolvedKey, ApiError> {
+    if expires_at.is_some_and(|at| at <= Utc::now()) {
+        log_audit_event(&state, &hash, route, method, 401);
+        return Err(ApiError::key_expired());
+    }
+    if state.key_cache.should_touch_last_used(&hash) {
+        touch_last_used(state.pool.clone(), hash.clone());
+    }
+    Ok(ResolvedKey {
+        hash,
+        rate_limit_per_min,
+        scopes,
+    })
+}
+
+/// Write `api_keys.last_used_at` off the request path (#559). Callers gate this
+/// through `KeyCache::should_touch_last_used`, so it runs at most once a minute
+/// per key.
+fn touch_last_used(pool: PgPool, hash: String) {
+    tokio::spawn(async move {
+        if let Err(e) = sqlx::query("UPDATE api_keys SET last_used_at = now() WHERE key_hash = $1")
+            .bind(&hash)
+            .execute(&pool)
+            .await
+        {
+            warn!(error = %e, "failed to update api_keys.last_used_at");
+        }
+    });
+}
+
+/// Queue an audit event for the batching writer (#558). Never awaits: the
+/// request path must not pay a Postgres round-trip for bookkeeping. When the
+/// queue is full the event is dropped and `audit_dropped` is incremented.
+fn log_audit_event(
+    state: &AppState,
     key_hash_prefix: &str,
     route: &str,
     method: &str,
     status_code: u16,
 ) {
-    let truncated_prefix = key_hash_prefix.chars().take(8).collect::<String>();
-    if let Err(e) = sqlx::query(
-        "INSERT INTO audit_log (key_hash_prefix, route, http_method, status_code)
-         VALUES ($1, $2, $3, $4)"
-    )
-    .bind(&truncated_prefix)
-    .bind(route)
-    .bind(method)
-    .bind(status_code as i32)
-    .execute(pool)
-    .await
-    {
-        warn!(error = %e, "failed to log audit event");
+    let Some(tx) = &state.audit_tx else {
+        return;
+    };
+    let event = AuditEvent {
+        key_hash_prefix: key_hash_prefix.chars().take(8).collect(),
+        route: route.to_string(),
+        http_method: method.to_string(),
+        status_code,
+    };
+    if tx.try_send(event).is_err() {
+        state.audit_dropped.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Maximum audit events waiting for the writer before new ones are dropped.
+const AUDIT_QUEUE_CAPACITY: usize = 10_000;
+/// Rows per multi-row INSERT.
+const AUDIT_BATCH_ROWS: usize = 500;
+/// Longest a queued audit event waits before it is written.
+const AUDIT_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Start the background task that drains audit events into `audit_log` in
+/// batches (#558). Returns the sender to store in `AppState::audit_tx`.
+pub fn spawn_audit_writer(pool: PgPool) -> mpsc::Sender<AuditEvent> {
+    let (tx, mut rx) = mpsc::channel(AUDIT_QUEUE_CAPACITY);
+    tokio::spawn(async move {
+        let mut batch: Vec<AuditEvent> = Vec::with_capacity(AUDIT_BATCH_ROWS);
+        let mut ticker = tokio::time::interval(AUDIT_FLUSH_INTERVAL);
+        loop {
+            tokio::select! {
+                event = rx.recv() => match event {
+                    Some(event) => {
+                        batch.push(event);
+                        if batch.len() >= AUDIT_BATCH_ROWS {
+                            flush_audit_batch(&pool, &mut batch).await;
+                        }
+                    }
+                    None => {
+                        flush_audit_batch(&pool, &mut batch).await;
+                        break;
+                    }
+                },
+                _ = ticker.tick() => flush_audit_batch(&pool, &mut batch).await,
+            }
+        }
+    });
+    tx
+}
+
+async fn flush_audit_batch(pool: &PgPool, batch: &mut Vec<AuditEvent>) {
+    if batch.is_empty() {
+        return;
+    }
+    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+        "INSERT INTO audit_log (key_hash_prefix, route, http_method, status_code) ",
+    );
+    query.push_values(batch.iter(), |mut row, event| {
+        row.push_bind(&event.key_hash_prefix)
+            .push_bind(&event.route)
+            .push_bind(&event.http_method)
+            .push_bind(event.status_code as i32);
+    });
+    if let Err(e) = query.build().execute(pool).await {
+        warn!(error = %e, rows = batch.len(), "failed to write audit events");
+    }
+    batch.clear();
 }
 
 /// Build a `429 Too Many Requests` response with the standard rate-limit
@@ -267,7 +401,7 @@ pub async fn auth_and_rate_limit(
     let route = uri.split('?').next().unwrap_or("").to_string();
 
     let (identity, limit, is_authenticated, _key_hash_opt) = match extract_key(&headers) {
-        Some(key) => resolve_key(&state, &key, &route, &method).await?,
+        Some(key) => authenticate(&state, &key, &route, &method, SCOPE_READ).await?,
         None => {
             if state.require_auth {
                 return Err(ApiError::unauthorized("missing API key"));
@@ -281,7 +415,7 @@ pub async fn auth_and_rate_limit(
     if !rl_status.allowed {
         if is_authenticated {
             let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
-            log_audit_event(&state.pool, hash_prefix, &route, &method, 429).await;
+            log_audit_event(&state, hash_prefix, &route, &method, 429);
         }
         return Ok(rate_limited_response(limit, rl_status.retry_after_secs, rl_status.tokens_remaining));
     }
@@ -291,7 +425,7 @@ pub async fn auth_and_rate_limit(
 
     if is_authenticated {
         let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
-        log_audit_event(&state.pool, hash_prefix, &route, &method, status).await;
+        log_audit_event(&state, hash_prefix, &route, &method, status);
     }
 
     Ok(response)
@@ -319,7 +453,7 @@ pub async fn rpc_auth_and_rate_limit(
     let route = uri.split('?').next().unwrap_or("").to_string();
 
     let (identity, limit, is_authenticated, _key_hash_opt) = match extract_key(&headers) {
-        Some(key) => resolve_key(&state, &key, &route, &method).await?,
+        Some(key) => authenticate(&state, &key, &route, &method, SCOPE_RPC).await?,
         None => {
             if state.rpc_require_auth {
                 return Err(ApiError::unauthorized(
@@ -336,7 +470,7 @@ pub async fn rpc_auth_and_rate_limit(
     if !rl_status.allowed {
         if is_authenticated {
             let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
-            log_audit_event(&state.pool, hash_prefix, &route, &method, 429).await;
+            log_audit_event(&state, hash_prefix, &route, &method, 429);
         }
         // #429: use the shared helper so RPC-route 429s also carry Retry-After
         // and X-RateLimit-* headers.
@@ -348,7 +482,7 @@ pub async fn rpc_auth_and_rate_limit(
 
     if is_authenticated {
         let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
-        log_audit_event(&state.pool, hash_prefix, &route, &method, status).await;
+        log_audit_event(&state, hash_prefix, &route, &method, status);
     }
 
     Ok(response)
@@ -374,7 +508,7 @@ pub async fn webhook_auth_and_rate_limit(
     let route = uri.split('?').next().unwrap_or("").to_string();
 
     let (identity, limit, is_authenticated, key_hash_opt) = match extract_key(&headers) {
-        Some(key) => resolve_key(&state, &key, &route, &method).await?,
+        Some(key) => authenticate(&state, &key, &route, &method, SCOPE_WEBHOOKS_WRITE).await?,
         None => {
             if state.require_auth {
                 return Err(ApiError::unauthorized("missing API key"));
@@ -388,7 +522,7 @@ pub async fn webhook_auth_and_rate_limit(
     if !rl_status.allowed {
         if is_authenticated {
             let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
-            log_audit_event(&state.pool, hash_prefix, &route, &method, 429).await;
+            log_audit_event(&state, hash_prefix, &route, &method, 429);
         }
         return Ok(rate_limited_response(limit, rl_status.retry_after_secs, rl_status.tokens_remaining));
     }
@@ -406,7 +540,7 @@ pub async fn webhook_auth_and_rate_limit(
 
     if is_authenticated {
         let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
-        log_audit_event(&state.pool, hash_prefix, &route, &method, status).await;
+        log_audit_event(&state, hash_prefix, &route, &method, status);
     }
 
     Ok(response)
@@ -446,7 +580,8 @@ pub async fn webhook_manage_auth_and_rate_limit(
 
     // Resolve through the same path as every other route group, so the key
     // cache (#430) and revocation handling stay in one place (#560).
-    let (identity, limit, _, _) = resolve_key(&state, &key, &route, &method).await?;
+    let required = if method == "GET" { SCOPE_READ } else { SCOPE_WEBHOOKS_WRITE };
+    let (identity, limit, _, _) = authenticate(&state, &key, &route, &method, required).await?;
     let hash = identity.trim_start_matches("key:").to_string();
 
     let rl_status = state.limiter.check(&identity, limit);
@@ -458,7 +593,7 @@ pub async fn webhook_manage_auth_and_rate_limit(
                 retry_after.to_string().parse().unwrap_or_else(|_| "60".parse().unwrap()),
             );
         }
-        log_audit_event(&state.pool, &hash, &route, &method, 429).await;
+        log_audit_event(&state, &hash, &route, &method, 429);
         return Ok(response);
     }
 
@@ -469,7 +604,7 @@ pub async fn webhook_manage_auth_and_rate_limit(
 
     let response = next.run(req).await;
     let status = response.status().as_u16();
-    log_audit_event(&state.pool, &hash, &route, &method, status).await;
+    log_audit_event(&state, &hash, &route, &method, status);
 
     Ok(response)
 }
@@ -801,6 +936,19 @@ mod integration_tests {
         .expect("insert api key");
     }
 
+    async fn insert_api_key_with_scopes(pool: &PgPool, key: &str, scopes: &[&str]) {
+        let scopes: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
+        sqlx::query(
+            "INSERT INTO api_keys (key_hash, revoked, rate_limit_per_min, created_at, scopes)
+             VALUES ($1, false, 100, NOW(), $2)",
+        )
+        .bind(hash_key(key))
+        .bind(&scopes)
+        .execute(pool)
+        .await
+        .expect("insert scoped api key");
+    }
+
     // ---- tests ----
 
     #[tokio::test]
@@ -819,6 +967,50 @@ mod integration_tests {
         let base = spawn_server(make_state(pool, true, 60)).await;
         let res = reqwest::get(format!("{base}/metrics")).await.unwrap();
         assert_eq!(res.status(), 200);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn expired_key_returns_401_key_expired() {
+        let pool = db_pool().await;
+        sqlx::query(
+            "INSERT INTO api_keys (key_hash, revoked, rate_limit_per_min, created_at, expires_at)
+             VALUES ($1, false, 100, NOW(), NOW() - interval '1 minute')",
+        )
+        .bind(hash_key("expired-key"))
+        .execute(&pool)
+        .await
+        .expect("insert expired api key");
+        let base = spawn_server(make_state(pool, true, 60)).await;
+        let res = reqwest::Client::new()
+            .get(format!("{base}/contracts"))
+            .header("x-api-key", "expired-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 401);
+        let body = res.text().await.unwrap();
+        assert!(body.contains("key_expired"), "body was {body}");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn read_only_key_cannot_create_webhook() {
+        let pool = db_pool().await;
+        insert_api_key_with_scopes(&pool, "read-only-key", &["read"]).await;
+        let base = spawn_server(make_state(pool.clone(), true, 60)).await;
+        let res = reqwest::Client::new()
+            .post(format!("{base}/webhooks"))
+            .header("x-api-key", "read-only-key")
+            .json(&serde_json::json!({
+                "url": "https://example.com/hook",
+                "events": ["contract_call"]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 403);
+        assert!(res.text().await.unwrap().contains("insufficient_scope"));
     }
 
     #[tokio::test]
@@ -965,7 +1157,7 @@ mod integration_tests {
     #[ignore = "needs postgres"]
     async fn authenticated_webhook_create_stores_owner_key_hash() {
         let pool = db_pool().await;
-        insert_api_key(&pool, "owner-key", false).await;
+        insert_api_key_with_scopes(&pool, "owner-key", &["webhooks:write"]).await;
         let base = spawn_server(make_state(pool.clone(), true, 60)).await;
         let client = reqwest::Client::new();
         let res = client

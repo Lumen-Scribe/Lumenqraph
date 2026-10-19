@@ -43,6 +43,8 @@ pub enum ErrorCode {
     BadRequest,
     InvalidContractId,
     Unauthorized,
+    KeyExpired,
+    InsufficientScope,
     NotFound,
     RateLimited,
     SimulationFailed,
@@ -58,6 +60,8 @@ impl ErrorCode {
             ErrorCode::BadRequest => "bad_request",
             ErrorCode::InvalidContractId => "invalid_contract_id",
             ErrorCode::Unauthorized => "unauthorized",
+            ErrorCode::KeyExpired => "key_expired",
+            ErrorCode::InsufficientScope => "insufficient_scope",
             ErrorCode::NotFound => "not_found",
             ErrorCode::RateLimited => "rate_limited",
             ErrorCode::SimulationFailed => "simulation_failed",
@@ -99,6 +103,18 @@ pub enum ApiError {
 impl ApiError {
     pub fn unauthorized(msg: impl Into<String>) -> Self {
         ApiError::Status(StatusCode::UNAUTHORIZED, ErrorCode::Unauthorized, msg.into())
+    }
+    /// The key's `expires_at` has passed (#559).
+    pub fn key_expired() -> Self {
+        ApiError::Status(StatusCode::UNAUTHORIZED, ErrorCode::KeyExpired, "API key expired".into())
+    }
+    /// The key is valid but lacks the scope this route group requires (#559).
+    pub fn insufficient_scope(required: &str) -> Self {
+        ApiError::Status(
+            StatusCode::FORBIDDEN,
+            ErrorCode::InsufficientScope,
+            format!("API key lacks required scope `{required}`"),
+        )
     }
     /// A 429 response. Pass the computed wait time from `RateLimitStatus` so the
     /// response carries a `Retry-After` header; `None` omits the header.

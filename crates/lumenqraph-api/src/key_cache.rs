@@ -20,6 +20,7 @@
 
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use lru::LruCache;
 use parking_lot::Mutex;
 use std::num::NonZeroUsize;
@@ -34,11 +35,19 @@ pub const TTL_SECS: u64 = 30;
 /// still protecting against random-key flood DoS on Postgres.
 pub const NEG_TTL_SECS: u64 = 5;
 
+/// Minimum interval between `last_used_at` writes for one key (#559).
+pub const LAST_USED_TOUCH_SECS: u64 = 60;
+
 /// The value stored for a cache hit.
 #[derive(Clone, Debug)]
 pub enum CachedKey {
-    /// Key exists, not revoked: store its per-minute rate limit.
-    Valid { rate_limit_per_min: i32 },
+    /// Key exists, not revoked: its per-minute rate limit, granted scopes and
+    /// optional expiry (#559).
+    Valid {
+        rate_limit_per_min: i32,
+        scopes: Vec<String>,
+        expires_at: Option<DateTime<Utc>>,
+    },
     /// Key is revoked.
     Revoked,
     /// Key is not found in `api_keys`.
@@ -49,6 +58,8 @@ pub enum CachedKey {
 struct Entry {
     value: CachedKey,
     expires_at: Instant,
+    /// When `last_used_at` was last written for this key (#559).
+    last_touch: Option<Instant>,
 }
 
 impl Entry {
@@ -85,12 +96,40 @@ impl KeyCache {
     }
 
     /// Insert a positive (valid) entry for `key_hash`.
-    pub fn insert_valid(&self, key_hash: &str, rate_limit_per_min: i32) {
+    pub fn insert_valid(
+        &self,
+        key_hash: &str,
+        rate_limit_per_min: i32,
+        scopes: Vec<String>,
+        expires_at: Option<DateTime<Utc>>,
+    ) {
         let entry = Entry {
-            value: CachedKey::Valid { rate_limit_per_min },
+            value: CachedKey::Valid {
+                rate_limit_per_min,
+                scopes,
+                expires_at,
+            },
             expires_at: Instant::now() + Duration::from_secs(TTL_SECS),
+            last_touch: None,
         };
         self.inner.lock().put(key_hash.to_string(), entry);
+    }
+
+    /// Returns `true` when `last_used_at` should be written for `key_hash`,
+    /// at most once per `LAST_USED_TOUCH_SECS`, and records the write.
+    pub fn should_touch_last_used(&self, key_hash: &str) -> bool {
+        let mut cache = self.inner.lock();
+        let Some(entry) = cache.get_mut(key_hash) else {
+            return false;
+        };
+        let now = Instant::now();
+        let due = entry
+            .last_touch
+            .map_or(true, |t| now.duration_since(t) >= Duration::from_secs(LAST_USED_TOUCH_SECS));
+        if due {
+            entry.last_touch = Some(now);
+        }
+        due
     }
 
     /// Insert a negative (revoked) entry for `key_hash`.
@@ -98,6 +137,7 @@ impl KeyCache {
         let entry = Entry {
             value: CachedKey::Revoked,
             expires_at: Instant::now() + Duration::from_secs(NEG_TTL_SECS),
+            last_touch: None,
         };
         self.inner.lock().put(key_hash.to_string(), entry);
     }
@@ -107,6 +147,7 @@ impl KeyCache {
         let entry = Entry {
             value: CachedKey::NotFound,
             expires_at: Instant::now() + Duration::from_secs(NEG_TTL_SECS),
+            last_touch: None,
         };
         self.inner.lock().put(key_hash.to_string(), entry);
     }
@@ -130,9 +171,9 @@ mod tests {
     #[test]
     fn valid_entry_is_returned() {
         let c = KeyCache::new(16);
-        c.insert_valid("hash1", 100);
+        c.insert_valid("hash1", 100, vec!["read".into()], None);
         match c.get("hash1") {
-            Some(CachedKey::Valid { rate_limit_per_min: 100 }) => {}
+            Some(CachedKey::Valid { rate_limit_per_min: 100, .. }) => {}
             other => panic!("unexpected: {:?}", other),
         }
     }
@@ -154,21 +195,30 @@ mod tests {
     #[test]
     fn invalidate_removes_entry() {
         let c = KeyCache::new(16);
-        c.insert_valid("hash4", 60);
+        c.insert_valid("hash4", 60, vec![], None);
         c.invalidate("hash4");
         assert!(c.get("hash4").is_none());
+    }
+
+    #[test]
+    fn last_used_touch_is_throttled_per_key() {
+        let c = KeyCache::new(16);
+        assert!(!c.should_touch_last_used("missing"));
+        c.insert_valid("t", 60, vec![], None);
+        assert!(c.should_touch_last_used("t"));
+        assert!(!c.should_touch_last_used("t"));
     }
 
     #[test]
     fn capacity_is_enforced_lru() {
         // Cap = 2: inserting a third entry should evict the LRU one.
         let c = KeyCache::new(2);
-        c.insert_valid("a", 10);
-        c.insert_valid("b", 20);
+        c.insert_valid("a", 10, vec![], None);
+        c.insert_valid("b", 20, vec![], None);
         // Touch "a" so "b" becomes LRU.
         c.get("a");
         // Insert "c" — "b" should be evicted.
-        c.insert_valid("c", 30);
+        c.insert_valid("c", 30, vec![], None);
         assert!(c.get("a").is_some(), "a was recently accessed and must survive");
         assert!(c.get("c").is_some(), "c was just inserted");
         // b was LRU and should be gone.

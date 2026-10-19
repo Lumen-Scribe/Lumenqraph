@@ -37,6 +37,7 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
     let lag = (tip - last).max(0);
     let lag_time_secs = lag * 5; // Approximate ~5 seconds per ledger
     let requests = state.http_requests.load(Ordering::Relaxed);
+    let audit_dropped = state.audit_dropped.load(Ordering::Relaxed);
 
     let cache_hits = state.call_cache.hits();
     let cache_misses = state.call_cache.misses();
@@ -91,6 +92,9 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
          # HELP lumenqraph_api_requests_total API requests served\n\
          # TYPE lumenqraph_api_requests_total counter\n\
          lumenqraph_api_requests_total {requests}\n\
+         # HELP lumenqraph_audit_dropped_total Audit events dropped because the writer queue was full\n\
+         # TYPE lumenqraph_audit_dropped_total counter\n\
+         lumenqraph_audit_dropped_total {audit_dropped}\n\
          # HELP lumenqraph_call_cache_hits_total Total cache hits for /call results\n\
          # TYPE lumenqraph_call_cache_hits_total counter\n\
          lumenqraph_call_cache_hits_total {cache_hits}\n\
