@@ -91,6 +91,9 @@ pub struct ApiConfig {
     pub readyz_max_age_secs: i64,
     pub health_max_lag_ledgers: i64,
     pub health_max_stale_secs: i64,
+    /// Require a fresh indexer for `/readyz` (default off, so an indexer stall
+    /// does not take every API replica out of rotation; #579).
+    pub readyz_require_fresh_index: bool,
 
     pub graphql: GraphqlConfig,
 
@@ -156,6 +159,7 @@ impl ApiConfig {
             readyz_max_age_secs: env_parse("READYZ_MAX_AGE_SECS", 120)?,
             health_max_lag_ledgers: env_parse("HEALTH_MAX_LAG_LEDGERS", 100)?,
             health_max_stale_secs: env_parse("HEALTH_MAX_STALE_SECS", 120)?,
+            readyz_require_fresh_index: env_bool("READYZ_REQUIRE_FRESH_INDEX", false)?,
 
             graphql: GraphqlConfig {
                 max_depth: env_parse("GRAPHQL_MAX_DEPTH", 12)?,
@@ -230,6 +234,7 @@ impl ApiConfig {
             readyz_max_age_secs: 120,
             health_max_lag_ledgers: 100,
             health_max_stale_secs: 120,
+            readyz_require_fresh_index: false,
             graphql: GraphqlConfig {
                 max_depth: 12,
                 max_complexity: 1000,
@@ -274,6 +279,7 @@ impl fmt::Debug for ApiConfig {
             .field("readyz_max_age_secs", &self.readyz_max_age_secs)
             .field("health_max_lag_ledgers", &self.health_max_lag_ledgers)
             .field("health_max_stale_secs", &self.health_max_stale_secs)
+            .field("readyz_require_fresh_index", &self.readyz_require_fresh_index)
             .field("graphql", &self.graphql)
             .field(
                 "webhook_encryption_key",
