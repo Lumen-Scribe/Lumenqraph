@@ -8,15 +8,8 @@ use axum::http::header;
 use axum::response::IntoResponse;
 
 use crate::error::ApiResult;
+use crate::metrics_middleware::escape_label_value;
 use crate::state::AppState;
-
-fn percentile(sorted: &[u64], p: f64) -> u64 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    let idx = ((sorted.len() as f64) * p / 100.0).ceil() as usize;
-    sorted[idx.saturating_sub(1)]
-}
 
 pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
     let status: Option<(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
@@ -147,34 +140,29 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
     body.push_str("# TYPE lumenqraph_http_request_duration_ms histogram\n");
     {
         let histograms = state.metrics.histogram_buckets.read();
-        for (key, samples) in histograms.iter() {
-            if samples.is_empty() {
-                continue;
+        for (key, hist) in histograms.iter() {
+            let labels = format!(
+                "route=\"{}\",method=\"{}\"",
+                escape_label_value(&key.route),
+                escape_label_value(&key.method)
+            );
+            for (bound, cumulative) in hist.cumulative() {
+                body.push_str(&format!(
+                    "lumenqraph_http_request_duration_ms_bucket{{{labels},le=\"{bound}\"}} {cumulative}\n"
+                ));
             }
-            let mut sorted = samples.clone();
-            sorted.sort_unstable();
-
-            let p50 = percentile(&sorted, 50.0);
-            let p95 = percentile(&sorted, 95.0);
-            let p99 = percentile(&sorted, 99.0);
-            let count = sorted.len();
-            let sum: u64 = sorted.iter().sum();
-
-            body.push_str(&format!("{key}_bucket{{le=\"0.001\"}} 0\n"));
-            body.push_str(&format!("{key}_bucket{{le=\"0.005\"}} 0\n"));
-            body.push_str(&format!("{key}_bucket{{le=\"0.01\"}} 0\n"));
-            body.push_str(&format!("{key}_bucket{{le=\"0.05\"}} 0\n"));
-            body.push_str(&format!("{key}_bucket{{le=\"0.1\"}} 0\n"));
-            body.push_str(&format!("{key}_bucket{{le=\"0.5\"}} 0\n"));
-            body.push_str(&format!("{key}_bucket{{le=\"1.0\"}} 0\n"));
-            body.push_str(&format!("{key}_bucket{{le=\"5.0\"}} 0\n"));
-            body.push_str(&format!("{key}_bucket{{le=\"10.0\"}} 0\n"));
-            body.push_str(&format!("{key}_bucket{{le=\"+Inf\"}} {count}\n"));
-            body.push_str(&format!("{key}_count {count}\n"));
-            body.push_str(&format!("{key}_sum {sum}\n"));
-            body.push_str(&format!("{key}_p50 {p50}\n"));
-            body.push_str(&format!("{key}_p95 {p95}\n"));
-            body.push_str(&format!("{key}_p99 {p99}\n"));
+            body.push_str(&format!(
+                "lumenqraph_http_request_duration_ms_bucket{{{labels},le=\"+Inf\"}} {}\n",
+                hist.count
+            ));
+            body.push_str(&format!(
+                "lumenqraph_http_request_duration_ms_sum{{{labels}}} {}\n",
+                hist.sum_ms
+            ));
+            body.push_str(&format!(
+                "lumenqraph_http_request_duration_ms_count{{{labels}}} {}\n",
+                hist.count
+            ));
         }
     }
 

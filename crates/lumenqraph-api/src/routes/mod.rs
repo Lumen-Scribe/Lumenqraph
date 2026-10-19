@@ -89,6 +89,11 @@ pub fn router(state: AppState) -> Router {
             "/contracts/:contract_id/simulate",
             post(read::simulate_call),
         )
+        // Re-fetches the WASM from RPC, so it shares the RPC rate limit.
+        .route(
+            "/contracts/:contract_id/refresh",
+            post(contracts::refresh_contract),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             rpc_auth_and_rate_limit,
@@ -108,10 +113,6 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/contracts/:contract_id/interface/diff",
             get(contracts::contract_interface_diff),
-        )
-        .route(
-            "/contracts/:contract_id/refresh",
-            post(contracts::refresh_contract),
         )
         .route(
             "/contracts/:contract_id/state",
@@ -179,10 +180,6 @@ pub fn router(state: AppState) -> Router {
         .route("/webhooks/:id/reenable", post(webhooks::reenable_webhook))
         .route("/webhooks/:id/rotate-secret", post(webhooks::rotate_webhook_secret))
         .route("/webhooks/:id/test", post(webhooks::test_webhook))
-        // GraphQL: POST executes queries, GET serves the GraphiQL IDE. Behind
-        // the same auth + rate-limit middleware as the REST data routes.
-        .route("/graphql", post(graphql_handler).get(graphiql))
-        .layer(Extension(schema))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             webhook_manage_auth_and_rate_limit,
@@ -267,5 +264,22 @@ pub fn router(state: AppState) -> Router {
         )
     } else {
         app
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::router;
+    use crate::state::test_state;
+
+    /// Building the router panics if two merged routers register the same
+    /// path and method (#548), so this fails `cargo test` instead of
+    /// preventing the API from starting. The pool never connects.
+    #[tokio::test]
+    async fn router_builds_without_overlapping_routes() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://test:test@localhost:5432/test")
+            .unwrap();
+        let _app = router(test_state(pool));
     }
 }

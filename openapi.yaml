@@ -574,6 +574,59 @@ paths:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
 
+  /livez:
+    get:
+      operationId: getLivez
+      summary: Process liveness probe.
+      description: Returns 200 while the process is serving requests. Always public.
+      security: []
+      tags: [observability]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /readyz:
+    get:
+      operationId: getReadyz
+      summary: Readiness probe, including database and indexer lag checks.
+      description: Returns 503 when the database is unreachable or the indexer lags beyond the configured threshold. Always public.
+      security: []
+      tags: [observability]
+      responses:
+        "200":
+          description: Ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          description: Not ready.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /metrics:
+    get:
+      operationId: getMetrics
+      summary: Prometheus metrics.
+      description: Public by default. Requires an API key when METRICS_REQUIRE_API_KEY=true.
+      security: []
+      tags: [observability]
+      responses:
+        "200":
+          description: Prometheus text exposition format.
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /contracts:
     get:
       operationId: listContracts
@@ -592,6 +645,104 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "429":
           $ref: "#/components/responses/TooManyRequests"
+
+  /contracts/{contract_id}/refresh:
+    post:
+      operationId: refreshContract
+      summary: Re-fetch a contract's on-chain WASM interface.
+      description: Forces the stored interface to be re-read from RPC, for example after an upgrade the indexer has not yet seen.
+      tags: [contracts]
+      parameters:
+        - $ref: "#/components/parameters/ContractId"
+      responses:
+        "200":
+          description: Refreshed.
+          content:
+            application/json:
+              schema:
+                type: object
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /contracts/{contract_id}/sdk:
+    get:
+      operationId: getContractSdk
+      summary: Generated client source for a contract's interface.
+      tags: [contracts]
+      parameters:
+        - $ref: "#/components/parameters/ContractId"
+        - name: lang
+          in: query
+          required: false
+          description: "Target language: `ts` (default), `python`, or `rust`."
+          schema:
+            type: string
+            enum: [ts, python, rust]
+        - name: version
+          in: query
+          required: false
+          description: Generate from a historical interface version instead of the current one.
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Generated source code.
+          content:
+            text/typescript:
+              schema:
+                type: string
+            text/x-python:
+              schema:
+                type: string
+            text/x-rust:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /contracts/{contract_id}/stats:
+    get:
+      operationId: getContractStats
+      summary: Time-series event statistics for a contract.
+      tags: [contracts]
+      parameters:
+        - $ref: "#/components/parameters/ContractId"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /contracts/{contract_id}/events/stream:
+    get:
+      operationId: streamContractEvents
+      summary: Live events for a contract over Server-Sent Events.
+      description: Emits new events as they are indexed. A keep-alive comment is sent every 15 seconds. Open connections do not block graceful shutdown.
+      tags: [events]
+      parameters:
+        - $ref: "#/components/parameters/ContractId"
+        - name: event_name
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Event stream.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
 
   /contracts/{contract_id}/interface:
     get:
@@ -761,6 +912,86 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/EventsPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /events/{event_id}:
+    get:
+      operationId: getEvent
+      summary: Fetch one event by its id.
+      tags: [events]
+      parameters:
+        - name: event_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventRecord"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /transactions/{tx_hash}/events:
+    get:
+      operationId: listTransactionEvents
+      summary: Events emitted by one transaction, in on-chain order.
+      description: Pages forward with `after` in ascending `(ledger, event_id)` order. Pass the previous response's `next_cursor` to fetch the rest of a transaction with more events than `limit`.
+      tags: [events]
+      parameters:
+        - name: tx_hash
+          in: path
+          required: true
+          description: 64 hexadecimal characters. Matched case-insensitively.
+          schema:
+            type: string
+            pattern: "^[0-9a-fA-F]{64}$"
+        - name: limit
+          in: query
+          required: false
+          description: Events per page (1–1000, default 100).
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+        - name: after
+          in: query
+          required: false
+          description: Opaque cursor from a previous response's `next_cursor`.
+          schema:
+            type: string
+        - name: successful_only
+          in: query
+          required: false
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tx_hash, count, has_more, data]
+                properties:
+                  tx_hash:
+                    type: string
+                  count:
+                    type: integer
+                  has_more:
+                    type: boolean
+                  next_cursor:
+                    type: [string, "null"]
+                    description: Pass as `after` for the next page; null on the last page.
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/EventRecord"
         "400":
           $ref: "#/components/responses/BadRequest"
 
@@ -1035,6 +1266,94 @@ paths:
                 $ref: "#/components/schemas/DeliveriesPage"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /webhooks/{id}/redrive:
+    post:
+      operationId: redriveWebhook
+      summary: Requeue failed deliveries for a webhook.
+      tags: [webhooks]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Redrive scheduled.
+          content:
+            application/json:
+              schema:
+                type: object
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /webhooks/{id}/reenable:
+    post:
+      operationId: reenableWebhook
+      summary: Re-activate a webhook that was disabled after repeated failures.
+      tags: [webhooks]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Webhook re-enabled.
+          content:
+            application/json:
+              schema:
+                type: object
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /webhooks/{id}/rotate-secret:
+    post:
+      operationId: rotateWebhookSecret
+      summary: Issue a new signing secret for a webhook.
+      tags: [webhooks]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: New secret issued. The secret is returned only in this response.
+          content:
+            application/json:
+              schema:
+                type: object
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /webhooks/{id}/test:
+    post:
+      operationId: testWebhook
+      summary: Send a test delivery to a webhook's URL.
+      tags: [webhooks]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Test delivery attempted; the result is in the body.
+          content:
+            application/json:
+              schema:
+                type: object
         "404":
           $ref: "#/components/responses/NotFound"
 

@@ -10,7 +10,6 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::warn;
@@ -250,6 +249,18 @@ fn rate_limited_response(limit: i32, retry_after_secs: Option<u64>, tokens_remai
         response.headers_mut().insert("X-RateLimit-Remaining", val);
     }
 
+    response
+}
+
+/// Response for a request over the per-IP concurrency limit. This is a client-side
+/// limit, so it is a 429 with a retry hint, not a 503, which clients and load
+/// balancers read as the server being unhealthy.
+fn concurrency_limited_response(limit: usize) -> Response {
+    let limit = i32::try_from(limit).unwrap_or(i32::MAX);
+    let mut response = rate_limited_response(limit, Some(1), 0);
+    if let Ok(val) = limit.to_string().parse() {
+        response.headers_mut().insert("X-Concurrency-Limit", val);
+    }
     response
 }
 
@@ -505,28 +516,52 @@ pub async fn concurrency_limit(
     next: Next,
 ) -> Response {
     let client_ip = extract_client_ip(&headers, Some(socket_addr), &state.ip_config);
-    let status = state.concurrency_limiter.acquire(&client_ip, state.max_concurrent_per_ip);
-
-    if !status.allowed {
-        let body = json!({
-            "code": "rate_limited",
-            "error": format!(
-                "too many concurrent requests from this IP (limit: {})",
-                status.limit
-            )
-        });
-        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
-    }
+    let Some(slot) = state
+        .concurrency_limiter
+        .try_acquire(&client_ip, state.max_concurrent_per_ip)
+    else {
+        return concurrency_limited_response(state.max_concurrent_per_ip);
+    };
 
     // Insert the client IP into extensions so release middleware can access it.
     req.extensions_mut().insert(client_ip.clone());
 
+    // The slot is released when `slot` drops. That happens after the response is
+    // produced, or earlier if the timeout layer or a client disconnect cancels this
+    // future, so a cancelled request cannot leak its slot.
     let response = next.run(req).await;
-
-    // Release the slot after request completes.
-    state.concurrency_limiter.release(&client_ip);
+    drop(slot);
 
     response
+}
+
+/// Per-client-IP rate limiting for sibling-instance mounts (#442).
+///
+/// API keys belong to the mounted upstream, not to this instance, so every
+/// caller is limited by IP here; the upstream still applies its own auth and
+/// per-key limits. The resolved IP is handed to the proxy handler, which
+/// appends it to `X-Forwarded-For` so the upstream sees the real client
+/// rather than this proxy's single address.
+pub async fn proxy_rate_limit(
+    State(state): State<AppState>,
+    ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    mut req: Request,
+    next: Next,
+) -> ApiResult<Response> {
+    state.http_requests.fetch_add(1, Ordering::Relaxed);
+
+    let client_ip = extract_client_ip(&headers, Some(socket_addr), &state.ip_config);
+    let rl_status = state
+        .proxy_limiter
+        .check(&format!("proxy:{client_ip}"), state.config.proxy.rate_limit_per_min);
+    if !rl_status.allowed {
+        return Err(ApiError::too_many_requests(rl_status.retry_after_secs));
+    }
+
+    req.extensions_mut()
+        .insert(crate::routes::proxy::ClientIp(client_ip));
+    Ok(next.run(req).await)
 }
 
 #[cfg(test)]
@@ -665,34 +700,6 @@ mod tests {
     }
 }
 
-/// Per-client-IP rate limiting for sibling-instance mounts (#442).
-///
-/// API keys belong to the mounted upstream, not to this instance, so every
-/// caller is limited by IP here; the upstream still applies its own auth and
-/// per-key limits. The resolved IP is handed to the proxy handler, which
-/// appends it to `X-Forwarded-For` so the upstream sees the real client
-/// rather than this proxy's single address.
-pub async fn proxy_rate_limit(
-    State(state): State<AppState>,
-    ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    mut req: Request,
-    next: Next,
-) -> ApiResult<Response> {
-    state.http_requests.fetch_add(1, Ordering::Relaxed);
-
-    let client_ip = extract_client_ip(&headers, Some(socket_addr), &state.ip_config);
-    let rl_status = state
-        .proxy_limiter
-        .check(&format!("proxy:{client_ip}"), state.config.proxy.rate_limit_per_min);
-    if !rl_status.allowed {
-        return Err(ApiError::too_many_requests(rl_status.retry_after_secs));
-    }
-
-    req.extensions_mut()
-        .insert(crate::routes::proxy::ClientIp(client_ip));
-    Ok(next.run(req).await)
-}
 
 // ---- HTTP-level integration tests ----------------------------------------
 //
@@ -707,7 +714,7 @@ pub async fn proxy_rate_limit(
 // schema, which would race with any parallel test.
 
 #[cfg(test)]
-mod integration_tests {
+pub(crate) mod integration_tests {
     use std::net::SocketAddr;
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
@@ -726,7 +733,7 @@ mod integration_tests {
 
     // ---- test fixtures ----
 
-    async fn db_pool() -> PgPool {
+    pub(crate) async fn db_pool() -> PgPool {
         let url =
             std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL must be set");
         let pool = PgPoolOptions::new()
@@ -747,7 +754,7 @@ mod integration_tests {
         pool
     }
 
-    fn make_state(pool: PgPool, require_auth: bool, anon_rate: i32) -> AppState {
+    pub(crate) fn make_state(pool: PgPool, require_auth: bool, anon_rate: i32) -> AppState {
         use crate::concurrency_limit::ConcurrencyLimiter;
         use crate::metrics_middleware::MetricsCollector;
         use crate::call_cache::CallCache;
@@ -783,7 +790,7 @@ mod integration_tests {
             metrics_require_auth: false,
             proxy_limiter: Arc::new(RateLimiter::new()),
             config: Arc::new(crate::config::ApiConfig::test_default()),
-            key_cache: Arc::new(KeyCache::new(256)),
+            key_cache: Arc::new(KeyCache::new(256, std::time::Duration::from_secs(30), std::time::Duration::from_secs(5))),
             ip_config: IpConfig { trusted_proxy_hops: 0, platform_header: None },
             audit_tx: None,
             audit_dropped: Arc::new(AtomicU64::new(0)),
@@ -791,7 +798,7 @@ mod integration_tests {
         }
     }
 
-    async fn spawn_server(state: AppState) -> String {
+    pub(crate) async fn spawn_server(state: AppState) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");

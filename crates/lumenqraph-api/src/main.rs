@@ -23,6 +23,7 @@ mod specs;
 mod state;
 mod url_validation;
 
+use std::future::IntoFuture;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,6 +45,63 @@ use rate_limit::RateLimiter;
 use read_cost_limit::ReadCostLimitConfig;
 use state::{AppState, BuildInfo};
 
+
+fn version_string() -> String {
+    format!(
+        "lumenqraph-api {}\ncommit: {}\nbuilt: {}",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("LUMENQRAPH_GIT_SHA").unwrap_or("unknown"),
+        option_env!("LUMENQRAPH_BUILD_TIME").unwrap_or("unknown"),
+    )
+}
+
+/// CORS for the configured allowlist. `CORS_ALLOWED_ORIGINS` was validated by
+/// `ApiConfig::from_env`, so an invalid entry cannot reach this point (#581).
+fn build_cors_layer(origins_str: &str) -> tower_http::cors::CorsLayer {
+    use tower_http::cors::CorsLayer;
+
+    if origins_str.trim() == "*" {
+        info!("CORS: allowing all origins (permissive mode)");
+        return CorsLayer::permissive();
+    }
+    let origins = config::parse_cors_origins(origins_str).expect("validated by ApiConfig::from_env");
+    if origins.is_empty() {
+        info!("CORS: no allowed origins configured; browsers will enforce same-origin policy");
+        return CorsLayer::new();
+    }
+    info!(origins = ?origins, "CORS: allowing configured origins");
+    let allowed: Vec<http::HeaderValue> = origins
+        .iter()
+        .map(|origin| http::HeaderValue::from_str(origin).expect("origin is a valid header value"))
+        .collect();
+
+    CorsLayer::new()
+        .allow_origin(allowed)
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::PATCH,
+            axum::http::Method::OPTIONS,
+            axum::http::Method::DELETE,
+        ])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::IF_NONE_MATCH,
+            http::HeaderName::from_static("x-api-key"),
+            http::HeaderName::from_static("x-request-id"),
+        ])
+        .expose_headers([
+            http::HeaderName::from_static("x-request-id"),
+            http::HeaderName::from_static("retry-after"),
+            http::HeaderName::from_static("x-ratelimit-limit"),
+            http::HeaderName::from_static("x-ratelimit-remaining"),
+            http::HeaderName::from_static("etag"),
+            http::HeaderName::from_static("deprecation"),
+            http::HeaderName::from_static("link"),
+        ])
+        .max_age(Duration::from_secs(600))
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -124,6 +182,10 @@ async fn main() -> anyhow::Result<()> {
             .to_string(),
     });
 
+    // Cancelled by `shutdown_signal`; long-lived SSE streams watch it so they end
+    // promptly instead of holding graceful shutdown until the hard timeout (#571).
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
     let state = AppState {
         pool,
         require_auth: config.require_auth,
@@ -152,16 +214,21 @@ async fn main() -> anyhow::Result<()> {
         metrics_require_auth: config.metrics_require_auth,
         proxy_limiter: Arc::new(RateLimiter::new()),
         config: Arc::clone(&config),
-        key_cache: Arc::new(KeyCache::new(2000)),
+        key_cache: Arc::new(KeyCache::new(
+            config.api_key_cache_capacity,
+            std::time::Duration::from_secs(config.api_key_cache_ttl_secs),
+            std::time::Duration::from_secs(config.api_key_cache_neg_ttl_secs),
+        )),
         ip_config: auth::IpConfig::from_env(),
         audit_tx: None,
         audit_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        event_fanout: Arc::new(routes::stream::EventFanout::new()),
-        shutdown: tokio_util::sync::CancellationToken::new(),
+        shutdown: shutdown.clone(),
     };
 
-    // One LISTEN connection for all SSE clients (#569).
-    routes::stream::spawn_listener(state.clone(), state.event_fanout.clone());
+    // Resolve the RPC network passphrase in the background so /health never
+    // waits on the RPC (#578).
+    let rpc = state.rpc.clone();
+    tokio::spawn(async move { rpc.warm_network_passphrase().await });
 
     let bind_addr = config.bind_addr.clone();
     let max_body_bytes = config.max_body_bytes;
@@ -182,22 +249,23 @@ async fn main() -> anyhow::Result<()> {
     info!(addr = %bind_addr, "lumenqraph api listening");
 
     let shutdown_timeout_secs = config.shutdown_timeout_secs;
+    let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
     let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(shutdown_timeout_secs));
+    .with_graceful_shutdown(async move {
+        shutdown_signal(shutdown_timeout_secs).await;
+        let _ = drain_started_tx.send(());
+    })
+    .into_future();
 
-    // Wrap the graceful shutdown in a hard timeout so a slow or stuck client
-    // cannot keep the process alive indefinitely during a rolling restart.
-    match tokio::time::timeout(
-        Duration::from_secs(shutdown_timeout_secs),
-        server,
-    )
-    .await
-    {
-        Ok(result) => result?,
-        Err(_) => {
+    // Bound the drain, not the server's lifetime: the hard deadline starts only
+    // once a shutdown signal has arrived. A slow or stuck client cannot keep the
+    // process alive during a rolling restart, and the API serves until signalled.
+    tokio::select! {
+        result = server => result?,
+        _ = force_exit_after_drain(drain_started_rx, shutdown_timeout_secs) => {
             info!(
                 timeout_secs = shutdown_timeout_secs,
                 "shutdown timeout reached; forcing exit"
@@ -205,6 +273,20 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Resolves `timeout_secs` after the shutdown signal, and never before it. If
+/// the server stops without a signal, the sender is dropped and this stays
+/// pending, so the server's own result is what `main` returns.
+async fn force_exit_after_drain(
+    drain_started: tokio::sync::oneshot::Receiver<()>,
+    timeout_secs: u64,
+) {
+    if drain_started.await.is_ok() {
+        tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
 }
 
 async fn shutdown_signal(shutdown_timeout_secs: u64) {
@@ -226,6 +308,8 @@ async fn shutdown_signal(shutdown_timeout_secs: u64) {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
+    // End long-lived streams now so axum's graceful shutdown can finish.
+    shutdown.cancel();
     info!(
         "shutdown signal received; draining in-flight requests (up to {}s)",
         shutdown_timeout_secs
@@ -306,5 +390,30 @@ mod tests {
                 "a G-strkey mixed with a valid C-strkey should be rejected: {err}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_deadline {
+    use std::time::Duration;
+
+    use super::force_exit_after_drain;
+
+    /// The hard deadline must not run while the API is serving normally, or it
+    /// exits 30s after boot (the bug this guards against).
+    #[tokio::test]
+    async fn deadline_does_not_fire_without_a_shutdown_signal() {
+        let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let fired = tokio::time::timeout(Duration::from_millis(50), force_exit_after_drain(rx, 0)).await;
+        assert!(fired.is_err(), "deadline fired before any shutdown signal");
+    }
+
+    #[tokio::test]
+    async fn deadline_fires_once_the_signal_has_arrived() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), force_exit_after_drain(rx, 0))
+            .await
+            .expect("deadline should fire after the signal");
     }
 }
