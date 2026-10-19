@@ -61,7 +61,7 @@ primary_region = "iad"
     timeout = "5s"
     grace_period = "30s"
     method = "GET"
-    path = "/health"
+    path = "/livez"
 
 # Resource allocation: the indexer does more work (WASM parsing, event decode,
 # state snapshots) than the stateless api and webhooks. Memory limits prevent

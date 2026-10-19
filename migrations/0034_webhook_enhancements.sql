@@ -9,21 +9,21 @@
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- Auto-disable bookkeeping for webhook endpoints.
-ALTER TABLE webhook_endpoints
+ALTER TABLE webhook_subscriptions
     ADD COLUMN IF NOT EXISTS consecutive_failures INTEGER NOT NULL DEFAULT 0;
 
-ALTER TABLE webhook_endpoints
+ALTER TABLE webhook_subscriptions
     ADD COLUMN IF NOT EXISTS disabled_at TIMESTAMPTZ;
 
-ALTER TABLE webhook_endpoints
+ALTER TABLE webhook_subscriptions
     ADD COLUMN IF NOT EXISTS disabled_reason TEXT;
 
 -- Monotonic sequence used to order deliveries per endpoint.
-ALTER TABLE webhook_endpoints
+ALTER TABLE webhook_subscriptions
     ADD COLUMN IF NOT EXISTS starting_seq BIGINT NOT NULL DEFAULT 0;
 
 -- Encrypted signing secret storage.
-ALTER TABLE webhook_endpoints
+ALTER TABLE webhook_subscriptions
     ADD COLUMN IF NOT EXISTS encrypted_secret BYTEA;
 
 -- Numeric representation of token transfer amounts for precise arithmetic.

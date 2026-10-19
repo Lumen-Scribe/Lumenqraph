@@ -7,7 +7,7 @@
 -- under the old version number are unaffected.
 
 -- #423: monotonic sequence for ordering deliveries within a subscription.
-ALTER TABLE webhook_deliveries
+ALTER TABLE webhook_subscriptions
     ADD COLUMN IF NOT EXISTS backfill_seq BIGINT;
 
 -- #426: record the last delivery status code and a short response snippet

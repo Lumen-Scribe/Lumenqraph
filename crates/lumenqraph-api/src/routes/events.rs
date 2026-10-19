@@ -37,15 +37,18 @@ pub struct EventsQuery {
     since: Option<String>,
     /// Optional time range filter: maximum timestamp (RFC3339).
     until: Option<String>,
-    /// Optional topic filter: filter by decoded_topics[0] value (e.g., topic0=transfer).
+    /// Optional topic filter: match decoded_topics[0]. A bare value such as
+    /// `topic0=transfer` is a string; a value starting with `"`, `[` or `{` must be
+    /// JSON, e.g. `topic0=%22transfer%22`.
     topic0: Option<String>,
-    /// Optional topic filter: filter by decoded_topics[1] value.
+    /// Optional topic filter: match decoded_topics[1]. Same format as `topic0`.
     topic1: Option<String>,
-    /// Optional topic filter: filter by decoded_topics[2] value.
+    /// Optional topic filter: match decoded_topics[2]. Same format as `topic0`.
     topic2: Option<String>,
-    /// Optional topic filter: filter by decoded_topics[3] value.
+    /// Optional topic filter: match decoded_topics[3]. Same format as `topic0`.
     topic3: Option<String>,
-    /// Optional parameter filter: filter by parameter name:value (e.g., from=GXXXX).
+    /// Optional parameter filter as `name:value`, e.g. `param=from:GXXXX`. The name
+    /// is split at the first `:`, so the value may contain colons.
     param: Option<String>,
     /// Optional filter to return only events from successful contract calls (default: false, returns all).
     successful_only: Option<bool>,
@@ -53,6 +56,41 @@ pub struct EventsQuery {
 
 fn default_limit() -> i64 {
     50
+}
+
+/// Parse a `topicN` filter into the JSON literal compared with `decoded_topics -> N`.
+///
+/// A value starting with `"`, `[` or `{` must be valid JSON. Any other value is a
+/// bare string and is matched as a JSON string, so `topic0=transfer` works without
+/// quoting. Numbers are strings too: `topic2=1000` matches the string `"1000"`,
+/// which is how i128 amounts are encoded.
+fn parse_topic_filter(raw: Option<&str>) -> ApiResult<Option<String>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let value = if raw.starts_with(['"', '[', '{']) {
+        serde_json::from_str::<serde_json::Value>(raw)
+            .map_err(|_| ApiError::bad_request("topic filter is not valid JSON"))?
+    } else {
+        serde_json::Value::String(raw.to_string())
+    };
+    Ok(Some(value.to_string()))
+}
+
+/// Parse the `param` filter (`name:value`) into a JSON object for `enriched @>`.
+fn parse_param_filter(raw: Option<&str>) -> ApiResult<Option<String>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let (name, value) = raw
+        .split_once(':')
+        .filter(|(name, _)| !name.is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request("param must be in the form name:value, e.g. param=from:GABC...")
+        })?;
+    let mut object = serde_json::Map::new();
+    object.insert(name.to_string(), serde_json::Value::String(value.to_string()));
+    Ok(Some(serde_json::Value::Object(object).to_string()))
 }
 
 /// Response envelope for `GET /contracts/:contract_id/events`.
@@ -64,6 +102,12 @@ pub async fn list_events(
     Query(q): Query<EventsQuery>,
 ) -> ApiResult<Json<EventsResponse>> {
     let limit = q.limit.clamp(1, 1000);
+
+    let topic0 = parse_topic_filter(q.topic0.as_deref())?;
+    let topic1 = parse_topic_filter(q.topic1.as_deref())?;
+    let topic2 = parse_topic_filter(q.topic2.as_deref())?;
+    let topic3 = parse_topic_filter(q.topic3.as_deref())?;
+    let param = parse_param_filter(q.param.as_deref())?;
 
     let page = PageRequest::<LedgerCursor>::parse(q.limit, 1000, q.offset, q.after.as_deref())?;
     let (after_ledger, after_event_id) = match page.after {
@@ -117,15 +161,12 @@ pub async fn list_events(
            AND ($4::bigint IS NULL OR ledger <= $4)
            AND ($5::timestamp IS NULL OR ledger_closed_at >= $5)
            AND ($6::timestamp IS NULL OR ledger_closed_at <= $6)
-           -- Topic filtering: decoded_topics is a JSONB array. To filter by position,
-           -- we use JSONB containment (@>) with null padding. For example, to match
-           -- decoded_topics[1], we build an array [null, value] and check containment.
-           -- This works because JSONB containment checks if the right side is a subset
-           -- of the left side, preserving position for array elements.
-           AND ($7::text IS NULL OR decoded_topics @> jsonb_build_array($7::jsonb))
-           AND ($8::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, $8::jsonb))
-           AND ($9::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, $9::jsonb))
-           AND ($10::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, jsonb_null::jsonb, $10::jsonb))
+           -- Topic filtering matches the value at an exact position: `-> n` reads
+           -- decoded_topics[n] as jsonb, so `topic1` only matches index 1.
+           AND ($7::text IS NULL OR (decoded_topics -> 0) = $7::jsonb)
+           AND ($8::text IS NULL OR (decoded_topics -> 1) = $8::jsonb)
+           AND ($9::text IS NULL OR (decoded_topics -> 2) = $9::jsonb)
+           AND ($10::text IS NULL OR (decoded_topics -> 3) = $10::jsonb)
            AND ($11::text IS NULL OR enriched @> ($11::jsonb))
            AND ($15::boolean IS NULL OR in_successful_call = $15)
            AND ($12::bigint IS NULL OR ledger < $12 OR (ledger = $12 AND event_id < $13))
@@ -138,11 +179,11 @@ pub async fn list_events(
     .bind(q.to_ledger)
     .bind(since_datetime)
     .bind(until_datetime)
-    .bind(&q.topic0)
-    .bind(&q.topic1)
-    .bind(&q.topic2)
-    .bind(&q.topic3)
-    .bind(&q.param)
+    .bind(&topic0)
+    .bind(&topic1)
+    .bind(&topic2)
+    .bind(&topic3)
+    .bind(&param)
     .bind(after_ledger)
     .bind(after_event_id)
     .bind(page.fetch_limit())
@@ -184,14 +225,45 @@ pub async fn get_event(
 /// `GET /transactions/:tx_hash/events` — all indexed events for a transaction.
 ///
 /// Returns events ordered by `(ledger ASC, event_id ASC)` — the same order
-/// they were emitted on-chain. Supports an optional `limit` query parameter
-/// (1–1000, default 100).
+/// they were emitted on-chain. Paginates with the same keyset `after` cursor
+/// as the other event lists: pass the previous response's `next_cursor` to
+/// fetch the rest of a transaction with more events than `limit`.
+///
+/// `tx_hash` must be 64 hexadecimal characters and is matched case-insensitively
+/// (it is normalised to lowercase); anything else is rejected with `400`.
 pub async fn transaction_events(
     State(state): State<AppState>,
     Path(tx_hash): Path<String>,
     Query(q): Query<TxEventsQuery>,
 ) -> ApiResult<Json<TxEventsResponse>> {
-    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let tx_hash = normalize_tx_hash(&tx_hash)?;
+    let page = PageRequest::<LedgerCursor>::parse(
+        q.limit.unwrap_or(100),
+        1000,
+        0,
+        q.after.as_deref(),
+    )?;
+    let page = page_transaction_events(&state.pool, &tx_hash, &page, q.successful_only).await?;
+    Ok(Json(TxEventsResponse {
+        tx_hash,
+        count: page.data.len(),
+        has_more: page.has_more,
+        next_cursor: page.next_cursor,
+        data: page.data,
+    }))
+}
+
+/// One keyset page of a transaction's events, ordered `(ledger, event_id)` ascending.
+async fn page_transaction_events(
+    pool: &sqlx::PgPool,
+    tx_hash: &str,
+    request: &PageRequest<LedgerCursor>,
+    successful_only: Option<bool>,
+) -> ApiResult<Page<EventRow>> {
+    let (after_ledger, after_event_id) = match request.after {
+        Some(ref c) => (Some(c.ledger), Some(c.event_id.as_str())),
+        None => (None, None),
+    };
 
     let events: Vec<EventRow> = sqlx::query_as(
         "SELECT event_id, contract_id, ledger, ledger_closed_at, event_type,
@@ -199,35 +271,39 @@ pub async fn transaction_events(
                 enriched, tx_hash, in_successful_call, paging_token, created_at
          FROM events
          WHERE tx_hash = $1
-           AND ($3::boolean IS NULL OR in_successful_call = $3)
+           AND ($2::boolean IS NULL OR in_successful_call = $2)
+           AND ($3::bigint IS NULL OR ledger > $3 OR (ledger = $3 AND event_id > $4))
          ORDER BY ledger ASC, event_id ASC
-         LIMIT $2",
+         LIMIT $5",
     )
-    .bind(&tx_hash)
-    .bind(limit + 1)
-    .bind(q.successful_only)
-    .fetch_all(&state.pool)
+    .bind(tx_hash)
+    .bind(successful_only)
+    .bind(after_ledger)
+    .bind(after_event_id)
+    .bind(request.fetch_limit())
+    .fetch_all(pool)
     .await?;
 
-    let has_more = events.len() as i64 > limit;
-    let result_events = if has_more {
-        events.into_iter().take(limit as usize).collect()
-    } else {
-        events
-    };
+    Ok(request.finish(events, |e| LedgerCursor::new(e.ledger, &e.event_id)))
+}
 
-    Ok(Json(TxEventsResponse {
-        tx_hash,
-        count: result_events.len(),
-        has_more,
-        data: result_events,
-    }))
+/// Validate a transaction hash and normalise it to lowercase hex.
+fn normalize_tx_hash(raw: &str) -> ApiResult<String> {
+    if raw.len() == 64 && raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(raw.to_ascii_lowercase())
+    } else {
+        Err(ApiError::bad_request(
+            "tx_hash must be 64 hexadecimal characters",
+        ))
+    }
 }
 
 #[derive(Deserialize)]
 pub struct TxEventsQuery {
     /// Maximum events to return (1–1000, default 100).
     limit: Option<i64>,
+    /// Opaque cursor from a previous response's `next_cursor`.
+    after: Option<String>,
     /// Optional filter to return only events from successful contract calls (default: false, returns all).
     successful_only: Option<bool>,
 }
@@ -240,6 +316,84 @@ pub struct TxEventsResponse {
     pub count: usize,
     /// Whether there are more results available (if limit was reached).
     pub has_more: bool,
+    /// Opaque cursor to pass as `after` for the next page; null on the last page.
+    pub next_cursor: Option<String>,
     /// The event rows, ordered by ledger and event_id ascending.
     pub data: Vec<EventRow>,
+}
+
+#[cfg(test)]
+mod tests {
+    //! Needs a migrated throwaway database. Run with:
+    //!
+    //!   TEST_DATABASE_URL=postgres://… cargo test -p lumenqraph-api -- --ignored
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use serde_json::Value;
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+
+    use super::list_events;
+    use crate::state::test_state;
+
+    const CONTRACT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+    const EVENT_ID: &str = "api-test-list-events-topics";
+
+    async fn count_events(app: &Router, query: &str) -> usize {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/contracts/{CONTRACT}/events?{query}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "query `{query}` must not fail");
+
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        body["data"].as_array().expect("`data` array").len()
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn list_events_returns_200_with_and_without_topic_filters() {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
+        let pool = PgPool::connect(&url).await.unwrap();
+
+        sqlx::query("DELETE FROM events WHERE event_id = $1")
+            .bind(EVENT_ID)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO events
+                (event_id, contract_id, ledger, ledger_closed_at, event_type, topics,
+                 decoded_topics, event_name, value, tx_hash, in_successful_call, paging_token)
+             VALUES ($1, $2, 1, now(), 'contract', '[]',
+                     '[\"transfer\", \"GABC\"]', 'transfer', '', 'tx', true, 'p1')",
+        )
+        .bind(EVENT_ID)
+        .bind(CONTRACT)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = Router::new()
+            .route("/contracts/:contract_id/events", get(list_events))
+            .with_state(test_state(pool.clone()));
+
+        assert_eq!(count_events(&app, "").await, 1);
+        assert_eq!(count_events(&app, "topic0=%22transfer%22").await, 1);
+        assert_eq!(count_events(&app, "topic1=%22GABC%22").await, 1);
+        assert_eq!(count_events(&app, "topic1=%22NOPE%22").await, 0);
+        assert_eq!(count_events(&app, "topic2=%22GABC%22").await, 0);
+
+        sqlx::query("DELETE FROM events WHERE event_id = $1")
+            .bind(EVENT_ID)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
 }

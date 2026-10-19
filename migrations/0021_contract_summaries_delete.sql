@@ -124,4 +124,3 @@ CREATE TRIGGER trg_update_contract_summary
 AFTER INSERT OR UPDATE OR DELETE ON events
 FOR EACH ROW
 EXECUTE FUNCTION update_contract_summary();
-</｜｜DSML｜｜ parameter>

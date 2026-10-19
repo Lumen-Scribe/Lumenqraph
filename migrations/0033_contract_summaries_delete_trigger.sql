@@ -6,21 +6,21 @@
 CREATE OR REPLACE FUNCTION update_contract_summary() RETURNS TRIGGER AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
-        INSERT INTO contract_summaries (contract_id, total_events, first_event_at, last_event_at)
+        INSERT INTO contract_summaries (contract_id, event_count, first_seen_ledger, last_seen_ledger)
         SELECT contract_id, COUNT(*), MIN(ledger), MAX(ledger)
         FROM new_events
         GROUP BY contract_id
         ON CONFLICT (contract_id) DO UPDATE SET
-            total_events = contract_summaries.total_events + EXCLUDED.total_events,
-            first_event_at = LEAST(contract_summaries.first_event_at, EXCLUDED.first_event_at),
-            last_event_at = GREATEST(contract_summaries.last_event_at, EXCLUDED.last_event_at);
+            event_count = contract_summaries.event_count + EXCLUDED.event_count,
+            first_seen_ledger = LEAST(contract_summaries.first_seen_ledger, EXCLUDED.first_seen_ledger),
+            last_seen_ledger = GREATEST(contract_summaries.last_seen_ledger, EXCLUDED.last_seen_ledger);
         RETURN NULL;
     ELSIF TG_OP = 'DELETE' THEN
         UPDATE contract_summaries cs
-        SET total_events = GREATEST(cs.total_events - d.deleted_count, 0),
-            last_event_at = COALESCE(
+        SET event_count = GREATEST(cs.event_count - d.deleted_count, 0),
+            last_seen_ledger = COALESCE(
                 (SELECT MAX(ledger) FROM events e WHERE e.contract_id = cs.contract_id),
-                cs.first_event_at
+                cs.first_seen_ledger
             )
         FROM (
             SELECT contract_id, COUNT(*) AS deleted_count

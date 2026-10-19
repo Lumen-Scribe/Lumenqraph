@@ -174,6 +174,7 @@ pub struct ErrorCase {
 #[derive(Debug, Clone, Serialize)]
 pub struct UdtErrorEnum {
     pub name: String,
+    pub doc: String,
     pub cases: Vec<ErrorCase>,
 }
 
@@ -487,6 +488,7 @@ impl ContractSpec {
             // to map `Error(Contract, #N)` to the declared case name.
             ScSpecEntry::UdtErrorEnumV0(e) => {
                 let name = string_of(&e.name);
+                let doc = string_of(&e.doc);
                 let cases: Vec<ErrorCase> = e
                     .cases
                     .iter()
@@ -498,11 +500,12 @@ impl ContractSpec {
                     .collect();
                 self.error_enums.push(UdtErrorEnum {
                     name: name.clone(),
+                    doc: doc.clone(),
                     cases: cases.clone(),
                 });
                 // Mirror into `errors`, the shape the interface JSON and diff
-                // consume (name + cases).
-                self.errors.push(UdtErrorEnum { name, cases });
+                // consume (name + doc + cases).
+                self.errors.push(UdtErrorEnum { name, doc, cases });
             }
         }
     }
