@@ -13,8 +13,10 @@
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::Extension;
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26,6 +28,7 @@ use tracing::{info, warn};
 
 use crate::error::ApiResult;
 use crate::extract::ValidContractId;
+use crate::request_id::RequestId;
 use crate::state::AppState;
 
 /// Maximum number of concurrent SSE streams allowed globally.
@@ -209,6 +212,7 @@ struct StreamState {
     rx: broadcast::Receiver<BroadcastEvent>,
     poll_secs: u64,
     last_ledger: i64,
+    request_id: String,
 }
 
 impl StreamState {
@@ -242,12 +246,33 @@ fn parse_last_event_id(value: &str) -> Option<Cursor> {
     })
 }
 
+/// Build the SSE `error` frame sent when a poll fails. It carries only a generic
+/// code and the request ID; driver error text is logged server-side and never
+/// reaches the client.
+fn error_frame_data(request_id: &str) -> String {
+    json!({ "code": "internal_error", "request_id": request_id }).to_string()
+}
+
+/// Log a failed poll, back off for one poll interval so a broken database is not
+/// retried in a hot loop, and return the sanitized error frame.
+async fn fetch_error_event(e: &crate::error::ApiError, request_id: &str, poll_secs: u64) -> Event {
+    tracing::error!(error = %e, request_id, "error fetching events");
+    sleep(Duration::from_secs(poll_secs)).await;
+    Event::default()
+        .event("error")
+        .data(error_frame_data(request_id))
+}
+
 pub async fn stream_events(
     State(state): State<AppState>,
     ValidContractId(contract_id): ValidContractId,
     Query(q): Query<StreamQuery>,
     headers: HeaderMap,
+    request_id: Option<Extension<RequestId>>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
+    let request_id = request_id
+        .map(|Extension(id)| id.0.to_string())
+        .unwrap_or_default();
     // Validate poll interval (min 1 second, max 60 seconds)
     let poll_secs = q.poll_interval.clamp(1, 60);
 
@@ -297,6 +322,7 @@ pub async fn stream_events(
         rx,
         poll_secs,
         last_ledger,
+        request_id,
     };
 
     // Create the stream. The unfold state carries a buffer of already-fetched
@@ -356,11 +382,9 @@ pub async fn stream_events(
                             }
                         }
                         Err(e) => {
-                            tracing::error!(error = %e, "error fetching events");
-                            return Some((
-                                Ok(Event::default().comment(format!("error: {}", e))),
-                                st,
-                            ));
+                            let frame =
+                                fetch_error_event(&e, &st.request_id, st.poll_secs).await;
+                            return Some((Ok(frame), st));
                         }
                     }
                 }
@@ -386,11 +410,9 @@ pub async fn stream_events(
                             }
                         }
                         Err(e) => {
-                            tracing::error!(error = %e, "error fetching events");
-                            return Some((
-                                Ok(Event::default().comment(format!("error: {}", e))),
-                                st,
-                            ));
+                            let frame =
+                                fetch_error_event(&e, &st.request_id, st.poll_secs).await;
+                            return Some((Ok(frame), st));
                         }
                     }
                 }
@@ -401,6 +423,30 @@ pub async fn stream_events(
     // Emit a keep-alive comment at least every 15 s so idle streams aren't
     // closed by proxies/load balancers with 60–100 s idle timeouts.
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #570 — SSE error frames must not leak driver or infrastructure error text.
+    #[test]
+    fn error_frame_carries_only_code_and_request_id() {
+        let data: serde_json::Value =
+            serde_json::from_str(&error_frame_data("req-123")).unwrap();
+        assert_eq!(data["code"], "internal_error");
+        assert_eq!(data["request_id"], "req-123");
+        assert_eq!(data.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn error_frame_never_contains_driver_error_text() {
+        let driver_error = "connection to server at 10.0.3.4 failed: relation \"events\" does not exist";
+        let data = error_frame_data("req-456");
+        assert!(!data.contains("10.0.3.4"));
+        assert!(!data.contains("relation"));
+        assert!(!data.contains(driver_error));
+    }
 }
 
 /// Resolve the current head of the event log for a contract, used as the
