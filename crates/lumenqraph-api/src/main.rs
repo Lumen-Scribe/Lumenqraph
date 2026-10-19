@@ -159,6 +159,11 @@ async fn main() -> anyhow::Result<()> {
         shutdown: tokio_util::sync::CancellationToken::new(),
     };
 
+    // Resolve the RPC network passphrase in the background so /health never
+    // waits on the RPC (#578).
+    let rpc = state.rpc.clone();
+    tokio::spawn(async move { rpc.warm_network_passphrase().await });
+
     let bind_addr = config.bind_addr.clone();
     let max_body_bytes = config.max_body_bytes;
     let request_timeout_secs = config.request_timeout_secs;

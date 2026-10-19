@@ -16,10 +16,10 @@ pub async fn health(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     .fetch_optional(&state.pool)
     .await?;
 
-    // Which network this deployment indexes, from the RPC itself (cached after
-    // the first successful probe) — lets clients like the explorer adapt
-    // instead of asking the user. `null` if the RPC is unreachable right now.
-    let passphrase = state.rpc.network_passphrase().await;
+    // Which network this deployment indexes, from the RPC itself. Resolved in
+    // the background at startup (never on this request path), so `null` until
+    // the first successful probe — an RPC outage cannot slow or fail /health.
+    let passphrase = state.rpc.cached_network_passphrase();
     let network = passphrase.as_deref().map(network_name);
     // Sibling instances mounted under this origin (e.g. {"testnet": "/testnet"})
     // so clients can discover other networks without configuration.
