@@ -3,7 +3,7 @@
 //! Exposes a `/metrics` endpoint on its own port for Prometheus scraping.
 
 use axum::extract::State;
-use axum::http::header;
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -17,13 +17,69 @@ use tracing::{error, info};
 
 use crate::dispatcher::PENDING_DELIVERIES;
 
+/// Default bind address for the webhook metrics listener.
+///
+/// Loopback-only by default so operational telemetry (backlog depth, failure
+/// rates) is not exposed on hosts with public interfaces. Set
+/// `WEBHOOKS_METRICS_BIND_ADDR` to `0.0.0.0:9091` (or a private network
+/// address) when Prometheus scrapes from another host.
+pub const DEFAULT_METRICS_BIND_ADDR: &str = "127.0.0.1:9091";
+
 #[derive(Clone)]
 pub struct MetricsState {
     pub pool: Arc<PgPool>,
+    /// Optional bearer token required on `/metrics` when set.
+    pub auth_token: Option<Arc<String>>,
+}
+
+impl MetricsState {
+    /// Returns true when the request is authorized to read `/metrics`.
+    ///
+    /// When no token is configured the endpoint is open (relying on the
+    /// loopback-by-default bind for protection).
+    fn authorized(&self, headers: &HeaderMap) -> bool {
+        let Some(expected) = self.auth_token.as_deref() else {
+            return true;
+        };
+        let Some(value) = headers.get(header::AUTHORIZATION) else {
+            return false;
+        };
+        let Ok(value) = value.to_str() else {
+            return false;
+        };
+        let Some(token) = value.strip_prefix("Bearer ") else {
+            return false;
+        };
+        constant_time_eq(token.as_bytes(), expected.as_bytes())
+    }
+}
+
+/// Constant-time byte comparison to avoid leaking the token via timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 pub async fn start_metrics_server(pool: Arc<PgPool>, bind_addr: &str) -> anyhow::Result<()> {
-    let state = MetricsState { pool };
+    start_metrics_server_with_token(pool, bind_addr, None).await
+}
+
+/// Start the metrics listener, optionally requiring a bearer token on `/metrics`.
+pub async fn start_metrics_server_with_token(
+    pool: Arc<PgPool>,
+    bind_addr: &str,
+    auth_token: Option<String>,
+) -> anyhow::Result<()> {
+    let state = MetricsState {
+        pool,
+        auth_token: auth_token.map(Arc::new),
+    };
 
     let app = Router::new()
         .route("/health", get(health))
@@ -81,7 +137,15 @@ async fn health(State(state): State<MetricsState>) -> impl IntoResponse {
     }
 }
 
-async fn metrics(State(state): State<MetricsState>) -> impl IntoResponse {
+async fn metrics(State(state): State<MetricsState>, headers: HeaderMap) -> impl IntoResponse {
+    if !state.authorized(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            String::from("unauthorized\n"),
+        );
+    }
+
     let mut body = String::new();
 
     // Emitted unconditionally, straight from the atomic the dispatcher refreshes
@@ -146,7 +210,10 @@ async fn metrics(State(state): State<MetricsState>) -> impl IntoResponse {
         }
     }
 
-    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        body,
+    )
 }
 
 struct WebhookMetrics {
@@ -205,4 +272,56 @@ async fn gather_metrics(pool: &PgPool) -> anyhow::Result<WebhookMetrics> {
         delivered_last_min,
         failed_last_min,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_with_token(token: Option<&str>) -> MetricsState {
+        // The pool is never touched by `authorized`, so a lazy pool is fine.
+        let pool = PgPool::connect_lazy("postgres://localhost/unused")
+            .expect("lazy pool construction");
+        MetricsState {
+            pool: Arc::new(pool),
+            auth_token: token.map(|t| Arc::new(t.to_string())),
+        }
+    }
+
+    #[test]
+    fn default_bind_addr_is_loopback() {
+        let addr: SocketAddr = DEFAULT_METRICS_BIND_ADDR.parse().expect("valid addr");
+        assert!(
+            addr.ip().is_loopback(),
+            "default metrics bind address must be loopback-only, got {addr}"
+        );
+    }
+
+    #[test]
+    fn no_token_configured_allows_requests() {
+        let state = state_with_token(None);
+        assert!(state.authorized(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn token_configured_rejects_missing_or_wrong_header() {
+        let state = state_with_token(Some("s3cret"));
+        assert!(!state.authorized(&HeaderMap::new()));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer wrong".parse().unwrap());
+        assert!(!state.authorized(&headers));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Basic s3cret".parse().unwrap());
+        assert!(!state.authorized(&headers));
+    }
+
+    #[test]
+    fn token_configured_accepts_matching_bearer() {
+        let state = state_with_token(Some("s3cret"));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer s3cret".parse().unwrap());
+        assert!(state.authorized(&headers));
+    }
 }

@@ -539,6 +539,14 @@ pub async fn deliver_with_shutdown(
                             Some((false, d.subscription_id))
                         }
                     }
+                    Err(e) if e.downcast_ref::<SourcePruned>().is_some() => {
+                        // Permanent, non-retryable: the source row was pruned.
+                        // Fail the delivery without touching attempts or the
+                        // subscriber's failure counters (#602).
+                        let _ = mark_failed_permanent(&pool, d.id, &e.to_string()).await;
+                        warn!(delivery = d.id, url = %d.url, error = %e, "webhook delivery dropped: source pruned");
+                        Some((false, d.subscription_id))
+                    }
                     Err(e) => {
                         let err_str = e.to_string();
                         let _ = mark_retry(&pool, &d, &err_str, config.max_attempts, &DeliveryOutcome::default()).await;
@@ -603,6 +611,10 @@ async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &C
 
     let secret = d.secret.as_ref().ok_or_else(|| anyhow::anyhow!("delivery has no decrypted secret"))?;
 
+    // A delivery whose source row was pruned (retention deletes old
+    // `contract_spec_versions`) can never succeed. Surface it as a distinct,
+    // permanent error so the caller can fail it without retrying or counting
+    // it against the subscriber (#602).
     let envelope = if let Some(event_id) = &d.event_id {
         let event: (
             String,
@@ -645,8 +657,9 @@ async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &C
             "SELECT contract_id, version, wasm_hash, previous_wasm_hash, breaking, diff, observed_at FROM contract_spec_versions WHERE id = $1",
         )
         .bind(upgrade_id)
-        .fetch_one(pool)
-        .await?;
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| anyhow::Error::new(SourcePruned))?;
 
         let upgrade_data = ContractUpgradeData {
             contract_id: upgrade.0,
@@ -660,7 +673,10 @@ async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &C
 
         WebhookEnvelope::for_upgrade(d.id, d.created_at, upgrade_data)
     } else {
-        return Err(anyhow::anyhow!("delivery has neither event_id nor upgrade_id"));
+        // An upgrade delivery with no `upgrade_id` means the referenced spec
+        // version was pruned (FK is `ON DELETE SET NULL`), so there is nothing
+        // left to deliver.
+        return Err(anyhow::Error::new(SourcePruned));
     };
 
     let body = serde_json::to_vec(&envelope)?;
@@ -728,6 +744,20 @@ async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &C
     })
 }
 
+/// Marker error for a delivery whose source row (e.g. the spec version behind an
+/// upgrade) no longer exists because retention pruned it. This is permanent:
+/// retrying can never succeed, and it must not count against the subscriber.
+#[derive(Debug)]
+struct SourcePruned;
+
+impl std::fmt::Display for SourcePruned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("source spec version was pruned")
+    }
+}
+
+impl std::error::Error for SourcePruned {}
+
 /// Map a delivery response to success/failure. Only `2xx` counts as delivered;
 /// a `3xx` is a failure because redirects are not followed.
 fn delivery_outcome(status: reqwest::StatusCode, location: Option<&str>) -> anyhow::Result<()> {
@@ -770,6 +800,21 @@ async fn mark_delivered(
     .bind(id)
     .bind(status_code)
     .bind(response_snippet)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Fail a delivery permanently without incrementing `attempts` or scheduling a
+/// retry. Used when the source row was pruned and no retry can ever succeed.
+async fn mark_failed_permanent(pool: &PgPool, id: i64, error_msg: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE webhook_deliveries
+         SET status = 'failed', last_error = $2, locked_until = NULL, locked_by = NULL
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(error_msg)
     .execute(pool)
     .await?;
     Ok(())
@@ -1092,6 +1137,72 @@ pub(crate) mod tests {
         // The watermark has advanced, so a second pass finds nothing new.
         assert_eq!(enqueue(&pool, 100).await.unwrap(), 0);
         assert_eq!(fetch_due(&pool, 100, "test-key").await.unwrap().len(), 1);
+    }
+
+    /// #602 — a pending upgrade delivery whose spec version was pruned must be
+    /// failed permanently: no retry scheduled, and the subscriber's failure
+    /// counters untouched (so it is never auto-disabled for it).
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn pruned_spec_version_fails_permanently_without_penalising_subscriber() {
+        let pool = fixture().await;
+        subscribe(&pool, "upgrade", None, "test-key").await;
+        add_version(&pool, 1, false).await;
+        add_version(&pool, 2, true).await;
+        assert_eq!(enqueue(&pool, 100).await.unwrap(), 1);
+
+        // Simulate retention pruning the referenced spec version. The FK is
+        // ON DELETE SET NULL, so the delivery's upgrade_id becomes NULL.
+        sqlx::query("DELETE FROM contract_spec_versions WHERE id = 2")
+            .execute(&pool)
+            .await
+            .expect("prune spec version");
+
+        let due = fetch_due(&pool, 100, "test-key").await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert!(due[0].upgrade_id.is_none(), "upgrade_id should be NULL after prune");
+
+        // send() must classify this as a permanent SourcePruned error.
+        let http = build_delivery_client(
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(5),
+        )
+        .expect("client");
+        let config = Config::for_test();
+        let err = send(&pool, &http, &due[0], &config).await.unwrap_err();
+        assert!(
+            err.downcast_ref::<SourcePruned>().is_some(),
+            "expected SourcePruned, got: {err}"
+        );
+
+        // Mirror the deliver() branch for a permanent failure.
+        mark_failed_permanent(&pool, due[0].id, &err.to_string())
+            .await
+            .unwrap();
+
+        let (status, attempts, last_error): (String, i32, Option<String>) = sqlx::query_as(
+            "SELECT status, attempts, last_error FROM webhook_deliveries WHERE id = $1",
+        )
+        .bind(due[0].id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(attempts, 0, "attempts must not be incremented");
+        assert_eq!(last_error.as_deref(), Some("source spec version was pruned"));
+
+        // No retry scheduled: nothing is due again.
+        assert!(fetch_due(&pool, 100, "test-key").await.unwrap().is_empty());
+
+        // Subscriber failure counters untouched.
+        let (consecutive_failures, active): (i32, bool) = sqlx::query_as(
+            "SELECT consecutive_failures, active FROM webhook_subscriptions LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(consecutive_failures, 0);
+        assert!(active, "subscriber must not be auto-disabled");
     }
 
     #[tokio::test]

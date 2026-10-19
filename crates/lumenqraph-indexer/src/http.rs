@@ -19,6 +19,26 @@ pub struct HttpState {
     pub pool: Arc<PgPool>,
     /// Reference to the live spec cache so its size can be reported in metrics.
     pub spec_cache: Arc<SpecCache>,
+    /// Optional bearer token required for `/metrics` (#605). When `None`, the
+    /// endpoint is unauthenticated (rely on binding to a private address).
+    pub metrics_bearer_token: Option<Arc<String>>,
+}
+
+/// Reads the optional metrics bearer token from the environment.
+///
+/// `METRICS_BEARER_TOKEN` takes precedence; for parity with the API's
+/// `METRICS_REQUIRE_API_KEY` semantics, `METRICS_API_KEY` is also accepted.
+/// Empty values are treated as "no auth configured".
+pub fn metrics_bearer_token_from_env() -> Option<Arc<String>> {
+    for key in ["METRICS_BEARER_TOKEN", "METRICS_API_KEY"] {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(Arc::new(v.to_string()));
+            }
+        }
+    }
+    None
 }
 
 pub async fn start_http_server(
@@ -26,7 +46,11 @@ pub async fn start_http_server(
     spec_cache: Arc<SpecCache>,
     bind_addr: &str,
 ) -> anyhow::Result<()> {
-    let state = HttpState { pool, spec_cache };
+    let state = HttpState {
+        pool,
+        spec_cache,
+        metrics_bearer_token: metrics_bearer_token_from_env(),
+    };
 
     let app = Router::new()
         .route("/health", get(health))
@@ -88,7 +112,20 @@ async fn health(State(state): State<HttpState>) -> impl IntoResponse {
     }
 }
 
-async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
+async fn metrics(
+    State(state): State<HttpState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Some(expected) = state.metrics_bearer_token.as_deref() {
+        if !bearer_token_matches(&headers, expected) {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+                "unauthorized".to_string(),
+            );
+        }
+    }
+
     let mut body = String::new();
 
     match gather_metrics(&state.pool).await {
@@ -155,7 +192,33 @@ async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
         }
     }
 
-    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        body,
+    )
+}
+
+/// Constant-time-ish comparison of the `Authorization: Bearer <token>` header.
+fn bearer_token_matches(headers: &axum::http::HeaderMap, expected: &str) -> bool {
+    let Some(value) = headers.get(header::AUTHORIZATION) else {
+        return false;
+    };
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let Some(token) = value.strip_prefix("Bearer ").or_else(|| value.strip_prefix("bearer ")) else {
+        return false;
+    };
+    let token = token.trim();
+    // Length check first, then byte-wise comparison without early exit.
+    if token.len() != expected.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in token.bytes().zip(expected.bytes()) {
+        diff |= a ^ b;
+    }
+    diff == 0
 }
 
 struct IndexerStatus {
@@ -279,4 +342,65 @@ fn env_parse_i64(key: &str, default: i64) -> i64 {
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn test_state(token: Option<&str>) -> HttpState {
+        // The pool is never touched by the auth check, so a lazy pool is fine.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://user:pass@localhost:5432/db")
+            .expect("lazy pool");
+        HttpState {
+            pool: Arc::new(pool),
+            spec_cache: Arc::new(SpecCache::new()),
+            metrics_bearer_token: token.map(|t| Arc::new(t.to_string())),
+        }
+    }
+
+    fn app_with(state: HttpState) -> Router {
+        Router::new()
+            .route("/health", get(health))
+            .route("/metrics", get(metrics))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn metrics_rejects_missing_token_when_configured() {
+        let app = app_with(test_state(Some("s3cret")));
+        let resp = app
+            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn metrics_rejects_wrong_token_when_configured() {
+        let app = app_with(test_state(Some("s3cret")));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header(header::AUTHORIZATION, "Bearer nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn bearer_token_matches_accepts_correct_token() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer s3cret".parse().unwrap());
+        assert!(bearer_token_matches(&headers, "s3cret"));
+        assert!(!bearer_token_matches(&headers, "other"));
+    }
 }

@@ -201,20 +201,19 @@ impl Config {
             enrichment_warn_threshold
         };
 
-        // Validate BALANCE_KEY_DURABILITY (must be "persistent" or "temporary").
+        // Validate BALANCE_KEY_DURABILITY strictly (must be "persistent" or
+        // "temporary"). A typo here would silently disable per-key indexing,
+        // so fail startup with a clear error instead.
         let balance_key_durability = std::env::var("BALANCE_KEY_DURABILITY")
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "persistent".to_string());
-        match balance_key_durability.trim().to_lowercase().as_str() {
-            "persistent" | "temporary" => {}
-            invalid => {
-                return Err(anyhow::anyhow!(
-                    "invalid BALANCE_KEY_DURABILITY {}: expected \"persistent\" or \"temporary\"",
-                    invalid
-                ));
-            }
-        }
+        parse_durability(&balance_key_durability).map_err(|e| {
+            anyhow::anyhow!(
+                "invalid BALANCE_KEY_DURABILITY {:?}: {e} (valid values: \"persistent\", \"temporary\")",
+                balance_key_durability
+            )
+        })?;
 
         // Parse key templates from JSON (KEY_TEMPLATES env var).
         // We deserialize into a plain intermediate struct and then convert to
@@ -238,16 +237,24 @@ impl Config {
             .map(|s| -> anyhow::Result<Vec<KeyTemplate>> {
                 let raw: Vec<KeyTemplateRaw> = serde_json::from_str(&s)
                     .map_err(|e| anyhow::anyhow!("invalid KEY_TEMPLATES JSON: {e}"))?;
-                Ok(raw
-                    .into_iter()
-                    .map(|r| KeyTemplate {
-                        symbol: r.symbol,
-                        event_names: r.event_names,
-                        param_indices: r.param_indices,
-                        durability: parse_durability(&r.durability),
-                        label: r.label,
+                raw.into_iter()
+                    .map(|r| {
+                        let durability = parse_durability(&r.durability).map_err(|e| {
+                            anyhow::anyhow!(
+                                "invalid durability {:?} for KEY_TEMPLATES symbol {:?}: {e} (valid values: \"persistent\", \"temporary\")",
+                                r.durability,
+                                r.symbol
+                            )
+                        })?;
+                        Ok(KeyTemplate {
+                            symbol: r.symbol,
+                            event_names: r.event_names,
+                            param_indices: r.param_indices,
+                            durability,
+                            label: r.label,
+                        })
                     })
-                    .collect())
+                    .collect::<anyhow::Result<Vec<KeyTemplate>>>()
             })
             .transpose()?
             .unwrap_or_default();
@@ -439,5 +446,67 @@ mod tests {
         const MAX_IDS_PER_FILTER: usize = 5;
         const MAX_FILTERS: usize = 5;
         assert_eq!(MAX_IDS_PER_FILTER * MAX_FILTERS, 25);
+    }
+
+    #[test]
+    fn invalid_balance_key_durability_fails_config_load() {
+        // Serialize env access across tests to avoid interference.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let saved: Vec<(String, Option<String>)> = [
+            "BALANCE_KEY_DURABILITY",
+            "DATABASE_URL",
+            "RPC_URL",
+            "RPC_URLS",
+            "KEY_TEMPLATES",
+        ]
+        .iter()
+        .map(|k| ((*k).to_string(), std::env::var(k).ok()))
+        .collect();
+
+        // Minimal valid environment so only the durability value is invalid.
+        std::env::set_var("DATABASE_URL", "postgres://localhost/test");
+        std::env::set_var("RPC_URL", "https://example.com");
+        std::env::remove_var("RPC_URLS");
+        std::env::remove_var("KEY_TEMPLATES");
+
+        for invalid in ["instance", "temp", "persistent ", "temporarily", ""] {
+            std::env::set_var("BALANCE_KEY_DURABILITY", invalid);
+            // Empty string is treated as unset (defaults to persistent), so it
+            // must succeed; all other typos must fail.
+            let result = Config::from_env();
+            if invalid.is_empty() {
+                assert!(result.is_ok(), "empty BALANCE_KEY_DURABILITY should default");
+            } else {
+                let err = result.expect_err("invalid BALANCE_KEY_DURABILITY must fail");
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("BALANCE_KEY_DURABILITY"),
+                    "error should name the variable: {msg}"
+                );
+                assert!(
+                    msg.contains("persistent") && msg.contains("temporary"),
+                    "error should list valid values: {msg}"
+                );
+            }
+        }
+
+        // Valid values must be accepted.
+        for valid in ["persistent", "temporary", "Persistent", "TEMPORARY"] {
+            std::env::set_var("BALANCE_KEY_DURABILITY", valid);
+            assert!(
+                Config::from_env().is_ok(),
+                "valid BALANCE_KEY_DURABILITY {valid:?} should be accepted"
+            );
+        }
+
+        // Restore environment.
+        for (key, value) in saved {
+            match value {
+                Some(v) => std::env::set_var(&key, v),
+                None => std::env::remove_var(&key),
+            }
+        }
     }
 }

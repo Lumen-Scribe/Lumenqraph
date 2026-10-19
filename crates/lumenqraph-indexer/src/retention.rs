@@ -93,6 +93,11 @@ pub async fn prune(pool: &PgPool, tip: i64, retention_ledgers: i64) -> anyhow::R
                     SELECT MAX(x.version) FROM contract_spec_versions x
                      WHERE x.contract_id = csv.contract_id
                 )
+                AND NOT EXISTS (
+                    SELECT 1 FROM webhook_deliveries wd
+                     WHERE wd.upgrade_id = csv.id
+                       AND wd.status = 'pending'
+                )
               LIMIT $2
          )",
         cutoff,
@@ -144,6 +149,11 @@ pub async fn prune_spec_versions(
                         SELECT MAX(x.version) FROM contract_spec_versions x
                          WHERE x.contract_id = csv.contract_id
                     )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM webhook_deliveries wd
+                         WHERE wd.upgrade_id = csv.id
+                           AND wd.status = 'pending'
+                    )
                   LIMIT $2
              )",
             cutoff,
@@ -168,6 +178,11 @@ pub async fn prune_spec_versions(
                             ) v),
                             0
                         )
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM webhook_deliveries wd
+                         WHERE wd.upgrade_id = csv.id
+                           AND wd.status = 'pending'
                     )
                   LIMIT $2
              )",
@@ -525,6 +540,98 @@ mod tests {
             "first_seen_ledger must advance to the next surviving event"
         );
         assert_eq!(last, 900, "last_seen_ledger must remain at the newest event");
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #602: pruning a spec version referenced by a pending upgrade
+    // delivery must not strand the delivery (no retries, no auto-disable).
+    // -------------------------------------------------------------------------
+
+    /// Insert a spec version row and return its id.
+    async fn insert_spec_version(pool: &PgPool, contract_id: &str, version: i32, ledger: i64) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO contract_spec_versions (contract_id, version, ledger, spec_hash, spec)
+             VALUES ($1,$2,$3,'hash','{}')
+             RETURNING id",
+        )
+        .bind(contract_id)
+        .bind(version)
+        .bind(ledger)
+        .fetch_one(pool)
+        .await
+        .expect("insert spec version")
+    }
+
+    /// A pending upgrade delivery referencing an old spec version must keep that
+    /// version alive through pruning, so the dispatcher can still resolve it and
+    /// the delivery is not retried into failure (which would count toward the
+    /// subscriber's auto-disable threshold).
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn prune_keeps_spec_version_referenced_by_pending_upgrade_delivery() {
+        let pool = fixture().await;
+
+        // Two versions of C1; the older one is referenced by a pending delivery.
+        let old_id = insert_spec_version(&pool, "C1", 1, 10).await;
+        let _new_id = insert_spec_version(&pool, "C1", 2, 20).await;
+
+        // A subscription and a pending upgrade delivery pointing at the old version.
+        let sub_id: i64 = sqlx::query_scalar(
+            "INSERT INTO webhook_subscriptions (url, secret, contract_id, events)
+             VALUES ('https://example.test/hook','secret','C1','[\"upgrade\"]')
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert subscription");
+        sqlx::query(
+            "INSERT INTO webhook_deliveries
+                 (subscription_id, event_id, upgrade_id, payload, status, attempts, next_attempt_at)
+             VALUES ($1,NULL,$2,'{}','pending',0,now())",
+        )
+        .bind(sub_id)
+        .bind(old_id)
+        .execute(&pool)
+        .await
+        .expect("insert delivery");
+
+        // Prune with a window that would otherwise drop the old version.
+        prune_spec_versions(&pool, 1000, 500, 1)
+            .await
+            .expect("prune spec versions");
+
+        // The referenced version must survive so the delivery can still resolve it.
+        assert_eq!(
+            count(
+                &pool,
+                &format!("SELECT count(*) FROM contract_spec_versions WHERE id = {old_id}")
+            )
+            .await,
+            1,
+            "a spec version referenced by a pending upgrade delivery must not be pruned"
+        );
+
+        // The delivery is still pending (never retried into failure).
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM webhook_deliveries WHERE status = 'pending' AND attempts = 0"
+            )
+            .await,
+            1,
+            "the pending upgrade delivery must remain pending with no attempts consumed"
+        );
+
+        // The subscription must not have been auto-disabled.
+        assert_eq!(
+            count(
+                &pool,
+                &format!("SELECT count(*) FROM webhook_subscriptions WHERE id = {sub_id} AND enabled = true")
+            )
+            .await,
+            1,
+            "a healthy upgrade subscriber must not be auto-disabled by pruning"
+        );
     }
 
     /// A contract that was never pruned must not be affected by pruning another

@@ -43,6 +43,12 @@ ALTER TABLE webhook_subscriptions
 
 -- A delivery now points at either an event or a spec version, never both and
 -- never neither.
+--
+-- NOTE: the FK on upgrade_id is ON DELETE CASCADE here, which means pruning a
+-- spec version silently deletes any pending upgrade deliveries that reference
+-- it. Migration 0009 replaces this with ON DELETE SET NULL so a pruned source
+-- row is recorded on the delivery (and failed permanently) rather than
+-- vanishing or being retried until max_attempts. See 0009 for the semantics.
 ALTER TABLE webhook_deliveries
     ALTER COLUMN event_id DROP NOT NULL,
     ADD COLUMN IF NOT EXISTS upgrade_id BIGINT
