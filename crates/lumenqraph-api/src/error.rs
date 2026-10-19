@@ -44,6 +44,7 @@ pub enum ErrorCode {
     InvalidContractId,
     Unauthorized,
     NotFound,
+    Conflict,
     RateLimited,
     SimulationFailed,
     NotAViewFunction,
@@ -60,6 +61,7 @@ impl ErrorCode {
             ErrorCode::InvalidContractId => "invalid_contract_id",
             ErrorCode::Unauthorized => "unauthorized",
             ErrorCode::NotFound => "not_found",
+            ErrorCode::Conflict => "conflict",
             ErrorCode::RateLimited => "rate_limited",
             ErrorCode::SimulationFailed => "simulation_failed",
             ErrorCode::NotAViewFunction => "not_a_view_function",
@@ -124,13 +126,8 @@ impl ApiError {
     pub fn not_found(msg: impl Into<String>) -> Self {
         ApiError::Status(StatusCode::NOT_FOUND, ErrorCode::NotFound, msg.into())
     }
-    /// `/call` was asked for a function that looks state-changing (#576).
-    pub fn not_a_view_function(msg: impl Into<String>) -> Self {
-        ApiError::Status(
-            StatusCode::BAD_REQUEST,
-            ErrorCode::NotAViewFunction,
-            msg.into(),
-        )
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        ApiError::Status(StatusCode::CONFLICT, ErrorCode::Conflict, msg.into())
     }
     pub fn simulation_failed(msg: impl Into<String>) -> Self {
         ApiError::Status(

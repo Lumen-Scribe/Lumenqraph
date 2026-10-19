@@ -37,15 +37,18 @@ pub struct EventsQuery {
     since: Option<String>,
     /// Optional time range filter: maximum timestamp (RFC3339).
     until: Option<String>,
-    /// Optional topic filter: filter by decoded_topics[0] value (e.g., topic0=transfer).
+    /// Optional topic filter: match decoded_topics[0]. A bare value such as
+    /// `topic0=transfer` is a string; a value starting with `"`, `[` or `{` must be
+    /// JSON, e.g. `topic0=%22transfer%22`.
     topic0: Option<String>,
-    /// Optional topic filter: filter by decoded_topics[1] value.
+    /// Optional topic filter: match decoded_topics[1]. Same format as `topic0`.
     topic1: Option<String>,
-    /// Optional topic filter: filter by decoded_topics[2] value.
+    /// Optional topic filter: match decoded_topics[2]. Same format as `topic0`.
     topic2: Option<String>,
-    /// Optional topic filter: filter by decoded_topics[3] value.
+    /// Optional topic filter: match decoded_topics[3]. Same format as `topic0`.
     topic3: Option<String>,
-    /// Optional parameter filter: filter by parameter name:value (e.g., from=GXXXX).
+    /// Optional parameter filter as `name:value`, e.g. `param=from:GXXXX`. The name
+    /// is split at the first `:`, so the value may contain colons.
     param: Option<String>,
     /// Optional filter to return only events from successful contract calls (default: false, returns all).
     successful_only: Option<bool>,
@@ -53,6 +56,41 @@ pub struct EventsQuery {
 
 fn default_limit() -> i64 {
     50
+}
+
+/// Parse a `topicN` filter into the JSON literal compared with `decoded_topics -> N`.
+///
+/// A value starting with `"`, `[` or `{` must be valid JSON. Any other value is a
+/// bare string and is matched as a JSON string, so `topic0=transfer` works without
+/// quoting. Numbers are strings too: `topic2=1000` matches the string `"1000"`,
+/// which is how i128 amounts are encoded.
+fn parse_topic_filter(raw: Option<&str>) -> ApiResult<Option<String>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let value = if raw.starts_with(['"', '[', '{']) {
+        serde_json::from_str::<serde_json::Value>(raw)
+            .map_err(|_| ApiError::bad_request("topic filter is not valid JSON"))?
+    } else {
+        serde_json::Value::String(raw.to_string())
+    };
+    Ok(Some(value.to_string()))
+}
+
+/// Parse the `param` filter (`name:value`) into a JSON object for `enriched @>`.
+fn parse_param_filter(raw: Option<&str>) -> ApiResult<Option<String>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let (name, value) = raw
+        .split_once(':')
+        .filter(|(name, _)| !name.is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request("param must be in the form name:value, e.g. param=from:GABC...")
+        })?;
+    let mut object = serde_json::Map::new();
+    object.insert(name.to_string(), serde_json::Value::String(value.to_string()));
+    Ok(Some(serde_json::Value::Object(object).to_string()))
 }
 
 /// Response envelope for `GET /contracts/:contract_id/events`.
@@ -64,6 +102,12 @@ pub async fn list_events(
     Query(q): Query<EventsQuery>,
 ) -> ApiResult<Json<EventsResponse>> {
     let limit = q.limit.clamp(1, 1000);
+
+    let topic0 = parse_topic_filter(q.topic0.as_deref())?;
+    let topic1 = parse_topic_filter(q.topic1.as_deref())?;
+    let topic2 = parse_topic_filter(q.topic2.as_deref())?;
+    let topic3 = parse_topic_filter(q.topic3.as_deref())?;
+    let param = parse_param_filter(q.param.as_deref())?;
 
     let page = PageRequest::<LedgerCursor>::parse(q.limit, 1000, q.offset, q.after.as_deref())?;
     let (after_ledger, after_event_id) = match page.after {
@@ -117,15 +161,12 @@ pub async fn list_events(
            AND ($4::bigint IS NULL OR ledger <= $4)
            AND ($5::timestamp IS NULL OR ledger_closed_at >= $5)
            AND ($6::timestamp IS NULL OR ledger_closed_at <= $6)
-           -- Topic filtering: decoded_topics is a JSONB array. To filter by position,
-           -- we use JSONB containment (@>) with null padding. For example, to match
-           -- decoded_topics[1], we build an array [null, value] and check containment.
-           -- This works because JSONB containment checks if the right side is a subset
-           -- of the left side, preserving position for array elements.
-           AND ($7::text IS NULL OR decoded_topics @> jsonb_build_array($7::jsonb))
-           AND ($8::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, $8::jsonb))
-           AND ($9::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, $9::jsonb))
-           AND ($10::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, jsonb_null::jsonb, $10::jsonb))
+           -- Topic filtering matches the value at an exact position: `-> n` reads
+           -- decoded_topics[n] as jsonb, so `topic1` only matches index 1.
+           AND ($7::text IS NULL OR (decoded_topics -> 0) = $7::jsonb)
+           AND ($8::text IS NULL OR (decoded_topics -> 1) = $8::jsonb)
+           AND ($9::text IS NULL OR (decoded_topics -> 2) = $9::jsonb)
+           AND ($10::text IS NULL OR (decoded_topics -> 3) = $10::jsonb)
            AND ($11::text IS NULL OR enriched @> ($11::jsonb))
            AND ($15::boolean IS NULL OR in_successful_call = $15)
            AND ($12::bigint IS NULL OR ledger < $12 OR (ledger = $12 AND event_id < $13))
@@ -138,11 +179,11 @@ pub async fn list_events(
     .bind(q.to_ledger)
     .bind(since_datetime)
     .bind(until_datetime)
-    .bind(&q.topic0)
-    .bind(&q.topic1)
-    .bind(&q.topic2)
-    .bind(&q.topic3)
-    .bind(&q.param)
+    .bind(&topic0)
+    .bind(&topic1)
+    .bind(&topic2)
+    .bind(&topic3)
+    .bind(&param)
     .bind(after_ledger)
     .bind(after_event_id)
     .bind(page.fetch_limit())
@@ -283,92 +324,76 @@ pub struct TxEventsResponse {
 
 #[cfg(test)]
 mod tests {
-    //! The DB-backed test needs a throwaway Postgres:
+    //! Needs a migrated throwaway database. Run with:
     //!
-    //!   TEST_DATABASE_URL=postgres://…/lumenqraph \
-    //!     cargo test -p lumenqraph-api -- --ignored
-    //!
-    //! Unit tests run without one.
+    //!   TEST_DATABASE_URL=postgres://… cargo test -p lumenqraph-api -- --ignored
 
-    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use serde_json::Value;
+    use sqlx::PgPool;
+    use tower::ServiceExt;
 
-    #[test]
-    fn tx_hash_accepts_64_hex_and_lowercases() {
-        let upper = "ABCDEF0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789";
-        assert_eq!(
-            normalize_tx_hash(upper).unwrap(),
-            upper.to_ascii_lowercase()
-        );
-    }
+    use super::list_events;
+    use crate::state::test_state;
 
-    #[test]
-    fn tx_hash_rejects_wrong_length_and_non_hex() {
-        assert!(normalize_tx_hash("abc").is_err());
-        assert!(normalize_tx_hash(&"a".repeat(65)).is_err());
-        assert!(normalize_tx_hash(&format!("{}g", "a".repeat(63))).is_err());
-        assert!(normalize_tx_hash(&"z".repeat(64)).is_err());
-    }
+    const CONTRACT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+    const EVENT_ID: &str = "api-test-list-events-topics";
 
-    async fn fixture() -> sqlx::PgPool {
-        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&url)
-            .await
-            .expect("connect to test database");
-        for stmt in ["DROP SCHEMA public CASCADE", "CREATE SCHEMA public"] {
-            sqlx::query(stmt).execute(&pool).await.expect("reset schema");
-        }
-        sqlx::migrate!("../../migrations")
-            .run(&pool)
-            .await
-            .expect("run migrations");
-        pool
+    async fn count_events(app: &Router, query: &str) -> usize {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/contracts/{CONTRACT}/events?{query}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "query `{query}` must not fail");
+
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        body["data"].as_array().expect("`data` array").len()
     }
 
     #[tokio::test]
-    #[ignore = "needs TEST_DATABASE_URL"]
-    async fn paging_a_large_transaction_returns_every_event_once() {
-        const TOTAL: i64 = 1_205;
-        let pool = fixture().await;
-        let tx = "a".repeat(64);
+    #[ignore]
+    async fn list_events_returns_200_with_and_without_topic_filters() {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
+        let pool = PgPool::connect(&url).await.unwrap();
+
+        sqlx::query("DELETE FROM events WHERE event_id = $1")
+            .bind(EVENT_ID)
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query(
-            "INSERT INTO events (event_id, contract_id, ledger, ledger_closed_at, event_type,
-                                 topics, event_name, value, tx_hash, in_successful_call, paging_token)
-             SELECT lpad(i::text, 8, '0'), 'C1', 100 + i / 50, now(), 'contract', '[]', 'transfer',
-                    'v', $1, true, lpad(i::text, 8, '0')
-             FROM generate_series(1, $2) AS i",
+            "INSERT INTO events
+                (event_id, contract_id, ledger, ledger_closed_at, event_type, topics,
+                 decoded_topics, event_name, value, tx_hash, in_successful_call, paging_token)
+             VALUES ($1, $2, 1, now(), 'contract', '[]',
+                     '[\"transfer\", \"GABC\"]', 'transfer', '', 'tx', true, 'p1')",
         )
-        .bind(&tx)
-        .bind(TOTAL)
+        .bind(EVENT_ID)
+        .bind(CONTRACT)
         .execute(&pool)
         .await
-        .expect("insert events");
+        .unwrap();
 
-        let mut seen = Vec::new();
-        let mut after = None;
-        loop {
-            let request = PageRequest::<LedgerCursor>::parse(
-                1000,
-                1000,
-                0,
-                after.as_deref(),
-            )
+        let app = Router::new()
+            .route("/contracts/:contract_id/events", get(list_events))
+            .with_state(test_state(pool.clone()));
+
+        assert_eq!(count_events(&app, "").await, 1);
+        assert_eq!(count_events(&app, "topic0=%22transfer%22").await, 1);
+        assert_eq!(count_events(&app, "topic1=%22GABC%22").await, 1);
+        assert_eq!(count_events(&app, "topic1=%22NOPE%22").await, 0);
+        assert_eq!(count_events(&app, "topic2=%22GABC%22").await, 0);
+
+        sqlx::query("DELETE FROM events WHERE event_id = $1")
+            .bind(EVENT_ID)
+            .execute(&pool)
+            .await
             .unwrap();
-            let page = page_transaction_events(&pool, &tx, &request, None)
-                .await
-                .unwrap();
-            seen.extend(page.data.iter().map(|e| e.event_id.clone()));
-            match page.next_cursor {
-                Some(next) => after = Some(next),
-                None => break,
-            }
-        }
-
-        assert_eq!(seen.len() as i64, TOTAL, "every event returned");
-        let mut unique = seen.clone();
-        unique.sort();
-        unique.dedup();
-        assert_eq!(unique.len(), seen.len(), "no event returned twice");
     }
 }

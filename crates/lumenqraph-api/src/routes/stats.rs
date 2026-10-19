@@ -51,7 +51,10 @@ fn parse_window(w: &str) -> Result<chrono::Duration, ApiError> {
     if w.is_empty() {
         return Err(ApiError::bad_request("Window parameter cannot be empty"));
     }
-    let (num_str, unit) = w.split_at(w.len().saturating_sub(1));
+    // Split before the last character, not the last byte: a multi-byte final
+    // character would make `split_at` panic on a non-boundary index (#573).
+    let unit_start = w.char_indices().next_back().map_or(0, |(i, _)| i);
+    let (num_str, unit) = w.split_at(unit_start);
     let num: i64 = num_str.parse().map_err(|_| {
         ApiError::bad_request("Invalid window format. Expected format like '7d', '24h', '30m'")
     })?;
@@ -69,35 +72,35 @@ fn parse_window(w: &str) -> Result<chrono::Duration, ApiError> {
     }
 }
 
+/// Maps a truncation alias to its SQL unit. `1M` means month and `1m` means
+/// minute, so `1M` is matched before the value is lowercased (#572).
+fn parse_trunc_alias(value: &str) -> Option<&'static str> {
+    if value == "1M" {
+        return Some("month");
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "1m" | "minute" | "min" => Some("minute"),
+        "1h" | "hour" => Some("hour"),
+        "1d" | "day" => Some("day"),
+        "1w" | "week" => Some("week"),
+        "month" => Some("month"),
+        _ => None,
+    }
+}
+
 fn parse_granularity(resolution: Option<&str>, bucket: &str) -> Result<Granularity, ApiError> {
-    if let Some(res) = resolution {
-        match res.to_ascii_lowercase().as_str() {
-            "1m" | "minute" | "min" => Ok(Granularity::Trunc("minute")),
-            "1h" | "hour" => Ok(Granularity::Trunc("hour")),
-            "1d" | "day" => Ok(Granularity::Trunc("day")),
-            "1w" | "week" => Ok(Granularity::Trunc("week")),
-            "1m" | "month" if res == "1M" || res.to_ascii_lowercase() == "month" => {
-                Ok(Granularity::Trunc("month"))
-            }
-            "ledger" => Ok(Granularity::Ledger),
-            _ => Err(ApiError::bad_request(
-                "Invalid resolution parameter: must be '1m', '1h', '1d', '1w', '1M' (or 'hour', 'day')",
-            )),
-        }
-    } else {
-        match bucket.to_ascii_lowercase().as_str() {
-            "hour" | "1h" => Ok(Granularity::Trunc("hour")),
-            "day" | "1d" => Ok(Granularity::Trunc("day")),
-            "minute" | "1m" => Ok(Granularity::Trunc("minute")),
-            "week" | "1w" => Ok(Granularity::Trunc("week")),
-            "month" | "1m" if bucket == "1M" || bucket.to_ascii_lowercase() == "month" => {
-                Ok(Granularity::Trunc("month"))
-            }
-            "ledger" => Ok(Granularity::Ledger),
-            _ => Err(ApiError::bad_request(
-                "Invalid bucket parameter: must be 'hour', 'day', or 'ledger'",
-            )),
-        }
+    let value = resolution.unwrap_or(bucket);
+    if value.eq_ignore_ascii_case("ledger") {
+        return Ok(Granularity::Ledger);
+    }
+    match parse_trunc_alias(value) {
+        Some(trunc) => Ok(Granularity::Trunc(trunc)),
+        None if resolution.is_some() => Err(ApiError::bad_request(
+            "Invalid resolution parameter: must be '1m', '1h', '1d', '1w', '1M', 'minute', 'hour', 'day', 'week', 'month', or 'ledger'",
+        )),
+        None => Err(ApiError::bad_request(
+            "Invalid bucket parameter: must be 'minute', 'hour', 'day', 'week', 'month', or 'ledger'",
+        )),
     }
 }
 
@@ -301,6 +304,159 @@ async fn query_stats_by_trunc(
     state: &AppState,
     contract_id: &str,
     trunc: &str,
-   
+    from: Option<chrono::DateTime<chrono::Utc>>,
+    to: Option<chrono::DateTime<chrono::Utc>>,
+) -> ApiResult<Vec<StatsBucket>> {
+    let sql = format!(
+        "SELECT date_trunc('{trunc}', ledger_closed_at)::text as bucket, COUNT(*) as count
+         FROM events
+         WHERE contract_id = $1
+           AND ($2::timestamp IS NULL OR ledger_closed_at >= $2)
+           AND ($3::timestamp IS NULL OR ledger_closed_at <= $3)
+         GROUP BY date_trunc('{trunc}', ledger_closed_at)
+         ORDER BY date_trunc('{trunc}', ledger_closed_at) DESC"
+    );
+    let rows: Vec<(String, i64)> = sqlx::query_as(&sql)
+        .bind(contract_id)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&state.pool)
+        .await?;
 
-/* … truncated 4766 chars — edit only what you need near the top … */
+    Ok(rows
+        .into_iter()
+        .map(|(bucket, count)| StatsBucket {
+            bucket,
+            count,
+            breakdown: None,
+        })
+        .collect())
+}
+
+async fn query_stats_by_trunc_grouped(
+    state: &AppState,
+    contract_id: &str,
+    trunc: &str,
+    from: Option<chrono::DateTime<chrono::Utc>>,
+    to: Option<chrono::DateTime<chrono::Utc>>,
+) -> ApiResult<Vec<StatsBucket>> {
+    let sql = format!(
+        "SELECT date_trunc('{trunc}', ledger_closed_at)::text as bucket, event_name, COUNT(*) as count
+         FROM events
+         WHERE contract_id = $1
+           AND ($2::timestamp IS NULL OR ledger_closed_at >= $2)
+           AND ($3::timestamp IS NULL OR ledger_closed_at <= $3)
+         GROUP BY date_trunc('{trunc}', ledger_closed_at), event_name
+         ORDER BY date_trunc('{trunc}', ledger_closed_at) DESC, event_name"
+    );
+    let rows: Vec<(String, Option<String>, i64)> = sqlx::query_as(&sql)
+        .bind(contract_id)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&state.pool)
+        .await?;
+
+    let mut result: std::collections::HashMap<String, (i64, std::collections::HashMap<String, i64>)> =
+        std::collections::HashMap::new();
+
+    for (bucket, event_name, count) in rows {
+        let entry = result.entry(bucket).or_insert((0, std::collections::HashMap::new()));
+        entry.0 += count;
+        if let Some(name) = event_name {
+            *entry.1.entry(name).or_insert(0) += count;
+        }
+    }
+
+    Ok(result
+        .into_iter()
+        .map(|(bucket, (total, breakdown))| StatsBucket {
+            bucket,
+            count: total,
+            breakdown: if breakdown.is_empty() {
+                None
+            } else {
+                Some(breakdown)
+            },
+        })
+        .collect())
+}
+
+async fn query_stats_by_ledger(
+    state: &AppState,
+    contract_id: &str,
+    from_ledger: Option<i64>,
+    to_ledger: Option<i64>,
+) -> ApiResult<Vec<StatsBucket>> {
+    let rows: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT ledger, COUNT(*) as count
+         FROM events
+         WHERE contract_id = $1
+           AND ($2::bigint IS NULL OR ledger >= $2)
+           AND ($3::bigint IS NULL OR ledger <= $3)
+         GROUP BY ledger
+         ORDER BY ledger DESC",
+    )
+    .bind(contract_id)
+    .bind(from_ledger)
+    .bind(to_ledger)
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(ledger, count)| StatsBucket {
+            bucket: ledger.to_string(),
+            count,
+            breakdown: None,
+        })
+        .collect())
+}
+
+async fn query_stats_by_ledger_grouped(
+    state: &AppState,
+    contract_id: &str,
+    from_ledger: Option<i64>,
+    to_ledger: Option<i64>,
+) -> ApiResult<Vec<StatsBucket>> {
+    let rows: Vec<(i64, Option<String>, i64)> = sqlx::query_as(
+        "SELECT ledger, event_name, COUNT(*) as count
+         FROM events
+         WHERE contract_id = $1
+           AND ($2::bigint IS NULL OR ledger >= $2)
+           AND ($3::bigint IS NULL OR ledger <= $3)
+         GROUP BY ledger, event_name
+         ORDER BY ledger DESC, event_name",
+    )
+    .bind(contract_id)
+    .bind(from_ledger)
+    .bind(to_ledger)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut result: std::collections::HashMap<String, (i64, std::collections::HashMap<String, i64>)> =
+        std::collections::HashMap::new();
+
+    for (ledger, event_name, count) in rows {
+        let bucket_key = ledger.to_string();
+        let entry = result
+            .entry(bucket_key)
+            .or_insert((0, std::collections::HashMap::new()));
+        entry.0 += count;
+        if let Some(name) = event_name {
+            *entry.1.entry(name).or_insert(0) += count;
+        }
+    }
+
+    Ok(result
+        .into_iter()
+        .map(|(bucket, (total, breakdown))| StatsBucket {
+            bucket,
+            count: total,
+            breakdown: if breakdown.is_empty() {
+                None
+            } else {
+                Some(breakdown)
+            },
+        })
+        .collect())
+}
