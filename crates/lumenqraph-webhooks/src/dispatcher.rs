@@ -69,6 +69,29 @@ pub async fn refresh_pending_gauge(pool: &PgPool) -> anyhow::Result<i64> {
     Ok(pending)
 }
 
+/// Advisory-lock key serialising the legacy secret backfill across replicas (#566).
+const WEBHOOK_SECRET_BACKFILL_LOCK: i64 = 566_001;
+
+/// Encrypt legacy plaintext subscription secrets into `encrypted_secret` (#566).
+///
+/// Runs in a transaction holding a transaction-scoped advisory lock, so
+/// replicas starting together do not race. The statement is idempotent: rows
+/// already encrypted no longer match. Returns the number of rows migrated.
+pub async fn backfill_encrypted_secrets(pool: &PgPool, encryption_key: &str) -> anyhow::Result<u64> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(WEBHOOK_SECRET_BACKFILL_LOCK)
+        .execute(&mut *tx)
+        .await?;
+    let migrated = sqlx::query(lumenqraph_core::crypto::BACKFILL_WEBHOOK_SECRETS_SQL)
+        .bind(encryption_key)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+    Ok(migrated)
+}
+
 /// Enqueue deliveries for everything new in both streams, and advance any
 /// per-subscription backfill cursors. Returns how many delivery rows were
 /// created (live + backfill combined).
@@ -136,9 +159,9 @@ async fn enqueue_backfill(pool: &PgPool, batch: i64) -> anyhow::Result<u64> {
                         (NOT (s.filter ? 'contract_id') OR s.filter->>'contract_id' = e.contract_id)
                         AND (NOT (s.filter ? 'event_name') OR s.filter->>'event_name' = e.event_name)
                         AND (NOT (s.filter ? 'topic0') OR e.decoded_topics @> jsonb_build_array((s.filter->>'topic0')::jsonb))
-                        AND (NOT (s.filter ? 'topic1') OR e.decoded_topics @> jsonb_build_array(jsonb_null::jsonb, (s.filter->>'topic1')::jsonb))
-                        AND (NOT (s.filter ? 'topic2') OR e.decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, (s.filter->>'topic2')::jsonb))
-                        AND (NOT (s.filter ? 'topic3') OR e.decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, jsonb_null::jsonb, (s.filter->>'topic3')::jsonb))
+                        AND (NOT (s.filter ? 'topic1') OR e.decoded_topics @> jsonb_build_array('null'::jsonb, (s.filter->>'topic1')::jsonb))
+                        AND (NOT (s.filter ? 'topic2') OR e.decoded_topics @> jsonb_build_array('null'::jsonb, 'null'::jsonb, (s.filter->>'topic2')::jsonb))
+                        AND (NOT (s.filter ? 'topic3') OR e.decoded_topics @> jsonb_build_array('null'::jsonb, 'null'::jsonb, 'null'::jsonb, (s.filter->>'topic3')::jsonb))
                         AND (NOT (s.filter ? 'to') OR e.enriched @> jsonb_build_object('to', s.filter->'to'))
                         AND (NOT (s.filter ? 'from') OR e.enriched @> jsonb_build_object('from', s.filter->'from'))
                         AND (NOT (s.filter ? 'amount') OR e.enriched @> jsonb_build_object('amount', s.filter->'amount'))
@@ -224,9 +247,9 @@ async fn enqueue_events(pool: &PgPool, batch: i64) -> anyhow::Result<u64> {
                     (NOT (s.filter ? 'contract_id') OR s.filter->>'contract_id' = e.contract_id)
                     AND (NOT (s.filter ? 'event_name') OR s.filter->>'event_name' = e.event_name)
                     AND (NOT (s.filter ? 'topic0') OR e.decoded_topics @> jsonb_build_array((s.filter->>'topic0')::jsonb))
-                    AND (NOT (s.filter ? 'topic1') OR e.decoded_topics @> jsonb_build_array(jsonb_null::jsonb, (s.filter->>'topic1')::jsonb))
-                    AND (NOT (s.filter ? 'topic2') OR e.decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, (s.filter->>'topic2')::jsonb))
-                    AND (NOT (s.filter ? 'topic3') OR e.decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, jsonb_null::jsonb, (s.filter->>'topic3')::jsonb))
+                    AND (NOT (s.filter ? 'topic1') OR e.decoded_topics @> jsonb_build_array('null'::jsonb, (s.filter->>'topic1')::jsonb))
+                    AND (NOT (s.filter ? 'topic2') OR e.decoded_topics @> jsonb_build_array('null'::jsonb, 'null'::jsonb, (s.filter->>'topic2')::jsonb))
+                    AND (NOT (s.filter ? 'topic3') OR e.decoded_topics @> jsonb_build_array('null'::jsonb, 'null'::jsonb, 'null'::jsonb, (s.filter->>'topic3')::jsonb))
                     AND (NOT (s.filter ? 'to') OR e.enriched @> jsonb_build_object('to', s.filter->'to'))
                     AND (NOT (s.filter ? 'from') OR e.enriched @> jsonb_build_object('from', s.filter->'from'))
                     AND (NOT (s.filter ? 'amount') OR e.enriched @> jsonb_build_object('amount', s.filter->'amount'))
@@ -323,6 +346,8 @@ struct DueDelivery {
     attempts: i32,
     url: String,
     secret: Option<String>,
+    /// Previous signing secret, present only while its rotation grace period is open.
+    previous_secret: Option<String>,
     event_id: Option<String>,
     upgrade_id: Option<i64>,
     created_at: DateTime<Utc>,
@@ -340,7 +365,7 @@ async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::R
     let worker = worker_id();
     let lock_duration = Duration::seconds(60);
 
-    let claimed: Vec<(i64, Uuid, i32, String, Option<String>, Option<String>, Option<i64>, DateTime<Utc>)> = sqlx::query_as(
+    let claimed: Vec<(i64, Uuid, i32, String, Option<String>, Option<String>, Option<String>, Option<i64>, DateTime<Utc>)> = sqlx::query_as(
         "UPDATE webhook_deliveries d
          SET locked_until = now() + $1, locked_by = $2
          WHERE d.id IN (
@@ -357,6 +382,10 @@ async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::R
                    d.attempts,
                    (SELECT url FROM webhook_subscriptions WHERE id = d.subscription_id),
                    (SELECT safe_decrypt_webhook_secret(encrypted_secret, $4) FROM webhook_subscriptions WHERE id = d.subscription_id),
+                   (SELECT CASE WHEN previous_secret_expires_at > now()
+                                THEN safe_decrypt_webhook_secret(previous_encrypted_secret, $4)
+                           END
+                    FROM webhook_subscriptions WHERE id = d.subscription_id),
                    d.event_id,
                    d.upgrade_id,
                    d.created_at",
@@ -371,7 +400,7 @@ async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::R
     let mut deliveries = Vec::new();
     let mut failed_subscriptions = Vec::new();
 
-    for (id, sub_id, attempts, url, decrypted_secret, event_id, upgrade_id, created_at) in claimed {
+    for (id, sub_id, attempts, url, decrypted_secret, decrypted_previous, event_id, upgrade_id, created_at) in claimed {
         let secret = match decrypted_secret {
             None => {
                 warn!(delivery = id, subscription = %sub_id, "failed to decrypt secret (NULL or wrong key)");
@@ -394,6 +423,7 @@ async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::R
             attempts,
             url,
             secret: Some(secret),
+            previous_secret: decrypted_previous.filter(|s| !s.is_empty()),
             event_id,
             upgrade_id,
             created_at,
@@ -538,15 +568,6 @@ pub async fn deliver_with_shutdown(
     Ok((delivered, failed))
 }
 
-    let delivered = results.iter().filter(|r| r.map_or(false, |(s, _)| s)).count() as u64;
-    let failed = results.iter().filter(|r| r.map_or(false, |(s, _)| !s)).count() as u64;
-
-    if delivered > 0 || failed > 0 {
-        info!(delivered, failed, "webhook deliveries processed");
-    }
-    Ok((delivered, failed))
-}
-
 fn build_per_host_limits(
     deliveries: &[DueDelivery],
     max_per_host: usize,
@@ -566,6 +587,13 @@ fn extract_host(url: &str) -> String {
         .ok()
         .and_then(|u| u.host_str().map(|s| s.to_string()))
         .unwrap_or_default()
+}
+
+/// Computes the hex-encoded HMAC-SHA256 of `signed_payload` under `secret`.
+fn sign_payload(secret: &str, signed_payload: &str) -> anyhow::Result<String> {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).context("invalid webhook secret")?;
+    mac.update(signed_payload.as_bytes());
+    Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
 async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &Config) -> anyhow::Result<DeliveryOutcome> {
@@ -639,13 +667,16 @@ async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &C
     let timestamp = Utc::now().timestamp();
     let signed_payload = format!("{}.{}", timestamp, std::str::from_utf8(&body)?);
 
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).context("invalid webhook secret")?;
-    mac.update(signed_payload.as_bytes());
-    let signature_v1 = hex::encode(mac.finalize().into_bytes());
+    // During a rotation grace period the previous secret signs too, so receivers
+    // that have not yet picked up the new secret keep verifying (#564).
+    let mut signature_header = format!("t={},v1={}", timestamp, sign_payload(secret, &signed_payload)?);
+    if let Some(previous) = &d.previous_secret {
+        signature_header.push_str(&format!(",v1={}", sign_payload(previous, &signed_payload)?));
+    }
 
     let parsed_url = Url::parse(&d.url).context("failed to parse URL")?;
     let host = parsed_url.host_str().context("URL must have a host")?;
-    let validated_ip = validate_webhook_url_at_delivery(&d.url).await?;
+    let validated_ip = validate_webhook_url_at_delivery(&d.url).await.map_err(|e| anyhow::anyhow!(e))?;
     let client = reqwest::Client::builder()
         .resolve(
             host,
@@ -661,7 +692,7 @@ async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &C
         .post(&d.url)
         .timeout(config.total_timeout())
         .header("Content-Type", "application/json")
-        .header("X-Lumenqraph-Signature", format!("t={},v1={}", timestamp, signature_v1))
+        .header("X-Lumenqraph-Signature", signature_header)
         .header("X-Lumenqraph-Delivery-Id", d.id.to_string())
         .header("X-Lumenqraph-Timestamp", timestamp.to_string())
         .header("X-Lumenqraph-Attempt", d.attempts.to_string())
@@ -672,20 +703,45 @@ async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &C
 
     let resp = client.execute(req).await.context("request failed")?;
     let status = resp.status();
-    let body_bytes = resp.bytes().await.context("failed to read webhook response body")?;
-    let snippet = String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(512)]).to_string();
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    // Redirects are never followed (SSRF guard); a 3xx is a failed delivery.
+    if status.is_redirection() {
+        delivery_outcome(status, location.as_deref())?;
+    }
     let retry_after = resp
         .headers()
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
         .map(|secs| Duration::seconds(secs as i64));
+    let body_bytes = resp.bytes().await.context("failed to read webhook response body")?;
+    let snippet = String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(512)]).to_string();
 
     Ok(DeliveryOutcome {
         status: Some(status.as_u16() as i32),
         retry_after,
         body_snippet: snippet,
     })
+}
+
+/// Map a delivery response to success/failure. Only `2xx` counts as delivered;
+/// a `3xx` is a failure because redirects are not followed.
+fn delivery_outcome(status: reqwest::StatusCode, location: Option<&str>) -> anyhow::Result<()> {
+    if status.is_success() {
+        Ok(())
+    } else if status.is_redirection() {
+        Err(anyhow::anyhow!(
+            "redirects are not followed: endpoint returned {} (Location: {})",
+            status,
+            location.unwrap_or("<none>")
+        ))
+    } else {
+        Err(anyhow::anyhow!("non-2xx status {status}"))
+    }
 }
 
 pub fn build_delivery_client(
@@ -826,7 +882,7 @@ async fn check_and_auto_disable(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     //! Enqueue + payload tests. These need a throwaway Postgres:
     //!
     //!   TEST_DATABASE_URL=postgres://…/lumenqraph \
@@ -840,7 +896,7 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
 
     /// Fresh, isolated schema per test — safe for parallel execution.
-    async fn fixture() -> PgPool {
+    pub(crate) async fn fixture() -> PgPool {
         let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
         // Each test gets a unique schema so concurrent tests never interfere.
         let schema = format!("test_{}", uuid::Uuid::new_v4().simple());
@@ -851,6 +907,12 @@ mod tests {
             .connect(&url)
             .await
             .expect("connect to TEST_DATABASE_URL");
+        // pgcrypto is database-wide: install it once in `public` so every test
+        // schema resolves `pgp_sym_*` through its search_path (#566).
+        sqlx::query("CREATE EXTENSION IF NOT EXISTS pgcrypto SCHEMA public")
+            .execute(&admin)
+            .await
+            .expect("create pgcrypto");
         sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
             .execute(&admin)
             .await
@@ -885,12 +947,13 @@ mod tests {
     /// A subscription of `kind`, optionally scoped to one contract.
     async fn subscribe(pool: &PgPool, kind: &str, contract_id: Option<&str>, encryption_key: &str) {
         sqlx::query(
-            "INSERT INTO webhook_subscriptions (url, kind, contract_id, encrypted_secret)
-             VALUES ('https://example.test/hook', $1, $2, $3)",
+            "INSERT INTO webhook_subscriptions (url, kind, contract_id, secret, encrypted_secret)
+             VALUES ('https://example.test/hook', $1, $2, 'test-secret',
+                     pgp_sym_encrypt('test-secret', $3))",
         )
         .bind(kind)
         .bind(contract_id)
-        .bind(encryption_key.as_bytes())  // Store as bytes for the test
+        .bind(encryption_key)
         .execute(pool)
         .await
         .expect("insert subscription");
@@ -924,6 +987,44 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert event");
+    }
+
+    /// #566 — a plaintext secret from before encryption is encrypted by the
+    /// backfill, and deliveries are still signed with the original secret.
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn legacy_plaintext_secret_is_encrypted_and_still_signs_deliveries() {
+        let pool = fixture().await;
+        sqlx::query(
+            "INSERT INTO webhook_subscriptions (url, kind, secret)
+             VALUES ('https://example.test/hook', 'upgrade', 'legacy-plain')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert legacy subscription");
+        add_version(&pool, 1, false).await;
+        add_version(&pool, 2, true).await;
+
+        assert_eq!(backfill_encrypted_secrets(&pool, "test-key").await.unwrap(), 1);
+        assert_eq!(
+            backfill_encrypted_secrets(&pool, "test-key").await.unwrap(),
+            0,
+            "a second run finds nothing left to encrypt"
+        );
+
+        let unencrypted: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM webhook_subscriptions
+             WHERE encrypted_secret IS NULL AND secret IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unencrypted, 0);
+
+        assert_eq!(enqueue(&pool, 100).await.unwrap(), 1);
+        let due = fetch_due(&pool, 100, "test-key").await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].secret.as_deref(), Some("legacy-plain"));
     }
 
     #[tokio::test]
@@ -1010,7 +1111,7 @@ mod tests {
         assert_eq!(due.len(), 5);
 
         for d in due {
-            mark_retry(&pool, &d, "test error", 5)
+            mark_retry(&pool, &d, "test error", 5, &DeliveryOutcome::default())
                 .await
                 .expect("mark retry");
         }
@@ -1161,5 +1262,19 @@ mod redirect_tests {
         assert!(delivery_outcome(reqwest::StatusCode::NO_CONTENT, None).is_ok());
         let err = delivery_outcome(reqwest::StatusCode::INTERNAL_SERVER_ERROR, None).unwrap_err();
         assert!(err.to_string().contains("non-2xx status"));
+    }
+}
+
+#[cfg(test)]
+mod rotation_signature_tests {
+    use super::sign_payload;
+
+    #[test]
+    fn previous_secret_produces_a_distinct_signature() {
+        let payload = "1700000000.{\"ok\":true}";
+        let current = sign_payload("new-secret", payload).unwrap();
+        let previous = sign_payload("old-secret", payload).unwrap();
+        assert_ne!(current, previous);
+        assert_eq!(current, sign_payload("new-secret", payload).unwrap());
     }
 }

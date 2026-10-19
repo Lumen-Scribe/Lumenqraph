@@ -8,15 +8,8 @@ use axum::http::header;
 use axum::response::IntoResponse;
 
 use crate::error::ApiResult;
+use crate::metrics_middleware::escape_label_value;
 use crate::state::AppState;
-
-fn percentile(sorted: &[u64], p: f64) -> u64 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    let idx = ((sorted.len() as f64) * p / 100.0).ceil() as usize;
-    sorted[idx.saturating_sub(1)]
-}
 
 pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
     let status: Option<(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
@@ -44,7 +37,10 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
     let cache_evictions = state.call_cache.evictions();
     let cache_size = state.call_cache.size();
 
-    let sse_active_streams = state.sse_active_streams.load(Ordering::Relaxed);
+    let sse_active_streams = crate::routes::stream::active_streams();
+    let sse_listener_up = u8::from(state.event_fanout.listener_up());
+    let sse_receivers = state.event_fanout.receivers();
+    let sse_lagged = state.event_fanout.lagged_total();
 
     let mut body = format!(
         "# HELP lumenqraph_indexer_last_processed_ledger Last ledger the indexer processed\n\
@@ -68,6 +64,9 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
          # HELP lumenqraph_indexer_errors_total Indexer poll-cycle errors\n\
          # TYPE lumenqraph_indexer_errors_total counter\n\
          lumenqraph_indexer_errors_total {errors}\n\
+         # HELP lumenqraph_rate_limit_backend_errors_total Redis rate-limit backend errors (each applies the configured fail mode)\n\
+         # TYPE lumenqraph_rate_limit_backend_errors_total counter\n\
+         lumenqraph_rate_limit_backend_errors_total {rate_limit_backend_errors}\n\
          # HELP lumenqraph_consecutive_errors Current number of consecutive poll-cycle failures (circuit breaker gauge; resets to 0 on success)\n\
          # TYPE lumenqraph_consecutive_errors gauge\n\
          lumenqraph_consecutive_errors {consecutive_errors}\n\
@@ -109,7 +108,16 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
          lumenqraph_call_cache_size {cache_size}\n\
          # HELP lumenqraph_sse_active_streams Currently open SSE streams\n\
          # TYPE lumenqraph_sse_active_streams gauge\n\
-         lumenqraph_sse_active_streams {sse_active_streams}\n",
+         lumenqraph_sse_active_streams {sse_active_streams}\n\
+         # HELP lumenqraph_sse_listener_up 1 while the shared LISTEN connection is connected\n\
+         # TYPE lumenqraph_sse_listener_up gauge\n\
+         lumenqraph_sse_listener_up {sse_listener_up}\n\
+         # HELP lumenqraph_sse_broadcast_receivers SSE connections subscribed to the fan-out\n\
+         # TYPE lumenqraph_sse_broadcast_receivers gauge\n\
+         lumenqraph_sse_broadcast_receivers {sse_receivers}\n\
+         # HELP lumenqraph_sse_broadcast_lagged_total Events dropped by SSE subscribers that fell behind\n\
+         # TYPE lumenqraph_sse_broadcast_lagged_total counter\n\
+         lumenqraph_sse_broadcast_lagged_total {sse_lagged}\n",
         last = last,
         tip = tip,
         lag = lag,
@@ -130,40 +138,38 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
         cache_evictions = cache_evictions,
         cache_size = cache_size,
         sse_active_streams = sse_active_streams,
+        sse_listener_up = sse_listener_up,
+        sse_receivers = sse_receivers,
+        sse_lagged = sse_lagged,
     );
 
     body.push_str("# HELP lumenqraph_http_request_duration_ms Per-route HTTP request latency\n");
     body.push_str("# TYPE lumenqraph_http_request_duration_ms histogram\n");
     {
         let histograms = state.metrics.histogram_buckets.read();
-        for (key, samples) in histograms.iter() {
-            if samples.is_empty() {
-                continue;
+        for (key, hist) in histograms.iter() {
+            let labels = format!(
+                "route=\"{}\",method=\"{}\"",
+                escape_label_value(&key.route),
+                escape_label_value(&key.method)
+            );
+            for (bound, cumulative) in hist.cumulative() {
+                body.push_str(&format!(
+                    "lumenqraph_http_request_duration_ms_bucket{{{labels},le=\"{bound}\"}} {cumulative}\n"
+                ));
             }
-            let mut sorted = samples.clone();
-            sorted.sort_unstable();
-
-            let p50 = percentile(&sorted, 50.0);
-            let p95 = percentile(&sorted, 95.0);
-            let p99 = percentile(&sorted, 99.0);
-            let count = sorted.len();
-            let sum: u64 = sorted.iter().sum();
-
-            body.push_str(&format!("{key}_bucket{{le=\"0.001\"}} 0\n"));
-            body.push_str(&format!("{key}_bucket{{le=\"0.005\"}} 0\n"));
-            body.push_str(&format!("{key}_bucket{{le=\"0.01\"}} 0\n"));
-            body.push_str(&format!("{key}_bucket{{le=\"0.05\"}} 0\n"));
-            body.push_str(&format!("{key}_bucket{{le=\"0.1\"}} 0\n"));
-            body.push_str(&format!("{key}_bucket{{le=\"0.5\"}} 0\n"));
-            body.push_str(&format!("{key}_bucket{{le=\"1.0\"}} 0\n"));
-            body.push_str(&format!("{key}_bucket{{le=\"5.0\"}} 0\n"));
-            body.push_str(&format!("{key}_bucket{{le=\"10.0\"}} 0\n"));
-            body.push_str(&format!("{key}_bucket{{le=\"+Inf\"}} {count}\n"));
-            body.push_str(&format!("{key}_count {count}\n"));
-            body.push_str(&format!("{key}_sum {sum}\n"));
-            body.push_str(&format!("{key}_p50 {p50}\n"));
-            body.push_str(&format!("{key}_p95 {p95}\n"));
-            body.push_str(&format!("{key}_p99 {p99}\n"));
+            body.push_str(&format!(
+                "lumenqraph_http_request_duration_ms_bucket{{{labels},le=\"+Inf\"}} {}\n",
+                hist.count
+            ));
+            body.push_str(&format!(
+                "lumenqraph_http_request_duration_ms_sum{{{labels}}} {}\n",
+                hist.sum_ms
+            ));
+            body.push_str(&format!(
+                "lumenqraph_http_request_duration_ms_count{{{labels}}} {}\n",
+                hist.count
+            ));
         }
     }
 

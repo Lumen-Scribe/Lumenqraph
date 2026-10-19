@@ -6,7 +6,7 @@ use axum::extract::State;
 use axum::http::header;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::{Json, Router, Server};
+use axum::{Json, Router};
 use chrono::Utc;
 use serde_json::json;
 use sqlx::PgPool;
@@ -92,6 +92,12 @@ async fn metrics(State(state): State<MetricsState>) -> impl IntoResponse {
     body.push_str(&format!(
         "lumenqraph_webhooks_pending_deliveries {}\n",
         PENDING_DELIVERIES.load(Ordering::Relaxed)
+    ));
+    body.push_str("# HELP lumenqraph_webhook_deliveries_pruned_total Delivery rows removed by retention since start\n");
+    body.push_str("# TYPE lumenqraph_webhook_deliveries_pruned_total counter\n");
+    body.push_str(&format!(
+        "lumenqraph_webhook_deliveries_pruned_total {}\n",
+        crate::prune::DELIVERIES_PRUNED.load(Ordering::Relaxed)
     ));
 
     match gather_metrics(&state.pool).await {

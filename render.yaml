@@ -44,6 +44,10 @@ services:
       - key: CONTRACT_IDS
         sync: false
 
+      # Render's router appends the client IP to X-Forwarded-For: trust exactly one hop.
+      - key: TRUSTED_PROXY_HOPS
+        value: "1"
+
       - key: RPC_URL
         value: https://mainnet.sorobanrpc.com
 

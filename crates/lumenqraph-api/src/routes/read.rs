@@ -9,13 +9,14 @@
 //! Argument encoding is driven by the contract's on-chain spec (captured at
 //! index time), so calls are type-checked before they ever hit the network.
 
-use axum::extract::{State};
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use lumenqraph_core::read::{self, EncodeError};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::call_cache::CallScope;
 use crate::error::{ApiError, ApiResult};
 use crate::extract::ValidContractId;
 use crate::read_cost_limit::validate_call_request;
@@ -52,9 +53,19 @@ pub struct CallRequest {
     source_account: Option<String>,
 }
 
+/// Query options for `POST /contracts/:id/call`.
+#[derive(Deserialize, Default)]
+pub struct CallQuery {
+    /// Allow a function the view heuristic doesn't recognise as a view.
+    /// Such results are never cached.
+    #[serde(default)]
+    allow_mutating: bool,
+}
+
 pub async fn call_function(
     State(state): State<AppState>,
     ValidContractId(contract_id): ValidContractId,
+    Query(query): Query<CallQuery>,
     Json(req): Json<CallRequest>,
 ) -> ApiResult<Json<Value>> {
 
@@ -72,12 +83,36 @@ pub async fn call_function(
         ));
     }
 
-    // Check the read-through cache before hitting RPC.
-    if let Some(cached) = state.call_cache.get(&contract_id, &req.function, &req.args) {
-        return Ok(Json(cached));
-    }
-
     let spec = state.specs.current(&state.pool, &contract_id).await?;
+
+    // `/call` is the read-only endpoint. Refuse functions the view heuristic
+    // rejects unless the caller opts in; opted-in results are never cached (#576).
+    let is_view = spec
+        .parsed
+        .as_ref()
+        .and_then(|p| read::is_view_function(p, &req.function));
+    if is_view == Some(false) && !query.allow_mutating {
+        return Err(ApiError::not_a_view_function(format!(
+            "'{}' looks state-changing, so /call will not run it. Use POST \
+             /contracts/{contract_id}/simulate, or pass ?allow_mutating=true.",
+            req.function
+        )));
+    }
+    let cacheable = !query.allow_mutating;
+
+    // The cache key includes the simulation's source account and the WASM hash
+    // the spec came from, so another caller's result, or one computed against
+    // an older interface, is never served (#575).
+    let scope = CallScope {
+        source_account: req.source_account.as_deref(),
+        wasm_hash: &spec.wasm_hash,
+    };
+    // Check the read-through cache before hitting RPC.
+    if cacheable {
+        if let Some(cached) = state.call_cache.get(&contract_id, &req.function, &req.args, scope) {
+            return Ok(Json(cached));
+        }
+    }
 
     // Encode against the cached, name-indexed parse: the spec section is never
     // re-parsed per request, and UDTs resolve in a hash lookup.
@@ -108,7 +143,9 @@ pub async fn call_function(
                 "result": read::decode_result(&result_xdr, &call, Some(parsed)),
                 "simulated_at_ledger": latest_ledger,
             });
-            state.call_cache.insert(&contract_id, &req.function, &req.args, response.clone());
+            if cacheable {
+                state.call_cache.insert(&contract_id, &req.function, &req.args, scope, response.clone());
+            }
             Ok(Json(response))
         }
         // A trap / bad call is the caller's problem, not a 500.
@@ -261,7 +298,7 @@ mod tests {
     use axum::Router;
     use serde_json::{json, Value};
     use stellar_xdr::curr::{
-        Limits, ScSpecEntry, ScSpecFunctionV0, ScSpecInputsEntry, ScSpecTypeDef, ScSymbol, WriteXdr,
+        Limits, ScSpecEntry, ScSpecFunctionV0, ScSpecTypeDef, ScSymbol, WriteXdr,
     };
     use tower::ServiceExt;
 
@@ -316,6 +353,7 @@ mod tests {
             CachedSpec {
                 parsed: lumenqraph_core::ContractSpec::from_spec_xdr(&spec_section).map(|p| p.spec),
                 section: spec_section,
+                wasm_hash: "test-hash".to_string(),
             },
         );
 
@@ -326,15 +364,16 @@ mod tests {
 
         AppState {
             pool,
+            event_fanout: Arc::new(crate::routes::stream::EventFanout::new()),
             require_auth: false,
             anon_rate_limit: 1_000_000,
-            limiter: Arc::new(RateLimiter::new()),
+            limiter: Arc::new(RateLimiter::memory()),
             http_requests: Arc::new(AtomicU64::new(0)),
             // Dummy RPC — never contacted in error-path tests.
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
             specs: Arc::new(cache),
             mounts: Arc::new(vec![]),
-            rpc_limiter: Arc::new(RateLimiter::new()),
+            rpc_limiter: Arc::new(RateLimiter::memory()),
             rpc_require_auth: false,
             rpc_anon_rate_limit: 1_000_000,
             metrics: Arc::new(crate::metrics_middleware::MetricsCollector::new()),
@@ -352,9 +391,10 @@ mod tests {
             health_max_lag_ledgers: 100,
             health_max_stale_secs: 120,
             metrics_require_auth: false,
-            proxy_limiter: Arc::new(RateLimiter::new()),
+            proxy_limiter: Arc::new(RateLimiter::memory()),
+            webhook_limiter: Arc::new(RateLimiter::memory()),
             config: Arc::new(crate::config::ApiConfig::test_default()),
-            key_cache: Arc::new(KeyCache::new(256)),
+            key_cache: Arc::new(KeyCache::new(256, std::time::Duration::from_secs(30), std::time::Duration::from_secs(5))),
             ip_config: crate::auth::IpConfig { trusted_proxy_hops: 0, platform_header: None },
             audit_tx: None,
             audit_dropped: Arc::new(AtomicU64::new(0)),
@@ -444,6 +484,58 @@ mod tests {
             msg.contains("nonexistent"),
             "error should mention the unknown function name: {msg}"
         );
+    }
+
+    // ── state-changing functions are gated on /call (#576) ──────────────────
+
+    #[tokio::test]
+    async fn call_refuses_state_changing_function_without_override() {
+        let contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let state = make_state(contract, single_fn_spec("transfer"));
+        let app = app_for(state);
+
+        let (status, body) = call(
+            app,
+            &format!("/contracts/{contract}/call"),
+            json!({ "function": "transfer", "args": {} }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "not_a_view_function");
+        assert!(body["error"].as_str().unwrap().contains("/simulate"));
+    }
+
+    #[tokio::test]
+    async fn call_still_runs_view_functions() {
+        let contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let state = make_state(contract, single_fn_spec("balance"));
+        let app = app_for(state);
+
+        let (_, body) = call(
+            app,
+            &format!("/contracts/{contract}/call"),
+            json!({ "function": "balance", "args": {} }),
+        )
+        .await;
+
+        assert_ne!(body["code"], "not_a_view_function");
+    }
+
+    #[tokio::test]
+    async fn call_allows_state_changing_function_with_override() {
+        let contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let state = make_state(contract, single_fn_spec("transfer"));
+        let app = app_for(state);
+
+        let (_, body) = call(
+            app,
+            &format!("/contracts/{contract}/call?allow_mutating=true"),
+            json!({ "function": "transfer", "args": {} }),
+        )
+        .await;
+
+        assert_ne!(body["code"], "not_a_view_function");
     }
 
     // ── missing argument → 400 ─────────────────────────────────────────────

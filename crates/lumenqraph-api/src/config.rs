@@ -12,6 +12,8 @@ use std::time::Duration;
 use anyhow::Context;
 pub use lumenqraph_core::db::DbConfig;
 
+use crate::rate_limit::RateLimitSettings;
+
 /// GraphQL schema limits.
 #[derive(Debug, Clone)]
 pub struct GraphqlConfig {
@@ -74,6 +76,8 @@ pub struct ApiConfig {
 
     pub require_auth: bool,
     pub anon_rate_limit: i32,
+    /// Backend, Redis URL and failure mode for every limiter (#554).
+    pub rate_limit: RateLimitSettings,
     pub rpc_require_auth: bool,
     pub rpc_anon_rate_limit: i32,
     pub metrics_require_auth: bool,
@@ -91,14 +95,21 @@ pub struct ApiConfig {
     pub readyz_max_age_secs: i64,
     pub health_max_lag_ledgers: i64,
     pub health_max_stale_secs: i64,
+    /// Require a fresh indexer for `/readyz` (default off, so an indexer stall
+    /// does not take every API replica out of rotation; #579).
+    pub readyz_require_fresh_index: bool,
+
+    /// API key lookup cache (`key_cache.rs`): entry capacity, positive-entry
+    /// TTL and negative-entry TTL. Lower the TTL for faster revocation.
+    pub api_key_cache_capacity: usize,
+    pub api_key_cache_ttl_secs: u64,
+    pub api_key_cache_neg_ttl_secs: u64,
 
     pub graphql: GraphqlConfig,
 
     /// `pgp_sym_encrypt` key for webhook secrets. `None` falls back to the
     /// legacy insecure test key (a warning is logged at startup).
     pub webhook_encryption_key: Option<String>,
-    /// Retention for delivered/failed webhook deliveries. `0` disables pruning.
-    pub webhook_delivery_retention_days: i64,
 
     /// Sibling instances mounted under a path prefix (`INSTANCE_MOUNTS`).
     pub mounts: Vec<(String, String)>,
@@ -114,6 +125,11 @@ impl ApiConfig {
         } else {
             env_parse("API_MAX_BODY_BYTES", 65536u64)?
         };
+
+        // Reject bad origins at startup, naming the entry, rather than letting
+        // CORS silently never match a browser's Origin header (#581).
+        let cors_allowed_origins = env_string("CORS_ALLOWED_ORIGINS", "");
+        parse_cors_origins(&cors_allowed_origins)?;
 
         let webhook_encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY")
             .ok()
@@ -136,11 +152,16 @@ impl ApiConfig {
             request_timeout_secs: env_parse("API_REQUEST_TIMEOUT_SECS", 60)?,
             shutdown_timeout_secs: env_parse("API_SHUTDOWN_TIMEOUT_SECS", 30)?,
             max_body_bytes,
-            cors_allowed_origins: env_string("CORS_ALLOWED_ORIGINS", ""),
+            cors_allowed_origins,
             explorer_dir: env_string("EXPLORER_DIR", "explorer"),
 
             require_auth: env_bool("REQUIRE_API_KEY", false)?,
             anon_rate_limit: env_parse("ANON_RATE_LIMIT_PER_MIN", 60)?,
+            rate_limit: RateLimitSettings::parse(
+                &env_string("RATE_LIMIT_BACKEND", "memory"),
+                std::env::var("REDIS_URL").ok().as_deref(),
+                &env_string("RATE_LIMIT_FAIL_MODE", "open"),
+            )?,
             rpc_require_auth: env_bool("RPC_REQUIRE_API_KEY", false)?,
             rpc_anon_rate_limit: env_parse("RPC_ROUTE_RATE_LIMIT_PER_MIN", 10)?,
             metrics_require_auth: env_bool("METRICS_REQUIRE_API_KEY", false)?,
@@ -156,6 +177,11 @@ impl ApiConfig {
             readyz_max_age_secs: env_parse("READYZ_MAX_AGE_SECS", 120)?,
             health_max_lag_ledgers: env_parse("HEALTH_MAX_LAG_LEDGERS", 100)?,
             health_max_stale_secs: env_parse("HEALTH_MAX_STALE_SECS", 120)?,
+            readyz_require_fresh_index: env_bool("READYZ_REQUIRE_FRESH_INDEX", false)?,
+
+            api_key_cache_capacity: env_positive("API_KEY_CACHE_CAPACITY", 2000)?,
+            api_key_cache_ttl_secs: env_parse("API_KEY_CACHE_TTL_SECS", 30)?,
+            api_key_cache_neg_ttl_secs: env_parse("API_KEY_CACHE_NEG_TTL_SECS", 5)?,
 
             graphql: GraphqlConfig {
                 max_depth: env_parse("GRAPHQL_MAX_DEPTH", 12)?,
@@ -164,10 +190,6 @@ impl ApiConfig {
             },
 
             webhook_encryption_key,
-            webhook_delivery_retention_days: env_parse(
-                "WEBHOOK_DELIVERY_RETENTION_DAYS",
-                crate::routes::webhooks::DEFAULT_WEBHOOK_DELIVERY_RETENTION_DAYS,
-            )?,
 
             mounts: crate::routes::proxy::parse_mounts(&env_string("INSTANCE_MOUNTS", "")),
             proxy: ProxyConfig {
@@ -217,6 +239,7 @@ impl ApiConfig {
             explorer_dir: "explorer".into(),
             require_auth: false,
             anon_rate_limit: 60,
+            rate_limit: RateLimitSettings::default(),
             rpc_require_auth: false,
             rpc_anon_rate_limit: 10,
             metrics_require_auth: false,
@@ -230,13 +253,16 @@ impl ApiConfig {
             readyz_max_age_secs: 120,
             health_max_lag_ledgers: 100,
             health_max_stale_secs: 120,
+            readyz_require_fresh_index: false,
+            api_key_cache_capacity: 2000,
+            api_key_cache_ttl_secs: 30,
+            api_key_cache_neg_ttl_secs: 5,
             graphql: GraphqlConfig {
                 max_depth: 12,
                 max_complexity: 1000,
                 introspection_enabled: false,
             },
             webhook_encryption_key: None,
-            webhook_delivery_retention_days: 14,
             mounts: Vec::new(),
             proxy: ProxyConfig::default(),
         }
@@ -261,6 +287,8 @@ impl fmt::Debug for ApiConfig {
             .field("explorer_dir", &self.explorer_dir)
             .field("require_auth", &self.require_auth)
             .field("anon_rate_limit", &self.anon_rate_limit)
+            .field("rate_limit_backend", &self.rate_limit.backend)
+            .field("rate_limit_fail_mode", &self.rate_limit.fail_mode)
             .field("rpc_require_auth", &self.rpc_require_auth)
             .field("rpc_anon_rate_limit", &self.rpc_anon_rate_limit)
             .field("metrics_require_auth", &self.metrics_require_auth)
@@ -274,14 +302,14 @@ impl fmt::Debug for ApiConfig {
             .field("readyz_max_age_secs", &self.readyz_max_age_secs)
             .field("health_max_lag_ledgers", &self.health_max_lag_ledgers)
             .field("health_max_stale_secs", &self.health_max_stale_secs)
+            .field("readyz_require_fresh_index", &self.readyz_require_fresh_index)
+            .field("api_key_cache_capacity", &self.api_key_cache_capacity)
+            .field("api_key_cache_ttl_secs", &self.api_key_cache_ttl_secs)
+            .field("api_key_cache_neg_ttl_secs", &self.api_key_cache_neg_ttl_secs)
             .field("graphql", &self.graphql)
             .field(
                 "webhook_encryption_key",
                 &self.webhook_encryption_key.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field(
-                "webhook_delivery_retention_days",
-                &self.webhook_delivery_retention_days,
             )
             .field("mounts", &self.mounts)
             .field("proxy", &self.proxy)
@@ -329,6 +357,50 @@ where
             .map_err(|e| anyhow::anyhow!("invalid {key}={v:?}: {e}")),
         _ => Ok(default),
     }
+}
+
+/// Parse `CORS_ALLOWED_ORIGINS` into the exact origins browsers send
+/// (`scheme://host[:port]`). An empty value or `*` yields an empty list; the
+/// caller decides what those mean. Any other entry must be a bare origin: no
+/// wildcards, path, query, credentials or trailing slash.
+pub fn parse_cors_origins(raw: &str) -> anyhow::Result<Vec<String>> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "*" {
+        return Ok(Vec::new());
+    }
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(parse_cors_origin)
+        .collect()
+}
+
+fn parse_cors_origin(entry: &str) -> anyhow::Result<String> {
+    let invalid = |why: &str| anyhow::anyhow!("invalid CORS_ALLOWED_ORIGINS entry {entry:?}: {why}");
+    if entry.contains('*') {
+        return Err(invalid("wildcards are not supported; list each origin explicitly"));
+    }
+    let url = url::Url::parse(entry).map_err(|_| invalid("not an absolute URL (expected https://host)"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(invalid("scheme must be http or https"));
+    }
+    if url.host_str().is_none() {
+        return Err(invalid("missing host"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid("credentials are not allowed"));
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() || entry.ends_with('/') {
+        return Err(invalid("must be an origin only: scheme://host[:port], with no path or trailing slash"));
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
+/// Like `env_parse`, but rejects zero (used for sizes that must be non-empty).
+fn env_positive(key: &str, default: usize) -> anyhow::Result<usize> {
+    let value: usize = env_parse(key, default)?;
+    anyhow::ensure!(value > 0, "invalid {key}=0: must be at least 1");
+    Ok(value)
 }
 
 /// Parse a boolean `key`, or return `default` when unset/empty. Anything other
@@ -389,5 +461,48 @@ mod tests {
             "postgres://db:5432"
         );
         assert_eq!(redact_url("https://rpc.example"), "https://rpc.example");
+    }
+}
+
+#[cfg(test)]
+mod cors_origin_tests {
+    use super::parse_cors_origins;
+
+    #[test]
+    fn accepts_bare_origins_and_drops_default_port() {
+        assert_eq!(
+            parse_cors_origins("https://a.com:443, http://localhost:3000").unwrap(),
+            vec!["https://a.com", "http://localhost:3000"]
+        );
+    }
+
+    #[test]
+    fn unset_and_wildcard_yield_no_list() {
+        assert!(parse_cors_origins("").unwrap().is_empty());
+        assert!(parse_cors_origins("*").unwrap().is_empty());
+    }
+
+    #[test]
+    fn trailing_slash_fails_and_names_the_entry() {
+        let err = parse_cors_origins("https://a.com/,foo").unwrap_err().to_string();
+        assert!(err.contains("https://a.com/"), "error must name the entry: {err}");
+    }
+
+    #[test]
+    fn missing_scheme_is_rejected() {
+        assert!(parse_cors_origins("app.example.com").is_err());
+    }
+
+    #[test]
+    fn wildcard_subdomains_are_rejected() {
+        assert!(parse_cors_origins("https://*.example.com").is_err());
+    }
+
+    #[test]
+    fn paths_queries_and_credentials_are_rejected() {
+        assert!(parse_cors_origins("https://a.com/app").is_err());
+        assert!(parse_cors_origins("https://a.com?x=1").is_err());
+        assert!(parse_cors_origins("https://user:pw@a.com").is_err());
+        assert!(parse_cors_origins("ftp://a.com").is_err());
     }
 }

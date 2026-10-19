@@ -31,6 +31,8 @@ primary_region = "iad"
 # events; set it to a comma-separated allowlist for a focused, cheaper index.
 [env]
   API_BIND_ADDR = "0.0.0.0:8080"
+  # Fly's edge proxy appends the client IP to X-Forwarded-For: trust exactly one hop.
+  TRUSTED_PROXY_HOPS = "1"
   RPC_URL = "https://mainnet.sorobanrpc.com"
   RUST_LOG = "info"
   STATE_INDEXING = "true"
@@ -59,7 +61,7 @@ primary_region = "iad"
     timeout = "5s"
     grace_period = "30s"
     method = "GET"
-    path = "/health"
+    path = "/livez"
 
 # Resource allocation: the indexer does more work (WASM parsing, event decode,
 # state snapshots) than the stateless api and webhooks. Memory limits prevent

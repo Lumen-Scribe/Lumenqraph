@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Above this many tracked IPs we drop stale entries.
@@ -91,6 +91,39 @@ impl ConcurrencyLimiter {
             if state.in_flight > 0 {
                 state.in_flight -= 1;
             }
+        }
+    }
+
+    /// Reserve a slot for `ip`. Returns `None` when the IP is at `max_concurrent`.
+    ///
+    /// The slot is released when the returned guard is dropped. Dropping it is
+    /// how a cancelled or timed-out request gives its slot back, so hold the
+    /// guard for the whole lifetime of the request.
+    pub fn try_acquire(self: &Arc<Self>, ip: &str, max_concurrent: usize) -> Option<ConcurrencySlot> {
+        if !self.acquire(ip, max_concurrent).allowed {
+            return None;
+        }
+        Some(ConcurrencySlot {
+            limiter: Arc::clone(self),
+            ip: ip.to_string(),
+            counted: max_concurrent > 0,
+        })
+    }
+}
+
+/// A reserved per-IP concurrency slot. Releases the slot on drop.
+#[must_use]
+pub struct ConcurrencySlot {
+    limiter: Arc<ConcurrencyLimiter>,
+    ip: String,
+    /// `false` when the limit is 0 (unlimited), so nothing was counted.
+    counted: bool,
+}
+
+impl Drop for ConcurrencySlot {
+    fn drop(&mut self) {
+        if self.counted {
+            self.limiter.release(&self.ip);
         }
     }
 }
@@ -218,6 +251,42 @@ mod tests {
         assert!(!limiter.acquire("192.168.1.1", 1).allowed);
         limiter.release("192.168.1.1");
         assert!(limiter.acquire("192.168.1.1", 1).allowed);
+    }
+
+    #[test]
+    fn dropping_slot_releases_it() {
+        let limiter = Arc::new(ConcurrencyLimiter::new());
+        let slot = limiter.try_acquire("192.168.1.1", 1).expect("first slot");
+        assert!(limiter.try_acquire("192.168.1.1", 1).is_none());
+        drop(slot);
+        assert!(limiter.try_acquire("192.168.1.1", 1).is_some());
+    }
+
+    #[test]
+    fn unlimited_slot_does_not_release_counted_slots() {
+        let limiter = Arc::new(ConcurrencyLimiter::new());
+        let held = limiter.try_acquire("192.168.1.1", 1).expect("held slot");
+        drop(limiter.try_acquire("192.168.1.1", 0));
+        assert!(limiter.try_acquire("192.168.1.1", 1).is_none());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn slot_is_released_when_request_is_cancelled() {
+        use std::time::Duration;
+
+        let limiter = Arc::new(ConcurrencyLimiter::new());
+        // Stand in for a request that never finishes, cancelled by the timeout layer.
+        let timed_out = tokio::time::timeout(Duration::from_millis(10), async {
+            let _slot = limiter.try_acquire("192.168.1.1", 1).expect("slot");
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert!(timed_out.is_err());
+        assert!(
+            limiter.try_acquire("192.168.1.1", 1).is_some(),
+            "a cancelled request must release its slot"
+        );
     }
 
     #[test]
