@@ -269,3 +269,89 @@ pub fn router(state: AppState) -> Router {
         app
     }
 }
+
+#[cfg(test)]
+mod openapi_coverage_tests {
+    //! Every route registered in this file must be documented in `openapi.yaml`.
+    //!
+    //! axum 0.7 does not expose its route table at runtime, so the test reads
+    //! the route registrations from this file's source and checks each path
+    //! against the spec's path keys.
+
+    use std::collections::HashSet;
+
+    /// The `.route(` call as text, split so this test's own source does not
+    /// match when the file is scanned.
+    const ROUTE_CALL: &str = concat!(".", "route", "(");
+
+    /// Axum's `:param` segments become OpenAPI's `{param}`.
+    fn to_openapi_path(route: &str) -> String {
+        route
+            .split('/')
+            .map(|segment| match segment.strip_prefix(':') {
+                Some(name) => format!("{{{name}}}"),
+                None => segment.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// Every route path registered in `source`, in OpenAPI form.
+    fn registered_paths(source: &str) -> Vec<String> {
+        let mut paths: Vec<String> = source
+            .match_indices(ROUTE_CALL)
+            .filter_map(|(idx, _)| {
+                let rest = source[idx + ROUTE_CALL.len()..].trim_start();
+                let rest = rest.strip_prefix('"')?;
+                let end = rest.find('"')?;
+                Some(to_openapi_path(&rest[..end]))
+            })
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// Path keys of the spec: top-level entries under `paths:` are indented by
+    /// exactly two spaces and start with `/`.
+    fn documented_paths(spec: &str) -> HashSet<&str> {
+        spec.lines()
+            .filter_map(|line| line.strip_prefix("  ")?.strip_suffix(':'))
+            .filter(|key| key.starts_with('/'))
+            .collect()
+    }
+
+    #[test]
+    fn route_params_convert_to_openapi_form() {
+        assert_eq!(
+            to_openapi_path("/webhooks/:id/rotate-secret"),
+            "/webhooks/{id}/rotate-secret"
+        );
+        assert_eq!(
+            to_openapi_path("/contracts/:contract_id/data/:key_hash"),
+            "/contracts/{contract_id}/data/{key_hash}"
+        );
+    }
+
+    #[test]
+    fn every_registered_route_is_documented_in_openapi_yaml() {
+        let routes = registered_paths(include_str!("mod.rs"));
+        assert!(
+            routes.len() > 20,
+            "route scan found only {} paths; the scanner is probably broken",
+            routes.len()
+        );
+
+        let spec = include_str!("../../../../openapi.yaml");
+        let documented = documented_paths(spec);
+        let missing: Vec<&String> = routes
+            .iter()
+            .filter(|path| !documented.contains(path.as_str()))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "routes registered in routes/mod.rs but missing from openapi.yaml: {missing:?}"
+        );
+    }
+}
