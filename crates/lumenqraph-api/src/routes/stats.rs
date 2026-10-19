@@ -51,7 +51,10 @@ fn parse_window(w: &str) -> Result<chrono::Duration, ApiError> {
     if w.is_empty() {
         return Err(ApiError::bad_request("Window parameter cannot be empty"));
     }
-    let (num_str, unit) = w.split_at(w.len().saturating_sub(1));
+    // Split before the last character, not the last byte: a multi-byte final
+    // character would make `split_at` panic on a non-boundary index (#573).
+    let unit_start = w.char_indices().next_back().map_or(0, |(i, _)| i);
+    let (num_str, unit) = w.split_at(unit_start);
     let num: i64 = num_str.parse().map_err(|_| {
         ApiError::bad_request("Invalid window format. Expected format like '7d', '24h', '30m'")
     })?;
@@ -353,5 +356,44 @@ mod tests {
     fn unknown_values_are_rejected() {
         assert!(parse_granularity(Some("2M"), "day").is_err());
         assert!(parse_granularity(None, "fortnight").is_err());
+    }
+
+    fn window_secs(window: &str) -> Option<i64> {
+        parse_window(window).ok().map(|d| d.num_seconds())
+    }
+
+    #[test]
+    fn window_parses_each_unit() {
+        assert_eq!(window_secs("30m"), Some(30 * 60));
+        assert_eq!(window_secs("24h"), Some(24 * 3_600));
+        assert_eq!(window_secs("7d"), Some(7 * 86_400));
+        assert_eq!(window_secs("2w"), Some(2 * 604_800));
+    }
+
+    /// #573 — a window ending in a multi-byte character is a 400, not a panic.
+    #[test]
+    fn window_ending_in_multibyte_char_is_rejected() {
+        assert!(parse_window("7é").is_err());
+        assert!(parse_window("1日").is_err());
+        assert!(parse_window("😀").is_err());
+    }
+
+    /// Property-style check: every string of up to three characters drawn from
+    /// an alphabet that includes multi-byte characters returns Ok or Err, and
+    /// never panics.
+    #[test]
+    fn window_never_panics_on_arbitrary_input() {
+        let alphabet = ['1', '7', 'd', 'h', 'm', 'w', 'é', '日', '😀', ' ', '-', '+'];
+        let mut inputs = vec![String::new()];
+        for _ in 0..3 {
+            let longer: Vec<String> = inputs
+                .iter()
+                .flat_map(|prefix| alphabet.iter().map(move |c| format!("{prefix}{c}")))
+                .collect();
+            inputs.extend(longer);
+        }
+        for input in &inputs {
+            let _ = parse_window(input);
+        }
     }
 }
