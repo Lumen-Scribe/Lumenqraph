@@ -16,6 +16,7 @@ use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::Sha256;
+use std::time::Duration as StdDuration;
 use sqlx::types::Json;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -693,6 +694,8 @@ async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &C
     let parsed_url = Url::parse(&d.url).context("failed to parse URL")?;
     let host = parsed_url.host_str().context("URL must have a host")?;
     let validated_ip = validate_webhook_url_at_delivery(&d.url).await.map_err(|e| anyhow::anyhow!(e))?;
+    // Pin the validated IP, but keep the same hardening as `build_delivery_client`:
+    // never follow redirects (SSRF guard, #447/#615) and bound connect/total time.
     let client = reqwest::Client::builder()
         .resolve(
             host,
@@ -701,6 +704,9 @@ async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &C
                 parsed_url.port().unwrap_or(if parsed_url.scheme() == "https" { 443 } else { 80 }),
             ),
         )
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(config.connect_timeout())
+        .timeout(config.total_timeout())
         .build()
         .context("failed to build pinned client")?;
 
@@ -734,8 +740,10 @@ async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &C
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
         .map(|secs| Duration::seconds(secs as i64));
-    let body_bytes = resp.bytes().await.context("failed to read webhook response body")?;
-    let snippet = String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(512)]).to_string();
+    // Read at most `response_body_cap` bytes, streaming chunk-by-chunk so a
+    // subscriber cannot force us to buffer an unbounded body (#616). Dropping
+    // the response afterwards aborts the connection.
+    let snippet = read_body_snippet(resp, config.response_body_cap()).await?;
 
     Ok(DeliveryOutcome {
         status: Some(status.as_u16() as i32),
@@ -744,19 +752,26 @@ async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &C
     })
 }
 
-/// Marker error for a delivery whose source row (e.g. the spec version behind an
-/// upgrade) no longer exists because retention pruned it. This is permanent:
-/// retrying can never succeed, and it must not count against the subscriber.
-#[derive(Debug)]
-struct SourcePruned;
-
-impl std::fmt::Display for SourcePruned {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("source spec version was pruned")
+/// Read at most `cap` bytes of a response body, streaming chunk-by-chunk so the
+/// full body is never buffered in memory (#616). The response is dropped when
+/// this returns, aborting the connection.
+async fn read_body_snippet(mut resp: reqwest::Response, cap: usize) -> anyhow::Result<String> {
+    let mut buf: Vec<u8> = Vec::with_capacity(cap.min(512));
+    while buf.len() < cap {
+        let chunk = resp
+            .chunk()
+            .await
+            .context("failed to read webhook response body")?;
+        match chunk {
+            Some(bytes) => {
+                let remaining = cap - buf.len();
+                buf.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+            }
+            None => break,
+        }
     }
+    Ok(String::from_utf8_lossy(&buf).to_string())
 }
-
-impl std::error::Error for SourcePruned {}
 
 /// Map a delivery response to success/failure. Only `2xx` counts as delivered;
 /// a `3xx` is a failure because redirects are not followed.
@@ -805,19 +820,24 @@ async fn mark_delivered(
     Ok(())
 }
 
-/// Fail a delivery permanently without incrementing `attempts` or scheduling a
-/// retry. Used when the source row was pruned and no retry can ever succeed.
-async fn mark_failed_permanent(pool: &PgPool, id: i64, error_msg: &str) -> anyhow::Result<()> {
-    sqlx::query(
-        "UPDATE webhook_deliveries
-         SET status = 'failed', last_error = $2, locked_until = NULL, locked_by = NULL
-         WHERE id = $1",
-    )
-    .bind(id)
-    .bind(error_msg)
-    .execute(pool)
-    .await?;
-    Ok(())
+/// Upper bound on the exponential backoff window, in seconds.
+const BACKOFF_CAP_SECS: i64 = 3600;
+/// Lower bound on a jittered retry delay, in seconds.
+const BACKOFF_FLOOR_SECS: i64 = 1;
+
+/// Compute the jittered retry delay for `attempts` failed attempts (#617).
+///
+/// Full jitter: `delay = rand(0, min(cap, base * 2^attempt))`, floored at
+/// [`BACKOFF_FLOOR_SECS`]. Spreading retries across the window avoids the
+/// thundering herd that lock-step exponential backoff produces during a
+/// subscriber outage.
+fn jittered_backoff<R: Rng + ?Sized>(attempts: i32, rng: &mut R) -> Duration {
+    let window = (2i64)
+        .saturating_pow(attempts.max(1) as u32)
+        .min(BACKOFF_CAP_SECS)
+        .max(BACKOFF_FLOOR_SECS);
+    let jittered = rng.gen_range(0..=window);
+    Duration::seconds(jittered.max(BACKOFF_FLOOR_SECS))
 }
 
 async fn mark_retry(
@@ -827,6 +847,19 @@ async fn mark_retry(
     max_attempts: i32,
     outcome: &DeliveryOutcome,
 ) -> anyhow::Result<()> {
+    mark_retry_with_rng(pool, d, err, max_attempts, outcome, &mut rand::thread_rng()).await
+}
+
+/// [`mark_retry`] with an injectable RNG so backoff jitter is deterministic in
+/// tests (#617).
+async fn mark_retry_with_rng<R: Rng + ?Sized>(
+    pool: &PgPool,
+    d: &DueDelivery,
+    err: &str,
+    max_attempts: i32,
+    outcome: &DeliveryOutcome,
+    rng: &mut R,
+) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
     let attempts = d.attempts + 1;
     let final_retry = attempts >= max_attempts;
@@ -834,8 +867,7 @@ async fn mark_retry(
         let capped = retry_after.min(Duration::hours(24));
         Utc::now() + capped
     } else {
-        let backoff = (2i64).saturating_pow(attempts.max(1) as u32).min(3600);
-        Utc::now() + Duration::seconds(backoff)
+        Utc::now() + jittered_backoff(attempts, rng)
     };
 
     if final_retry {
@@ -1221,8 +1253,10 @@ pub(crate) mod tests {
         let due = fetch_due(&pool, 100, "test-key").await.unwrap();
         assert_eq!(due.len(), 5);
 
+        // Deterministic RNG so the variance assertion is stable (#617).
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5EED);
         for d in due {
-            mark_retry(&pool, &d, "test error", 5, &DeliveryOutcome::default())
+            mark_retry_with_rng(&pool, &d, "test error", 5, &DeliveryOutcome::default(), &mut rng)
                 .await
                 .expect("mark retry");
         }
@@ -1245,6 +1279,30 @@ pub(crate) mod tests {
             "Expected variance in retry times due to jitter, got {} unique times",
             unique_times.len()
         );
+    }
+
+    #[test]
+    fn jittered_backoff_spreads_retries_across_the_window() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let delays: Vec<i64> = (0..32)
+            .map(|_| jittered_backoff(3, &mut rng).num_seconds())
+            .collect();
+        // Window for attempt 3 is 8s; delays must be within [1, 8].
+        assert!(delays.iter().all(|&d| (1..=8).contains(&d)), "{delays:?}");
+        let unique: std::collections::HashSet<_> = delays.iter().collect();
+        assert!(unique.len() > 1, "expected spread, got {delays:?}");
+    }
+
+    #[test]
+    fn jittered_backoff_respects_floor_and_cap() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        // Huge attempt count: window is capped, delay never exceeds the cap.
+        for _ in 0..64 {
+            let d = jittered_backoff(40, &mut rng).num_seconds();
+            assert!((BACKOFF_FLOOR_SECS..=BACKOFF_CAP_SECS).contains(&d), "{d}");
+        }
     }
 
     // ── Cross-language signing test vector (issue #270) ──────────────────────
@@ -1299,6 +1357,22 @@ mod redirect_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    /// Build a `DueDelivery` pointing at `url` with a fixed secret, for driving
+    /// `send()` without a database.
+    fn due_for(url: &str) -> DueDelivery {
+        DueDelivery {
+            id: 1,
+            subscription_id: uuid::Uuid::nil(),
+            attempts: 0,
+            url: url.to_string(),
+            secret: Some("test-secret".to_string()),
+            previous_secret: None,
+            event_id: None,
+            upgrade_id: None,
+            created_at: Utc::now(),
+        }
+    }
+
     #[tokio::test]
     async fn redirect_to_internal_target_is_not_followed() {
         // Stand-in for an internal service (e.g. 169.254.169.254): counts hits.
@@ -1330,23 +1404,15 @@ mod redirect_tests {
             }
         });
 
+        // Drive the real delivery path. `send()` needs a pool only to build the
+        // envelope, which fails before any query for a delivery with neither
+        // event nor upgrade id — so we exercise the HTTP path via a lazy pool.
+        let pool = sqlx::PgPool::connect_lazy("postgres://unused/unused").unwrap();
         let http = build_delivery_client(StdDuration::from_secs(2), StdDuration::from_secs(5))
             .expect("client");
-        let resp = http
-            .post(format!("http://{hook_addr}/hook"))
-            .header("Content-Type", "application/json")
-            .body("{}")
-            .send()
-            .await
-            .expect("request to hook");
-
-        assert_eq!(resp.status(), reqwest::StatusCode::FOUND);
-        let loc = resp
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        let err = delivery_outcome(resp.status(), loc.as_deref()).unwrap_err();
+        let config = Config::default();
+        let d = due_for(&format!("http://{hook_addr}/hook"));
+        let err = send(&pool, &http, &d, &config).await.unwrap_err();
         assert!(
             err.to_string().contains("redirects are not followed"),
             "unexpected error: {err}"
@@ -1354,6 +1420,47 @@ mod redirect_tests {
 
         tokio::time::sleep(StdDuration::from_millis(100)).await;
         assert_eq!(hits.load(Ordering::SeqCst), 0, "redirect target was contacted");
+    }
+
+    #[tokio::test]
+    async fn oversized_response_body_is_read_bounded() {
+        // Server that streams ~100 MB of body without ever finishing.
+        let hook = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hook_addr = hook.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = hook.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 104857600\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+                let chunk = vec![b'A'; 64 * 1024];
+                for _ in 0..1600 {
+                    if sock.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let http = build_delivery_client(StdDuration::from_secs(2), StdDuration::from_secs(5))
+            .expect("client");
+        let resp = http
+            .get(format!("http://{hook_addr}/hook"))
+            .send()
+            .await
+            .expect("request to hook");
+
+        let started = std::time::Instant::now();
+        let snippet = read_body_snippet(resp, 512).await.expect("read body");
+        assert!(snippet.len() <= 512, "snippet not bounded: {}", snippet.len());
+        assert!(
+            started.elapsed() < StdDuration::from_secs(2),
+            "reading bounded body took too long: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

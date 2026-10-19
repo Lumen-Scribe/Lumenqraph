@@ -93,11 +93,17 @@ exactly how each `ScVal` XDR variant is rendered in the generic decoder. The
 spec-driven `enriched` field (present for contracts with an on-chain interface)
 always adds explicit type names and resolves ambiguities.
 
+Every row below is backed by a decoder output: the `json_dialect_snapshot`
+`insta` test in `crates/lumenqraph-core/src/xdr.rs` decodes one sample of each
+variant and snapshots the result (`crates/lumenqraph-core/src/snapshots/`).
+If the decoder changes, that snapshot changes with it — the table and the code
+cannot drift apart silently.
+
 | XDR variant | JSON representation |
 |---|---|
 | `ScvBool` | `true` / `false` |
 | `ScvVoid` | `null` |
-| `ScvError` | `{"_error":true}` |
+| `ScvError` | `{"error":{"type":"<type>","code":<code>}}`, e.g. `{"error":{"type":"contract","code":1}}` |
 | `ScvU32` | JSON number (safe for all 32-bit values) |
 | `ScvI32` | JSON number (safe for all 32-bit values) |
 | `ScvU64` | decimal string, e.g. `"18446744073709551615"` |
@@ -116,11 +122,14 @@ always adds explicit type names and resolves ambiguities.
 | `ScvMap` (collisions or non-string keys) | array of `{"key":…,"val":…}` pair objects |
 | `ScvAddress` (account) | `G…` strkey, 56 chars |
 | `ScvAddress` (contract) | `C…` strkey, 56 chars |
-| `ScvAddress` (other) | `"_addr_type_<N>"` placeholder |
+| `ScvAddress` (muxed account) | `M…` strkey |
+| `ScvAddress` (claimable balance) | `B…` strkey |
+| `ScvAddress` (liquidity pool) | `L…` strkey |
+| `ScvAddress` (unknown type) | `null` — the address cannot be rendered as a strkey |
 | `ScvContractInstance` (tag 19) | `{"_xdr_tag":19}` — payload consumed safely |
 | `ScvLedgerKeyContractInstance` (tag 20) | `{"_xdr_tag":20}` — no payload |
 | `ScvLedgerKeyNonce` (tag 21) | `{"_xdr_tag":21}` — payload consumed safely |
-| unknown tag | `{"_xdr_tag":<N>}` fallback; surrounding siblings unaffected |
+| unknown tag | whole value falls back to `{"_type":"unknown","xdr":"<base64>"}`; surrounding siblings unaffected |
 
 **Known ambiguities in the generic decoder** (use `enriched` to distinguish):
 

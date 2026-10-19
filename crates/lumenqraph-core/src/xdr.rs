@@ -7,8 +7,8 @@
 //! (`G...`/`C...`/`M...`/`B...`/`L...`); bytes as hex.
 //!
 //! Decoding is always best-effort: on any malformed input we fall back to
-//! `{"_xdr": "<base64>"}` so nothing is lost and one weird event can't break
-//! ingestion.
+//! `{"_type":"unknown","xdr":"<base64>"}` so nothing is lost and one weird
+//! event can't break ingestion.
 //!
 //! ## JSON dialect
 //!
@@ -16,11 +16,16 @@
 //! See also [`docs/API.md`](../../../docs/API.md) for the consumer-facing
 //! description.
 //!
+//! The table is backed by the `dialect_snapshot` test in this module, which
+//! decodes one sample of each variant and snapshots the output
+//! (`snapshots/*dialect_snapshot*`). If you change a mapping, update the table
+//! and re-accept the snapshot together.
+//!
 //! | XDR variant               | JSON representation                                 |
 //! |---------------------------|-----------------------------------------------------|
 //! | `ScvBool`                 | `true` / `false`                                    |
 //! | `ScvVoid`                 | `null`                                              |
-//! | `ScvError`                | `{"_error":true}`                                   |
+//! | `ScvError`                | `{"error":{"type":"<name>","code":<code>}}`         |
 //! | `ScvU32`                  | JSON number (u32 fits safely in f64)                |
 //! | `ScvI32`                  | JSON number (i32 fits safely in f64)                |
 //! | `ScvU64`                  | decimal string (e.g. `"18446744073709551615"`)       |
@@ -42,11 +47,11 @@
 //! | `ScvAddress` (muxed)      | `M…` strkey (69 chars)                              |
 //! | `ScvAddress` (claimable balance) | `B…` strkey                                  |
 //! | `ScvAddress` (liquidity pool)    | `L…` strkey                                  |
-//! | `ScvAddress` (unknown type) | whole value falls back to `{"_type":"unknown",…}` |
+//! | `ScvAddress` (unknown type) | whole value falls back to `{"_type":"unknown","xdr":"<base64>"}` |
 //! | `ScvContractInstance` (19)| `{"_xdr_tag":19}` — payload consumed safely         |
 //! | `ScvLedgerKeyContractInstance` (20) | `{"_xdr_tag":20}` — no payload            |
 //! | `ScvLedgerKeyNonce` (21)  | `{"_xdr_tag":21}` — payload consumed safely         |
-//! | unknown tag               | `{"_xdr_tag":<N>}` fallback; surrounding data intact|
+//! | unknown tag               | whole value falls back to `{"_type":"unknown","xdr":"<base64>"}` |
 //!
 //! **Ambiguities to be aware of:**
 //! - `Symbol("abc")` and `String("abc")` both decode to `"abc"` — the type
@@ -408,10 +413,13 @@ impl<'a> Cursor<'a> {
                 let _nonce = self.i64()?;
                 json!({ "_xdr_tag": SCV_LEDGER_KEY_NONCE })
             }
-            // Any other unknown tag: return an opaque marker. No bytes consumed
-            // beyond the tag (which is fine — we signal failure via None so the
-            // top-level falls back, keeping the cursor state irrelevant).
-            _ => json!({ "_xdr_tag": tag }),
+            // Any other unknown tag (e.g. a future ScVal variant added by a
+            // protocol upgrade): we cannot know the payload layout, so we
+            // cannot keep the cursor aligned. Signal failure via `None` so the
+            // whole value falls back losslessly to the raw base64 — inside a
+            // vec/map this stops decoding the container cleanly instead of
+            // reading the unknown payload as the next element.
+            _ => return None,
         })
     }
 
@@ -566,19 +574,23 @@ pub fn is_valid_contract_id(s: &str) -> bool {
 /// Accepts a comma-separated list of C-strkey contract addresses (or an empty
 /// string / unset for "index everything"). Returns an error if:
 /// * any entry is not a valid C-strkey,
-/// * the number of entries exceeds the `getEvents` RPC limit of 25 (5 filters ×
-///   5 IDs).
+/// * the number of *unique* entries exceeds the `getEvents` RPC limit of 25
+///   (5 filters × 5 IDs).
+///
+/// Duplicates are removed while preserving first-seen order (a warning listing
+/// them is logged), so repeated IDs don't waste filter capacity or produce
+/// duplicate RPC filters.
 ///
 /// This function is shared by all services that need to read `CONTRACT_IDS` so
 /// that validation never drifts between the indexer, API, webhooks, and MCP.
 pub fn parse_contract_ids(raw: &str) -> Result<Vec<String>, String> {
-    let ids: Vec<String> = raw
+    let entries: Vec<String> = raw
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
 
-    for id in &ids {
+    for id in &entries {
         if !is_valid_contract_id(id) {
             return Err(format!(
                 "invalid CONTRACT_ID {id:?}: expected a C\u{2026} strkey (Soroban contract address)"
@@ -586,10 +598,28 @@ pub fn parse_contract_ids(raw: &str) -> Result<Vec<String>, String> {
         }
     }
 
+    // #612: de-duplicate while preserving first-seen order.
+    let mut seen = std::collections::HashSet::new();
+    let mut duplicates: Vec<String> = Vec::new();
+    let mut ids: Vec<String> = Vec::with_capacity(entries.len());
+    for id in entries {
+        if seen.insert(id.clone()) {
+            ids.push(id);
+        } else {
+            duplicates.push(id);
+        }
+    }
+    if !duplicates.is_empty() {
+        tracing::warn!(
+            duplicates = ?duplicates,
+            "CONTRACT_IDS contains duplicate entries; ignoring repeats"
+        );
+    }
+
     const MAX_CONTRACT_IDS: usize = 25; // 5 filters × 5 IDs per filter
     if ids.len() > MAX_CONTRACT_IDS {
         return Err(format!(
-            "CONTRACT_IDS contains {} entries, but getEvents supports at most {} \
+            "CONTRACT_IDS contains {} unique entries, but getEvents supports at most {} \
              contract IDs (5 filters × 5 IDs per filter). \
              Remove {} contract IDs, or run multiple instances each covering a \
              different subset.",
@@ -677,16 +707,173 @@ mod tests {
     }
 
     #[test]
-    fn unknown_scval_tag_returns_discriminator() {
-        // Create an XDR with an unknown tag (999) — not one of the SCV_* constants.
+    fn unknown_scval_tag_falls_back_to_unknown() {
+        // #610: an unknown top-level tag (999) must fall back losslessly to the
+        // documented `{"_type":"unknown","xdr":"<base64>"}` shape.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&999u32.to_be_bytes());
         let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let result = b64(&raw);
 
-        // Should return a structured unknown marker (no trailing-byte fallback
-        // because unknown tags consume nothing after the tag itself).
-        assert_eq!(result.get("_xdr_tag").and_then(|v| v.as_u64()), Some(999));
+        assert_eq!(
+            result,
+            serde_json::json!({ "_type": "unknown", "xdr": raw })
+        );
+    }
+
+    #[test]
+    fn unknown_tag_nested_in_vec_falls_back_for_whole_value() {
+        // #610: a vec whose second element has an unknown tag (999) followed by
+        // a valid element must yield the documented whole-value fallback — the
+        // unknown payload must not be misread as the next element.
+        let mut bytes = SCV_VEC.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&1u32.to_be_bytes()); // present
+        bytes.extend_from_slice(&3u32.to_be_bytes()); // len = 3
+        // element 0: valid u32
+        bytes.extend_from_slice(&SCV_U32.to_be_bytes());
+        bytes.extend_from_slice(&7u32.to_be_bytes());
+        // element 1: unknown tag with an opaque payload
+        bytes.extend_from_slice(&999u32.to_be_bytes());
+        bytes.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        // element 2: valid u32 (would be misread as the unknown payload)
+        bytes.extend_from_slice(&SCV_U32.to_be_bytes());
+        bytes.extend_from_slice(&9u32.to_be_bytes());
+
+        let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&raw);
+        assert_eq!(
+            result,
+            serde_json::json!({ "_type": "unknown", "xdr": raw }),
+            "unknown nested tag must fall back for the whole value, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn dialect_snapshot() {
+        // #611: decode one sample per ScVal variant so the documented dialect
+        // table is backed by tested output. Re-accept the snapshot when a
+        // mapping changes, and update the module docs in the same commit.
+        fn sym(s: &str) -> Vec<u8> {
+            let mut v = SCV_SYMBOL.to_be_bytes().to_vec();
+            v.extend_from_slice(&(s.len() as u32).to_be_bytes());
+            v.extend_from_slice(s.as_bytes());
+            let pad = (4 - (s.len() % 4)) % 4;
+            v.extend(std::iter::repeat(0u8).take(pad));
+            v
+        }
+        fn u32v(n: u32) -> Vec<u8> {
+            let mut v = SCV_U32.to_be_bytes().to_vec();
+            v.extend_from_slice(&n.to_be_bytes());
+            v
+        }
+        fn enc(bytes: &[u8]) -> String {
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        }
+
+        let mut samples: Vec<(&str, Vec<u8>)> = Vec::new();
+
+        let mut b = SCV_BOOL.to_be_bytes().to_vec();
+        b.extend_from_slice(&1u32.to_be_bytes());
+        samples.push(("bool", b));
+        samples.push(("void", SCV_VOID.to_be_bytes().to_vec()));
+
+        // ScvError: Contract error type 0, code 7.
+        let mut b = SCV_ERROR.to_be_bytes().to_vec();
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&7u32.to_be_bytes());
+        samples.push(("error_contract", b));
+
+        samples.push(("u32", u32v(42)));
+        let mut b = SCV_I32.to_be_bytes().to_vec();
+        b.extend_from_slice(&(-42i32).to_be_bytes());
+        samples.push(("i32", b));
+        let mut b = SCV_U64.to_be_bytes().to_vec();
+        b.extend_from_slice(&u64::MAX.to_be_bytes());
+        samples.push(("u64", b));
+        let mut b = SCV_I64.to_be_bytes().to_vec();
+        b.extend_from_slice(&i64::MIN.to_be_bytes());
+        samples.push(("i64", b));
+        let mut b = SCV_TIMEPOINT.to_be_bytes().to_vec();
+        b.extend_from_slice(&123u64.to_be_bytes());
+        samples.push(("timepoint", b));
+        let mut b = SCV_DURATION.to_be_bytes().to_vec();
+        b.extend_from_slice(&456u64.to_be_bytes());
+        samples.push(("duration", b));
+        let mut b = SCV_U128.to_be_bytes().to_vec();
+        b.extend_from_slice(&0u64.to_be_bytes());
+        b.extend_from_slice(&300u64.to_be_bytes());
+        samples.push(("u128", b));
+        let mut b = SCV_I128.to_be_bytes().to_vec();
+        b.extend_from_slice(&(-1i64).to_be_bytes());
+        b.extend_from_slice(&u64::MAX.to_be_bytes());
+        samples.push(("i128", b));
+        let mut b = SCV_U256.to_be_bytes().to_vec();
+        b.extend_from_slice(&[0xABu8; 32]);
+        samples.push(("u256", b));
+        let mut b = SCV_I256.to_be_bytes().to_vec();
+        b.extend_from_slice(&[0xCDu8; 32]);
+        samples.push(("i256", b));
+
+        let mut b = SCV_BYTES.to_be_bytes().to_vec();
+        b.extend_from_slice(&2u32.to_be_bytes());
+        b.extend_from_slice(&[0xDE, 0xAD]);
+        b.extend_from_slice(&[0, 0]);
+        samples.push(("bytes", b));
+
+        let mut b = SCV_STRING.to_be_bytes().to_vec();
+        b.extend_from_slice(&3u32.to_be_bytes());
+        b.extend_from_slice(b"abc");
+        b.extend_from_slice(&[0]);
+        samples.push(("string", b));
+        samples.push(("symbol", sym("fee")));
+
+        let mut b = SCV_VEC.to_be_bytes().to_vec();
+        b.extend_from_slice(&1u32.to_be_bytes());
+        b.extend_from_slice(&2u32.to_be_bytes());
+        b.extend(u32v(1));
+        b.extend(u32v(2));
+        samples.push(("vec", b));
+
+        let mut b = SCV_MAP.to_be_bytes().to_vec();
+        b.extend_from_slice(&1u32.to_be_bytes());
+        b.extend_from_slice(&1u32.to_be_bytes());
+        b.extend(sym("a"));
+        b.extend(u32v(1));
+        samples.push(("map", b));
+
+        let mut b = SCV_ADDRESS.to_be_bytes().to_vec();
+        b.extend_from_slice(&SC_ADDRESS_ACCOUNT.to_be_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&[0u8; 32]);
+        samples.push(("address_account", b));
+
+        let mut b = SCV_ADDRESS.to_be_bytes().to_vec();
+        b.extend_from_slice(&SC_ADDRESS_CONTRACT.to_be_bytes());
+        b.extend_from_slice(&[0u8; 32]);
+        samples.push(("address_contract", b));
+
+        let mut b = SCV_CONTRACT_INSTANCE.to_be_bytes().to_vec();
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&[0u8; 32]);
+        b.extend_from_slice(&0u32.to_be_bytes());
+        samples.push(("contract_instance", b));
+
+        samples.push((
+            "ledger_key_contract_instance",
+            SCV_LEDGER_KEY_CONTRACT_INSTANCE.to_be_bytes().to_vec(),
+        ));
+
+        let mut b = SCV_LEDGER_KEY_NONCE.to_be_bytes().to_vec();
+        b.extend_from_slice(&42i64.to_be_bytes());
+        samples.push(("ledger_key_nonce", b));
+
+        samples.push(("unknown_tag", 999u32.to_be_bytes().to_vec()));
+
+        let mut out = serde_json::Map::new();
+        for (name, bytes) in samples {
+            out.insert(name.to_string(), decode_scval_base64(&enc(&bytes)));
+        }
+        insta::assert_json_snapshot!("dialect_snapshot", Value::Object(out));
     }
 
     // ── #410: edge cases ─────────────────────────────────────────────────
@@ -1055,6 +1242,24 @@ mod tests {
 
         let raw25 = ids[..25].join(",");
         assert_eq!(parse_contract_ids(&raw25).unwrap().len(), 25);
+    }
+
+    #[test]
+    fn parse_contract_ids_deduplicates_preserving_order() {
+        // #612: 26 entries with one duplicate → 25 unique IDs, in first-seen
+        // order, and no "too many" error.
+        let ids: Vec<String> = (0u8..25)
+            .map(|i| make_contract_strkey(&[i; 32]))
+            .collect();
+        // Append a duplicate of the first ID to reach 26 entries.
+        let mut entries = ids.clone();
+        entries.push(ids[0].clone());
+        assert_eq!(entries.len(), 26);
+
+        let raw = entries.join(",");
+        let parsed = parse_contract_ids(&raw).expect("26 entries with one duplicate should pass");
+        assert_eq!(parsed.len(), 25, "duplicates must be removed");
+        assert_eq!(parsed, ids, "order must be preserved");
     }
 }
 
