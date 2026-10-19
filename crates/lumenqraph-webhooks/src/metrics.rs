@@ -6,7 +6,7 @@ use axum::extract::State;
 use axum::http::header;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::{Json, Router, Server};
+use axum::{Json, Router};
 use chrono::Utc;
 use serde_json::json;
 use sqlx::PgPool;

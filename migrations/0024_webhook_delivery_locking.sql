@@ -8,10 +8,11 @@ ALTER TABLE webhook_deliveries
     ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS locked_by TEXT;
 
--- Index for finding claimable rows: pending, due, and not locked.
+-- Index for finding claimable rows: pending, due, and not locked. The lock
+-- check is left to the query because index predicates must be immutable.
 CREATE INDEX IF NOT EXISTS idx_deliveries_claimable
     ON webhook_deliveries (status, next_attempt_at)
-    WHERE status = 'pending' AND (locked_until IS NULL OR locked_until < now());
+    WHERE status = 'pending';  -- now() is not allowed in an index predicate
 
 COMMENT ON COLUMN webhook_deliveries.locked_until IS 
     'Lease expiry time for delivery claim. Allows crashed workers'' claims to be retried.';

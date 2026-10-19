@@ -663,7 +663,7 @@ mod tests {
             );
         }
     }
-
+}
 
 /// Per-client-IP rate limiting for sibling-instance mounts (#442).
 ///

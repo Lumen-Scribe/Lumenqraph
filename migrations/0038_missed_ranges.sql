@@ -16,3 +16,11 @@ CREATE TABLE IF NOT EXISTS missed_ranges (
 CREATE INDEX IF NOT EXISTS idx_missed_ranges_unrecovered
     ON missed_ranges (contract_id, start_ledger)
     WHERE recovered_at IS NULL;
+
+-- From 0028: runs after the table is created above (0028 sorts before it).
+ALTER TABLE missed_ranges
+    ADD COLUMN IF NOT EXISTS recoverable BOOLEAN NOT NULL DEFAULT TRUE;
+
+CREATE INDEX IF NOT EXISTS idx_missed_ranges_recoverable
+    ON missed_ranges (detected_at)
+    WHERE recovered_at IS NULL AND recoverable = TRUE;

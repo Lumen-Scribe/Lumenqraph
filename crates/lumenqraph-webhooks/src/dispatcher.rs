@@ -136,9 +136,9 @@ async fn enqueue_backfill(pool: &PgPool, batch: i64) -> anyhow::Result<u64> {
                         (NOT (s.filter ? 'contract_id') OR s.filter->>'contract_id' = e.contract_id)
                         AND (NOT (s.filter ? 'event_name') OR s.filter->>'event_name' = e.event_name)
                         AND (NOT (s.filter ? 'topic0') OR e.decoded_topics @> jsonb_build_array((s.filter->>'topic0')::jsonb))
-                        AND (NOT (s.filter ? 'topic1') OR e.decoded_topics @> jsonb_build_array(jsonb_null::jsonb, (s.filter->>'topic1')::jsonb))
-                        AND (NOT (s.filter ? 'topic2') OR e.decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, (s.filter->>'topic2')::jsonb))
-                        AND (NOT (s.filter ? 'topic3') OR e.decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, jsonb_null::jsonb, (s.filter->>'topic3')::jsonb))
+                        AND (NOT (s.filter ? 'topic1') OR e.decoded_topics @> jsonb_build_array('null'::jsonb, (s.filter->>'topic1')::jsonb))
+                        AND (NOT (s.filter ? 'topic2') OR e.decoded_topics @> jsonb_build_array('null'::jsonb, 'null'::jsonb, (s.filter->>'topic2')::jsonb))
+                        AND (NOT (s.filter ? 'topic3') OR e.decoded_topics @> jsonb_build_array('null'::jsonb, 'null'::jsonb, 'null'::jsonb, (s.filter->>'topic3')::jsonb))
                         AND (NOT (s.filter ? 'to') OR e.enriched @> jsonb_build_object('to', s.filter->'to'))
                         AND (NOT (s.filter ? 'from') OR e.enriched @> jsonb_build_object('from', s.filter->'from'))
                         AND (NOT (s.filter ? 'amount') OR e.enriched @> jsonb_build_object('amount', s.filter->'amount'))
@@ -224,9 +224,9 @@ async fn enqueue_events(pool: &PgPool, batch: i64) -> anyhow::Result<u64> {
                     (NOT (s.filter ? 'contract_id') OR s.filter->>'contract_id' = e.contract_id)
                     AND (NOT (s.filter ? 'event_name') OR s.filter->>'event_name' = e.event_name)
                     AND (NOT (s.filter ? 'topic0') OR e.decoded_topics @> jsonb_build_array((s.filter->>'topic0')::jsonb))
-                    AND (NOT (s.filter ? 'topic1') OR e.decoded_topics @> jsonb_build_array(jsonb_null::jsonb, (s.filter->>'topic1')::jsonb))
-                    AND (NOT (s.filter ? 'topic2') OR e.decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, (s.filter->>'topic2')::jsonb))
-                    AND (NOT (s.filter ? 'topic3') OR e.decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, jsonb_null::jsonb, (s.filter->>'topic3')::jsonb))
+                    AND (NOT (s.filter ? 'topic1') OR e.decoded_topics @> jsonb_build_array('null'::jsonb, (s.filter->>'topic1')::jsonb))
+                    AND (NOT (s.filter ? 'topic2') OR e.decoded_topics @> jsonb_build_array('null'::jsonb, 'null'::jsonb, (s.filter->>'topic2')::jsonb))
+                    AND (NOT (s.filter ? 'topic3') OR e.decoded_topics @> jsonb_build_array('null'::jsonb, 'null'::jsonb, 'null'::jsonb, (s.filter->>'topic3')::jsonb))
                     AND (NOT (s.filter ? 'to') OR e.enriched @> jsonb_build_object('to', s.filter->'to'))
                     AND (NOT (s.filter ? 'from') OR e.enriched @> jsonb_build_object('from', s.filter->'from'))
                     AND (NOT (s.filter ? 'amount') OR e.enriched @> jsonb_build_object('amount', s.filter->'amount'))
@@ -538,15 +538,6 @@ pub async fn deliver_with_shutdown(
     Ok((delivered, failed))
 }
 
-    let delivered = results.iter().filter(|r| r.map_or(false, |(s, _)| s)).count() as u64;
-    let failed = results.iter().filter(|r| r.map_or(false, |(s, _)| !s)).count() as u64;
-
-    if delivered > 0 || failed > 0 {
-        info!(delivered, failed, "webhook deliveries processed");
-    }
-    Ok((delivered, failed))
-}
-
 fn build_per_host_limits(
     deliveries: &[DueDelivery],
     max_per_host: usize,
@@ -645,7 +636,7 @@ async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &C
 
     let parsed_url = Url::parse(&d.url).context("failed to parse URL")?;
     let host = parsed_url.host_str().context("URL must have a host")?;
-    let validated_ip = validate_webhook_url_at_delivery(&d.url).await?;
+    let validated_ip = validate_webhook_url_at_delivery(&d.url).await.map_err(|e| anyhow::anyhow!(e))?;
     let client = reqwest::Client::builder()
         .resolve(
             host,
@@ -672,20 +663,45 @@ async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &C
 
     let resp = client.execute(req).await.context("request failed")?;
     let status = resp.status();
-    let body_bytes = resp.bytes().await.context("failed to read webhook response body")?;
-    let snippet = String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(512)]).to_string();
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    // Redirects are never followed (SSRF guard); a 3xx is a failed delivery.
+    if status.is_redirection() {
+        delivery_outcome(status, location.as_deref())?;
+    }
     let retry_after = resp
         .headers()
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
         .map(|secs| Duration::seconds(secs as i64));
+    let body_bytes = resp.bytes().await.context("failed to read webhook response body")?;
+    let snippet = String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(512)]).to_string();
 
     Ok(DeliveryOutcome {
         status: Some(status.as_u16() as i32),
         retry_after,
         body_snippet: snippet,
     })
+}
+
+/// Map a delivery response to success/failure. Only `2xx` counts as delivered;
+/// a `3xx` is a failure because redirects are not followed.
+fn delivery_outcome(status: reqwest::StatusCode, location: Option<&str>) -> anyhow::Result<()> {
+    if status.is_success() {
+        Ok(())
+    } else if status.is_redirection() {
+        Err(anyhow::anyhow!(
+            "redirects are not followed: endpoint returned {} (Location: {})",
+            status,
+            location.unwrap_or("<none>")
+        ))
+    } else {
+        Err(anyhow::anyhow!("non-2xx status {status}"))
+    }
 }
 
 pub fn build_delivery_client(
@@ -885,12 +901,13 @@ mod tests {
     /// A subscription of `kind`, optionally scoped to one contract.
     async fn subscribe(pool: &PgPool, kind: &str, contract_id: Option<&str>, encryption_key: &str) {
         sqlx::query(
-            "INSERT INTO webhook_subscriptions (url, kind, contract_id, encrypted_secret)
-             VALUES ('https://example.test/hook', $1, $2, $3)",
+            "INSERT INTO webhook_subscriptions (url, kind, contract_id, secret, encrypted_secret)
+             VALUES ('https://example.test/hook', $1, $2, 'test-secret',
+                     pgp_sym_encrypt('test-secret', $3))",
         )
         .bind(kind)
         .bind(contract_id)
-        .bind(encryption_key.as_bytes())  // Store as bytes for the test
+        .bind(encryption_key)
         .execute(pool)
         .await
         .expect("insert subscription");
@@ -1010,7 +1027,7 @@ mod tests {
         assert_eq!(due.len(), 5);
 
         for d in due {
-            mark_retry(&pool, &d, "test error", 5)
+            mark_retry(&pool, &d, "test error", 5, &DeliveryOutcome::default())
                 .await
                 .expect("mark retry");
         }
