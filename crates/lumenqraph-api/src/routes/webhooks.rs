@@ -144,20 +144,34 @@ pub struct CreateWebhook {
     since: Option<String>,
 }
 
+/// Deserializes a field so that an absent key is `None` (leave unchanged) and
+/// an explicit `null` is `Some(None)` (clear the stored value).
+fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(de).map(Some)
+}
+
 #[derive(Deserialize)]
 pub struct UpdateWebhook {
     /// Toggle active/paused state of the subscription.
     active: Option<bool>,
-    /// Update legacy single contract filter.
-    contract_id: Option<String>,
-    /// Update legacy single event filter.
-    event_name: Option<String>,
-    #[serde(default)]
-    contract_ids: Option<Vec<String>>,
-    #[serde(default)]
-    event_names: Option<Vec<String>>,
-    #[serde(default)]
-    filter: Option<Value>,
+    /// New delivery URL. Validated with the same SSRF rules as create.
+    url: Option<String>,
+    /// Update legacy single contract filter. `null` clears it.
+    #[serde(default, deserialize_with = "double_option")]
+    contract_id: Option<Option<String>>,
+    /// Update legacy single event filter. `null` clears it.
+    #[serde(default, deserialize_with = "double_option")]
+    event_name: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    contract_ids: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "double_option")]
+    event_names: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "double_option")]
+    filter: Option<Option<Value>>,
 }
 
 /// Response returned by `create_webhook`. Carries the one-time plaintext
@@ -477,42 +491,25 @@ pub async fn update_webhook(
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateWebhook>,
 ) -> ApiResult<Json<Value>> {
-    if body.active.is_none() && body.contract_id.is_none() && body.event_name.is_none() && body.contract_ids.is_none() && body.event_names.is_none() && body.filter.is_none() {
+    let touches_event_fields = body.event_name.is_some() || body.event_names.is_some();
+    if body.active.is_none()
+        && body.url.is_none()
+        && body.contract_id.is_none()
+        && !touches_event_fields
+        && body.contract_ids.is_none()
+        && body.filter.is_none()
+    {
         return Err(ApiError::bad_request("no fields to update"));
     }
 
-    if let Some(ref filter) = body.filter {
+    if let Some(Some(ref filter)) = body.filter {
         validate_webhook_filter(filter)?;
     }
-
-    let current: (String, bool, Option<String>, Option<String>, Option<Vec<String>>, Option<Vec<String>>, Option<Value>) = sqlx::query_as(
-        "SELECT kind, active, contract_id, event_name, contract_ids, event_names, filter FROM webhook_subscriptions WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| ApiError::not_found("webhook subscription not found"))?;
-
-    let (kind, _active, cur_contract, cur_event, cur_contracts, cur_events, cur_filter) = current;
-    if kind == "upgrade" && (body.event_name.is_some() || body.event_names.is_some()) {
-        return Err(ApiError::bad_request(
-            "event_name does not apply to an `upgrade` subscription",
-        ));
+    if let Some(ref url) = body.url {
+        url_validation::validate_webhook_url(url)
+            .map_err(|e| ApiError::bad_request(format!("invalid webhook url: {}", e)))?;
     }
-
-    let next_contract_id = body.contract_id.as_deref().or(cur_contract.as_deref());
-    let next_event_name = body.event_name.as_deref().or(cur_event.as_deref());
-    let next_contract_ids = match body.contract_ids {
-        Some(ref ids) => Some(ids.clone()),
-        None => cur_contracts,
-    };
-    let next_event_names = match body.event_names {
-        Some(ref names) => Some(names.clone()),
-        None => cur_events,
-    };
-    let next_filter = body.filter.or(cur_filter);
-
-    if let Some(ref ids) = next_contract_ids {
+    if let Some(Some(ref ids)) = body.contract_ids {
         if ids.len() > 25 {
             return Err(ApiError::bad_request("contract_ids must contain at most 25 entries"));
         }
@@ -520,7 +517,7 @@ pub async fn update_webhook(
             validate_contract_id(cid)?;
         }
     }
-    if let Some(ref names) = next_event_names {
+    if let Some(Some(ref names)) = body.event_names {
         if names.len() > 25 {
             return Err(ApiError::bad_request("event_names must contain at most 25 entries"));
         }
@@ -529,41 +526,91 @@ pub async fn update_webhook(
         }
     }
 
-    let updated: (Uuid, String, String, Option<String>, Option<String>, Option<Vec<String>>, Option<Vec<String>>, Option<Value>, bool, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+    let kind: String = sqlx::query_scalar("SELECT kind FROM webhook_subscriptions WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| ApiError::not_found("webhook subscription not found"))?;
+    if kind == "upgrade" && touches_event_fields {
+        return Err(ApiError::bad_request(
+            "event_name does not apply to an `upgrade` subscription",
+        ));
+    }
+
+    // Each optional field is paired with a `set_*` flag so an explicit `null`
+    // (clear) can be distinguished from an absent key (leave unchanged). COALESCE
+    // alone cannot express "set to NULL".
+    let (set_contract, contract_id) = split_clearable(body.contract_id);
+    let (set_event, event_name) = split_clearable(body.event_name);
+    let (set_contracts, contract_ids) = split_clearable(body.contract_ids);
+    let (set_events, event_names) = split_clearable(body.event_names);
+    let (set_filter, filter) = split_clearable(body.filter);
+    // Re-enabling clears the auto-disable state so the subscription stays on.
+    let reactivate = body.active == Some(true);
+
+    let row: WebhookListRow = sqlx::query_as(
         "UPDATE webhook_subscriptions
-            SET active      = COALESCE($2, active),
-                contract_id = COALESCE($3, contract_id),
-                event_name  = COALESCE($4, event_name),
-                contract_ids = COALESCE($5, contract_ids),
-                event_names = COALESCE($6, event_names),
-                filter      = COALESCE($7, filter)
+            SET active       = COALESCE($2, active),
+                url          = COALESCE($3, url),
+                contract_id  = CASE WHEN $4 THEN $5 ELSE contract_id END,
+                event_name   = CASE WHEN $6 THEN $7 ELSE event_name END,
+                contract_ids = CASE WHEN $8 THEN $9 ELSE contract_ids END,
+                event_names  = CASE WHEN $10 THEN $11 ELSE event_names END,
+                filter       = CASE WHEN $12 THEN COALESCE($13, 'null'::jsonb) ELSE filter END,
+                auto_disabled_at     = CASE WHEN $14 THEN NULL ELSE auto_disabled_at END,
+                auto_disabled_reason = CASE WHEN $14 THEN NULL ELSE auto_disabled_reason END,
+                consecutive_failures = CASE WHEN $14 THEN 0 ELSE consecutive_failures END
           WHERE id = $1
-          RETURNING id, url, kind, contract_id, event_name, contract_ids, event_names, filter, active, created_at",
+          RETURNING id, url, kind, contract_id, event_name, contract_ids, event_names, filter, active, created_at, auto_disabled_at, auto_disabled_reason",
     )
     .bind(id)
     .bind(body.active)
-    .bind(next_contract_id)
-    .bind(next_event_name)
-    .bind(&next_contract_ids)
-    .bind(&next_event_names)
-    .bind(&next_filter)
+    .bind(body.url.as_deref())
+    .bind(set_contract)
+    .bind(contract_id.as_deref())
+    .bind(set_event)
+    .bind(event_name.as_deref())
+    .bind(set_contracts)
+    .bind(&contract_ids)
+    .bind(set_events)
+    .bind(&event_names)
+    .bind(set_filter)
+    .bind(&filter)
+    .bind(reactivate)
     .fetch_one(&state.pool)
     .await?;
 
     log_webhook_action(&state.pool, "webhook_update", &id.to_string()).await;
 
-    Ok(Json(json!({
-        "id": updated.0,
-        "url": updated.1,
-        "kind": updated.2,
-        "contract_id": updated.3,
-        "event_name": updated.4,
-        "contract_ids": updated.5,
-        "event_names": updated.6,
-        "filter": updated.7,
-        "active": updated.8,
-        "created_at": updated.9,
-    })))
+    Ok(Json(webhook_row_json(row)))
+}
+
+/// Splits a tri-state PATCH field into `(should_set, value)`. An absent key
+/// yields `(false, None)`; `null` yields `(true, None)` to clear the column.
+fn split_clearable<T>(field: Option<Option<T>>) -> (bool, Option<T>) {
+    match field {
+        None => (false, None),
+        Some(value) => (true, value),
+    }
+}
+
+/// Serializes a subscription row in the same shape as `list_webhooks`.
+fn webhook_row_json(row: WebhookListRow) -> Value {
+    let (id, url, kind, contract_id, event_name, contract_ids, event_names, filter, active, created_at, auto_disabled_at, auto_disabled_reason) = row;
+    json!({
+        "id": id,
+        "url": url,
+        "kind": kind,
+        "contract_id": contract_id,
+        "event_name": event_name,
+        "contract_ids": contract_ids,
+        "event_names": event_names,
+        "filter": filter,
+        "active": active,
+        "created_at": created_at,
+        "auto_disabled_at": auto_disabled_at,
+        "auto_disabled_reason": auto_disabled_reason,
+    })
 }
 
 pub async fn delete_webhook(
@@ -812,4 +859,38 @@ pub async fn rotate_webhook_secret(
         "previous_secret_expires_at": chrono::Utc::now()
             + chrono::Duration::seconds(grace_seconds),
     })))
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+
+    #[test]
+    fn absent_field_leaves_value_unchanged() {
+        let body: UpdateWebhook = serde_json::from_str("{}").unwrap();
+        assert!(body.contract_id.is_none());
+        assert!(body.filter.is_none());
+        assert_eq!(split_clearable(body.contract_id), (false, None));
+    }
+
+    #[test]
+    fn explicit_null_clears_value() {
+        let body: UpdateWebhook =
+            serde_json::from_str(r#"{"contract_id": null, "filter": null}"#).unwrap();
+        assert_eq!(body.contract_id, Some(None));
+        assert_eq!(split_clearable(body.contract_id), (true, None));
+        assert_eq!(split_clearable(body.filter), (true, None));
+    }
+
+    #[test]
+    fn present_value_is_set() {
+        let body: UpdateWebhook =
+            serde_json::from_str(r#"{"contract_ids": ["CABC"], "url": "https://example.com/hook"}"#)
+                .unwrap();
+        assert_eq!(
+            split_clearable(body.contract_ids),
+            (true, Some(vec!["CABC".to_string()]))
+        );
+        assert_eq!(body.url.as_deref(), Some("https://example.com/hook"));
+    }
 }
