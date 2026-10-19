@@ -3,21 +3,21 @@
 //! and only their SHA-256 hash is ever compared against the database.
 //! Anonymous requests are rate limited per client IP address.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::error::{ApiError, ApiResult};
 use crate::key_cache::CachedKey;
-use crate::state::AppState;
+use crate::state::{AppState, AuditEvent};
 
 /// SHA-256 hex of an API key. Used both here and by the key-generation script.
 pub fn hash_key(key: &str) -> String {
@@ -57,7 +57,7 @@ fn extract_key(headers: &HeaderMap) -> Option<String> {
 #[derive(Clone, Debug)]
 pub struct IpConfig {
     /// Number of trusted reverse-proxy hops sitting in front of the API
-    /// (controlled by `TRUSTED_PROXY_HOPS`, default 1).
+    /// (controlled by `TRUSTED_PROXY_HOPS`, default 0).
     ///
     /// With `hops = 1`, the rightmost entry in `X-Forwarded-For` that was
     /// **not** added by the trusted proxy is the client IP. Proxies append on
@@ -72,24 +72,57 @@ pub struct IpConfig {
     pub platform_header: Option<String>,
 }
 
+/// Parse `TRUSTED_PROXY_HOPS`. Unset or unparseable values mean zero hops, so
+/// a directly exposed API never trusts a client-supplied `X-Forwarded-For`.
+fn parse_trusted_proxy_hops(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0)
+}
+
 impl IpConfig {
     /// Read configuration from the environment. Called once at startup.
     pub fn from_env() -> Self {
-        let trusted_proxy_hops = std::env::var("TRUSTED_PROXY_HOPS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(1);
+        let trusted_proxy_hops =
+            parse_trusted_proxy_hops(std::env::var("TRUSTED_PROXY_HOPS").ok().as_deref());
 
         let platform_header = std::env::var("CLIENT_IP_HEADER").ok().and_then(|v| {
             let v = v.trim().to_lowercase();
             if v.is_empty() { None } else { Some(v) }
         });
 
+        tracing::info!(
+            trusted_proxy_hops,
+            platform_header = platform_header.as_deref().unwrap_or("none"),
+            "client IP resolution configured"
+        );
+
         IpConfig {
             trusted_proxy_hops,
             platform_header,
         }
     }
+}
+
+/// Parse a client-supplied IP candidate into its canonical text form.
+///
+/// Accepts a bare IPv4 or IPv6 address, an IPv4 address with a port, or a
+/// bracketed IPv6 address with an optional port. Anything else, including
+/// over-long strings, returns `None`.
+fn parse_client_ip(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    let addr = if let Some(rest) = s.strip_prefix('[') {
+        let (inner, after) = rest.split_once(']')?;
+        if !after.is_empty() {
+            after.strip_prefix(':')?.parse::<u16>().ok()?;
+        }
+        inner.parse::<IpAddr>().ok()?
+    } else if let Ok(ip) = s.parse::<IpAddr>() {
+        ip
+    } else {
+        let (host, port) = s.rsplit_once(':')?;
+        port.parse::<u16>().ok()?;
+        host.parse::<IpAddr>().ok()?
+    };
+    Some(addr.to_string())
 }
 
 /// Extract the real client IP address from an incoming request (#428).
@@ -105,19 +138,22 @@ impl IpConfig {
 ///    Proxies *append* the peer address to XFF, so the rightmost entry is the
 ///    one the outermost trusted proxy actually saw. We skip `hops` entries from
 ///    the right (one per trusted proxy layer) to land on the real client IP.
-///    With `hops = 1` (default): `X-Forwarded-For: 1.2.3.4, 5.6.7.8` yields
+///    With `hops = 1`: `X-Forwarded-For: 1.2.3.4, 5.6.7.8` yields
 ///    `5.6.7.8` — the attacker's leftmost spoofed entries are ignored.
 ///    With `hops = 0`: XFF is not consulted.
 ///
 /// 3. **TCP peer address** — used when no proxy configuration is trusted.
+///
+/// A candidate from either header is used only if it parses as an IP address.
+/// Otherwise the next source is tried, so arbitrary strings never become
+/// rate-limit, concurrency or log keys.
 pub fn extract_client_ip(headers: &HeaderMap, socket_addr: Option<SocketAddr>, cfg: &IpConfig) -> String {
     // 1. Platform-specific single-value header (Fly, Cloudflare, nginx real_ip…).
     if let Some(ref header_name) = cfg.platform_header {
         if let Some(ip) = headers
             .get(header_name.as_str())
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+            .and_then(parse_client_ip)
         {
             return ip;
         }
@@ -128,12 +164,11 @@ pub fn extract_client_ip(headers: &HeaderMap, socket_addr: Option<SocketAddr>, c
         if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
             let parts: Vec<&str> = xff.split(',').map(|s| s.trim()).collect();
             // `parts.len() - hops` gives the index of the real client entry.
-            // If there are fewer entries than hops (misconfigured / no proxy),
-            // fall back to the leftmost entry rather than panicking.
-            if !parts.is_empty() {
-                let idx = parts.len().saturating_sub(cfg.trusted_proxy_hops);
-                let ip = parts[idx].to_string();
-                if !ip.is_empty() {
+            // Fewer entries than trusted hops means the header did not pass
+            // through the proxies we expect, so its leftmost entry is entirely
+            // client-controlled. Ignore it and use the socket address instead.
+            if parts.len() >= cfg.trusted_proxy_hops {
+                if let Some(ip) = parse_client_ip(parts[parts.len() - cfg.trusted_proxy_hops]) {
                     return ip;
                 }
             }
@@ -146,84 +181,216 @@ pub fn extract_client_ip(headers: &HeaderMap, socket_addr: Option<SocketAddr>, c
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Scope granting read access to the data routes (#559).
+pub const SCOPE_READ: &str = "read";
+/// Scope granting access to the RPC-backed routes (`/call`, `/simulate`) (#559).
+pub const SCOPE_RPC: &str = "rpc";
+/// Scope granting webhook create, update, delete, rotate and redrive (#559).
+pub const SCOPE_WEBHOOKS_WRITE: &str = "webhooks:write";
+/// Scope satisfying every other scope check (#559).
+pub const SCOPE_ADMIN: &str = "admin";
+
+/// A key that passed revocation and expiry checks.
+struct ResolvedKey {
+    hash: String,
+    rate_limit_per_min: i32,
+    scopes: Vec<String>,
+}
+
+/// Resolve `key` and require `required` (or `admin`) in its scopes.
+///
+/// Returns `(identity, limit, is_authenticated, key_hash)`, the same shape the
+/// middlewares use for anonymous and authenticated callers alike. Handlers
+/// read the key hash to scope their queries to the owning key (#421, #561).
+async fn authenticate(
+    state: &AppState,
+    key: &str,
+    route: &str,
+    method: &str,
+    required: &str,
+) -> Result<(String, i32, bool, Option<String>), ApiError> {
+    let resolved = resolve_key(state, key, route, method).await?;
+    if !resolved.scopes.iter().any(|s| s == required || s == SCOPE_ADMIN) {
+        return Err(ApiError::insufficient_scope(required));
+    }
+    Ok((
+        format!("key:{}", resolved.hash),
+        resolved.rate_limit_per_min,
+        true,
+        Some(resolved.hash),
+    ))
+}
+
 /// Perform a key lookup, consulting the in-process LRU cache first (#430).
 ///
-/// Returns `Ok((identity, limit, is_authenticated, key_hash_opt))` on success,
-/// or an `ApiError` that should be returned to the caller directly. The key
-/// hash is `Some` only for authenticated callers, so handlers can record the
-/// owner of created resources (#421).
+/// Rejects revoked, unknown and expired keys (#559). Every route group goes
+/// through here, so the cache and revocation handling live in one place (#560).
 async fn resolve_key(
     state: &AppState,
     key: &str,
     route: &str,
     method: &str,
-) -> Result<(String, i32, bool, Option<String>), ApiError> {
+) -> Result<ResolvedKey, ApiError> {
     let hash = hash_key(key);
 
     // --- Cache look-up (#430) ---
     if let Some(cached) = state.key_cache.get(&hash) {
         return match cached {
-            CachedKey::Valid { rate_limit_per_min } => {
-                Ok((format!("key:{hash}"), rate_limit_per_min, true, Some(hash)))
+            CachedKey::Valid { rate_limit_per_min, scopes, expires_at } => {
+                accept_key(state, hash, rate_limit_per_min, scopes, expires_at, route, method).await
             }
             CachedKey::Revoked => {
-                log_audit_event(&state.pool, &hash, route, method, 401).await;
+                log_audit_event(&state, &hash, route, method, 401);
                 Err(ApiError::unauthorized("API key revoked"))
             }
             CachedKey::NotFound => {
-                log_audit_event(&state.pool, &hash, route, method, 401).await;
+                log_audit_event(&state, &hash, route, method, 401);
                 Err(ApiError::unauthorized("invalid API key"))
             }
         };
     }
 
     // --- DB look-up on cache miss (#430) ---
-    let row: Option<(bool, i32)> = sqlx::query_as(
-        "SELECT revoked, rate_limit_per_min FROM api_keys WHERE key_hash = $1",
+    let row: Option<(bool, i32, Vec<String>, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT revoked, rate_limit_per_min, scopes, expires_at FROM api_keys WHERE key_hash = $1",
     )
     .bind(&hash)
     .fetch_optional(&state.pool)
     .await?;
 
     match row {
-        Some((false, limit)) => {
-            state.key_cache.insert_valid(&hash, limit);
-            Ok((format!("key:{hash}"), limit, true, Some(hash)))
+        Some((false, limit, scopes, expires_at)) => {
+            state.key_cache.insert_valid(&hash, limit, scopes.clone(), expires_at);
+            accept_key(state, hash, limit, scopes, expires_at, route, method).await
         }
-        Some((true, _)) => {
+        Some((true, _, _, _)) => {
             state.key_cache.insert_revoked(&hash);
-            log_audit_event(&state.pool, &hash, route, method, 401).await;
+            log_audit_event(&state, &hash, route, method, 401);
             Err(ApiError::unauthorized("API key revoked"))
         }
         None => {
             state.key_cache.insert_not_found(&hash);
-            log_audit_event(&state.pool, &hash, route, method, 401).await;
+            log_audit_event(&state, &hash, route, method, 401);
             Err(ApiError::unauthorized("invalid API key"))
         }
     }
 }
 
-async fn log_audit_event(
-    pool: &PgPool,
+/// Final checks for a non-revoked key: expiry (#559), then `last_used_at`.
+async fn accept_key(
+    state: &AppState,
+    hash: String,
+    rate_limit_per_min: i32,
+    scopes: Vec<String>,
+    expires_at: Option<DateTime<Utc>>,
+    route: &str,
+    method: &str,
+) -> Result<ResolvedKey, ApiError> {
+    if expires_at.is_some_and(|at| at <= Utc::now()) {
+        log_audit_event(&state, &hash, route, method, 401);
+        return Err(ApiError::key_expired());
+    }
+    if state.key_cache.should_touch_last_used(&hash) {
+        touch_last_used(state.pool.clone(), hash.clone());
+    }
+    Ok(ResolvedKey {
+        hash,
+        rate_limit_per_min,
+        scopes,
+    })
+}
+
+/// Write `api_keys.last_used_at` off the request path (#559). Callers gate this
+/// through `KeyCache::should_touch_last_used`, so it runs at most once a minute
+/// per key.
+fn touch_last_used(pool: PgPool, hash: String) {
+    tokio::spawn(async move {
+        if let Err(e) = sqlx::query("UPDATE api_keys SET last_used_at = now() WHERE key_hash = $1")
+            .bind(&hash)
+            .execute(&pool)
+            .await
+        {
+            warn!(error = %e, "failed to update api_keys.last_used_at");
+        }
+    });
+}
+
+/// Queue an audit event for the batching writer (#558). Never awaits: the
+/// request path must not pay a Postgres round-trip for bookkeeping. When the
+/// queue is full the event is dropped and `audit_dropped` is incremented.
+fn log_audit_event(
+    state: &AppState,
     key_hash_prefix: &str,
     route: &str,
     method: &str,
     status_code: u16,
 ) {
-    let truncated_prefix = key_hash_prefix.chars().take(8).collect::<String>();
-    if let Err(e) = sqlx::query(
-        "INSERT INTO audit_log (key_hash_prefix, route, http_method, status_code)
-         VALUES ($1, $2, $3, $4)"
-    )
-    .bind(&truncated_prefix)
-    .bind(route)
-    .bind(method)
-    .bind(status_code as i32)
-    .execute(pool)
-    .await
-    {
-        warn!(error = %e, "failed to log audit event");
+    let Some(tx) = &state.audit_tx else {
+        return;
+    };
+    let event = AuditEvent {
+        key_hash_prefix: key_hash_prefix.chars().take(8).collect(),
+        route: route.to_string(),
+        http_method: method.to_string(),
+        status_code,
+    };
+    if tx.try_send(event).is_err() {
+        state.audit_dropped.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Maximum audit events waiting for the writer before new ones are dropped.
+const AUDIT_QUEUE_CAPACITY: usize = 10_000;
+/// Rows per multi-row INSERT.
+const AUDIT_BATCH_ROWS: usize = 500;
+/// Longest a queued audit event waits before it is written.
+const AUDIT_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Start the background task that drains audit events into `audit_log` in
+/// batches (#558). Returns the sender to store in `AppState::audit_tx`.
+pub fn spawn_audit_writer(pool: PgPool) -> mpsc::Sender<AuditEvent> {
+    let (tx, mut rx) = mpsc::channel(AUDIT_QUEUE_CAPACITY);
+    tokio::spawn(async move {
+        let mut batch: Vec<AuditEvent> = Vec::with_capacity(AUDIT_BATCH_ROWS);
+        let mut ticker = tokio::time::interval(AUDIT_FLUSH_INTERVAL);
+        loop {
+            tokio::select! {
+                event = rx.recv() => match event {
+                    Some(event) => {
+                        batch.push(event);
+                        if batch.len() >= AUDIT_BATCH_ROWS {
+                            flush_audit_batch(&pool, &mut batch).await;
+                        }
+                    }
+                    None => {
+                        flush_audit_batch(&pool, &mut batch).await;
+                        break;
+                    }
+                },
+                _ = ticker.tick() => flush_audit_batch(&pool, &mut batch).await,
+            }
+        }
+    });
+    tx
+}
+
+async fn flush_audit_batch(pool: &PgPool, batch: &mut Vec<AuditEvent>) {
+    if batch.is_empty() {
+        return;
+    }
+    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+        "INSERT INTO audit_log (key_hash_prefix, route, http_method, status_code) ",
+    );
+    query.push_values(batch.iter(), |mut row, event| {
+        row.push_bind(&event.key_hash_prefix)
+            .push_bind(&event.route)
+            .push_bind(&event.http_method)
+            .push_bind(event.status_code as i32);
+    });
+    if let Err(e) = query.build().execute(pool).await {
+        warn!(error = %e, rows = batch.len(), "failed to write audit events");
+    }
+    batch.clear();
 }
 
 /// Build a `429 Too Many Requests` response with the standard rate-limit
@@ -253,6 +420,18 @@ fn rate_limited_response(limit: i32, retry_after_secs: Option<u64>, tokens_remai
     response
 }
 
+/// Response for a request over the per-IP concurrency limit. This is a client-side
+/// limit, so it is a 429 with a retry hint, not a 503, which clients and load
+/// balancers read as the server being unhealthy.
+fn concurrency_limited_response(limit: usize) -> Response {
+    let limit = i32::try_from(limit).unwrap_or(i32::MAX);
+    let mut response = rate_limited_response(limit, Some(1), 0);
+    if let Ok(val) = limit.to_string().parse() {
+        response.headers_mut().insert("X-Concurrency-Limit", val);
+    }
+    response
+}
+
 pub async fn auth_and_rate_limit(
     State(state): State<AppState>,
     ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
@@ -267,7 +446,7 @@ pub async fn auth_and_rate_limit(
     let route = uri.split('?').next().unwrap_or("").to_string();
 
     let (identity, limit, is_authenticated, _key_hash_opt) = match extract_key(&headers) {
-        Some(key) => resolve_key(&state, &key, &route, &method).await?,
+        Some(key) => authenticate(&state, &key, &route, &method, SCOPE_READ).await?,
         None => {
             if state.require_auth {
                 return Err(ApiError::unauthorized("missing API key"));
@@ -277,11 +456,11 @@ pub async fn auth_and_rate_limit(
         }
     };
 
-    let rl_status = state.limiter.check(&identity, limit);
+    let rl_status = state.limiter.check(&identity, limit).await;
     if !rl_status.allowed {
         if is_authenticated {
             let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
-            log_audit_event(&state.pool, hash_prefix, &route, &method, 429).await;
+            log_audit_event(&state, hash_prefix, &route, &method, 429);
         }
         return Ok(rate_limited_response(limit, rl_status.retry_after_secs, rl_status.tokens_remaining));
     }
@@ -291,7 +470,7 @@ pub async fn auth_and_rate_limit(
 
     if is_authenticated {
         let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
-        log_audit_event(&state.pool, hash_prefix, &route, &method, status).await;
+        log_audit_event(&state, hash_prefix, &route, &method, status);
     }
 
     Ok(response)
@@ -319,7 +498,7 @@ pub async fn rpc_auth_and_rate_limit(
     let route = uri.split('?').next().unwrap_or("").to_string();
 
     let (identity, limit, is_authenticated, _key_hash_opt) = match extract_key(&headers) {
-        Some(key) => resolve_key(&state, &key, &route, &method).await?,
+        Some(key) => authenticate(&state, &key, &route, &method, SCOPE_RPC).await?,
         None => {
             if state.rpc_require_auth {
                 return Err(ApiError::unauthorized(
@@ -332,11 +511,11 @@ pub async fn rpc_auth_and_rate_limit(
         }
     };
 
-    let rl_status = state.rpc_limiter.check(&identity, limit);
+    let rl_status = state.rpc_limiter.check(&identity, limit).await;
     if !rl_status.allowed {
         if is_authenticated {
             let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
-            log_audit_event(&state.pool, hash_prefix, &route, &method, 429).await;
+            log_audit_event(&state, hash_prefix, &route, &method, 429);
         }
         // #429: use the shared helper so RPC-route 429s also carry Retry-After
         // and X-RateLimit-* headers.
@@ -348,7 +527,7 @@ pub async fn rpc_auth_and_rate_limit(
 
     if is_authenticated {
         let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
-        log_audit_event(&state.pool, hash_prefix, &route, &method, status).await;
+        log_audit_event(&state, hash_prefix, &route, &method, status);
     }
 
     Ok(response)
@@ -374,7 +553,7 @@ pub async fn webhook_auth_and_rate_limit(
     let route = uri.split('?').next().unwrap_or("").to_string();
 
     let (identity, limit, is_authenticated, key_hash_opt) = match extract_key(&headers) {
-        Some(key) => resolve_key(&state, &key, &route, &method).await?,
+        Some(key) => authenticate(&state, &key, &route, &method, SCOPE_WEBHOOKS_WRITE).await?,
         None => {
             if state.require_auth {
                 return Err(ApiError::unauthorized("missing API key"));
@@ -384,11 +563,11 @@ pub async fn webhook_auth_and_rate_limit(
         }
     };
 
-    let rl_status = state.webhook_limiter.check(&identity, limit);
+    let rl_status = state.webhook_limiter.check(&identity, limit).await;
     if !rl_status.allowed {
         if is_authenticated {
             let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
-            log_audit_event(&state.pool, hash_prefix, &route, &method, 429).await;
+            log_audit_event(&state, hash_prefix, &route, &method, 429);
         }
         return Ok(rate_limited_response(limit, rl_status.retry_after_secs, rl_status.tokens_remaining));
     }
@@ -406,7 +585,7 @@ pub async fn webhook_auth_and_rate_limit(
 
     if is_authenticated {
         let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
-        log_audit_event(&state.pool, hash_prefix, &route, &method, status).await;
+        log_audit_event(&state, hash_prefix, &route, &method, status);
     }
 
     Ok(response)
@@ -444,27 +623,14 @@ pub async fn webhook_manage_auth_and_rate_limit(
         "webhook management routes require an API key regardless of REQUIRE_API_KEY"
     ))?;
 
-    let hash = hash_key(&key);
-    let row: Option<(bool, i32)> = sqlx::query_as(
-        "SELECT revoked, rate_limit_per_min FROM api_keys WHERE key_hash = $1",
-    )
-    .bind(&hash)
-    .fetch_optional(&state.pool)
-    .await?;
-    let limit = match row {
-        Some((false, limit)) => limit,
-        Some((true, _)) => {
-            log_audit_event(&state.pool, &hash, &route, &method, 401).await;
-            return Err(ApiError::unauthorized("API key revoked"));
-        }
-        None => {
-            log_audit_event(&state.pool, &hash, &route, &method, 401).await;
-            return Err(ApiError::unauthorized("invalid API key"));
-        }
-    };
+    // Resolve through the same path as every other route group, so the key
+    // cache (#430) and revocation handling stay in one place (#560).
+    let required = if method == "GET" { SCOPE_READ } else { SCOPE_WEBHOOKS_WRITE };
+    let (identity, limit, _, _) = authenticate(&state, &key, &route, &method, required).await?;
+    let hash = identity.trim_start_matches("key:").to_string();
 
     let identity = format!("key:{hash}");
-    let rl_status = state.limiter.check(&identity, limit);
+    let rl_status = state.limiter.check(&identity, limit).await;
     if !rl_status.allowed {
         let mut response = (StatusCode::TOO_MANY_REQUESTS, crate::error::rate_limit_error()).into_response();
         if let Some(retry_after) = rl_status.retry_after_secs {
@@ -473,7 +639,7 @@ pub async fn webhook_manage_auth_and_rate_limit(
                 retry_after.to_string().parse().unwrap_or_else(|_| "60".parse().unwrap()),
             );
         }
-        log_audit_event(&state.pool, &hash, &route, &method, 429).await;
+        log_audit_event(&state, &hash, &route, &method, 429);
         return Ok(response);
     }
 
@@ -484,7 +650,7 @@ pub async fn webhook_manage_auth_and_rate_limit(
 
     let response = next.run(req).await;
     let status = response.status().as_u16();
-    log_audit_event(&state.pool, &hash, &route, &method, status).await;
+    log_audit_event(&state, &hash, &route, &method, status);
 
     Ok(response)
 }
@@ -505,28 +671,52 @@ pub async fn concurrency_limit(
     next: Next,
 ) -> Response {
     let client_ip = extract_client_ip(&headers, Some(socket_addr), &state.ip_config);
-    let status = state.concurrency_limiter.acquire(&client_ip, state.max_concurrent_per_ip);
-
-    if !status.allowed {
-        let body = json!({
-            "code": "rate_limited",
-            "error": format!(
-                "too many concurrent requests from this IP (limit: {})",
-                status.limit
-            )
-        });
-        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
-    }
+    let Some(slot) = state
+        .concurrency_limiter
+        .try_acquire(&client_ip, state.max_concurrent_per_ip)
+    else {
+        return concurrency_limited_response(state.max_concurrent_per_ip);
+    };
 
     // Insert the client IP into extensions so release middleware can access it.
     req.extensions_mut().insert(client_ip.clone());
 
+    // The slot is released when `slot` drops. That happens after the response is
+    // produced, or earlier if the timeout layer or a client disconnect cancels this
+    // future, so a cancelled request cannot leak its slot.
     let response = next.run(req).await;
-
-    // Release the slot after request completes.
-    state.concurrency_limiter.release(&client_ip);
+    drop(slot);
 
     response
+}
+
+/// Per-client-IP rate limiting for sibling-instance mounts (#442).
+///
+/// API keys belong to the mounted upstream, not to this instance, so every
+/// caller is limited by IP here; the upstream still applies its own auth and
+/// per-key limits. The resolved IP is handed to the proxy handler, which
+/// appends it to `X-Forwarded-For` so the upstream sees the real client
+/// rather than this proxy's single address.
+pub async fn proxy_rate_limit(
+    State(state): State<AppState>,
+    ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    mut req: Request,
+    next: Next,
+) -> ApiResult<Response> {
+    state.http_requests.fetch_add(1, Ordering::Relaxed);
+
+    let client_ip = extract_client_ip(&headers, Some(socket_addr), &state.ip_config);
+    let rl_status = state
+        .proxy_limiter
+        .check(&format!("proxy:{client_ip}"), state.config.proxy.rate_limit_per_min);
+    if !rl_status.allowed {
+        return Err(ApiError::too_many_requests(rl_status.retry_after_secs));
+    }
+
+    req.extensions_mut()
+        .insert(crate::routes::proxy::ClientIp(client_ip));
+    Ok(next.run(req).await)
 }
 
 #[cfg(test)]
@@ -623,6 +813,72 @@ mod tests {
     }
 
     #[test]
+    fn unset_trusted_proxy_hops_defaults_to_zero() {
+        assert_eq!(parse_trusted_proxy_hops(None), 0);
+        assert_eq!(parse_trusted_proxy_hops(Some("not-a-number")), 0);
+        assert_eq!(parse_trusted_proxy_hops(Some(" 2 ")), 2);
+    }
+
+    #[test]
+    fn default_config_ignores_spoofed_xff_when_exposed_directly() {
+        let cfg = IpConfig {
+            trusted_proxy_hops: parse_trusted_proxy_hops(None),
+            platform_header: None,
+        };
+        let peer: SocketAddr = "10.0.0.5:4321".parse().unwrap();
+        let h = make_headers("x-forwarded-for", "9.9.9.9");
+        assert_eq!(extract_client_ip(&h, Some(peer), &cfg), "10.0.0.5");
+    }
+
+    #[test]
+    fn fewer_xff_entries_than_hops_falls_back_to_socket() {
+        let peer: SocketAddr = "10.0.0.5:4321".parse().unwrap();
+        let h = make_headers("x-forwarded-for", "1.2.3.4");
+        assert_eq!(extract_client_ip(&h, Some(peer), &cfg(2)), "10.0.0.5");
+    }
+
+    #[test]
+    fn parse_client_ip_accepts_ip_forms_and_strips_port() {
+        assert_eq!(parse_client_ip("1.2.3.4"), Some("1.2.3.4".into()));
+        assert_eq!(parse_client_ip(" 1.2.3.4:5555 "), Some("1.2.3.4".into()));
+        assert_eq!(parse_client_ip("2001:db8::1"), Some("2001:db8::1".into()));
+        assert_eq!(parse_client_ip("[2001:db8::1]:443"), Some("2001:db8::1".into()));
+        assert_eq!(parse_client_ip("[2001:db8::1]"), Some("2001:db8::1".into()));
+    }
+
+    #[test]
+    fn parse_client_ip_rejects_non_ip_values() {
+        assert_eq!(parse_client_ip(""), None);
+        assert_eq!(parse_client_ip("unknown"), None);
+        assert_eq!(parse_client_ip("1.2.3.4:notaport"), None);
+        assert_eq!(parse_client_ip("1.2.3.4:99999"), None);
+        assert_eq!(parse_client_ip("[2001:db8::1]x"), None);
+        assert_eq!(parse_client_ip(&"x".repeat(4096)), None);
+    }
+
+    #[test]
+    fn invalid_xff_entry_falls_back_to_socket() {
+        let peer: SocketAddr = "10.0.0.5:4321".parse().unwrap();
+        let h = make_headers("x-forwarded-for", "1.2.3.4, not-an-ip");
+        assert_eq!(extract_client_ip(&h, Some(peer), &cfg(1)), "10.0.0.5");
+    }
+
+    #[test]
+    fn invalid_platform_header_falls_back_to_xff() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            HeaderName::from_bytes(b"fly-client-ip").unwrap(),
+            HeaderValue::from_str("x".repeat(256).as_str()).unwrap(),
+        );
+        h.insert(
+            HeaderName::from_bytes(b"x-forwarded-for").unwrap(),
+            HeaderValue::from_str("1.2.3.4, 5.6.7.8").unwrap(),
+        );
+        let ip = extract_client_ip(&h, None, &cfg_with_platform(1, "fly-client-ip"));
+        assert_eq!(ip, "5.6.7.8");
+    }
+
+    #[test]
     fn platform_header_takes_priority_over_xff() {
         let mut h = HeaderMap::new();
         h.insert(
@@ -663,36 +919,8 @@ mod tests {
             );
         }
     }
-
-
-/// Per-client-IP rate limiting for sibling-instance mounts (#442).
-///
-/// API keys belong to the mounted upstream, not to this instance, so every
-/// caller is limited by IP here; the upstream still applies its own auth and
-/// per-key limits. The resolved IP is handed to the proxy handler, which
-/// appends it to `X-Forwarded-For` so the upstream sees the real client
-/// rather than this proxy's single address.
-pub async fn proxy_rate_limit(
-    State(state): State<AppState>,
-    ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    mut req: Request,
-    next: Next,
-) -> ApiResult<Response> {
-    state.http_requests.fetch_add(1, Ordering::Relaxed);
-
-    let client_ip = extract_client_ip(&headers, Some(socket_addr), &state.ip_config);
-    let rl_status = state
-        .proxy_limiter
-        .check(&format!("proxy:{client_ip}"), state.config.proxy.rate_limit_per_min);
-    if !rl_status.allowed {
-        return Err(ApiError::too_many_requests(rl_status.retry_after_secs));
-    }
-
-    req.extensions_mut()
-        .insert(crate::routes::proxy::ClientIp(client_ip));
-    Ok(next.run(req).await)
 }
+
 
 // ---- HTTP-level integration tests ----------------------------------------
 //
@@ -707,7 +935,7 @@ pub async fn proxy_rate_limit(
 // schema, which would race with any parallel test.
 
 #[cfg(test)]
-mod integration_tests {
+pub(crate) mod integration_tests {
     use std::net::SocketAddr;
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
@@ -726,7 +954,7 @@ mod integration_tests {
 
     // ---- test fixtures ----
 
-    async fn db_pool() -> PgPool {
+    pub(crate) async fn db_pool() -> PgPool {
         let url =
             std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL must be set");
         let pool = PgPoolOptions::new()
@@ -747,7 +975,7 @@ mod integration_tests {
         pool
     }
 
-    fn make_state(pool: PgPool, require_auth: bool, anon_rate: i32) -> AppState {
+    pub(crate) fn make_state(pool: PgPool, require_auth: bool, anon_rate: i32) -> AppState {
         use crate::concurrency_limit::ConcurrencyLimiter;
         use crate::metrics_middleware::MetricsCollector;
         use crate::call_cache::CallCache;
@@ -755,14 +983,15 @@ mod integration_tests {
 
         AppState {
             pool,
+            event_fanout: Arc::new(crate::routes::stream::EventFanout::new()),
             require_auth,
             anon_rate_limit: anon_rate,
-            limiter: Arc::new(RateLimiter::new()),
+            limiter: Arc::new(RateLimiter::memory()),
             http_requests: Arc::new(AtomicU64::new(0)),
             rpc: RpcClient::new("http://127.0.0.1:26657", 30),
             specs: Arc::new(SpecCache::new()),
             mounts: Arc::new(vec![]),
-            rpc_limiter: Arc::new(RateLimiter::new()),
+            rpc_limiter: Arc::new(RateLimiter::memory()),
             rpc_require_auth: false,
             rpc_anon_rate_limit: 100,
             metrics: Arc::new(MetricsCollector::new()),
@@ -780,9 +1009,10 @@ mod integration_tests {
             health_max_lag_ledgers: 100,
             health_max_stale_secs: 120,
             metrics_require_auth: false,
-            proxy_limiter: Arc::new(RateLimiter::new()),
+            proxy_limiter: Arc::new(RateLimiter::memory()),
+            webhook_limiter: Arc::new(RateLimiter::memory()),
             config: Arc::new(crate::config::ApiConfig::test_default()),
-            key_cache: Arc::new(KeyCache::new(256)),
+            key_cache: Arc::new(KeyCache::new(256, std::time::Duration::from_secs(30), std::time::Duration::from_secs(5))),
             ip_config: IpConfig { trusted_proxy_hops: 0, platform_header: None },
             audit_tx: None,
             audit_dropped: Arc::new(AtomicU64::new(0)),
@@ -790,7 +1020,7 @@ mod integration_tests {
         }
     }
 
-    async fn spawn_server(state: AppState) -> String {
+    pub(crate) async fn spawn_server(state: AppState) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -816,6 +1046,19 @@ mod integration_tests {
         .expect("insert api key");
     }
 
+    async fn insert_api_key_with_scopes(pool: &PgPool, key: &str, scopes: &[&str]) {
+        let scopes: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
+        sqlx::query(
+            "INSERT INTO api_keys (key_hash, revoked, rate_limit_per_min, created_at, scopes)
+             VALUES ($1, false, 100, NOW(), $2)",
+        )
+        .bind(hash_key(key))
+        .bind(&scopes)
+        .execute(pool)
+        .await
+        .expect("insert scoped api key");
+    }
+
     // ---- tests ----
 
     #[tokio::test]
@@ -834,6 +1077,50 @@ mod integration_tests {
         let base = spawn_server(make_state(pool, true, 60)).await;
         let res = reqwest::get(format!("{base}/metrics")).await.unwrap();
         assert_eq!(res.status(), 200);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn expired_key_returns_401_key_expired() {
+        let pool = db_pool().await;
+        sqlx::query(
+            "INSERT INTO api_keys (key_hash, revoked, rate_limit_per_min, created_at, expires_at)
+             VALUES ($1, false, 100, NOW(), NOW() - interval '1 minute')",
+        )
+        .bind(hash_key("expired-key"))
+        .execute(&pool)
+        .await
+        .expect("insert expired api key");
+        let base = spawn_server(make_state(pool, true, 60)).await;
+        let res = reqwest::Client::new()
+            .get(format!("{base}/contracts"))
+            .header("x-api-key", "expired-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 401);
+        let body = res.text().await.unwrap();
+        assert!(body.contains("key_expired"), "body was {body}");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn read_only_key_cannot_create_webhook() {
+        let pool = db_pool().await;
+        insert_api_key_with_scopes(&pool, "read-only-key", &["read"]).await;
+        let base = spawn_server(make_state(pool.clone(), true, 60)).await;
+        let res = reqwest::Client::new()
+            .post(format!("{base}/webhooks"))
+            .header("x-api-key", "read-only-key")
+            .json(&serde_json::json!({
+                "url": "https://example.com/hook",
+                "events": ["contract_call"]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 403);
+        assert!(res.text().await.unwrap().contains("insufficient_scope"));
     }
 
     #[tokio::test]
@@ -980,7 +1267,7 @@ mod integration_tests {
     #[ignore = "needs postgres"]
     async fn authenticated_webhook_create_stores_owner_key_hash() {
         let pool = db_pool().await;
-        insert_api_key(&pool, "owner-key", false).await;
+        insert_api_key_with_scopes(&pool, "owner-key", &["webhooks:write"]).await;
         let base = spawn_server(make_state(pool.clone(), true, 60)).await;
         let client = reqwest::Client::new();
         let res = client

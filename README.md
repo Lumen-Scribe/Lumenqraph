@@ -228,14 +228,18 @@ All configuration is via environment variables (see [`.env.example`](.env.exampl
 | `READYZ_LAG_THRESHOLD` | `100` | Max ledger lag (in ledgers) for `/readyz` to return 200. |
 | `READYZ_MAX_AGE_SECS` | `120` | Max age of indexer cursor (in seconds) for `/readyz` to return 200. |
 | `HEALTH_MAX_LAG_LEDGERS` | `100` | Max ledger lag for `/health` to show "ok" status. |
+| `API_KEY_CACHE_CAPACITY` | `2000` | Max API keys held in the in-process lookup cache per replica. Must be at least 1. |
+| `API_KEY_CACHE_TTL_SECS` | `30` | How long a valid key lookup is cached. Revoking a key takes up to this long to take effect on each replica; lower it for faster revocation at the cost of more database lookups. |
+| `API_KEY_CACHE_NEG_TTL_SECS` | `5` | How long an unknown or revoked key lookup is cached. |
 | `HEALTH_MAX_STALE_SECS` | `120` | Max age of indexer cursor (in seconds) for `/health` to show "ok" status. |
+| `READYZ_REQUIRE_FRESH_INDEX` | `false` | When `true`, `/readyz` also returns 503 while the indexer lags or is stale. Off by default so an indexer stall does not remove every API replica from rotation; `/health` reports `degraded` either way. |
 | `RUST_LOG` | `info` | Log filter (`tracing` syntax). |
 
 ## API
 
 Base URL defaults to `http://localhost:8080`. Full reference: [docs/API.md](docs/API.md).
 
-**Authentication.** Data routes accept an API key via `Authorization: Bearer <key>` or `x-api-key: <key>`. When `REQUIRE_API_KEY=false` (default), unauthenticated callers are allowed up to `ANON_RATE_LIMIT_PER_MIN`. `/health`, `/livez`, and `/readyz` are always public. `/metrics` is public by default and can be restricted with `METRICS_REQUIRE_API_KEY=true`. Rate-limit breaches return `429`; invalid or revoked keys return `401`.
+**Authentication.** Data routes accept an API key via `Authorization: Bearer <key>` or `x-api-key: <key>`. When `REQUIRE_API_KEY=false` (default), unauthenticated callers are allowed up to `ANON_RATE_LIMIT_PER_MIN`. `/health`, `/livez`, and `/readyz` are always public. `/readyz` checks only the API's own dependencies (database reachable, schema compatible) unless `READYZ_REQUIRE_FRESH_INDEX=true`. `/metrics` is public by default and can be restricted with `METRICS_REQUIRE_API_KEY=true`. Rate-limit breaches return `429`; invalid or revoked keys return `401`.
 
 | Method | Path | Description |
 | --- | --- | --- |

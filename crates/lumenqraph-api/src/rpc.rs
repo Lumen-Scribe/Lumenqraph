@@ -137,6 +137,23 @@ impl RpcClient {
             .cloned()
     }
 
+    /// The cached network passphrase, without any RPC I/O. `None` until a probe
+    /// has succeeded (see [`RpcClient::warm_network_passphrase`]).
+    pub fn cached_network_passphrase(&self) -> Option<String> {
+        self.passphrase.get().cloned()
+    }
+
+    /// Resolve the passphrase in the background, retrying with capped backoff
+    /// until the RPC answers. Request handlers never wait on this.
+    pub async fn warm_network_passphrase(&self) {
+        let mut delay = Duration::from_secs(1);
+        while self.network_passphrase().await.is_none() {
+            tracing::warn!(retry_in_secs = delay.as_secs(), "rpc network passphrase unavailable, retrying");
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(60));
+        }
+    }
+
     /// Simulate a base64 transaction envelope. `Ok(SimOutcome::Error)` carries a
     /// client-facing message (e.g. the function trapped); `Err` is transport.
     pub async fn simulate(&self, tx_xdr: &str) -> anyhow::Result<SimOutcome> {
@@ -256,5 +273,18 @@ impl RpcClient {
             LedgerEntryData::ContractCode(cc) => Ok(Some((hash_hex, cc.code.into(), ledger_seq))),
             _ => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod passphrase_cache_tests {
+    use super::*;
+
+    /// `/health` reads the cache on the request path, so an unresolved
+    /// passphrase must be reported immediately without touching the RPC.
+    #[test]
+    fn cached_passphrase_is_none_before_any_probe() {
+        let client = RpcClient::new("http://127.0.0.1:1", 1);
+        assert!(client.cached_network_passphrase().is_none());
     }
 }

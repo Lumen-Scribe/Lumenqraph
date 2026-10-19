@@ -27,6 +27,8 @@ pub struct Config {
     /// so a missing key is a hard startup failure rather than a silent
     /// security regression.
     pub encryption_key: String,
+    /// Days to keep delivered/failed `webhook_deliveries` rows; `0` disables pruning.
+    pub delivery_retention_days: i64,
 }
 
 impl std::fmt::Debug for Config {
@@ -48,6 +50,7 @@ impl std::fmt::Debug for Config {
             .field("db_idle_timeout_secs", &self.db_idle_timeout_secs)
             .field("db_connect_retries", &self.db_connect_retries)
             .field("encryption_key", &"[REDACTED]")
+            .field("delivery_retention_days", &self.delivery_retention_days)
             .finish()
     }
 }
@@ -88,6 +91,10 @@ impl Config {
             db_idle_timeout_secs: parse("DATABASE_IDLE_TIMEOUT_SECS", 600)?,
             db_connect_retries: parse("DATABASE_CONNECT_RETRIES", 30)?,
             encryption_key,
+            delivery_retention_days: parse(
+                "WEBHOOK_DELIVERY_RETENTION_DAYS",
+                crate::prune::DEFAULT_RETENTION_DAYS,
+            )?,
         })
     }
 

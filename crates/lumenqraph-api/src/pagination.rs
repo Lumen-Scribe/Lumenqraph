@@ -21,7 +21,7 @@
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use base64::engine::general_purpose::STANDARD as B64;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use serde::Serialize;
 
@@ -34,9 +34,29 @@ pub const MAX_OFFSET: i64 = 10_000;
 const OFFSET_DEPRECATION_WARNING: &str =
     "299 - \"offset pagination is deprecated; use the 'after' cursor from next_cursor\"";
 
+/// Encode an opaque cursor payload as URL-safe base64 without padding.
+///
+/// The output only contains `[A-Za-z0-9_-]`, so it survives being pasted into a
+/// query string without percent-encoding.
+fn encode_payload(payload: &str) -> String {
+    URL_SAFE_NO_PAD.encode(payload)
+}
+
+/// Decode an opaque cursor payload.
+///
+/// Accepts the URL-safe alphabet and, for backward compatibility, the standard
+/// alphabet that cursors issued before the switch still use.
+fn decode_payload(raw: &str) -> Result<String, &'static str> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(raw)
+        .or_else(|_| STANDARD.decode(raw))
+        .map_err(|_| "invalid cursor")?;
+    String::from_utf8(bytes).map_err(|_| "invalid cursor")
+}
+
 /// Encode a cursor from (ledger, event_id) position.
 pub fn encode_cursor(ledger: i64, event_id: &str) -> String {
-    B64.encode(format!("{ledger}|{event_id}"))
+    encode_payload(&format!("{ledger}|{event_id}"))
 }
 
 /// Decode a cursor to (ledger, event_id).
@@ -47,8 +67,7 @@ pub fn encode_cursor(ledger: i64, event_id: &str) -> String {
 ///   the client rather than silently restarting from page 1.
 pub fn decode_cursor(cursor: Option<&str>) -> Result<Option<(i64, String)>, &'static str> {
     let Some(raw) = cursor else { return Ok(None) };
-    let bytes = B64.decode(raw).map_err(|_| "invalid cursor")?;
-    let s = String::from_utf8(bytes).map_err(|_| "invalid cursor")?;
+    let s = decode_payload(raw)?;
     let (ledger, id) = s.split_once('|').ok_or("invalid cursor")?;
     let ledger = ledger.parse::<i64>().map_err(|_| "invalid cursor")?;
     Ok(Some((ledger, id.to_string())))
@@ -59,30 +78,28 @@ pub fn decode_cursor(cursor: Option<&str>) -> Result<Option<(i64, String)>, &'st
 /// Used by the `contracts` connection, which orders by
 /// `last_seen_ledger DESC, contract_id`.
 pub fn encode_contract_cursor(last_seen_ledger: i64, contract_id: &str) -> String {
-    B64.encode(format!("{last_seen_ledger}|{contract_id}"))
+    encode_payload(&format!("{last_seen_ledger}|{contract_id}"))
 }
 
 /// Decode a cursor to (last_seen_ledger, contract_id).
 ///
-/// - `Ok(None)` — no cursor supplied; callers should start from the newest page.
-/// - `Ok(Some((ledger, id)))` — valid cursor, decoded successfully.
-/// - `Err` — cursor was present but malformed; callers must surface an error to
-///   the client rather than silently restarting from page 1.
+/// Same wire format as [`decode_cursor`], so both share one implementation.
 pub fn decode_contract_cursor(
     cursor: Option<&str>,
 ) -> Result<Option<(i64, String)>, &'static str> {
-    let Some(raw) = cursor else { return Ok(None) };
-    let bytes = B64.decode(raw).map_err(|_| "invalid cursor")?;
-    let s = String::from_utf8(bytes).map_err(|_| "invalid cursor")?;
-    let (ledger, id) = s.split_once('|').ok_or("invalid cursor")?;
-    let ledger = ledger.parse::<i64>().map_err(|_| "invalid cursor")?;
-    Ok(Some((ledger, id.to_string())))
+    decode_cursor(cursor)
 }
 
 /// Configuration for keyset (cursor) pagination requests.
 pub struct PaginationConfig {
     pub after_ledger: Option<i64>,
     pub after_event_id: Option<String>,
+}
+
+/// A keyset position that round-trips through an opaque `after` string.
+pub trait Cursor: Sized {
+    fn encode(&self) -> String;
+    fn decode(raw: &str) -> Result<Self, &'static str>;
 }
 
 /// `(ledger, event_id)` position, used by all event-derived views.
@@ -118,12 +135,11 @@ pub struct IdCursor(pub i64);
 
 impl Cursor for IdCursor {
     fn encode(&self) -> String {
-        B64.encode(self.0.to_string())
+        encode_payload(&self.0.to_string())
     }
 
     fn decode(raw: &str) -> Result<Self, &'static str> {
-        let bytes = B64.decode(raw).map_err(|_| "invalid cursor")?;
-        let s = String::from_utf8(bytes).map_err(|_| "invalid cursor")?;
+        let s = decode_payload(raw)?;
         s.parse::<i64>().map(IdCursor).map_err(|_| "invalid cursor")
     }
 }
@@ -261,5 +277,78 @@ impl ContractPaginationConfig {
             after_last_seen_ledger,
             after_contract_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use url::form_urlencoded;
+
+    fn is_url_safe(s: &str) -> bool {
+        s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    }
+
+    proptest! {
+        #[test]
+        fn ledger_cursor_round_trips_unescaped_in_query(
+            ledger in any::<i64>(),
+            event_id in "[0-9]{7}-[0-9]{10}",
+        ) {
+            let cursor = encode_cursor(ledger, &event_id);
+            prop_assert!(is_url_safe(&cursor));
+
+            // Pass the cursor through a query string without percent-encoding.
+            let query = format!("after={cursor}");
+            let parsed: Vec<(String, String)> = form_urlencoded::parse(query.as_bytes())
+                .into_owned()
+                .collect();
+            prop_assert_eq!(&parsed[0].1, &cursor);
+
+            let decoded = decode_cursor(Some(&parsed[0].1)).unwrap();
+            prop_assert_eq!(decoded, Some((ledger, event_id)));
+        }
+
+        #[test]
+        fn contract_cursor_round_trips_unescaped_in_query(
+            ledger in any::<i64>(),
+            contract_id in "C[A-Z2-7]{55}",
+        ) {
+            let cursor = encode_contract_cursor(ledger, &contract_id);
+            prop_assert!(is_url_safe(&cursor));
+
+            let query = format!("after={cursor}");
+            let parsed: Vec<(String, String)> = form_urlencoded::parse(query.as_bytes())
+                .into_owned()
+                .collect();
+            let decoded = decode_contract_cursor(Some(&parsed[0].1)).unwrap();
+            prop_assert_eq!(decoded, Some((ledger, contract_id)));
+        }
+
+        #[test]
+        fn id_cursor_round_trips(id in any::<i64>()) {
+            let cursor = IdCursor(id).encode();
+            prop_assert!(is_url_safe(&cursor));
+            prop_assert_eq!(IdCursor::decode(&cursor), Ok(IdCursor(id)));
+        }
+    }
+
+    #[test]
+    fn legacy_standard_alphabet_cursors_still_decode() {
+        // Built with the standard alphabet, which emits `+`, `/` and `=`.
+        let legacy = STANDARD.encode("1234567|0001234-0000000001");
+        assert!(legacy.contains('=') || legacy.contains('+') || legacy.contains('/'));
+        assert_eq!(
+            decode_cursor(Some(&legacy)),
+            Ok(Some((1234567, "0001234-0000000001".to_string())))
+        );
+    }
+
+    #[test]
+    fn malformed_cursor_is_rejected() {
+        assert!(decode_cursor(Some("!!!")).is_err());
+        assert!(decode_cursor(Some(&URL_SAFE_NO_PAD.encode("no-separator"))).is_err());
     }
 }
