@@ -323,6 +323,8 @@ struct DueDelivery {
     attempts: i32,
     url: String,
     secret: Option<String>,
+    /// Previous signing secret, present only while its rotation grace period is open.
+    previous_secret: Option<String>,
     event_id: Option<String>,
     upgrade_id: Option<i64>,
     created_at: DateTime<Utc>,
@@ -340,7 +342,7 @@ async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::R
     let worker = worker_id();
     let lock_duration = Duration::seconds(60);
 
-    let claimed: Vec<(i64, Uuid, i32, String, Option<String>, Option<String>, Option<i64>, DateTime<Utc>)> = sqlx::query_as(
+    let claimed: Vec<(i64, Uuid, i32, String, Option<String>, Option<String>, Option<String>, Option<i64>, DateTime<Utc>)> = sqlx::query_as(
         "UPDATE webhook_deliveries d
          SET locked_until = now() + $1, locked_by = $2
          WHERE d.id IN (
@@ -357,6 +359,10 @@ async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::R
                    d.attempts,
                    (SELECT url FROM webhook_subscriptions WHERE id = d.subscription_id),
                    (SELECT safe_decrypt_webhook_secret(encrypted_secret, $4) FROM webhook_subscriptions WHERE id = d.subscription_id),
+                   (SELECT CASE WHEN previous_secret_expires_at > now()
+                                THEN safe_decrypt_webhook_secret(previous_encrypted_secret, $4)
+                           END
+                    FROM webhook_subscriptions WHERE id = d.subscription_id),
                    d.event_id,
                    d.upgrade_id,
                    d.created_at",
@@ -371,7 +377,7 @@ async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::R
     let mut deliveries = Vec::new();
     let mut failed_subscriptions = Vec::new();
 
-    for (id, sub_id, attempts, url, decrypted_secret, event_id, upgrade_id, created_at) in claimed {
+    for (id, sub_id, attempts, url, decrypted_secret, decrypted_previous, event_id, upgrade_id, created_at) in claimed {
         let secret = match decrypted_secret {
             None => {
                 warn!(delivery = id, subscription = %sub_id, "failed to decrypt secret (NULL or wrong key)");
@@ -394,6 +400,7 @@ async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::R
             attempts,
             url,
             secret: Some(secret),
+            previous_secret: decrypted_previous.filter(|s| !s.is_empty()),
             event_id,
             upgrade_id,
             created_at,
@@ -568,6 +575,13 @@ fn extract_host(url: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Computes the hex-encoded HMAC-SHA256 of `signed_payload` under `secret`.
+fn sign_payload(secret: &str, signed_payload: &str) -> anyhow::Result<String> {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).context("invalid webhook secret")?;
+    mac.update(signed_payload.as_bytes());
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
 async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &Config) -> anyhow::Result<DeliveryOutcome> {
     validate_webhook_url_at_delivery(&d.url)
         .await
@@ -639,9 +653,12 @@ async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &C
     let timestamp = Utc::now().timestamp();
     let signed_payload = format!("{}.{}", timestamp, std::str::from_utf8(&body)?);
 
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).context("invalid webhook secret")?;
-    mac.update(signed_payload.as_bytes());
-    let signature_v1 = hex::encode(mac.finalize().into_bytes());
+    // During a rotation grace period the previous secret signs too, so receivers
+    // that have not yet picked up the new secret keep verifying (#564).
+    let mut signature_header = format!("t={},v1={}", timestamp, sign_payload(secret, &signed_payload)?);
+    if let Some(previous) = &d.previous_secret {
+        signature_header.push_str(&format!(",v1={}", sign_payload(previous, &signed_payload)?));
+    }
 
     let parsed_url = Url::parse(&d.url).context("failed to parse URL")?;
     let host = parsed_url.host_str().context("URL must have a host")?;
@@ -661,7 +678,7 @@ async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &C
         .post(&d.url)
         .timeout(config.total_timeout())
         .header("Content-Type", "application/json")
-        .header("X-Lumenqraph-Signature", format!("t={},v1={}", timestamp, signature_v1))
+        .header("X-Lumenqraph-Signature", signature_header)
         .header("X-Lumenqraph-Delivery-Id", d.id.to_string())
         .header("X-Lumenqraph-Timestamp", timestamp.to_string())
         .header("X-Lumenqraph-Attempt", d.attempts.to_string())
@@ -1161,5 +1178,19 @@ mod redirect_tests {
         assert!(delivery_outcome(reqwest::StatusCode::NO_CONTENT, None).is_ok());
         let err = delivery_outcome(reqwest::StatusCode::INTERNAL_SERVER_ERROR, None).unwrap_err();
         assert!(err.to_string().contains("non-2xx status"));
+    }
+}
+
+#[cfg(test)]
+mod rotation_signature_tests {
+    use super::sign_payload;
+
+    #[test]
+    fn previous_secret_produces_a_distinct_signature() {
+        let payload = "1700000000.{\"ok\":true}";
+        let current = sign_payload("new-secret", payload).unwrap();
+        let previous = sign_payload("old-secret", payload).unwrap();
+        assert_ne!(current, previous);
+        assert_eq!(current, sign_payload("new-secret", payload).unwrap());
     }
 }

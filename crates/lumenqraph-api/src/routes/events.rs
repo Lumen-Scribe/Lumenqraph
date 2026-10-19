@@ -117,15 +117,12 @@ pub async fn list_events(
            AND ($4::bigint IS NULL OR ledger <= $4)
            AND ($5::timestamp IS NULL OR ledger_closed_at >= $5)
            AND ($6::timestamp IS NULL OR ledger_closed_at <= $6)
-           -- Topic filtering: decoded_topics is a JSONB array. To filter by position,
-           -- we use JSONB containment (@>) with null padding. For example, to match
-           -- decoded_topics[1], we build an array [null, value] and check containment.
-           -- This works because JSONB containment checks if the right side is a subset
-           -- of the left side, preserving position for array elements.
-           AND ($7::text IS NULL OR decoded_topics @> jsonb_build_array($7::jsonb))
-           AND ($8::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, $8::jsonb))
-           AND ($9::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, $9::jsonb))
-           AND ($10::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, jsonb_null::jsonb, $10::jsonb))
+           -- Topic filtering matches the value at an exact position: `-> n` reads
+           -- decoded_topics[n] as jsonb, so `topic1` only matches index 1.
+           AND ($7::text IS NULL OR (decoded_topics -> 0) = $7::jsonb)
+           AND ($8::text IS NULL OR (decoded_topics -> 1) = $8::jsonb)
+           AND ($9::text IS NULL OR (decoded_topics -> 2) = $9::jsonb)
+           AND ($10::text IS NULL OR (decoded_topics -> 3) = $10::jsonb)
            AND ($11::text IS NULL OR enriched @> ($11::jsonb))
            AND ($15::boolean IS NULL OR in_successful_call = $15)
            AND ($12::bigint IS NULL OR ledger < $12 OR (ledger = $12 AND event_id < $13))
@@ -242,4 +239,80 @@ pub struct TxEventsResponse {
     pub has_more: bool,
     /// The event rows, ordered by ledger and event_id ascending.
     pub data: Vec<EventRow>,
+}
+
+#[cfg(test)]
+mod tests {
+    //! Needs a migrated throwaway database. Run with:
+    //!
+    //!   TEST_DATABASE_URL=postgres://… cargo test -p lumenqraph-api -- --ignored
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use serde_json::Value;
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+
+    use super::list_events;
+    use crate::state::test_state;
+
+    const CONTRACT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+    const EVENT_ID: &str = "api-test-list-events-topics";
+
+    async fn count_events(app: &Router, query: &str) -> usize {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/contracts/{CONTRACT}/events?{query}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "query `{query}` must not fail");
+
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        body["data"].as_array().expect("`data` array").len()
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn list_events_returns_200_with_and_without_topic_filters() {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
+        let pool = PgPool::connect(&url).await.unwrap();
+
+        sqlx::query("DELETE FROM events WHERE event_id = $1")
+            .bind(EVENT_ID)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO events
+                (event_id, contract_id, ledger, ledger_closed_at, event_type, topics,
+                 decoded_topics, event_name, value, tx_hash, in_successful_call, paging_token)
+             VALUES ($1, $2, 1, now(), 'contract', '[]',
+                     '[\"transfer\", \"GABC\"]', 'transfer', '', 'tx', true, 'p1')",
+        )
+        .bind(EVENT_ID)
+        .bind(CONTRACT)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = Router::new()
+            .route("/contracts/:contract_id/events", get(list_events))
+            .with_state(test_state(pool.clone()));
+
+        assert_eq!(count_events(&app, "").await, 1);
+        assert_eq!(count_events(&app, "topic0=%22transfer%22").await, 1);
+        assert_eq!(count_events(&app, "topic1=%22GABC%22").await, 1);
+        assert_eq!(count_events(&app, "topic1=%22NOPE%22").await, 0);
+        assert_eq!(count_events(&app, "topic2=%22GABC%22").await, 0);
+
+        sqlx::query("DELETE FROM events WHERE event_id = $1")
+            .bind(EVENT_ID)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
 }

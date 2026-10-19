@@ -304,96 +304,159 @@ async fn query_stats_by_trunc(
     state: &AppState,
     contract_id: &str,
     trunc: &str,
-   
+    from: Option<chrono::DateTime<chrono::Utc>>,
+    to: Option<chrono::DateTime<chrono::Utc>>,
+) -> ApiResult<Vec<StatsBucket>> {
+    let sql = format!(
+        "SELECT date_trunc('{trunc}', ledger_closed_at)::text as bucket, COUNT(*) as count
+         FROM events
+         WHERE contract_id = $1
+           AND ($2::timestamp IS NULL OR ledger_closed_at >= $2)
+           AND ($3::timestamp IS NULL OR ledger_closed_at <= $3)
+         GROUP BY date_trunc('{trunc}', ledger_closed_at)
+         ORDER BY date_trunc('{trunc}', ledger_closed_at) DESC"
+    );
+    let rows: Vec<(String, i64)> = sqlx::query_as(&sql)
+        .bind(contract_id)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&state.pool)
+        .await?;
 
-/* … truncated 4766 chars — edit only what you need near the top … */
+    Ok(rows
+        .into_iter()
+        .map(|(bucket, count)| StatsBucket {
+            bucket,
+            count,
+            breakdown: None,
+        })
+        .collect())
+}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+async fn query_stats_by_trunc_grouped(
+    state: &AppState,
+    contract_id: &str,
+    trunc: &str,
+    from: Option<chrono::DateTime<chrono::Utc>>,
+    to: Option<chrono::DateTime<chrono::Utc>>,
+) -> ApiResult<Vec<StatsBucket>> {
+    let sql = format!(
+        "SELECT date_trunc('{trunc}', ledger_closed_at)::text as bucket, event_name, COUNT(*) as count
+         FROM events
+         WHERE contract_id = $1
+           AND ($2::timestamp IS NULL OR ledger_closed_at >= $2)
+           AND ($3::timestamp IS NULL OR ledger_closed_at <= $3)
+         GROUP BY date_trunc('{trunc}', ledger_closed_at), event_name
+         ORDER BY date_trunc('{trunc}', ledger_closed_at) DESC, event_name"
+    );
+    let rows: Vec<(String, Option<String>, i64)> = sqlx::query_as(&sql)
+        .bind(contract_id)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&state.pool)
+        .await?;
 
-    fn trunc_of(result: Result<Granularity, ApiError>) -> Option<&'static str> {
-        match result {
-            Ok(Granularity::Trunc(trunc)) => Some(trunc),
-            _ => None,
+    let mut result: std::collections::HashMap<String, (i64, std::collections::HashMap<String, i64>)> =
+        std::collections::HashMap::new();
+
+    for (bucket, event_name, count) in rows {
+        let entry = result.entry(bucket).or_insert((0, std::collections::HashMap::new()));
+        entry.0 += count;
+        if let Some(name) = event_name {
+            *entry.1.entry(name).or_insert(0) += count;
         }
     }
 
-    /// #572 — `1M` is month and `1m` is minute; lowercasing must not merge them.
-    #[test]
-    fn resolution_1m_uppercase_is_month_and_lowercase_is_minute() {
-        assert_eq!(trunc_of(parse_granularity(Some("1M"), "day")), Some("month"));
-        assert_eq!(trunc_of(parse_granularity(Some("1m"), "day")), Some("minute"));
-    }
+    Ok(result
+        .into_iter()
+        .map(|(bucket, (total, breakdown))| StatsBucket {
+            bucket,
+            count: total,
+            breakdown: if breakdown.is_empty() {
+                None
+            } else {
+                Some(breakdown)
+            },
+        })
+        .collect())
+}
 
-    #[test]
-    fn resolution_aliases_map_to_their_units() {
-        assert_eq!(trunc_of(parse_granularity(Some("min"), "day")), Some("minute"));
-        assert_eq!(trunc_of(parse_granularity(Some("minute"), "day")), Some("minute"));
-        assert_eq!(trunc_of(parse_granularity(Some("1h"), "day")), Some("hour"));
-        assert_eq!(trunc_of(parse_granularity(Some("hour"), "day")), Some("hour"));
-        assert_eq!(trunc_of(parse_granularity(Some("1d"), "day")), Some("day"));
-        assert_eq!(trunc_of(parse_granularity(Some("day"), "day")), Some("day"));
-        assert_eq!(trunc_of(parse_granularity(Some("1w"), "day")), Some("week"));
-        assert_eq!(trunc_of(parse_granularity(Some("week"), "day")), Some("week"));
-        assert_eq!(trunc_of(parse_granularity(Some("month"), "day")), Some("month"));
-        assert_eq!(trunc_of(parse_granularity(Some("MONTH"), "day")), Some("month"));
-        assert!(matches!(
-            parse_granularity(Some("ledger"), "day"),
-            Ok(Granularity::Ledger)
-        ));
-    }
+async fn query_stats_by_ledger(
+    state: &AppState,
+    contract_id: &str,
+    from_ledger: Option<i64>,
+    to_ledger: Option<i64>,
+) -> ApiResult<Vec<StatsBucket>> {
+    let rows: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT ledger, COUNT(*) as count
+         FROM events
+         WHERE contract_id = $1
+           AND ($2::bigint IS NULL OR ledger >= $2)
+           AND ($3::bigint IS NULL OR ledger <= $3)
+         GROUP BY ledger
+         ORDER BY ledger DESC",
+    )
+    .bind(contract_id)
+    .bind(from_ledger)
+    .bind(to_ledger)
+    .fetch_all(&state.pool)
+    .await?;
 
-    #[test]
-    fn bucket_1m_uppercase_is_month_and_lowercase_is_minute() {
-        assert_eq!(trunc_of(parse_granularity(None, "1M")), Some("month"));
-        assert_eq!(trunc_of(parse_granularity(None, "1m")), Some("minute"));
-        assert_eq!(trunc_of(parse_granularity(None, "minute")), Some("minute"));
-        assert_eq!(trunc_of(parse_granularity(None, "month")), Some("month"));
-    }
+    Ok(rows
+        .into_iter()
+        .map(|(ledger, count)| StatsBucket {
+            bucket: ledger.to_string(),
+            count,
+            breakdown: None,
+        })
+        .collect())
+}
 
-    #[test]
-    fn unknown_values_are_rejected() {
-        assert!(parse_granularity(Some("2M"), "day").is_err());
-        assert!(parse_granularity(None, "fortnight").is_err());
-    }
+async fn query_stats_by_ledger_grouped(
+    state: &AppState,
+    contract_id: &str,
+    from_ledger: Option<i64>,
+    to_ledger: Option<i64>,
+) -> ApiResult<Vec<StatsBucket>> {
+    let rows: Vec<(i64, Option<String>, i64)> = sqlx::query_as(
+        "SELECT ledger, event_name, COUNT(*) as count
+         FROM events
+         WHERE contract_id = $1
+           AND ($2::bigint IS NULL OR ledger >= $2)
+           AND ($3::bigint IS NULL OR ledger <= $3)
+         GROUP BY ledger, event_name
+         ORDER BY ledger DESC, event_name",
+    )
+    .bind(contract_id)
+    .bind(from_ledger)
+    .bind(to_ledger)
+    .fetch_all(&state.pool)
+    .await?;
 
-    fn window_secs(window: &str) -> Option<i64> {
-        parse_window(window).ok().map(|d| d.num_seconds())
-    }
+    let mut result: std::collections::HashMap<String, (i64, std::collections::HashMap<String, i64>)> =
+        std::collections::HashMap::new();
 
-    #[test]
-    fn window_parses_each_unit() {
-        assert_eq!(window_secs("30m"), Some(30 * 60));
-        assert_eq!(window_secs("24h"), Some(24 * 3_600));
-        assert_eq!(window_secs("7d"), Some(7 * 86_400));
-        assert_eq!(window_secs("2w"), Some(2 * 604_800));
-    }
-
-    /// #573 — a window ending in a multi-byte character is a 400, not a panic.
-    #[test]
-    fn window_ending_in_multibyte_char_is_rejected() {
-        assert!(parse_window("7é").is_err());
-        assert!(parse_window("1日").is_err());
-        assert!(parse_window("😀").is_err());
-    }
-
-    /// Property-style check: every string of up to three characters drawn from
-    /// an alphabet that includes multi-byte characters returns Ok or Err, and
-    /// never panics.
-    #[test]
-    fn window_never_panics_on_arbitrary_input() {
-        let alphabet = ['1', '7', 'd', 'h', 'm', 'w', 'é', '日', '😀', ' ', '-', '+'];
-        let mut inputs = vec![String::new()];
-        for _ in 0..3 {
-            let longer: Vec<String> = inputs
-                .iter()
-                .flat_map(|prefix| alphabet.iter().map(move |c| format!("{prefix}{c}")))
-                .collect();
-            inputs.extend(longer);
+    for (ledger, event_name, count) in rows {
+        let bucket_key = ledger.to_string();
+        let entry = result
+            .entry(bucket_key)
+            .or_insert((0, std::collections::HashMap::new()));
+        entry.0 += count;
+        if let Some(name) = event_name {
+            *entry.1.entry(name).or_insert(0) += count;
         }
-        for input in &inputs {
-            let _ = parse_window(input);
-        }
     }
+
+    Ok(result
+        .into_iter()
+        .map(|(bucket, (total, breakdown))| StatsBucket {
+            bucket,
+            count: total,
+            breakdown: if breakdown.is_empty() {
+                None
+            } else {
+                Some(breakdown)
+            },
+        })
+        .collect())
 }

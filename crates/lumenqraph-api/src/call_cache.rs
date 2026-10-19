@@ -88,6 +88,20 @@ impl CallCache {
         }
     }
 
+    /// Drop every cached result for one contract, e.g. after its WASM changed
+    /// on-chain, so the next call re-reads state through the new interface.
+    pub fn invalidate_contract(&self, contract_id: &str) {
+        let mut cache = self.inner.lock().unwrap();
+        let stale: Vec<Key> = cache
+            .iter()
+            .filter(|(key, _)| key.contract_id == contract_id)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &stale {
+            cache.pop(key);
+        }
+    }
+
     /// Get cache hit count (for Prometheus metrics).
     pub fn hits(&self) -> u64 {
         self.hits.load(Ordering::Relaxed)
@@ -194,5 +208,27 @@ mod tests {
         let args2 = json!({"x": 10, "outer": {"a": 1, "b": 2}});
         cache.insert("C1", "fn", &args1, json!("result"));
         assert_eq!(cache.get("C1", "fn", &args2), Some(json!("result")));
+    }
+}
+
+#[cfg(test)]
+mod invalidate_contract_tests {
+    use super::CallCache;
+    use serde_json::json;
+
+    #[test]
+    fn invalidate_contract_drops_only_that_contracts_entries() {
+        let cache = CallCache::new(100, 60);
+        let args = json!({});
+        cache.insert("CA_ONE", "balance", &args, json!(1));
+        cache.insert("CA_ONE", "name", &args, json!("one"));
+        cache.insert("CA_TWO", "balance", &args, json!(2));
+
+        cache.invalidate_contract("CA_ONE");
+
+        assert_eq!(cache.get("CA_ONE", "balance", &args), None);
+        assert_eq!(cache.get("CA_ONE", "name", &args), None);
+        assert_eq!(cache.get("CA_TWO", "balance", &args), Some(json!(2)));
+        assert_eq!(cache.size(), 1);
     }
 }
