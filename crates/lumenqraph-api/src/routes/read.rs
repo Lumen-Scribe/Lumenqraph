@@ -353,6 +353,7 @@ mod tests {
             health_max_stale_secs: 120,
             metrics_require_auth: false,
             proxy_limiter: Arc::new(RateLimiter::new()),
+            webhook_limiter: Arc::new(RateLimiter::new()),
             config: Arc::new(crate::config::ApiConfig::test_default()),
             key_cache: Arc::new(KeyCache::new(256)),
             ip_config: crate::auth::IpConfig { trusted_proxy_hops: 0, platform_header: None },

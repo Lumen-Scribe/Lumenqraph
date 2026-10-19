@@ -159,13 +159,23 @@ impl RateLimitBackend for MemoryBackend {
 /// Redis backend: global limits across all replicas using sliding window
 pub struct RedisBackend {
     client: redis::Client,
+    namespace: String,
 }
 
 impl RedisBackend {
-    pub fn new(redis_url: &str) -> anyhow::Result<Self> {
+    pub fn new(redis_url: &str, namespace: &str) -> anyhow::Result<Self> {
         let client = redis::Client::open(redis_url)?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            namespace: namespace.to_string(),
+        })
     }
+}
+
+/// Redis key for one identity under one limiter. Each limiter has its own
+/// namespace, so budgets on different routes never share a bucket.
+fn redis_key(namespace: &str, identity: &str) -> String {
+    format!("ratelimit:{namespace}:{identity}")
 }
 
 impl RateLimitBackend for RedisBackend {
@@ -190,7 +200,7 @@ impl RateLimitBackend for RedisBackend {
             }
         };
 
-        let key = format!("ratelimit:{}", identity);
+        let key = redis_key(&self.namespace, identity);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -255,14 +265,21 @@ impl RateLimiter {
     }
 
     pub fn from_env() -> Self {
+        Self::from_env_with_namespace("default")
+    }
+
+    /// Like `from_env`, but Redis keys are prefixed with `namespace`. Give each
+    /// limiter its own namespace so their budgets stay independent when they
+    /// share one Redis instance.
+    pub fn from_env_with_namespace(namespace: &str) -> Self {
         let backend_type = std::env::var("RATE_LIMIT_BACKEND")
             .unwrap_or_else(|_| "memory".to_string());
-        
+
         match backend_type.as_str() {
             "redis" => {
                 let redis_url = std::env::var("REDIS_URL")
                     .expect("REDIS_URL must be set when RATE_LIMIT_BACKEND=redis");
-                match RedisBackend::new(&redis_url) {
+                match RedisBackend::new(&redis_url, namespace) {
                     Ok(backend) => Self {
                         backend: Box::new(backend),
                     },
@@ -329,6 +346,22 @@ mod tests {
         assert!(rl.check("a", 1).allowed);
         assert!(!rl.check("a", 1).allowed);
         assert!(rl.check("b", 1).allowed);
+    }
+
+    #[test]
+    fn separate_limiters_do_not_share_buckets() {
+        let general = memory_limiter();
+        let rpc = memory_limiter();
+        assert!(general.check("anon:1", 1).allowed);
+        assert!(!general.check("anon:1", 1).allowed);
+        assert!(rpc.check("anon:1", 1).allowed, "rpc budget must not be spent by general traffic");
+    }
+
+    #[test]
+    fn redis_keys_are_namespaced_per_limiter() {
+        assert_eq!(redis_key("rpc", "anon:1"), "ratelimit:rpc:anon:1");
+        assert_ne!(redis_key("rpc", "anon:1"), redis_key("main", "anon:1"));
+        assert_ne!(redis_key("webhook", "key:abc"), redis_key("proxy", "key:abc"));
     }
 
     #[test]
