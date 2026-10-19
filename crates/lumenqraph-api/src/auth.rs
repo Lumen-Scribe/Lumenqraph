@@ -505,26 +505,28 @@ pub async fn concurrency_limit(
     next: Next,
 ) -> Response {
     let client_ip = extract_client_ip(&headers, Some(socket_addr), &state.ip_config);
-    let status = state.concurrency_limiter.acquire(&client_ip, state.max_concurrent_per_ip);
-
-    if !status.allowed {
+    let Some(slot) = state
+        .concurrency_limiter
+        .try_acquire(&client_ip, state.max_concurrent_per_ip)
+    else {
         let body = json!({
             "code": "rate_limited",
             "error": format!(
                 "too many concurrent requests from this IP (limit: {})",
-                status.limit
+                state.max_concurrent_per_ip
             )
         });
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
-    }
+    };
 
     // Insert the client IP into extensions so release middleware can access it.
     req.extensions_mut().insert(client_ip.clone());
 
+    // The slot is released when `slot` drops. That happens after the response is
+    // produced, or earlier if the timeout layer or a client disconnect cancels this
+    // future, so a cancelled request cannot leak its slot.
     let response = next.run(req).await;
-
-    // Release the slot after request completes.
-    state.concurrency_limiter.release(&client_ip);
+    drop(slot);
 
     response
 }
