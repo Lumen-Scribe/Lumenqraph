@@ -28,11 +28,7 @@ impl MetricsCollector {
         }
     }
 
-    pub async fn middleware(
-        self,
-        req: Request,
-        next: Next,
-    ) -> Response {
+    pub async fn middleware(&self, req: Request, next: Next) -> Response {
         let method = req.method().clone();
         let uri = req.uri().path().to_string();
         let start = Instant::now();
@@ -74,9 +70,17 @@ fn extract_route_template(path: &str, _method: &Method) -> String {
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
     let mut template = String::new();
-    for segment in segments {
+    for (index, segment) in segments.iter().enumerate() {
         template.push('/');
-        if is_uuid_like(segment) || is_numeric(segment) {
+        // Contract StrKeys are neither numeric nor UUID-shaped. Treat the
+        // identifier position in known dynamic routes as a placeholder so a
+        // caller-provided address cannot create unbounded metric labels.
+        let follows_resource = index > 0
+            && matches!(
+                segments[index - 1],
+                "contracts" | "events" | "webhooks" | "transactions"
+            );
+        if follows_resource || is_uuid_like(segment) || is_numeric(segment) {
             template.push_str("{id}");
         } else {
             template.push_str(segment);

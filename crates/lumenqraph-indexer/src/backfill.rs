@@ -132,11 +132,9 @@ mod tests {
     }
 
     fn test_config(rpc_url: impl Into<String>, page_size: u32) -> Config {
-        let rpc_url = rpc_url.into();
         Config {
             database_url: String::new(),
-            rpc_url: rpc_url.clone(),
-            rpc_urls: vec![rpc_url],
+            rpc_url: rpc_url.into(),
             contract_ids: vec![],
             poll_interval_secs: 5,
             page_size,
@@ -154,7 +152,6 @@ mod tests {
             enrichment_warn_threshold: 0.5,
             key_templates: vec![],
             spec_cache_max_entries: 2000,
-            spec_fetch_concurrency: 4,
         }
     }
 
@@ -246,7 +243,7 @@ mod tests {
         // Second run against a fresh mock that serves the same pages.
         let rpc_url2 = spawn_mock_rpc(1000, make_pages()).await;
         let rpc2 = RpcClient::new(&rpc_url2, 30);
-        let specs2 = SpecCache::new(2000, 4);
+        let specs2 = SpecCache::new(2000);
         let (second, _) = fetch_and_store(&pool, &rpc2, &config, &specs2, 500, 1000)
             .await
             .expect("second run");
@@ -327,7 +324,7 @@ mod tests {
 
         let rpc = RpcClient::new(&rpc_url, 30);
         let config = test_config(&rpc_url, 2);
-        let specs = SpecCache::new(2000, 4);
+        let specs = SpecCache::new(2000);
 
         // Simulate what backfill::run does: fetch page 1, store it, checkpoint.
         let (inserted, _) = fetch_and_store(&pool, &rpc, &config, &specs, 500, tip)
@@ -412,7 +409,7 @@ pub async fn run(
     }
     info!(from = start, to = tip, "starting backfill");
 
-    let specs = SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
+    let specs = SpecCache::new(config.spec_cache_max_entries);
 
     // Drive the paging loop here so we can checkpoint the cursor after every
     // successfully stored page.  An interrupted backfill can be resumed by
@@ -444,11 +441,7 @@ pub async fn run(
         let mut batch = Vec::with_capacity(page_len);
         for ev in &page.events {
             let spec = specs.get(&pool, &rpc, &ev.contract_id, ev.ledger).await;
-            if let Some(new_ev) = crate::convert::to_new_event(ev, spec.as_deref()) {
-                batch.push(new_ev);
-            }
-            // #399: None means unparseable timestamp — event silently skipped here;
-            // error is already logged by parse_ledger_closed_at.
+            batch.push(crate::convert::to_new_event(ev, spec.as_deref()));
         }
         let inserted = crate::store::insert_events(&pool, &batch).await?;
         total_inserted += inserted;

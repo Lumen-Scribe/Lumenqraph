@@ -20,73 +20,33 @@ mod rpc;
 mod tools;
 
 use anyhow::Context;
-use axum::{
-    body::Body,
-    extract::State as AxumState,
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
-    routing::{get, post},
-    Json, Router,
-};
 use serde_json::{json, Value};
+use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
-use std::str::FromStr;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::info;
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use rpc::RpcClient;
 
 /// Latest MCP protocol revision we default to when a client sends none.
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
-const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
-
-fn db_setting<T: FromStr>(service_key: &str, common_key: &str, default: T) -> anyhow::Result<T>
-where
-    T::Err: std::fmt::Display,
-{
-    let key = if std::env::var(service_key)
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
-        service_key
-    } else {
-        common_key
-    };
-    match std::env::var(key) {
-        Ok(value) if !value.trim().is_empty() => value
-            .trim()
-            .parse()
-            .map_err(|error| anyhow::anyhow!("invalid {key}={value:?}: {error}")),
-        _ => Ok(default),
-    }
-}
 
 #[derive(Clone)]
 pub struct State {
     pub pool: PgPool,
     pub rpc: RpcClient,
-    pub rpc_limiter: rpc::RpcRateLimiter,
     pub auth_token: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
-
-    // healthcheck: probe /healthz of the streamable-HTTP transport and exit
-    // 0/1 (#469). Only meaningful when MCP_HTTP_BIND is set; a stdio server
-    // has no listener to probe.
-    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
-        match std::env::var("MCP_HTTP_BIND") {
-            Ok(bind) => lumenqraph_core::healthcheck::run_and_exit(&bind, "/healthz"),
-            Err(_) => {
-                eprintln!("healthcheck failed: MCP_HTTP_BIND is not set (stdio mode has no HTTP listener)");
-                std::process::exit(1);
-            }
-        }
-    }
     // IMPORTANT: log to stderr — stdout is the JSON-RPC channel.
-    lumenqraph_core::telemetry::init_tracing_stderr();
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(fmt::layer().with_writer(std::io::stderr))
+        .init();
 
     let database_url = std::env::var("DATABASE_URL").context("missing DATABASE_URL")?;
     let rpc_url = std::env::var("RPC_URL")
@@ -95,11 +55,6 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(30);
-    let rpc_rate_limit_per_min: usize = std::env::var("MCP_RPC_RATE_LIMIT_PER_MIN")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(60);
-    let auth_token = std::env::var("MCP_AUTH_TOKEN").ok();
 
     // Validate CONTRACT_IDS at startup so a misconfigured address is caught
     // immediately rather than silently ignored.
@@ -108,24 +63,16 @@ async fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let db = lumenqraph_core::db::DbConfig {
-        max_connections: db_setting("MCP_DATABASE_MAX_CONNECTIONS", "DATABASE_MAX_CONNECTIONS", 5u32)?,
-        min_connections: db_setting("MCP_DATABASE_MIN_CONNECTIONS", "DATABASE_MIN_CONNECTIONS", 0u32)?,
-        acquire_timeout_secs: db_setting("MCP_DATABASE_ACQUIRE_TIMEOUT_SECS", "DATABASE_ACQUIRE_TIMEOUT_SECS", 30u64)?,
-        idle_timeout_secs: db_setting("MCP_DATABASE_IDLE_TIMEOUT_SECS", "DATABASE_IDLE_TIMEOUT_SECS", 600u64)?,
-        connect_retries: db_setting("MCP_DATABASE_CONNECT_RETRIES", "DATABASE_CONNECT_RETRIES", 30u32)?,
-    };
-    let pool = lumenqraph_core::db::connect_with_retry(&database_url, &db).await?;
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await
+        .context("failed to connect to Postgres")?;
     let state = State {
         pool,
         rpc: RpcClient::new(rpc_url, rpc_timeout_secs),
-        rpc_limiter: rpc::RpcRateLimiter::new(rpc_rate_limit_per_min),
         auth_token,
     };
-
-    if let Ok(http_bind) = std::env::var("MCP_HTTP_BIND") {
-        return serve_http(state, http_bind).await;
-    }
 
     info!("lumenqraph MCP server ready (stdio)");
     serve(state).await
@@ -134,50 +81,6 @@ async fn main() -> anyhow::Result<()> {
 /// The stdio JSON-RPC loop: read a message per line, dispatch, write responses.
 async fn serve(state: State) -> anyhow::Result<()> {
     serve_io(state, tokio::io::stdin(), tokio::io::stdout()).await
-}
-
-async fn serve_http(state: State, bind: String) -> anyhow::Result<()> {
-    let app = Router::new()
-        .route("/mcp", post(handle_http_request))
-        .route("/healthz", get(|| async { "ok" }))
-        .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind(&bind).await?;
-    info!(bind = %bind, "lumenqraph MCP server ready (streamable HTTP)");
-    axum::serve(listener, app).await?;
-    Ok(())
-}
-
-async fn handle_http_request(
-    AxumState(state): AxumState<State>,
-    headers: HeaderMap,
-    body: Body,
-) -> Response {
-    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
-        Ok(bytes) => bytes,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid JSON-RPC body").into_response(),
-    };
-
-    let mut msg: Value = match serde_json::from_slice(&bytes) {
-        Ok(v) => v,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid JSON body").into_response(),
-    };
-
-    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        msg["authorization"] = Value::String(auth.to_string());
-    }
-
-    let authenticated = state.auth_token.as_ref().map_or(true, |token| {
-        msg.get("authorization")
-            .and_then(Value::as_str)
-            .map(|value| value.strip_prefix("Bearer ").unwrap_or(value).trim() == token)
-            .unwrap_or(false)
-    });
-
-    match handle(&state, msg, authenticated).await {
-        Some((resp, _)) => Json(resp).into_response(),
-        None => StatusCode::NO_CONTENT.into_response(),
-    }
 }
 
 /// Protocol loop over any `AsyncRead` / `AsyncWrite` pair (stdin/stdout in
@@ -201,11 +104,7 @@ where
                 continue;
             }
         };
-        let authenticated = state
-            .auth_token
-            .as_ref()
-            .map_or(true, |token| check_auth(&msg, token));
-        if let Some((response, _)) = handle(&state, msg, authenticated).await {
+        if let Some(response) = handle(&state, msg).await {
             write_to(&mut out, &response).await?;
         }
     }
@@ -308,16 +207,11 @@ async fn handle(state: &State, msg: Value, authenticated: bool) -> Option<(Value
 }
 
 fn initialize_result(msg: &Value) -> Value {
-    let requested = msg
+    let protocol_version = msg
         .get("params")
         .and_then(|p| p.get("protocolVersion"))
         .and_then(Value::as_str)
         .unwrap_or(DEFAULT_PROTOCOL_VERSION);
-    let protocol_version = if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) {
-        requested
-    } else {
-        SUPPORTED_PROTOCOL_VERSIONS.last().copied().unwrap_or(DEFAULT_PROTOCOL_VERSION)
-    };
     json!({
         "protocolVersion": protocol_version,
         "capabilities": { "tools": {} },
@@ -347,14 +241,10 @@ async fn handle_tools_call(state: &State, id: Option<Value>, msg: &Value) -> Val
 
 fn tool_content(payload: &Value, is_error: bool) -> Value {
     let text = serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string());
-    let mut out = json!({
+    json!({
         "content": [ { "type": "text", "text": text } ],
         "isError": is_error,
-    });
-    if !payload.is_null() {
-        out["structuredContent"] = payload.clone();
-    }
-    out
+    })
 }
 
 fn result_response(id: Option<Value>, result: Value) -> Value {
@@ -370,13 +260,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn initialize_negotiates_supported_protocol_versions() {
-        let supported = json!({ "params": { "protocolVersion": "2025-06-18" } });
-        assert_eq!(initialize_result(&supported)["protocolVersion"], "2025-06-18");
-
-        let unsupported = json!({ "params": { "protocolVersion": "2027-01-01" } });
-        assert_eq!(initialize_result(&unsupported)["protocolVersion"], "2025-06-18");
-
+    fn initialize_echoes_client_protocol_version() {
+        let req = json!({ "params": { "protocolVersion": "2025-06-18" } });
+        assert_eq!(initialize_result(&req)["protocolVersion"], "2025-06-18");
+        // Falls back when the client omits it.
         assert_eq!(
             initialize_result(&json!({}))["protocolVersion"],
             DEFAULT_PROTOCOL_VERSION
@@ -408,10 +295,6 @@ mod tests {
                 "get_contract_state",
                 "get_contract_data",
                 "query_events",
-                "get_event",
-                "get_transaction_events",
-                "get_contract_stats",
-                "list_contract_functions",
                 "call_contract",
                 "simulate_call",
                 "query_transfers",
@@ -424,11 +307,7 @@ mod tests {
         for t in defs.as_array().unwrap() {
             assert_eq!(
                 t["inputSchema"]["type"], "object",
-                "each tool needs an input schema"
-            );
-            assert_eq!(
-                t["outputSchema"]["type"], "object",
-                "each tool needs an output schema"
+                "each tool needs a schema"
             );
             assert!(!t["description"].as_str().unwrap().is_empty());
         }
@@ -439,7 +318,6 @@ mod tests {
         let ok = tool_content(&json!({ "x": 1 }), false);
         assert_eq!(ok["isError"], false);
         assert_eq!(ok["content"][0]["type"], "text");
-        assert_eq!(ok["structuredContent"]["x"], 1);
         assert_eq!(tool_content(&json!({}), true)["isError"], true);
     }
 
@@ -467,7 +345,6 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
-            rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
         };
         let resp = handle(&state, msg, true).await;
@@ -482,7 +359,6 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
-            rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
         };
         let msg = json!({ "jsonrpc": "2.0", "id": 1, "method": "unknown/method" });
@@ -499,7 +375,6 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
-            rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
         };
         let msg = json!({ "jsonrpc": "2.0", "id": 42, "method": "ping" });
@@ -518,7 +393,6 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
-            rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: Some("secret123".to_string()),
         };
         let msg = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} });
@@ -539,7 +413,6 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
-            rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: Some("secret123".to_string()),
         };
         let msg = json!({
@@ -561,14 +434,13 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
-            rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
         };
         let msg = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
         let (resp, _) = handle(&state, msg, true).await.unwrap();
         assert_eq!(resp["id"], 2);
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 17, "all declared MCP tools must be present");
+        assert_eq!(tools.len(), 13, "all thirteen tools must be declared");
         for tool in tools {
             // Every tool must have a non-empty name, description, and an object schema.
             assert!(!tool["name"].as_str().unwrap_or("").is_empty());
@@ -593,7 +465,6 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
-            rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
         };
         let msg = json!({
@@ -670,7 +541,6 @@ mod tests {
         let state = State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
-            rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
         };
         let msg = json!({
@@ -720,7 +590,6 @@ mod tests {
         State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
-            rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
         }
     }
@@ -802,8 +671,6 @@ mod protocol_tests {
         State {
             pool,
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
-            rpc_limiter: rpc::RpcRateLimiter::new(60),
-            auth_token: None,
         }
     }
 

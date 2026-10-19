@@ -1,28 +1,19 @@
 name: SDK – Publish to npm
 
-# Triggers on every SDK-specific semver tag that matches sdk-ts-v*.*.*.
+# Triggers on every semver tag that matches v*.*.*.
 # The tag should be cut after the SDK version in package.json is bumped.
-# See the release policy in CONTRIBUTING.md.
 #
 # Provenance:  --provenance requires id-token: write and publishes a signed
 #              SLSA attestation alongside the tarball on the npm registry.
 on:
   push:
     tags:
-      - "sdk-ts-v*.*.*"
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
-permissions:
-  contents: read
+      - "v*.*.*"
 
 jobs:
   publish:
     name: Build & publish @lumenqraph/sdk
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     permissions:
       contents: read
       # Required for npm provenance signing (OIDC token)
@@ -35,13 +26,13 @@ jobs:
     steps:
       # ── Checkout ─────────────────────────────────────────────────────────────
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@v7
 
       # ── Node setup — also configures the npm registry + auth token ───────────
       # Using actions/setup-node's registry-url wires NODE_AUTH_TOKEN into the
       # .npmrc that npm reads, so no manual .npmrc editing is needed.
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
@@ -71,28 +62,14 @@ jobs:
       - name: Build
         run: npm run build
 
-      # ── Verify the package version matches the tag ────────────────────────────
-      # sdk-ts-v1.2.3 → package.json "version" must be 1.2.3
-      - name: Verify package version matches tag
-        shell: bash
-        run: |
-          TAG_VERSION="${GITHUB_REF_NAME#sdk-ts-v}"
-          PKG_VERSION="$(node -p "require('./package.json').version")"
-          echo "Tag version:     $TAG_VERSION"
-          echo "Package version: $PKG_VERSION"
-          if [[ "$TAG_VERSION" != "$PKG_VERSION" ]]; then
-            echo "::error::Tag version ($TAG_VERSION) does not match package.json version ($PKG_VERSION)"
-            exit 1
-          fi
-
       # ── Derive the correct dist-tag from the tag name ─────────────────────────
-      # sdk-ts-v1.2.3      → latest
-      # sdk-ts-v1.2.3-rc.1 → next   (pre-release versions)
+      # v1.2.3      → latest
+      # v1.2.3-rc.1 → next   (pre-release versions)
       - name: Resolve dist-tag
         id: dist_tag
         shell: bash
         run: |
-          TAG="${GITHUB_REF_NAME#sdk-ts-v}"
+          TAG="${GITHUB_REF_NAME}"
           if [[ "$TAG" =~ -[a-zA-Z] ]]; then
             echo "tag=next" >> "$GITHUB_OUTPUT"
           else

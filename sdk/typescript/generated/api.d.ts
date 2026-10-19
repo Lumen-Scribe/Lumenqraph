@@ -194,57 +194,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/contracts/{contract_id}/swaps": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Materialized AMM swaps, newest first. */
-        get: operations["listContractSwaps"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/contracts/{contract_id}/nfts": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Materialized NFT mint/transfer/burn events, newest first. */
-        get: operations["listContractNftEvents"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/contracts/{contract_id}/liquidity": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Materialized liquidity add/remove events, newest first. */
-        get: operations["listContractLiquidityEvents"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/contracts/{contract_id}/call": {
         parameters: {
             query?: never;
@@ -309,23 +258,6 @@ export interface paths {
         post?: never;
         /** Delete a webhook subscription. */
         delete: operations["deleteWebhook"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/webhooks/{id}/deliveries": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Delivery attempts for a subscription, newest first (keyset on delivery id). */
-        get: operations["listWebhookDeliveries"];
-        put?: never;
-        post?: never;
-        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -526,50 +458,6 @@ export interface components {
         ErrorResponse: {
             error: string;
         };
-        PageMeta: {
-            /** @description Whether more rows are available after this page. */
-            has_more: boolean;
-            /** @description Opaque cursor to pass as `after` for the next page. Null on the last page. */
-            next_cursor: string | null;
-        };
-        EventsPage: components["schemas"]["PageMeta"] & {
-            data: components["schemas"]["EventRecord"][];
-        };
-        TransfersPage: components["schemas"]["PageMeta"] & {
-            data: components["schemas"]["Transfer"][];
-        };
-        /** @description Page of materialized swap, NFT or liquidity rows. */
-        MaterializedPage: components["schemas"]["PageMeta"] & {
-            data: {
-                [key: string]: unknown;
-            }[];
-        };
-        WebhookDelivery: {
-            /** Format: int64 */
-            id: number;
-            /** @enum {string} */
-            status: "pending" | "delivered" | "failed";
-            attempts: number;
-            last_error?: string | null;
-            /** Format: date-time */
-            delivered_at?: string | null;
-            /** Format: date-time */
-            created_at: string;
-        };
-        DeliverySummary: {
-            /** Format: int64 */
-            total: number;
-            /** Format: int64 */
-            delivered: number;
-            /** Format: int64 */
-            failed: number;
-            /** Format: int64 */
-            pending: number;
-        };
-        DeliveriesPage: components["schemas"]["PageMeta"] & {
-            data: components["schemas"]["WebhookDelivery"][];
-            summary?: components["schemas"]["DeliverySummary"];
-        };
     };
     responses: {
         /** @description The requested resource was not found. */
@@ -599,15 +487,6 @@ export interface components {
                 "application/json": components["schemas"]["ErrorResponse"];
             };
         };
-        /** @description Invalid parameter (e.g. malformed cursor or offset above the cap). */
-        BadRequest: {
-            headers: {
-                [name: string]: unknown;
-            };
-            content: {
-                "application/json": components["schemas"]["ErrorResponse"];
-            };
-        };
     };
     parameters: {
         /** @description Bech32m `C…` contract address. */
@@ -615,15 +494,8 @@ export interface components {
         KeyHash: string;
         /** @description Maximum number of results to return. */
         Limit: number;
-        /**
-         * @deprecated
-         * @description Deprecated: number of results to skip. Capped at 10000 (400 above
-         *     that). Responses to offset requests carry `Deprecation: true` and
-         *     `Warning` headers. Ignored when `after` is present. Use `after`.
-         */
+        /** @description Number of results to skip (pagination). */
         Offset: number;
-        /** @description Opaque keyset cursor; the `next_cursor` of the previous page. */
-        After: string;
     };
     requestBodies: never;
     headers: never;
@@ -875,15 +747,8 @@ export interface operations {
             query?: {
                 /** @description Maximum number of results to return. */
                 limit?: components["parameters"]["Limit"];
-                /**
-                 * @deprecated
-                 * @description Deprecated: number of results to skip. Capped at 10000 (400 above
-                 *     that). Responses to offset requests carry `Deprecation: true` and
-                 *     `Warning` headers. Ignored when `after` is present. Use `after`.
-                 */
+                /** @description Number of results to skip (pagination). */
                 offset?: components["parameters"]["Offset"];
-                /** @description Opaque keyset cursor; the `next_cursor` of the previous page. */
-                after?: components["parameters"]["After"];
                 /** @description Filter to a specific event name. */
                 event_name?: string;
             };
@@ -902,10 +767,9 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["EventsPage"];
+                    "application/json": components["schemas"]["EventRecord"][];
                 };
             };
-            400: components["responses"]["BadRequest"];
         };
     };
     listContractTransfers: {
@@ -913,19 +777,8 @@ export interface operations {
             query?: {
                 /** @description Maximum number of results to return. */
                 limit?: components["parameters"]["Limit"];
-                /**
-                 * @deprecated
-                 * @description Deprecated: number of results to skip. Capped at 10000 (400 above
-                 *     that). Responses to offset requests carry `Deprecation: true` and
-                 *     `Warning` headers. Ignored when `after` is present. Use `after`.
-                 */
+                /** @description Number of results to skip (pagination). */
                 offset?: components["parameters"]["Offset"];
-                /** @description Opaque keyset cursor; the `next_cursor` of the previous page. */
-                after?: components["parameters"]["After"];
-                /** @description Filter by sender address. */
-                from?: string;
-                /** @description Filter by recipient address. */
-                to?: string;
             };
             header?: never;
             path: {
@@ -942,136 +795,9 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TransfersPage"];
+                    "application/json": components["schemas"]["Transfer"][];
                 };
             };
-            400: components["responses"]["BadRequest"];
-        };
-    };
-    listContractSwaps: {
-        parameters: {
-            query?: {
-                /** @description Maximum number of results to return. */
-                limit?: components["parameters"]["Limit"];
-                /**
-                 * @deprecated
-                 * @description Deprecated: number of results to skip. Capped at 10000 (400 above
-                 *     that). Responses to offset requests carry `Deprecation: true` and
-                 *     `Warning` headers. Ignored when `after` is present. Use `after`.
-                 */
-                offset?: components["parameters"]["Offset"];
-                /** @description Opaque keyset cursor; the `next_cursor` of the previous page. */
-                after?: components["parameters"]["After"];
-                /** @description Filter by sender address. */
-                sender?: string;
-                /** @description Filter by sold token. */
-                sell_token?: string;
-                /** @description Filter by bought token. */
-                buy_token?: string;
-            };
-            header?: never;
-            path: {
-                /** @description Bech32m `C…` contract address. */
-                contract_id: components["parameters"]["ContractId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description OK */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MaterializedPage"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-        };
-    };
-    listContractNftEvents: {
-        parameters: {
-            query?: {
-                /** @description Maximum number of results to return. */
-                limit?: components["parameters"]["Limit"];
-                /**
-                 * @deprecated
-                 * @description Deprecated: number of results to skip. Capped at 10000 (400 above
-                 *     that). Responses to offset requests carry `Deprecation: true` and
-                 *     `Warning` headers. Ignored when `after` is present. Use `after`.
-                 */
-                offset?: components["parameters"]["Offset"];
-                /** @description Opaque keyset cursor; the `next_cursor` of the previous page. */
-                after?: components["parameters"]["After"];
-                /** @description Filter by event kind. */
-                kind?: "mint" | "transfer" | "burn";
-                /** @description Filter by sender address. */
-                from?: string;
-                /** @description Filter by recipient address. */
-                to?: string;
-                /** @description Filter by token id. */
-                token_id?: string;
-            };
-            header?: never;
-            path: {
-                /** @description Bech32m `C…` contract address. */
-                contract_id: components["parameters"]["ContractId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description OK */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MaterializedPage"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
-        };
-    };
-    listContractLiquidityEvents: {
-        parameters: {
-            query?: {
-                /** @description Maximum number of results to return. */
-                limit?: components["parameters"]["Limit"];
-                /**
-                 * @deprecated
-                 * @description Deprecated: number of results to skip. Capped at 10000 (400 above
-                 *     that). Responses to offset requests carry `Deprecation: true` and
-                 *     `Warning` headers. Ignored when `after` is present. Use `after`.
-                 */
-                offset?: components["parameters"]["Offset"];
-                /** @description Opaque keyset cursor; the `next_cursor` of the previous page. */
-                after?: components["parameters"]["After"];
-                /** @description Filter by event kind. */
-                kind?: "add" | "remove";
-                /** @description Filter by liquidity provider. */
-                provider?: string;
-            };
-            header?: never;
-            path: {
-                /** @description Bech32m `C…` contract address. */
-                contract_id: components["parameters"]["ContractId"];
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description OK */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MaterializedPage"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
         };
     };
     callContractFunction: {
@@ -1208,44 +934,6 @@ export interface operations {
                 };
                 content?: never;
             };
-            404: components["responses"]["NotFound"];
-        };
-    };
-    listWebhookDeliveries: {
-        parameters: {
-            query?: {
-                /** @description Maximum number of results to return. */
-                limit?: components["parameters"]["Limit"];
-                /**
-                 * @deprecated
-                 * @description Deprecated: number of results to skip. Capped at 10000 (400 above
-                 *     that). Responses to offset requests carry `Deprecation: true` and
-                 *     `Warning` headers. Ignored when `after` is present. Use `after`.
-                 */
-                offset?: components["parameters"]["Offset"];
-                /** @description Opaque keyset cursor; the `next_cursor` of the previous page. */
-                after?: components["parameters"]["After"];
-                /** @description Include per-status counts (runs an aggregate over all deliveries). */
-                include_summary?: boolean;
-            };
-            header?: never;
-            path: {
-                id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description OK */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["DeliveriesPage"];
-                };
-            };
-            400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
         };
     };

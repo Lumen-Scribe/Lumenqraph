@@ -16,20 +16,29 @@ pub async fn openapi_json() -> impl IntoResponse {
     (StatusCode::OK, axum::Json(ApiDoc::openapi()))
 }
 
-/// Serve the Swagger UI at `/docs`
-pub fn swagger_ui() -> Router {
+/// Serve the Swagger UI at `/docs`.
+pub fn swagger_ui<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     SwaggerUi::new("/docs/swagger-ui")
         .url("/openapi.json", ApiDoc::openapi())
         .into()
 }
 
-/// Serve the Redoc UI at `/redoc`
-pub fn redoc_ui() -> Router {
+/// Serve the Redoc UI at `/redoc`.
+pub fn redoc_ui<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     Redoc::new(ApiDoc::openapi()).into()
 }
 
-/// OpenAPI documentation endpoint
-pub fn router() -> Router {
+/// OpenAPI documentation endpoint.
+pub fn router<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     Router::new()
         .route("/openapi.json", get(openapi_json))
         .merge(swagger_ui())

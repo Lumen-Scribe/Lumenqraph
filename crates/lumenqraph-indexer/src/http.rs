@@ -72,9 +72,6 @@ async fn health(State(state): State<HttpState>) -> impl IntoResponse {
                     "chain_tip_ledger": status.chain_tip_ledger,
                     "lag_ledgers": status.lag_ledgers,
                     "seconds_since_cursor_update": status.secs_since_update,
-                    "unrecovered_missed_ranges": status.unrecovered_missed_ranges,
-                    "recoverable_missed_ranges": status.recoverable_missed_ranges,
-                    "unrecoverable_missed_ranges": status.unrecoverable_missed_ranges,
                 })),
             )
         }
@@ -126,29 +123,6 @@ async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
             body.push_str("# HELP lumenqraph_spec_cache_size Current number of entries in the in-memory spec cache\n");
             body.push_str("# TYPE lumenqraph_spec_cache_size gauge\n");
             body.push_str(&format!("lumenqraph_spec_cache_size {cache_size}\n"));
-
-            // RPC failover counter (#398).
-            body.push_str("# HELP lumenqraph_indexer_rpc_failovers_total Total number of RPC endpoint failovers\n");
-            body.push_str("# TYPE lumenqraph_indexer_rpc_failovers_total counter\n");
-            body.push_str(&format!("lumenqraph_indexer_rpc_failovers_total {}\n", metrics.rpc_failovers_total));
-
-            // Timestamp parse error counter (#399).
-            body.push_str("# HELP lumenqraph_indexer_timestamp_parse_errors_total Total ledgerClosedAt parse failures (never stored as Utc::now())\n");
-            body.push_str("# TYPE lumenqraph_indexer_timestamp_parse_errors_total counter\n");
-            body.push_str(&format!("lumenqraph_indexer_timestamp_parse_errors_total {}\n", metrics.timestamp_parse_errors_total));
-
-            body.push_str("# HELP lumenqraph_rpc_oldest_ledger Oldest ledger currently available from the RPC provider\n");
-            body.push_str("# TYPE lumenqraph_rpc_oldest_ledger gauge\n");
-            body.push_str(&format!("lumenqraph_rpc_oldest_ledger {}\n", crate::poller::rpc_oldest_ledger()));
-            body.push_str("# HELP lumenqraph_indexer_unrecovered_missed_ranges Number of ledger ranges not yet recovered\n");
-            body.push_str("# TYPE lumenqraph_indexer_unrecovered_missed_ranges gauge\n");
-            body.push_str(&format!("lumenqraph_indexer_unrecovered_missed_ranges {}\n", metrics.unrecovered_missed_ranges));
-            body.push_str("# HELP lumenqraph_indexer_recoverable_missed_ranges Unrecovered ranges still within RPC retention\n");
-            body.push_str("# TYPE lumenqraph_indexer_recoverable_missed_ranges gauge\n");
-            body.push_str(&format!("lumenqraph_indexer_recoverable_missed_ranges {}\n", metrics.recoverable_missed_ranges));
-            body.push_str("# HELP lumenqraph_indexer_unrecoverable_missed_ranges Unrecovered ranges outside RPC retention\n");
-            body.push_str("# TYPE lumenqraph_indexer_unrecoverable_missed_ranges gauge\n");
-            body.push_str(&format!("lumenqraph_indexer_unrecoverable_missed_ranges {}\n", metrics.unrecoverable_missed_ranges));
         }
         Err(e) => {
             error!(error = %e, "failed to gather indexer metrics");
@@ -164,9 +138,6 @@ struct IndexerStatus {
     lag_ledgers: i64,
     secs_since_update: i64,
     is_healthy: bool,
-    unrecovered_missed_ranges: i64,
-    recoverable_missed_ranges: i64,
-    unrecoverable_missed_ranges: i64,
 }
 
 async fn get_indexer_status(pool: &PgPool) -> anyhow::Result<IndexerStatus> {
@@ -187,14 +158,6 @@ async fn get_indexer_status(pool: &PgPool) -> anyhow::Result<IndexerStatus> {
     let max_stale_secs = env_parse_i64("HEALTH_MAX_STALE_SECS", 120);
     let max_lag_ledgers = env_parse_i64("HEALTH_MAX_LAG_LEDGERS", 100);
     let is_healthy = secs_since_update <= max_stale_secs && lag_ledgers < max_lag_ledgers;
-    let (recoverable_missed_ranges, unrecoverable_missed_ranges): (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*) FILTER (WHERE recoverable), COUNT(*) FILTER (WHERE NOT recoverable)
-         FROM missed_ranges WHERE recovered_at IS NULL",
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap_or((0, 0));
-    let unrecovered_missed_ranges = recoverable_missed_ranges + unrecoverable_missed_ranges;
 
     Ok(IndexerStatus {
         last_processed_ledger: last,
@@ -202,9 +165,6 @@ async fn get_indexer_status(pool: &PgPool) -> anyhow::Result<IndexerStatus> {
         lag_ledgers,
         secs_since_update,
         is_healthy,
-        unrecovered_missed_ranges,
-        recoverable_missed_ranges,
-        unrecoverable_missed_ranges,
     })
 }
 
@@ -216,47 +176,30 @@ struct IndexerMetrics {
     events_ingested_total: i64,
     errors_total: i64,
     enrichment_rate: f64,
-    /// Cumulative RPC endpoint failovers (#398).
-    rpc_failovers_total: i64,
-    /// Cumulative timestamp parse errors (#399).
-    timestamp_parse_errors_total: i64,
-    unrecovered_missed_ranges: i64,
-    recoverable_missed_ranges: i64,
-    unrecoverable_missed_ranges: i64,
 }
 
 async fn gather_metrics(pool: &PgPool) -> anyhow::Result<IndexerMetrics> {
-    let status: Option<(i64, i64, i64, i64, i64, i64, i64, i64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-        "SELECT last_processed_ledger, chain_tip_ledger, events_ingested_total, errors_total, events_enriched_total, events_not_enriched_total,
-                COALESCE(rpc_failovers_total, 0),
-                COALESCE(timestamp_parse_errors_total, 0),
-                updated_at
+    let status: Option<(i64, i64, i64, i64, i64, i64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT last_processed_ledger, chain_tip_ledger, events_ingested_total, errors_total, events_enriched_total, events_not_enriched_total, updated_at
          FROM indexer_cursor WHERE id = 1",
     )
     .fetch_optional(pool)
     .await?;
 
-    let Some((last, tip, events, errors, enriched, not_enriched, rpc_failovers, ts_errors, updated_at)) = status else {
+    let Some((last, tip, events, errors, enriched, not_enriched, updated_at)) = status else {
         anyhow::bail!("indexer cursor not initialized");
     };
 
     let lag_ledgers = (tip - last).max(0);
     let secs_since_update = (Utc::now() - updated_at).num_seconds();
 
+    // Calculate enrichment rate
     let total_enriched = enriched + not_enriched;
     let enrichment_rate = if total_enriched > 0 {
         enriched as f64 / total_enriched as f64
     } else {
-        1.0
+        1.0 // Default to 1.0 (100%) if no events yet
     };
-    let (recoverable_missed_ranges, unrecoverable_missed_ranges): (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*) FILTER (WHERE recoverable), COUNT(*) FILTER (WHERE NOT recoverable)
-         FROM missed_ranges WHERE recovered_at IS NULL",
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap_or((0, 0));
-    let unrecovered_missed_ranges = recoverable_missed_ranges + unrecoverable_missed_ranges;
 
     Ok(IndexerMetrics {
         last_processed_ledger: last,
@@ -266,11 +209,6 @@ async fn gather_metrics(pool: &PgPool) -> anyhow::Result<IndexerMetrics> {
         events_ingested_total: events,
         errors_total: errors,
         enrichment_rate,
-        rpc_failovers_total: rpc_failovers,
-        timestamp_parse_errors_total: ts_errors,
-        unrecovered_missed_ranges,
-        recoverable_missed_ranges,
-        unrecoverable_missed_ranges,
     })
 }
 

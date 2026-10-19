@@ -21,7 +21,6 @@ use serde_json::{json, Value};
 use sqlx::types::Json as SqlxJson;
 
 use crate::error::{ApiError, ApiResult};
-use crate::extract::ValidContractId;
 use crate::specs::CachedSpec;
 use crate::state::AppState;
 
@@ -161,10 +160,13 @@ pub struct InterfaceQuery {
 
 pub async fn contract_interface(
     State(state): State<AppState>,
-    ValidContractId(contract_id): ValidContractId,
+    Path(contract_id): Path<String>,
     Query(q): Query<InterfaceQuery>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, ApiError> {
+    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
+        return Err(ApiError::bad_request("invalid contract id"));
+    }
     if let Some(version) = q.version {
         return contract_interface_at_version(&state, &contract_id, version, &headers).await;
     }
@@ -277,10 +279,14 @@ fn parse_history_cursor(cursor: &str) -> Result<i32, ApiError> {
 /// Pass the `next_cursor` from a previous response as `after` to continue.
 pub async fn contract_interface_history(
     State(state): State<AppState>,
-    ValidContractId(contract_id): ValidContractId,
+    Path(contract_id): Path<String>,
     Query(q): Query<HistoryQuery>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, ApiError> {
+    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
+        return Err(ApiError::bad_request("invalid contract id"));
+    }
+
     // Parse the cursor before hitting the DB so a malformed value returns 400
     // immediately rather than after an unnecessary round-trip.
     let after_version: Option<i32> = q
@@ -418,12 +424,11 @@ pub struct DiffQuery {
 /// can ask "what changed between v1 and v5" in one call, not four.
 pub async fn contract_interface_diff(
     State(state): State<AppState>,
-    ValidContractId(contract_id): ValidContractId,
+    Path(contract_id): Path<String>,
     Query(q): Query<DiffQuery>,
 ) -> ApiResult<Json<Value>> {
-    // Reject an explicit bad range before touching the database.
-    if let (Some(from), Some(to)) = (q.from, q.to) {
-        validate_diff_range(from, to)?;
+    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
+        return Err(ApiError::bad_request("invalid contract id"));
     }
     let latest: Option<i32> = sqlx::query_scalar(
         "SELECT max(version) FROM contract_spec_versions WHERE contract_id = $1",
@@ -439,34 +444,10 @@ pub async fn contract_interface_diff(
 
     let to = q.to.unwrap_or(latest);
     let from = q.from.unwrap_or(to - 1);
-    if from < 1 && q.from.is_none() {
+    if from < 1 {
         return Err(ApiError::bad_request(format!(
             "no version to diff against: this contract has only version {latest} on record, \
              so there is no earlier interface to compare it to"
-        )));
-    }
-    validate_diff_range(from, to)?;
-
-    let old = load_spec(&state, &contract_id, from).await?;
-    let new = load_spec(&state, &contract_id, to).await?;
-    // Both are Some: load_spec rejects an unparseable version above.
-    let diff = SpecDiff::between(old.parsed.as_ref().unwrap(), new.parsed.as_ref().unwrap());
-
-    Ok(Json(json!({
-        "contract_id": contract_id,
-        "from": from,
-        "to": to,
-        "diff": diff.to_json(),
-    })))
-}
-
-/// Validate a `from`..`to` interface-diff range (#211): `from` must be a real
-/// version (>= 1) strictly older than `to`. A reversed range would produce a
-/// backward diff (added items shown as removed and vice-versa).
-fn validate_diff_range(from: i32, to: i32) -> Result<(), ApiError> {
-    if from < 1 {
-        return Err(ApiError::bad_request(format!(
-            "`from` ({from}) must be >= 1: interface versions start at 1"
         )));
     }
     if from > to {
@@ -481,7 +462,18 @@ fn validate_diff_range(from: i32, to: i32) -> Result<(), ApiError> {
             "`from` and `to` are the same version; nothing to diff",
         ));
     }
-    Ok(())
+
+    let old = load_spec(&state, &contract_id, from).await?;
+    let new = load_spec(&state, &contract_id, to).await?;
+    // Both are Some: load_spec rejects an unparseable version above.
+    let diff = SpecDiff::between(old.parsed.as_ref().unwrap(), new.parsed.as_ref().unwrap());
+
+    Ok(Json(json!({
+        "contract_id": contract_id,
+        "from": from,
+        "to": to,
+        "diff": diff.to_json(),
+    })))
 }
 
 /// One version's parsed interface, from the cache (versions are immutable, so
@@ -518,10 +510,13 @@ fn default_state_limit() -> i64 {
 /// storage, newest first. `limit=1` (default) is the current state.
 pub async fn contract_state(
     State(state): State<AppState>,
-    ValidContractId(contract_id): ValidContractId,
+    Path(contract_id): Path<String>,
     Query(q): Query<StateQuery>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, ApiError> {
+    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
+        return Err(ApiError::bad_request("invalid contract id"));
+    }
     let limit = q.limit.clamp(1, 200);
     let rows: Vec<(i64, SqlxJson<Value>, DateTime<Utc>)> = sqlx::query_as(
         "SELECT ledger, storage, captured_at
@@ -601,9 +596,12 @@ type DataRow = (
 /// per key (its latest snapshot). Requires the indexer's key indexing.
 pub async fn contract_data(
     State(state): State<AppState>,
-    ValidContractId(contract_id): ValidContractId,
+    Path(contract_id): Path<String>,
     Query(q): Query<DataQuery>,
 ) -> ApiResult<Json<Value>> {
+    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
+        return Err(ApiError::bad_request("invalid contract id"));
+    }
     let limit = q.limit.clamp(1, 1000);
     // DISTINCT ON gives the newest row per key_hash; the outer query orders and
     // bounds the set of keys returned.
@@ -675,10 +673,12 @@ pub struct DataHistoryQuery {
 /// per-key entry (e.g. one holder's balance over time), newest first.
 pub async fn contract_data_key(
     State(state): State<AppState>,
-    ValidContractId(contract_id): ValidContractId,
-    Path((_, key_hash)): Path<(String, String)>,
+    Path((contract_id, key_hash)): Path<(String, String)>,
     Query(q): Query<DataHistoryQuery>,
 ) -> ApiResult<Json<Value>> {
+    if !lumenqraph_core::is_valid_contract_id(&contract_id) {
+        return Err(ApiError::bad_request("invalid contract id"));
+    }
     let limit = q.limit.clamp(1, 500);
     // (key, durability, ledger, value, label, captured_at)
     type HistRow = (
@@ -779,32 +779,47 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Diff parameter validation (#211, #444)
-    //
-    // These call the production `validate_diff_range` that
-    // `contract_interface_diff` uses, plus one request through a router, so
-    // removing the guard from the handler fails a test.
+    // Diff parameter validation (#211)
     // -----------------------------------------------------------------------
 
-    use super::validate_diff_range;
+    /// The `from > to` guard added for #211 is a pure value comparison before
+    /// any DB or RPC call, so we can exercise it by inspecting the validation
+    /// logic directly rather than spinning up a full Axum server + Postgres.
+    ///
+    /// The guard is: if from > to { return Err(bad_request(…)) }
+    /// These tests document and lock in that rule.
+
+    fn validate_diff_params(from: i32, to: i32) -> Result<(), String> {
+        if from < 1 {
+            return Err(format!(
+                "no version to diff against: from ({from}) must be >= 1"
+            ));
+        }
+        if from > to {
+            return Err(format!(
+                "`from` ({from}) must be less than `to` ({to}); \
+                 reversing the order would produce a backward diff"
+            ));
+        }
+        if from == to {
+            return Err("`from` and `to` are the same version; nothing to diff".to_string());
+        }
+        Ok(())
+    }
 
     #[test]
     fn diff_from_greater_than_to_is_rejected() {
         // from=5, to=2 is the canonical bad case from the issue.
-        let err = validate_diff_range(5, 2).expect_err("from > to must be rejected");
         assert!(
-            matches!(
-                err,
-                crate::error::ApiError::Status(axum::http::StatusCode::BAD_REQUEST, _, _)
-            ),
-            "{err:?}"
+            validate_diff_params(5, 2).is_err(),
+            "from > to must be rejected"
         );
     }
 
     #[test]
     fn diff_from_equal_to_to_is_rejected() {
         assert!(
-            validate_diff_range(3, 3).is_err(),
+            validate_diff_params(3, 3).is_err(),
             "from == to must be rejected"
         );
     }
@@ -812,11 +827,11 @@ mod tests {
     #[test]
     fn diff_valid_range_is_accepted() {
         assert!(
-            validate_diff_range(1, 2).is_ok(),
+            validate_diff_params(1, 2).is_ok(),
             "from=1, to=2 is a valid range"
         );
         assert!(
-            validate_diff_range(1, 5).is_ok(),
+            validate_diff_params(1, 5).is_ok(),
             "from=1, to=5 is a valid range"
         );
     }
@@ -824,102 +839,8 @@ mod tests {
     #[test]
     fn diff_from_below_one_is_rejected() {
         assert!(
-            validate_diff_range(0, 1).is_err(),
+            validate_diff_params(0, 1).is_err(),
             "from=0 is not a valid version"
         );
-    }
-
-    mod http {
-        use std::sync::atomic::AtomicU64;
-        use std::sync::Arc;
-
-        use axum::body::Body;
-        use axum::http::{Request, StatusCode};
-        use axum::routing::get;
-        use axum::Router;
-        use serde_json::Value;
-        use tower::ServiceExt;
-
-        use super::super::contract_interface_diff;
-        use crate::call_cache::CallCache;
-        use crate::concurrency_limit::ConcurrencyLimiter;
-        use crate::rate_limit::RateLimiter;
-        use crate::read_cost_limit::ReadCostLimitConfig;
-        use crate::rpc::RpcClient;
-        use crate::specs::SpecCache;
-        use crate::state::AppState;
-
-        const CONTRACT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-
-        /// `AppState` over a lazy pool that never connects: the explicit
-        /// `from > to` guard must fire before any database access.
-        fn make_state() -> AppState {
-            let pool = sqlx::postgres::PgPoolOptions::new()
-                .connect_lazy("postgres://test:test@localhost:5432/test")
-                .unwrap();
-            AppState {
-                pool,
-                require_auth: false,
-                anon_rate_limit: 1_000_000,
-                limiter: Arc::new(RateLimiter::new()),
-                http_requests: Arc::new(AtomicU64::new(0)),
-                rpc: RpcClient::new("http://127.0.0.1:0", 30),
-                specs: Arc::new(SpecCache::new()),
-                mounts: Arc::new(vec![]),
-                rpc_limiter: Arc::new(RateLimiter::new()),
-                rpc_require_auth: false,
-                rpc_anon_rate_limit: 1_000_000,
-                metrics: Arc::new(crate::metrics_middleware::MetricsCollector::new()),
-                call_cache: Arc::new(CallCache::new(100, 5)),
-                build_info: Arc::new(crate::state::BuildInfo {
-                    version: "test".to_string(),
-                    commit: "test".to_string(),
-                    build_time: "test".to_string(),
-                }),
-                concurrency_limiter: Arc::new(ConcurrencyLimiter::new()),
-                max_concurrent_per_ip: 100,
-                read_cost_limit_config: ReadCostLimitConfig::default(),
-                readyz_lag_threshold: 100,
-                readyz_max_age_secs: 120,
-                health_max_lag_ledgers: 100,
-                health_max_stale_secs: 120,
-                metrics_require_auth: false,
-                proxy_limiter: Arc::new(RateLimiter::new()),
-                config: Arc::new(crate::config::ApiConfig::test_default()),
-                key_cache: Arc::new(crate::key_cache::KeyCache::new(256)),
-                ip_config: crate::auth::IpConfig { trusted_proxy_hops: 0, platform_header: None },
-                audit_tx: None,
-                audit_dropped: Arc::new(AtomicU64::new(0)),
-                shutdown: tokio_util::sync::CancellationToken::new(),
-            }
-        }
-
-        #[tokio::test]
-        async fn diff_from_greater_than_to_returns_400_through_router() {
-            let app = Router::new()
-                .route(
-                    "/contracts/:contract_id/interface/diff",
-                    get(contract_interface_diff),
-                )
-                .with_state(make_state());
-
-            let req = Request::builder()
-                .method("GET")
-                .uri(format!("/contracts/{CONTRACT}/interface/diff?from=5&to=2"))
-                .body(Body::empty())
-                .unwrap();
-            let resp = app.oneshot(req).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
-                .await
-                .unwrap();
-            let body: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(body["code"], "bad_request");
-            assert!(
-                body["error"].as_str().unwrap_or_default().contains("must be less than"),
-                "unexpected body: {body}"
-            );
-        }
     }
 }

@@ -11,71 +11,22 @@
 //! renamed, retyped, or moved from topic to data all change how a client must
 //! encode a call or decode an event, and all show up here.
 //!
-//! ## Severity classification
-//!
-//! Each change carries a [`Severity`] level so consumers can distinguish
-//! genuinely breaking changes from harmless additions:
-//!
-//! - [`Severity::Breaking`] — removed items, changed parameter types/names,
-//!   reordered parameters, changed enum discriminant values, moved event params
-//!   from topic to data. Any integration built against the old interface may
-//!   stop working.
-//! - [`Severity::PotentiallyBreaking`] — added cases to an existing union or
-//!   enum (exhaustive decoders / match arms break), added fields to a
-//!   map-format event (decoders that reject unknown keys break).
-//! - [`Severity::Additive`] — new functions, events, or types added to the
-//!   interface. Existing integrations are unaffected.
-//!
-//! [`SpecDiff::breaking`] is kept for backwards compatibility and remains `true`
-//! whenever `max_severity` is [`Severity::Breaking`].
-//!
 //! A change is [`breaking`](SpecDiff::breaking) if it can invalidate an existing
 //! integration: anything removed or changed. Purely additive upgrades are not.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::spec::ContractSpec;
-
-/// Three-level severity classification for a single diff item or an entire
-/// [`SpecDiff`].
-///
-/// The ordering reflects impact: `Additive < PotentiallyBreaking < Breaking`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Severity {
-    /// Only new items were added; no existing consumer is affected.
-    Additive,
-    /// Existing consumers *may* break depending on how they decode the type
-    /// (e.g. exhaustive match on an enum whose case list grew).
-    PotentiallyBreaking,
-    /// An existing integration built against the old interface may no longer
-    /// work (item removed, signature changed, parameters reordered, enum
-    /// discriminant changed).
-    Breaking,
-}
-
-impl Default for Severity {
-    fn default() -> Self {
-        Severity::Additive
-    }
-}
 
 /// The difference between two parsed interfaces, oldest to newest.
 #[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
 pub struct SpecDiff {
     /// True if anything was removed or changed — i.e. an integration built
     /// against the old interface may no longer work.
-    ///
-    /// Kept for backwards compatibility. Equivalent to
-    /// `max_severity == Severity::Breaking`.
     pub breaking: bool,
-    /// The maximum severity across all sections. Use this to drive alert
-    /// filtering: `Additive` upgrades are noise-free; `PotentiallyBreaking`
-    /// warrants attention for exhaustive decoders; `Breaking` requires action.
-    pub max_severity: Severity,
     /// One human-readable line per change, for logs, alerts, and UIs.
     pub summary: Vec<String>,
     pub functions: SectionDiff,
@@ -87,9 +38,9 @@ pub struct SpecDiff {
 /// Added / removed / changed items within one section of the interface.
 #[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
 pub struct SectionDiff {
-    /// Signatures present only in the new interface. Always [`Severity::Additive`].
+    /// Signatures present only in the new interface.
     pub added: Vec<String>,
-    /// Signatures present only in the old interface. Always [`Severity::Breaking`].
+    /// Signatures present only in the old interface.
     pub removed: Vec<String>,
     /// Items whose name persisted but whose signature moved.
     pub changed: Vec<ChangedItem>,
@@ -97,9 +48,6 @@ pub struct SectionDiff {
     /// whose parameter *order* changed. Soroban encoding is positional, so a
     /// reorder breaks every caller that passes arguments by position.
     pub reordered: Vec<ReorderedItem>,
-    /// Items that gained new cases (union/enum) or fields (map-format event)
-    /// without losing or changing existing ones. May break exhaustive decoders.
-    pub potentially_breaking: Vec<PotentiallyBreakingItem>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -107,8 +55,6 @@ pub struct ChangedItem {
     pub name: String,
     pub from: String,
     pub to: String,
-    /// Always [`Severity::Breaking`].
-    pub severity: Severity,
 }
 
 /// A function whose parameter set is identical but whose parameter *order*
@@ -122,22 +68,6 @@ pub struct ReorderedItem {
     pub from: String,
     /// The parameter list as it appears in the new interface (ordered).
     pub to: String,
-    /// Always [`Severity::Breaking`].
-    pub severity: Severity,
-}
-
-/// An item that acquired new cases or fields without losing existing ones.
-/// Exhaustive decoders (e.g. a Rust `match` with no wildcard arm) may fail on
-/// the newly added variant; all other consumers are unaffected.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct PotentiallyBreakingItem {
-    pub name: String,
-    pub from: String,
-    pub to: String,
-    /// Always [`Severity::PotentiallyBreaking`].
-    pub severity: Severity,
-    /// A short description of what was added.
-    pub description: String,
 }
 
 impl SectionDiff {
@@ -146,21 +76,6 @@ impl SectionDiff {
             && self.removed.is_empty()
             && self.changed.is_empty()
             && self.reordered.is_empty()
-            && self.potentially_breaking.is_empty()
-    }
-
-    /// Maximum severity of any item in this section.
-    fn max_severity(&self) -> Severity {
-        if !self.removed.is_empty() || !self.changed.is_empty() || !self.reordered.is_empty() {
-            Severity::Breaking
-        } else if !self.potentially_breaking.is_empty() {
-            Severity::PotentiallyBreaking
-        } else if !self.added.is_empty() {
-            Severity::Additive
-        } else {
-            // Empty section — no severity.
-            Severity::Additive
-        }
     }
 
     /// Additions can't break an existing caller; removals, changes, and
@@ -178,21 +93,11 @@ impl SpecDiff {
         let (new_fsigs, new_fparams) = function_sigs(new);
         let functions =
             diff_section_with_params(&old_fsigs, &new_fsigs, &old_fparams, &new_fparams);
-        let events = diff_events(old, new);
-        let types = diff_types(old, new);
-
-        let max_severity = [
-            functions.max_severity(),
-            events.max_severity(),
-            types.max_severity(),
-        ]
-        .into_iter()
-        .max()
-        .unwrap_or_default();
+        let events = diff_section(&event_sigs(old), &event_sigs(new));
+        let types = diff_section(&type_sigs(old), &type_sigs(new));
 
         let mut diff = SpecDiff {
             breaking: functions.has_breaking() || events.has_breaking() || types.has_breaking(),
-            max_severity,
             summary: Vec::new(),
             functions,
             events,
@@ -231,12 +136,6 @@ impl SpecDiff {
                     item.name, item.from, item.to
                 ));
             }
-            for item in &section.potentially_breaking {
-                out.push(format!(
-                    "potentially breaking {kind} {}: {}",
-                    item.name, item.description
-                ));
-            }
             for sig in &section.added {
                 out.push(format!("added {kind} {sig}"));
             }
@@ -248,172 +147,6 @@ impl SpecDiff {
     pub fn to_json(&self) -> Value {
         json!(self)
     }
-}
-
-/// Diff the event sections of two interfaces.
-///
-/// Events are compared by rendered signature (name, param names/types, param
-/// locations, and data format). A changed signature is normally
-/// [`Severity::Breaking`] — moving a param from topic to data, retyping it, or
-/// switching the body layout all break consumers. The one exception is adding
-/// new fields to a map-format event's data block: decoders that read only the
-/// named fields they know still work, so that is
-/// [`Severity::PotentiallyBreaking`].
-fn diff_events(old: &ContractSpec, new: &ContractSpec) -> SectionDiff {
-    let old_sigs = event_sigs(old);
-    let new_sigs = event_sigs(new);
-    let mut diff = diff_section(&old_sigs, &new_sigs);
-
-    // Reclassify map-format events that only gained data fields as
-    // potentially-breaking rather than breaking.
-    let mut still_changed = Vec::new();
-    for item in diff.changed.drain(..) {
-        if let (Some(before), Some(after)) = (find_event(old, &item.name), find_event(new, &item.name))
-        {
-            if let Some(description) = map_event_added_fields(before, after) {
-                diff.potentially_breaking.push(PotentiallyBreakingItem {
-                    name: item.name,
-                    from: item.from,
-                    to: item.to,
-                    severity: Severity::PotentiallyBreaking,
-                    description,
-                });
-                continue;
-            }
-        }
-        still_changed.push(item);
-    }
-    diff.changed = still_changed;
-    diff
-}
-
-fn find_event<'a>(
-    spec: &'a ContractSpec,
-    name: &str,
-) -> Option<&'a crate::spec::EventSpec> {
-    spec.events.iter().find(|e| e.name == name)
-}
-
-/// If `new` is `old` with only extra data-located params appended (and both are
-/// map-format events), return a description of the added fields. Otherwise
-/// return `None`, meaning the change is not a pure additive field addition.
-fn map_event_added_fields(
-    old: &crate::spec::EventSpec,
-    new: &crate::spec::EventSpec,
-) -> Option<String> {
-    if old.data_format != new.data_format {
-        return None;
-    }
-    // Only map-format events have named data fields that can be added safely.
-    if !format!("{}", new.data_format).eq_ignore_ascii_case("map") {
-        return None;
-    }
-    if new.params.len() <= old.params.len() {
-        return None;
-    }
-    // Every old param must be present, unchanged, at the same index.
-    for (o, n) in old.params.iter().zip(new.params.iter()) {
-        if o.name != n.name || o.type_name != n.type_name || o.location != n.location {
-            return None;
-        }
-    }
-    // The extra params must all be data-located.
-    let added: Vec<&str> = new.params[old.params.len()..]
-        .iter()
-        .map(|p| {
-            if !format!("{}", p.location).eq_ignore_ascii_case("data") {
-                return "";
-            }
-            p.name.as_str()
-        })
-        .collect();
-    if added.iter().any(|n| n.is_empty()) {
-        return None;
-    }
-    Some(format!("added field(s) {}", added.join(", ")))
-}
-
-/// Diff the user-defined type sections of two interfaces: structs, unions,
-/// regular enums, and error enums all share one namespace.
-///
-/// Removed types and changed signatures (including renumbered enum/error
-/// discriminants) are [`Severity::Breaking`]. Adding cases to an existing union
-/// or enum is [`Severity::PotentiallyBreaking`] (exhaustive decoders break).
-/// New types are [`Severity::Additive`].
-fn diff_types(old: &ContractSpec, new: &ContractSpec) -> SectionDiff {
-    let old_sigs = type_sigs(old);
-    let new_sigs = type_sigs(new);
-    let mut diff = diff_section(&old_sigs, &new_sigs);
-
-    // Reclassify changes that only added cases to an existing union/enum as
-    // potentially-breaking rather than breaking.
-    let mut still_changed = Vec::new();
-    for item in diff.changed.drain(..) {
-        if let Some(description) = added_cases_only(old, new, &item.name) {
-            diff.potentially_breaking.push(PotentiallyBreakingItem {
-                name: item.name,
-                from: item.from,
-                to: item.to,
-                severity: Severity::PotentiallyBreaking,
-                description,
-            });
-            continue;
-        }
-        still_changed.push(item);
-    }
-    diff.changed = still_changed;
-    diff
-}
-
-/// If the only difference between the old and new type named `name` is that
-/// cases were appended to a union or enum (existing cases unchanged), return a
-/// description of the added cases. Otherwise `None`.
-fn added_cases_only(old: &ContractSpec, new: &ContractSpec, name: &str) -> Option<String> {
-    // Union: existing cases unchanged, new cases appended.
-    if let (Some(o), Some(n)) = (
-        old.unions.iter().find(|u| u.name == name),
-        new.unions.iter().find(|u| u.name == name),
-    ) {
-        if n.cases.len() > o.cases.len() {
-            let same_prefix = o
-                .cases
-                .iter()
-                .zip(n.cases.iter())
-                .all(|(a, b)| a.name == b.name && a.type_names == b.type_names);
-            if same_prefix {
-                let added: Vec<&str> = n.cases[o.cases.len()..]
-                    .iter()
-                    .map(|c| c.name.as_str())
-                    .collect();
-                return Some(format!("added case(s) {}", added.join(", ")));
-            }
-        }
-        return None;
-    }
-
-    // Regular enum: existing cases unchanged, new cases appended.
-    if let (Some(o), Some(n)) = (
-        old.enums.iter().find(|e| e.name == name),
-        new.enums.iter().find(|e| e.name == name),
-    ) {
-        if n.cases.len() > o.cases.len() {
-            let same_prefix = o
-                .cases
-                .iter()
-                .zip(n.cases.iter())
-                .all(|(a, b)| a == b);
-            if same_prefix {
-                let added: Vec<&str> = n.cases[o.cases.len()..]
-                    .iter()
-                    .map(|(cname, _)| cname.as_str())
-                    .collect();
-                return Some(format!("added case(s) {}", added.join(", ")));
-            }
-        }
-        return None;
-    }
-
-    None
 }
 
 /// Compare two name-to-signature maps. Names are the identity: a name in both
@@ -454,7 +187,6 @@ fn diff_section_with_params(
                             name: name.clone(),
                             from: before.clone(),
                             to: after.clone(),
-                            severity: Severity::Breaking,
                         });
                         continue;
                     }
@@ -463,7 +195,6 @@ fn diff_section_with_params(
                     name: name.clone(),
                     from: before.clone(),
                     to: after.clone(),
-                    severity: Severity::Breaking,
                 });
             }
             (Some(_), Some(_)) => {}
@@ -518,10 +249,6 @@ fn function_sigs(spec: &ContractSpec) -> (BTreeMap<String, String>, BTreeMap<Str
 /// Event signatures carry each param's location and the body's data format:
 /// moving a param from topic to data, or switching the body layout, silently
 /// breaks every consumer decoding that event, so both belong in the identity.
-///
-/// Unlike functions, events can have *additive* changes: adding a new param to
-/// a map-format event's data block is `PotentiallyBreaking` (not `Breaking`)
-/// because a decoder that reads only named fields it knows still works.
 fn event_sigs(spec: &ContractSpec) -> BTreeMap<String, String> {
     spec.events
         .iter()
@@ -539,10 +266,8 @@ fn event_sigs(spec: &ContractSpec) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Structs, unions, regular enums, and error enums share one type namespace,
-/// so they share one section — which also means a type that changes kind reads
-/// as a change, not a swap. Error enums are included because renumbering or
-/// removing a case is a breaking change for callers that match on numeric codes.
+/// Structs, unions, and enums share one namespace, so they share one section —
+/// which also means a type that changes kind reads as a change, not a swap.
 fn type_sigs(spec: &ContractSpec) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
 
@@ -585,18 +310,6 @@ fn type_sigs(spec: &ContractSpec) -> BTreeMap<String, String> {
             format!("enum {} {{ {} }}", e.name, cases.join(", ")),
         );
     }
-    // Error enums: renumbering a case changes its rendered sig → breaking change.
-    for e in &spec.errors {
-        let cases: Vec<String> = e
-            .cases
-            .iter()
-            .map(|(name, value)| format!("{name} = {value}"))
-            .collect();
-        out.insert(
-            e.name.clone(),
-            format!("error enum {} {{ {} }}", e.name, cases.join(", ")),
-        );
-    }
     out
 }
 
@@ -613,7 +326,7 @@ mod tests {
         for e in entries {
             body.extend(e.to_xdr(Limits::none()).unwrap());
         }
-        ContractSpec::from_spec_xdr_simple(&body).expect("test spec should parse")
+        ContractSpec::from_spec_xdr(&body).expect("test spec should parse")
     }
 
     /// `name(<inputs>) -> <output>`
@@ -663,30 +376,6 @@ mod tests {
         })
     }
 
-    fn map_event(
-        name: &str,
-        params: &[(&str, ScSpecTypeDef, ScSpecEventParamLocationV0)],
-    ) -> ScSpecEntry {
-        ScSpecEntry::EventV0(ScSpecEventV0 {
-            doc: "".try_into().unwrap(),
-            lib: "".try_into().unwrap(),
-            name: ScSymbol(name.try_into().unwrap()),
-            prefix_topics: vec![ScSymbol(name.try_into().unwrap())].try_into().unwrap(),
-            params: params
-                .iter()
-                .map(|(n, t, loc)| ScSpecEventParamV0 {
-                    doc: "".try_into().unwrap(),
-                    name: (*n).try_into().unwrap(),
-                    type_: t.clone(),
-                    location: *loc,
-                })
-                .collect::<Vec<_>>()
-                .try_into()
-                .unwrap(),
-            data_format: ScSpecEventDataFormat::Map,
-        })
-    }
-
     #[test]
     fn identical_interfaces_produce_an_empty_non_breaking_diff() {
         let a = spec_of(&[func(
@@ -702,7 +391,6 @@ mod tests {
         let d = SpecDiff::between(&a, &b);
         assert!(d.is_empty());
         assert!(!d.breaking);
-        assert_eq!(d.max_severity, Severity::Additive);
         assert!(d.summary.is_empty());
     }
 
@@ -715,7 +403,6 @@ mod tests {
         ]);
         let d = SpecDiff::between(&old, &new);
         assert!(!d.breaking);
-        assert_eq!(d.max_severity, Severity::Additive);
         assert_eq!(d.functions.added, vec!["pause() -> void"]);
         assert_eq!(d.summary, vec!["added function pause() -> void"]);
     }
@@ -729,7 +416,6 @@ mod tests {
         let new = spec_of(&[func("balance", &[], Some(ScSpecTypeDef::I128))]);
         let d = SpecDiff::between(&old, &new);
         assert!(d.breaking);
-        assert_eq!(d.max_severity, Severity::Breaking);
         assert_eq!(d.functions.removed, vec!["withdraw(amount: i128) -> void"]);
     }
 
@@ -739,7 +425,6 @@ mod tests {
         let new = spec_of(&[func("mint", &[("amount", ScSpecTypeDef::U128)], None)]);
         let d = SpecDiff::between(&old, &new);
         assert!(d.breaking);
-        assert_eq!(d.max_severity, Severity::Breaking);
         assert!(d.functions.added.is_empty());
         assert!(d.functions.removed.is_empty());
         assert_eq!(
@@ -748,7 +433,6 @@ mod tests {
                 name: "mint".into(),
                 from: "mint(amount: i128) -> void".into(),
                 to: "mint(amount: u128) -> void".into(),
-                severity: Severity::Breaking,
             }]
         );
     }
@@ -759,7 +443,6 @@ mod tests {
         let new = spec_of(&[func("decimals", &[], Some(ScSpecTypeDef::U64))]);
         let d = SpecDiff::between(&old, &new);
         assert!(d.breaking);
-        assert_eq!(d.max_severity, Severity::Breaking);
         assert_eq!(d.functions.changed[0].to, "decimals() -> u64");
     }
 
@@ -799,7 +482,6 @@ mod tests {
         )]);
         let d = SpecDiff::between(&old, &new);
         assert!(d.breaking);
-        assert_eq!(d.max_severity, Severity::Breaking);
         assert_eq!(d.events.changed.len(), 1);
         assert!(d.events.changed[0].to.contains("to: Address @data"));
     }
@@ -817,7 +499,6 @@ mod tests {
         let new = spec_of(&[func("balance", &[], Some(ScSpecTypeDef::I128))]);
         let d = SpecDiff::between(&old, &new);
         assert!(d.breaking);
-        assert_eq!(d.max_severity, Severity::Breaking);
         assert_eq!(d.events.removed.len(), 1);
         assert!(d.events.removed[0].starts_with("burn(amount: i128 @data)"));
     }
@@ -881,7 +562,6 @@ mod tests {
         ]);
         let d = SpecDiff::between(&old, &new);
         assert!(!d.breaking);
-        assert_eq!(d.max_severity, Severity::Additive);
         assert_eq!(d.types.added.len(), 1);
         assert!(d.types.added[0].contains("struct Position"));
     }
@@ -909,7 +589,6 @@ mod tests {
         let new = spec_of(&[func("balance", &[], Some(ScSpecTypeDef::I128))]);
         let d = SpecDiff::between(&old, &new);
         assert!(d.breaking);
-        assert_eq!(d.max_severity, Severity::Breaking);
         assert_eq!(d.types.removed.len(), 1);
     }
 
@@ -947,7 +626,6 @@ mod tests {
         let new = spec_of(&[position_new]);
         let d = SpecDiff::between(&old, &new);
         assert!(d.breaking);
-        assert_eq!(d.max_severity, Severity::Breaking);
         assert_eq!(d.types.changed.len(), 1);
         assert!(d.types.changed[0].from.contains("i128"));
         assert!(d.types.changed[0].to.contains("u128"));
@@ -980,143 +658,8 @@ mod tests {
         let new = spec_of(&[func("balance", &[], Some(ScSpecTypeDef::I128)), status_enum]);
         let d = SpecDiff::between(&old, &new);
         assert!(!d.breaking);
-        assert_eq!(d.max_severity, Severity::Additive);
         assert_eq!(d.types.added.len(), 1);
         assert!(d.types.added[0].contains("enum Status"));
-    }
-
-    /// Adding a new case to an existing enum is potentially breaking (exhaustive
-    /// decoders will fail) but not fully breaking (non-exhaustive decoders are fine).
-    #[test]
-    fn adding_an_enum_case_is_potentially_breaking_not_breaking() {
-        use stellar_xdr::curr::{ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0};
-
-        let status_old = ScSpecEntry::UdtEnumV0(ScSpecUdtEnumV0 {
-            doc: "".try_into().unwrap(),
-            lib: "".try_into().unwrap(),
-            name: "Status".try_into().unwrap(),
-            cases: vec![
-                ScSpecUdtEnumCaseV0 {
-                    doc: "".try_into().unwrap(),
-                    name: "Active".try_into().unwrap(),
-                    value: 0,
-                },
-                ScSpecUdtEnumCaseV0 {
-                    doc: "".try_into().unwrap(),
-                    name: "Inactive".try_into().unwrap(),
-                    value: 1,
-                },
-            ]
-            .try_into()
-            .unwrap(),
-        });
-
-        let status_new = ScSpecEntry::UdtEnumV0(ScSpecUdtEnumV0 {
-            doc: "".try_into().unwrap(),
-            lib: "".try_into().unwrap(),
-            name: "Status".try_into().unwrap(),
-            cases: vec![
-                ScSpecUdtEnumCaseV0 {
-                    doc: "".try_into().unwrap(),
-                    name: "Active".try_into().unwrap(),
-                    value: 0,
-                },
-                ScSpecUdtEnumCaseV0 {
-                    doc: "".try_into().unwrap(),
-                    name: "Inactive".try_into().unwrap(),
-                    value: 1,
-                },
-                ScSpecUdtEnumCaseV0 {
-                    doc: "".try_into().unwrap(),
-                    name: "Pending".try_into().unwrap(),
-                    value: 2,
-                },
-            ]
-            .try_into()
-            .unwrap(),
-        });
-
-        let old = spec_of(&[status_old]);
-        let new = spec_of(&[status_new]);
-        let d = SpecDiff::between(&old, &new);
-        // Not breaking — no existing case was removed or changed.
-        assert!(!d.breaking, "adding an enum case must not be breaking");
-        assert_eq!(
-            d.max_severity,
-            Severity::PotentiallyBreaking,
-            "adding an enum case should be potentially_breaking"
-        );
-        assert!(d.types.changed.is_empty(), "must not appear in 'changed'");
-        assert_eq!(
-            d.types.potentially_breaking.len(),
-            1,
-            "must appear in 'potentially_breaking'"
-        );
-        assert!(
-            d.types.potentially_breaking[0].description.contains("Pending"),
-            "description should name the new case: {}",
-            d.types.potentially_breaking[0].description
-        );
-    }
-
-    /// Changing an enum case's discriminant value is fully breaking — any
-    /// serialised value that matched the old case now maps to a different case.
-    #[test]
-    fn changing_enum_case_value_is_breaking() {
-        use stellar_xdr::curr::{ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0};
-
-        let status_old = ScSpecEntry::UdtEnumV0(ScSpecUdtEnumV0 {
-            doc: "".try_into().unwrap(),
-            lib: "".try_into().unwrap(),
-            name: "Status".try_into().unwrap(),
-            cases: vec![
-                ScSpecUdtEnumCaseV0 {
-                    doc: "".try_into().unwrap(),
-                    name: "Active".try_into().unwrap(),
-                    value: 0,
-                },
-                ScSpecUdtEnumCaseV0 {
-                    doc: "".try_into().unwrap(),
-                    name: "Inactive".try_into().unwrap(),
-                    value: 1,
-                },
-            ]
-            .try_into()
-            .unwrap(),
-        });
-
-        // Inactive's value changed from 1 → 2.
-        let status_new = ScSpecEntry::UdtEnumV0(ScSpecUdtEnumV0 {
-            doc: "".try_into().unwrap(),
-            lib: "".try_into().unwrap(),
-            name: "Status".try_into().unwrap(),
-            cases: vec![
-                ScSpecUdtEnumCaseV0 {
-                    doc: "".try_into().unwrap(),
-                    name: "Active".try_into().unwrap(),
-                    value: 0,
-                },
-                ScSpecUdtEnumCaseV0 {
-                    doc: "".try_into().unwrap(),
-                    name: "Inactive".try_into().unwrap(),
-                    value: 2,
-                },
-            ]
-            .try_into()
-            .unwrap(),
-        });
-
-        let old = spec_of(&[status_old]);
-        let new = spec_of(&[status_new]);
-        let d = SpecDiff::between(&old, &new);
-        assert!(d.breaking, "changing an enum case value must be breaking");
-        assert_eq!(d.max_severity, Severity::Breaking);
-        assert_eq!(
-            d.types.changed.len(),
-            1,
-            "must appear in 'changed', not 'potentially_breaking'"
-        );
-        assert!(d.types.potentially_breaking.is_empty());
     }
 
     #[test]
@@ -1160,71 +703,11 @@ mod tests {
         let new = spec_of(&[status_new]);
         let d = SpecDiff::between(&old, &new);
         assert!(d.breaking);
-        assert_eq!(d.max_severity, Severity::Breaking);
         assert_eq!(d.types.changed.len(), 1);
     }
 
-    /// Adding a new void case to an existing union is potentially breaking:
-    /// exhaustive match arms fail, but non-exhaustive decoders are fine.
     #[test]
-    fn adding_a_union_case_is_potentially_breaking_not_breaking() {
-        use stellar_xdr::curr::{ScSpecUdtUnionCaseV0, ScSpecUdtUnionCaseVoidV0, ScSpecUdtUnionV0};
-
-        let action_old = ScSpecEntry::UdtUnionV0(ScSpecUdtUnionV0 {
-            doc: "".try_into().unwrap(),
-            lib: "".try_into().unwrap(),
-            name: "Action".try_into().unwrap(),
-            cases: vec![
-                ScSpecUdtUnionCaseV0::VoidV0(ScSpecUdtUnionCaseVoidV0 {
-                    doc: "".try_into().unwrap(),
-                    name: "Cancel".try_into().unwrap(),
-                }),
-                ScSpecUdtUnionCaseV0::VoidV0(ScSpecUdtUnionCaseVoidV0 {
-                    doc: "".try_into().unwrap(),
-                    name: "Execute".try_into().unwrap(),
-                }),
-            ]
-            .try_into()
-            .unwrap(),
-        });
-
-        let action_new = ScSpecEntry::UdtUnionV0(ScSpecUdtUnionV0 {
-            doc: "".try_into().unwrap(),
-            lib: "".try_into().unwrap(),
-            name: "Action".try_into().unwrap(),
-            cases: vec![
-                ScSpecUdtUnionCaseV0::VoidV0(ScSpecUdtUnionCaseVoidV0 {
-                    doc: "".try_into().unwrap(),
-                    name: "Cancel".try_into().unwrap(),
-                }),
-                ScSpecUdtUnionCaseV0::VoidV0(ScSpecUdtUnionCaseVoidV0 {
-                    doc: "".try_into().unwrap(),
-                    name: "Execute".try_into().unwrap(),
-                }),
-                ScSpecUdtUnionCaseV0::VoidV0(ScSpecUdtUnionCaseVoidV0 {
-                    doc: "".try_into().unwrap(),
-                    name: "Pause".try_into().unwrap(),
-                }),
-            ]
-            .try_into()
-            .unwrap(),
-        });
-
-        let old = spec_of(&[action_old]);
-        let new = spec_of(&[action_new]);
-        let d = SpecDiff::between(&old, &new);
-        assert!(!d.breaking, "adding a union case must not be breaking");
-        assert_eq!(d.max_severity, Severity::PotentiallyBreaking);
-        assert!(d.types.changed.is_empty(), "must not appear in 'changed'");
-        assert_eq!(d.types.potentially_breaking.len(), 1);
-        assert!(
-            d.types.potentially_breaking[0].description.contains("Pause"),
-            "description should name the new case"
-        );
-    }
-
-    #[test]
-    fn an_added_union_is_not_breaking() {
+    fn an_added_union_case_is_not_breaking() {
         use stellar_xdr::curr::{ScSpecUdtUnionCaseV0, ScSpecUdtUnionCaseVoidV0, ScSpecUdtUnionV0};
 
         let old = spec_of(&[func("balance", &[], Some(ScSpecTypeDef::I128))]);
@@ -1251,7 +734,6 @@ mod tests {
         ]);
         let d = SpecDiff::between(&old, &new);
         assert!(!d.breaking);
-        assert_eq!(d.max_severity, Severity::Additive);
         assert_eq!(d.types.added.len(), 1);
         assert!(d.types.added[0].contains("union Action"));
     }
@@ -1294,7 +776,6 @@ mod tests {
         let new = spec_of(&[action_new]);
         let d = SpecDiff::between(&old, &new);
         assert!(d.breaking);
-        assert_eq!(d.max_severity, Severity::Breaking);
         assert_eq!(d.types.changed.len(), 1);
     }
 
@@ -1304,7 +785,6 @@ mod tests {
         let new = spec_of(&[func("pull", &[("amount", ScSpecTypeDef::I128)], None)]);
         let d = SpecDiff::between(&old, &new);
         assert!(d.breaking);
-        assert_eq!(d.max_severity, Severity::Breaking);
         assert_eq!(d.functions.added.len(), 1);
         assert_eq!(d.functions.removed.len(), 1);
         assert!(d.functions.changed.is_empty());
@@ -1337,7 +817,6 @@ mod tests {
         )]);
         let d = SpecDiff::between(&old, &new);
         assert!(d.breaking, "parameter reorder must be breaking");
-        assert_eq!(d.max_severity, Severity::Breaking);
         assert!(
             d.functions.changed.is_empty(),
             "a pure reorder must not appear in 'changed'"
@@ -1412,63 +891,7 @@ mod tests {
         ]);
         let d = SpecDiff::between(&old, &new);
         assert!(!d.breaking);
-        assert_eq!(d.max_severity, Severity::Additive);
         assert_eq!(d.events.added.len(), 1);
-    }
-
-    /// Adding a field to a map-format event is potentially breaking (exhaustive
-    /// decoders that reject unknown fields will fail) but not fully breaking.
-    #[test]
-    fn adding_map_event_field_is_potentially_breaking() {
-        let old = spec_of(&[map_event(
-            "swap",
-            &[
-                (
-                    "from",
-                    ScSpecTypeDef::Address,
-                    ScSpecEventParamLocationV0::TopicList,
-                ),
-                (
-                    "amount_in",
-                    ScSpecTypeDef::I128,
-                    ScSpecEventParamLocationV0::Data,
-                ),
-            ],
-        )]);
-        let new = spec_of(&[map_event(
-            "swap",
-            &[
-                (
-                    "from",
-                    ScSpecTypeDef::Address,
-                    ScSpecEventParamLocationV0::TopicList,
-                ),
-                (
-                    "amount_in",
-                    ScSpecTypeDef::I128,
-                    ScSpecEventParamLocationV0::Data,
-                ),
-                (
-                    "amount_out",
-                    ScSpecTypeDef::I128,
-                    ScSpecEventParamLocationV0::Data,
-                ),
-            ],
-        )]);
-        let d = SpecDiff::between(&old, &new);
-        assert!(
-            !d.breaking,
-            "adding a map-event field must not be fully breaking"
-        );
-        assert_eq!(d.max_severity, Severity::PotentiallyBreaking);
-        assert!(d.events.changed.is_empty(), "must not be in 'changed'");
-        assert_eq!(d.events.potentially_breaking.len(), 1);
-        assert!(
-            d.events.potentially_breaking[0]
-                .description
-                .contains("amount_out"),
-            "description should name the new field"
-        );
     }
 
     #[test]
@@ -1515,205 +938,10 @@ mod tests {
 
         let d = SpecDiff::between(&old, &new);
         assert!(d.breaking);
-        assert_eq!(d.max_severity, Severity::Breaking);
         assert_eq!(d.functions.removed.len(), 1);
         assert_eq!(d.functions.added.len(), 1);
         assert_eq!(d.events.removed.len(), 1);
         assert_eq!(d.events.added.len(), 1);
         assert_eq!(d.types.removed.len(), 1);
-    }
-
-    // ── #510/#511: single-category diffs and severity ─────────────────────────
-
-    /// A change that touches only an event must be reported in the events
-    /// section with the right severity, and nothing else.
-    #[test]
-    fn an_event_only_change_is_reported_with_correct_severity() {
-        let old = spec_of(&[
-            func("balance", &[], Some(ScSpecTypeDef::I128)),
-            event(
-                "transfer",
-                &[(
-                    "amount",
-                    ScSpecTypeDef::I128,
-                    ScSpecEventParamLocationV0::Data,
-                )],
-            ),
-        ]);
-        // Retype the event param — breaking.
-        let new = spec_of(&[
-            func("balance", &[], Some(ScSpecTypeDef::I128)),
-            event(
-                "transfer",
-                &[(
-                    "amount",
-                    ScSpecTypeDef::U128,
-                    ScSpecEventParamLocationV0::Data,
-                )],
-            ),
-        ]);
-        let d = SpecDiff::between(&old, &new);
-        assert!(d.functions.is_empty(), "functions must be untouched");
-        assert!(d.types.is_empty(), "types must be untouched");
-        assert_eq!(d.events.changed.len(), 1);
-        assert_eq!(d.events.changed[0].severity, Severity::Breaking);
-        assert!(d.breaking);
-        assert_eq!(d.max_severity, Severity::Breaking);
-    }
-
-    /// A change that touches only a UDT must be reported in the types section.
-    #[test]
-    fn a_udt_only_change_is_reported_with_correct_severity() {
-        use stellar_xdr::curr::{ScSpecUdtStructFieldV0, ScSpecUdtStructV0};
-
-        let make = |ty: ScSpecTypeDef| {
-            ScSpecEntry::UdtStructV0(ScSpecUdtStructV0 {
-                doc: "".try_into().unwrap(),
-                lib: "".try_into().unwrap(),
-                name: "Position".try_into().unwrap(),
-                fields: vec![ScSpecUdtStructFieldV0 {
-                    doc: "".try_into().unwrap(),
-                    name: "amount".try_into().unwrap(),
-                    type_: ty,
-                }]
-                .try_into()
-                .unwrap(),
-            })
-        };
-
-        let old = spec_of(&[make(ScSpecTypeDef::I128)]);
-        let new = spec_of(&[make(ScSpecTypeDef::U128)]);
-        let d = SpecDiff::between(&old, &new);
-        assert!(d.functions.is_empty(), "functions must be untouched");
-        assert!(d.events.is_empty(), "events must be untouched");
-        assert_eq!(d.types.changed.len(), 1);
-        assert_eq!(d.types.changed[0].severity, Severity::Breaking);
-        assert!(d.breaking);
-        assert_eq!(d.max_severity, Severity::Breaking);
-    }
-
-    /// A change that touches only an error enum must be reported in the types
-    /// section with the right severity.
-    #[test]
-    fn an_error_enum_only_change_is_reported_with_correct_severity() {
-        use stellar_xdr::curr::{ScSpecUdtErrorEnumCaseV0, ScSpecUdtErrorEnumV0};
-
-        let make = |cases: &[(&str, u32)]| {
-            ScSpecEntry::UdtErrorEnumV0(ScSpecUdtErrorEnumV0 {
-                doc: "".try_into().unwrap(),
-                lib: "".try_into().unwrap(),
-                name: "ContractError".try_into().unwrap(),
-                cases: cases
-                    .iter()
-                    .map(|(n, v)| ScSpecUdtErrorEnumCaseV0 {
-                        doc: "".try_into().unwrap(),
-                        name: (*n).try_into().unwrap(),
-                        value: *v,
-                    })
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .unwrap(),
-            })
-        };
-
-        // Renumbering an error case is breaking.
-        let old = spec_of(&[make(&[("InsufficientBalance", 1), ("Unauthorized", 2)])]);
-        let new = spec_of(&[make(&[("InsufficientBalance", 1), ("Unauthorized", 3)])]);
-        let d = SpecDiff::between(&old, &new);
-        assert!(d.functions.is_empty(), "functions must be untouched");
-        assert!(d.events.is_empty(), "events must be untouched");
-        assert_eq!(d.types.changed.len(), 1);
-        assert_eq!(d.types.changed[0].severity, Severity::Breaking);
-        assert!(d.breaking);
-        assert_eq!(d.max_severity, Severity::Breaking);
-    }
-
-    // ── #403: error enum diffing ──────────────────────────────────────────────
-
-    mod error_enum_diff {
-        use super::*;
-        use stellar_xdr::curr::{ScSpecUdtErrorEnumCaseV0, ScSpecUdtErrorEnumV0};
-
-        fn error_enum(name: &str, cases: &[(&str, u32)]) -> ScSpecEntry {
-            ScSpecEntry::UdtErrorEnumV0(ScSpecUdtErrorEnumV0 {
-                doc: "".try_into().unwrap(),
-                lib: "".try_into().unwrap(),
-                name: name.try_into().unwrap(),
-                cases: cases
-                    .iter()
-                    .map(|(n, v)| ScSpecUdtErrorEnumCaseV0 {
-                        doc: "".try_into().unwrap(),
-                        name: (*n).try_into().unwrap(),
-                        value: *v,
-                    })
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .unwrap(),
-            })
-        }
-
-        /// Adding a new error case is NOT breaking (additive).
-        #[test]
-        fn adding_an_error_case_is_not_breaking() {
-            let old = spec_of(&[
-                func("balance", &[], Some(ScSpecTypeDef::I128)),
-                error_enum("ContractError", &[("InsufficientBalance", 1)]),
-            ]);
-            let new = spec_of(&[
-                func("balance", &[], Some(ScSpecTypeDef::I128)),
-                error_enum(
-                    "ContractError",
-                    &[("InsufficientBalance", 1), ("Unauthorized", 2)],
-                ),
-            ]);
-            let d = SpecDiff::between(&old, &new);
-            assert!(!d.breaking, "adding an error case must not be breaking");
-            assert_eq!(d.types.changed.len(), 1, "the error enum sig changed");
-        }
-
-        /// Renumbering an error case IS breaking.
-        #[test]
-        fn renumbering_an_error_case_is_breaking() {
-            let old = spec_of(&[error_enum(
-                "ContractError",
-                &[("InsufficientBalance", 1), ("Unauthorized", 2)],
-            )]);
-            // Unauthorized moved from 2 to 3 — clients matching on the old code break.
-            let new = spec_of(&[error_enum(
-                "ContractError",
-                &[("InsufficientBalance", 1), ("Unauthorized", 3)],
-            )]);
-            let d = SpecDiff::between(&old, &new);
-            assert!(d.breaking, "renumbering an error case must be breaking");
-            assert_eq!(d.types.changed.len(), 1);
-            assert!(d.types.changed[0].from.contains("Unauthorized = 2"));
-            assert!(d.types.changed[0].to.contains("Unauthorized = 3"));
-        }
-
-        /// Removing an error case IS breaking.
-        #[test]
-        fn removing_an_error_case_is_breaking() {
-            let old = spec_of(&[error_enum(
-                "ContractError",
-                &[("InsufficientBalance", 1), ("Unauthorized", 2)],
-            )]);
-            let new = spec_of(&[error_enum("ContractError", &[("InsufficientBalance", 1)])]);
-            let d = SpecDiff::between(&old, &new);
-            assert!(d.breaking, "removing an error case must be breaking");
-        }
-
-        /// Removing an entire error enum IS breaking.
-        #[test]
-        fn removing_an_error_enum_is_breaking() {
-            let old = spec_of(&[
-                func("balance", &[], Some(ScSpecTypeDef::I128)),
-                error_enum("ContractError", &[("InsufficientBalance", 1)]),
-            ]);
-            let new = spec_of(&[func("balance", &[], Some(ScSpecTypeDef::I128))]);
-            let d = SpecDiff::between(&old, &new);
-            assert!(d.breaking, "removing an error enum must be breaking");
-            assert_eq!(d.types.removed.len(), 1);
-            assert!(d.types.removed[0].contains("error enum ContractError"));
-        }
     }
 }

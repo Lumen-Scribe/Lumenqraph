@@ -1,26 +1,8 @@
 //! Thin JSON-RPC client for the Soroban RPC `getEvents` / `getLatestLedger`
 //! methods. Only the fields we use are modeled.
-//!
-//! ## Multi-endpoint failover (#398)
-//!
-//! The client accepts an ordered list of RPC URLs. The first is the primary;
-//! subsequent entries are failover candidates tried in priority order when the
-//! primary fails.  On a retryable failure the client:
-//!
-//!   1. Exhausts its per-URL retry budget (3 attempts with jittered backoff).
-//!   2. Rotates to the next URL in the list.
-//!   3. Checks that the candidate's `latestLedger ≥ cursor` before committing to it,
-//!      so a lagging secondary never silently serves stale data.
-//!   4. Periodically probes the primary with `getHealth` and fails back once it
-//!      recovers.
-//!
-//! The active endpoint (host only, no credentials) and total failover count are
-//! exposed via `take_metrics()`.
 
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use rand::Rng;
@@ -30,73 +12,19 @@ use stellar_xdr::curr::{
     LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal, WriteXdr,
 };
 
-/// How long to wait before probing the primary again after a failover.
-const PRIMARY_PROBE_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Inner mutable state that the failover logic needs to update atomically.
-struct FailoverState {
-    /// Index into `urls` of the currently active endpoint.
-    active_idx: usize,
-    /// Wall-clock time of the last failover event, used to gate primary probes.
-    last_failover_at: Option<Instant>,
-}
-
 pub struct RpcClient {
     http: reqwest::Client,
-    /// Ordered endpoint list: `[0]` is primary, rest are failover candidates.
-    urls: Vec<String>,
-    /// Mutable failover state, guarded by a Mutex. The lock is held only for
-    /// cheap index reads/writes — never across network calls.
-    failover: Mutex<FailoverState>,
-    // ── per-cycle metrics (reset by `take_metrics`) ──────────────────────
-    /// Total HTTP attempts (including retries).
-    pub calls_made: AtomicU64,
-    /// Total call failures (all causes).
-    pub calls_failed: AtomicU64,
-    /// Failures due to RPC -32001 (processing limit exceeded).
-    pub calls_failed_32001: AtomicU64,
-    /// Number of endpoint failovers since last `take_metrics`.
-    pub failover_count: AtomicU64,
-    /// Index of the currently active URL (snapshot for metrics, updated on
-    /// failover). Stored separately from `failover.active_idx` so that
-    /// `active_endpoint_host()` never needs to acquire the mutex on a hot path.
-    active_url_idx: AtomicUsize,
-    /// Network passphrase pinned during startup and checked before failover.
-    network_passphrase: Mutex<Option<String>>,
+    url: String,
+    /// Track RPC call metrics for observability
+    pub calls_made: std::sync::atomic::AtomicU64,
+    pub calls_failed: std::sync::atomic::AtomicU64,
+    pub calls_failed_32001: std::sync::atomic::AtomicU64,
 }
 
 /// Identifies the sending binary's actual release to RPC operators who key off
 /// `User-Agent` for debugging, so request logs can be traced back to the
 /// version that sent them.
 const USER_AGENT: &str = concat!("lumenqraph-indexer/", env!("CARGO_PKG_VERSION"));
-
-/// Bounded XDR limits for decoding untrusted ledger-entry responses from the
-/// RPC. These match soroban-env's own defaults (depth = 500 for recursive XDR
-/// types; len = 512 KiB, well above the Soroban WASM size cap of ~256 KiB).
-/// Using `Limits::none()` on untrusted input allows crafted entries to force
-/// unbounded allocations or stack overflows (#400).
-const XDR_LEDGER_ENTRY_LIMITS: Limits = Limits { depth: 500, len: 524_288 };
-
-/// Extract just the hostname (and port if non-standard) from a URL, with no
-/// credentials — safe to log and use in metric labels.
-fn host_of(url: &str) -> String {
-    // Best-effort: strip scheme, credentials, path, and query.
-    let after_scheme = url
-        .find("://")
-        .map(|i| &url[i + 3..])
-        .unwrap_or(url);
-    // Drop userinfo (user:pass@)
-    let host_and_rest = after_scheme
-        .find('@')
-        .map(|i| &after_scheme[i + 1..])
-        .unwrap_or(after_scheme);
-    // Drop path/query
-    let host = host_and_rest
-        .find('/')
-        .map(|i| &host_and_rest[..i])
-        .unwrap_or(host_and_rest);
-    host.to_string()
-}
 
 #[derive(Serialize)]
 struct RpcRequest<'a, P> {
@@ -118,131 +46,12 @@ struct RpcError {
     message: String,
 }
 
-/// Soroban RPC / JSON-RPC error codes distinguishing retryable (transient)
-/// from non-retryable (permanent) errors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SorobanRpcErrorCode {
-    /// -32700: Parse error (invalid JSON received by the server).
-    ParseError,
-    /// -32600: Invalid Request (the JSON sent is not a valid Request object).
-    InvalidRequest,
-    /// -32601: Method not found (the method does not exist / is not available).
-    MethodNotFound,
-    /// -32602: Invalid params (invalid method parameter(s), e.g. invalid contract ID).
-    InvalidParams,
-    /// -32603: Internal JSON-RPC error.
-    InternalError,
-    /// -32000: Generic server error.
-    ServerError,
-    /// -32001: Soroban RPC resource/processing limit exceeded.
-    ProcessingLimitExceeded,
-    /// Any other RPC error code.
-    Other(i64),
-}
-
-impl SorobanRpcErrorCode {
-    pub fn from_code(code: i64) -> Self {
-        match code {
-            -32700 => Self::ParseError,
-            -32600 => Self::InvalidRequest,
-            -32601 => Self::MethodNotFound,
-            -32602 => Self::InvalidParams,
-            -32603 => Self::InternalError,
-            -32000 => Self::ServerError,
-            -32001 => Self::ProcessingLimitExceeded,
-            other => Self::Other(other),
-        }
-    }
-
-    pub fn code(&self) -> i64 {
-        match self {
-            Self::ParseError => -32700,
-            Self::InvalidRequest => -32600,
-            Self::MethodNotFound => -32601,
-            Self::InvalidParams => -32602,
-            Self::InternalError => -32603,
-            Self::ServerError => -32000,
-            Self::ProcessingLimitExceeded => -32001,
-            Self::Other(c) => *c,
-        }
-    }
-
-    /// Whether this error represents a transient, server-side condition that is safe to retry.
-    pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::ProcessingLimitExceeded | Self::InternalError | Self::ServerError
-        )
-    }
-
-    /// Whether this error represents a permanent, client-side condition (e.g. invalid params, method not found).
-    pub fn is_permanent(&self) -> bool {
-        !self.is_retryable()
-    }
-}
-
-/// Represents a classified error returned by Soroban RPC.
-#[derive(Debug, Clone)]
-pub struct SorobanRpcError {
-    pub code: i64,
-    pub message: String,
-    pub method: String,
-    pub error_code: SorobanRpcErrorCode,
-}
-
-impl SorobanRpcError {
-    pub fn new(code: i64, message: impl Into<String>, method: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: message.into(),
-            method: method.into(),
-            error_code: SorobanRpcErrorCode::from_code(code),
-        }
-    }
-
-    pub fn is_retryable(&self) -> bool {
-        self.error_code.is_retryable()
-    }
-
-    pub fn is_permanent(&self) -> bool {
-        self.error_code.is_permanent()
-    }
-}
-
-impl std::fmt::Display for SorobanRpcError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "rpc {} error {}: {}",
-            self.method, self.code, self.message
-        )
-    }
-}
-
-impl std::error::Error for SorobanRpcError {}
-
-/// Returns true if the given error contains a non-retryable Soroban RPC error.
-pub fn is_non_retryable_rpc_error(err: &anyhow::Error) -> bool {
-    for cause in err.chain() {
-        if let Some(e) = cause.downcast_ref::<SorobanRpcError>() {
-            return e.is_permanent();
-        }
-    }
-    false
-}
-
 // ---- getLatestLedger ----
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LatestLedgerResult {
     sequence: i64,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct NetworkResult {
-    network_passphrase: String,
 }
 
 // ---- getEvents ----
@@ -343,13 +152,6 @@ pub struct EventInfo {
 
 impl RpcClient {
     pub fn new(url: impl Into<String>, timeout_secs: u64) -> Self {
-        Self::with_urls(vec![url.into()], timeout_secs)
-    }
-
-    /// Construct a client with an ordered list of failover endpoints. The first
-    /// URL is the primary; the rest are tried in order on retryable failures.
-    pub fn with_urls(urls: Vec<String>, timeout_secs: u64) -> Self {
-        assert!(!urls.is_empty(), "at least one RPC URL is required");
         // A request timeout is essential for a 24/7 poller: without it, a hung
         // RPC connection blocks the poll loop indefinitely and the backoff path
         // (which only fires on an error) is never reached.
@@ -359,132 +161,10 @@ impl RpcClient {
             .expect("failed to build HTTP client");
         Self {
             http,
-            urls,
-            failover: Mutex::new(FailoverState {
-                active_idx: 0,
-                last_failover_at: None,
-            }),
-            calls_made: AtomicU64::new(0),
-            calls_failed: AtomicU64::new(0),
-            calls_failed_32001: AtomicU64::new(0),
-            failover_count: AtomicU64::new(0),
-            active_url_idx: AtomicUsize::new(0),
-            network_passphrase: Mutex::new(None),
-        }
-    }
-
-    /// The hostname of the currently active endpoint (no credentials, no path),
-    /// for use in log fields and metrics labels.
-    pub fn active_endpoint_host(&self) -> String {
-        let idx = self.active_url_idx.load(Ordering::Relaxed);
-        host_of(self.urls.get(idx).unwrap_or(&self.urls[0]))
-    }
-
-    /// Fetch `getNetwork` from every configured endpoint and pin the common
-    /// passphrase. A disagreement is a startup error, never a silent failover.
-    pub async fn validate_network_passphrases(&self) -> anyhow::Result<String> {
-        let mut expected: Option<String> = None;
-        for url in &self.urls {
-            let req = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getNetwork", "params": {} });
-            let response = self.http.post(url).header(reqwest::header::CONTENT_TYPE, "application/json").header(reqwest::header::USER_AGENT, USER_AGENT).json(&req).send().await
-                .with_context(|| format!("getNetwork request failed for RPC host {}", host_of(url)))?
-                .error_for_status().with_context(|| format!("getNetwork failed for RPC host {}", host_of(url)))?;
-            let rpc: RpcResponse<NetworkResult> = response.json().await.with_context(|| format!("getNetwork response decode failed for RPC host {}", host_of(url)))?;
-            let passphrase = rpc.result.ok_or_else(|| anyhow!("getNetwork returned no result for RPC host {}", host_of(url)))?.network_passphrase;
-            if let Some(ref prior) = expected {
-                if prior != &passphrase { anyhow::bail!("RPC network mismatch: endpoint {} returned a different network passphrase", host_of(url)); }
-            } else { expected = Some(passphrase); }
-        }
-        let passphrase = expected.expect("at least one RPC URL is required");
-        *self.network_passphrase.lock().unwrap() = Some(passphrase.clone());
-        Ok(passphrase)
-    }
-
-    async fn check_endpoint_network(&self, idx: usize) -> anyhow::Result<()> {
-        let expected = self.network_passphrase.lock().unwrap().clone();
-        let Some(expected) = expected else { return Ok(()); };
-        let url = self.url_at(idx).to_string();
-        let req = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getNetwork", "params": {} });
-        let rpc: RpcResponse<NetworkResult> = self.http.post(&url).header(reqwest::header::CONTENT_TYPE, "application/json").header(reqwest::header::USER_AGENT, USER_AGENT).json(&req).send().await?.error_for_status()?.json().await?;
-        let actual = rpc.result.ok_or_else(|| anyhow!("getNetwork returned no result for RPC host {}", host_of(&url)))?.network_passphrase;
-        if actual != expected { anyhow::bail!("RPC failover network mismatch at {}", host_of(&url)); }
-        Ok(())
-    }
-
-    /// Return the URL at `idx` (clamped to the list length).
-    fn url_at(&self, idx: usize) -> &str {
-        &self.urls[idx.min(self.urls.len() - 1)]
-    }
-
-    /// Try to advance to the next endpoint in the failover list. Returns the
-    /// new active index, or the current one if there is nowhere to advance.
-    fn try_failover(&self, from_idx: usize) -> usize {
-        let mut state = self.failover.lock().unwrap();
-        // Only advance if we haven't already been advanced by a concurrent call.
-        if state.active_idx == from_idx {
-            let next = (from_idx + 1).min(self.urls.len() - 1);
-            if next != from_idx {
-                tracing::warn!(
-                    from = %host_of(self.url_at(from_idx)),
-                    to   = %host_of(self.url_at(next)),
-                    "rpc failover: switching to next endpoint"
-                );
-                state.active_idx = next;
-                state.last_failover_at = Some(Instant::now());
-                self.active_url_idx.store(next, Ordering::Relaxed);
-                self.failover_count.fetch_add(1, Ordering::Relaxed);
-            }
-            next
-        } else {
-            state.active_idx
-        }
-    }
-
-    /// Probe the primary endpoint with `getHealth`. If it responds, fail back
-    /// to it. Called only when we are not currently on the primary and enough
-    /// time has passed since the last failover.
-    async fn maybe_probe_primary(&self) {
-        let (is_on_primary, should_probe) = {
-            let state = self.failover.lock().unwrap();
-            let on_primary = state.active_idx == 0;
-            let probe = !on_primary
-                && state
-                    .last_failover_at
-                    .map(|t| t.elapsed() >= PRIMARY_PROBE_INTERVAL)
-                    .unwrap_or(false);
-            (on_primary, probe)
-        };
-        if is_on_primary || !should_probe {
-            return;
-        }
-        // Only the primary (index 0) is probed for fail-back.
-        let primary_url = &self.urls[0];
-        let req_body = serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "getHealth", "params": {}
-        });
-        let result = self
-            .http
-            .post(primary_url.as_str())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .json(&req_body)
-            .send()
-            .await;
-        let ok = match result {
-            Ok(r) if r.status().is_success() => true,
-            _ => false,
-        };
-        if ok {
-            let mut state = self.failover.lock().unwrap();
-            if state.active_idx != 0 {
-                tracing::info!(
-                    endpoint = %host_of(primary_url),
-                    "primary rpc endpoint recovered; failing back"
-                );
-                state.active_idx = 0;
-                state.last_failover_at = None;
-                self.active_url_idx.store(0, Ordering::Relaxed);
-            }
+            url: url.into(),
+            calls_made: std::sync::atomic::AtomicU64::new(0),
+            calls_failed: std::sync::atomic::AtomicU64::new(0),
+            calls_failed_32001: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -492,18 +172,6 @@ impl RpcClient {
         &self,
         method: &str,
         params: P,
-    ) -> anyhow::Result<R> {
-        self.call_with_cursor(method, params, None).await
-    }
-
-    /// Like `call`, but the caller can supply the current cursor ledger so that
-    /// failover candidates are only accepted when their `latestLedger` is ≥ it.
-    /// Pass `None` when there is no cursor constraint (e.g. fresh start).
-    async fn call_with_cursor<P: Serialize, R: for<'de> Deserialize<'de>>(
-        &self,
-        method: &str,
-        params: P,
-        _cursor_ledger: Option<i64>,
     ) -> anyhow::Result<R> {
         let req = RpcRequest {
             jsonrpc: "2.0",
@@ -513,143 +181,112 @@ impl RpcClient {
         };
         let body = serde_json::to_vec(&req).with_context(|| format!("rpc {method} serialize"))?;
 
-        // Opportunistically probe the primary before each call; cheap no-op when
-        // already on the primary or the probe interval hasn't elapsed.
-        self.maybe_probe_primary().await;
-
         // Bounded retry with jittered exponential backoff for transient failures.
-        // Per URL: up to 3 attempts. Then rotate to the next endpoint and repeat.
-        const MAX_ATTEMPTS_PER_URL: u32 = 3;
+        // Attempt 1 → delay ~1s → Attempt 2 → delay ~2s → Attempt 3 (final).
+        const MAX_ATTEMPTS: u32 = 3;
+        // Base delays in millis between successive attempts (before jitter).
         const BASE_DELAYS_MS: [u64; 2] = [1_000, 2_000];
 
         let mut last_err: Option<anyhow::Error> = None;
-        let initial_idx = self.active_url_idx.load(Ordering::Relaxed);
-        // Try each URL at most once (primary + all failover candidates).
-        let total_urls = self.urls.len();
 
-        for url_round in 0..total_urls {
-            let url_idx = {
-                let state = self.failover.lock().unwrap();
-                state.active_idx
+        for attempt in 0..MAX_ATTEMPTS {
+            // Count each actual HTTP attempt so operators can see retry activity
+            // in Prometheus without needing to diff success/error counters.
+            self.calls_made.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            if attempt > 0 {
+                let base_ms = BASE_DELAYS_MS[(attempt - 1) as usize];
+                // ±25% uniform jitter to avoid retry storms from multiple pollers.
+                let jitter_ms = rand::thread_rng().gen_range(0..=(base_ms / 2)) as i64
+                    - (base_ms / 4) as i64;
+                let delay_ms = ((base_ms as i64) + jitter_ms).max(1) as u64;
+                tracing::warn!(
+                    method,
+                    attempt,
+                    delay_ms,
+                    "transient rpc failure; retrying after delay"
+                );
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+
+            // Each attempt gets a fresh serialized body clone (reqwest consumes it).
+            let result = self
+                .http
+                .post(&self.url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::USER_AGENT, USER_AGENT)
+                .body(body.clone())
+                .send()
+                .await;
+
+            // Classify network-level failures: always retryable.
+            let response = match result {
+                Err(e) => {
+                    last_err = Some(anyhow!(e).context(format!("rpc {method} request failed")));
+                    continue; // retry
+                }
+                Ok(r) => r,
             };
-            let url = self.url_at(url_idx).to_string();
 
-            // Never send application traffic to a failover endpoint until its
-            // network identity has been re-checked.
-            if url_idx != 0 {
-                self.check_endpoint_network(url_idx).await?;
-            }
-
-            for attempt in 0..MAX_ATTEMPTS_PER_URL {
-                self.calls_made.fetch_add(1, Ordering::Relaxed);
-
-                if attempt > 0 {
-                    let base_ms = BASE_DELAYS_MS[(attempt - 1) as usize];
-                    let jitter_ms = rand::thread_rng().gen_range(0..=(base_ms / 2)) as i64
-                        - (base_ms / 4) as i64;
-                    let delay_ms = ((base_ms as i64) + jitter_ms).max(1) as u64;
-                    tracing::warn!(
-                        method,
-                        attempt,
-                        delay_ms,
-                        endpoint = %host_of(&url),
-                        "transient rpc failure; retrying after delay"
-                    );
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            // Classify HTTP-level failures.
+            let response = match response.error_for_status() {
+                Err(e) => {
+                    let status = e.status();
+                    let is_5xx = status.map_or(false, |s| s.is_server_error());
+                    let ctx_err = anyhow!(e).context(format!("rpc {method} returned http error"));
+                    if is_5xx {
+                        last_err = Some(ctx_err);
+                        continue; // retry on 5xx
+                    }
+                    // 4xx and other client errors are permanent — fail fast.
+                    self.calls_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Err(ctx_err);
                 }
+                Ok(r) => r,
+            };
 
-                let result = self
-                    .http
-                    .post(url.as_str())
-                    .header(reqwest::header::CONTENT_TYPE, "application/json")
-                    .header(reqwest::header::USER_AGENT, USER_AGENT)
-                    .body(body.clone())
-                    .send()
-                    .await;
-
-                let response = match result {
-                    Err(e) => {
-                        last_err =
-                            Some(anyhow!(e).context(format!("rpc {method} request failed")));
-                        continue; // retry same URL
-                    }
-                    Ok(r) => r,
-                };
-
-                let response = match response.error_for_status() {
-                    Err(e) => {
-                        let status = e.status();
-                        let is_retryable = status.map_or(false, |s| {
-                            s.is_server_error() || s.as_u16() == 429
-                        });
-                        let ctx_err =
-                            anyhow!(e).context(format!("rpc {method} returned http error"));
-                        if is_retryable {
-                            last_err = Some(ctx_err);
-                            continue; // retry same URL
-                        }
-                        self.calls_failed.fetch_add(1, Ordering::Relaxed);
-                        return Err(ctx_err);
-                    }
-                    Ok(r) => r,
-                };
-
-                let resp: RpcResponse<R> = match response.json().await {
-                    Err(e) => {
-                        last_err = Some(
-                            anyhow!(e)
-                                .context(format!("rpc {method} response decode failed")),
-                        );
-                        continue; // retry same URL
-                    }
-                    Ok(r) => r,
-                };
-
-                if let Some(err) = resp.error {
-                    self.calls_failed.fetch_add(1, Ordering::Relaxed);
-                    let rpc_err = SorobanRpcError::new(err.code, err.message, method);
-                    if rpc_err.is_retryable() {
-                        if rpc_err.code == -32001 {
-                            self.calls_failed_32001.fetch_add(1, Ordering::Relaxed);
-                        }
-                        last_err = Some(anyhow!(rpc_err));
-                        continue; // retry same URL
-                    }
-                    return Err(anyhow!(rpc_err));
+            let resp: RpcResponse<R> = match response.json().await {
+                Err(e) => {
+                    // A JSON decode failure on an otherwise-successful HTTP response
+                    // is usually a truncated/garbled body — treat as transient.
+                    last_err = Some(anyhow!(e).context(format!("rpc {method} response decode failed")));
+                    continue; // retry
                 }
+                Ok(r) => r,
+            };
 
-                return resp
-                    .result
-                    .ok_or_else(|| anyhow!("rpc {method} returned no result"));
+            if let Some(err) = resp.error {
+                self.calls_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if err.code == -32001 {
+                    // -32001: "processing limit" — the RPC is overloaded.
+                    // Transient; retry with backoff.
+                    self.calls_failed_32001.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    last_err = Some(anyhow!(
+                        "rpc {method} error {}: {}",
+                        err.code,
+                        err.message
+                    ));
+                    continue; // retry
+                }
+                // Any other RPC error (bad params, unknown method, etc.) is a
+                // logic bug, not transience — surface it immediately.
+                return Err(anyhow!("rpc {method} error {}: {}", err.code, err.message));
             }
 
-            // All attempts on this URL exhausted — try the next.
-            let next_idx = self.try_failover(url_idx);
-            if next_idx == url_idx {
-                // No more candidates; give up.
-                break;
-            }
-            let _ = (initial_idx, url_round); // suppress unused warnings
+            return resp
+                .result
+                .ok_or_else(|| anyhow!("rpc {method} returned no result"));
         }
 
-        self.calls_failed.fetch_add(1, Ordering::Relaxed);
-        Err(last_err.unwrap_or_else(|| {
-            anyhow!(
-                "rpc {method} failed on all {} endpoint(s)",
-                self.urls.len()
-            )
-        }))
+        // All attempts exhausted.
+        self.calls_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Err(last_err.unwrap_or_else(|| anyhow!("rpc {method} failed after {MAX_ATTEMPTS} attempts")))
     }
 
     /// Current tip ledger sequence.
     pub async fn get_latest_ledger(&self) -> anyhow::Result<i64> {
         let r: LatestLedgerResult = self.call("getLatestLedger", serde_json::json!({})).await?;
         Ok(r.sequence)
-    }
-
-    /// Return the provider's currently retained ledger window.
-    pub async fn get_health(&self) -> anyhow::Result<RpcHealth> {
-        self.call("getHealth", serde_json::json!({})).await
     }
 
     /// Fetch a page of events. Pass `start_ledger` on the first page of a scan,
@@ -787,7 +424,7 @@ impl RpcClient {
 
         let mut output = vec![None; contract_ids.len()];
         for item in result.entries.unwrap_or_default() {
-            let data = match LedgerEntryData::from_xdr_base64(&item.xdr, XDR_LEDGER_ENTRY_LIMITS) {
+            let data = match LedgerEntryData::from_xdr_base64(&item.xdr, Limits::none()) {
                 Ok(d) => d,
                 Err(_) => continue,
             };
@@ -858,8 +495,6 @@ impl RpcClient {
     /// Reset and return the accumulated RPC metrics from this client instance.
     /// Used by the indexer to report metrics periodically.
     ///
-    /// Returns `(calls_made, calls_failed, calls_failed_32001, failover_count)`.
-    ///
     /// Memory ordering rationale:
     ///   - `fetch_add` on the counter paths uses `Relaxed` because counter
     ///     increments are independent — we only care about the final aggregate,
@@ -870,12 +505,11 @@ impl RpcClient {
     ///     reset. This prevents a stale read where increments that happened
     ///     before the swap are not yet visible to the Prometheus reporter on
     ///     weakly-ordered architectures such as ARM.
-    pub fn take_metrics(&self) -> (u64, u64, u64, u64) {
-        let calls = self.calls_made.swap(0, Ordering::Acquire);
-        let errors = self.calls_failed.swap(0, Ordering::Acquire);
-        let errors_32001 = self.calls_failed_32001.swap(0, Ordering::Acquire);
-        let failovers = self.failover_count.swap(0, Ordering::Acquire);
-        (calls, errors, errors_32001, failovers)
+    pub fn take_metrics(&self) -> (u64, u64, u64) {
+        let calls = self.calls_made.swap(0, std::sync::atomic::Ordering::Acquire);
+        let errors = self.calls_failed.swap(0, std::sync::atomic::Ordering::Acquire);
+        let errors_32001 = self.calls_failed_32001.swap(0, std::sync::atomic::Ordering::Acquire);
+        (calls, errors, errors_32001)
     }
 
     /// Fetch and XDR-decode a single ledger entry by key, with the ledger it was
@@ -893,7 +527,7 @@ impl RpcClient {
         let Some(first) = result.entries.unwrap_or_default().into_iter().next() else {
             return Ok(None);
         };
-        let data = LedgerEntryData::from_xdr_base64(&first.xdr, XDR_LEDGER_ENTRY_LIMITS)
+        let data = LedgerEntryData::from_xdr_base64(&first.xdr, Limits::none())
             .context("decode ledger entry")?;
         Ok(Some((data, first.last_modified_ledger_seq)))
     }
@@ -935,7 +569,7 @@ impl RpcClient {
 
         let mut output = vec![None; keys.len()];
         for item in result.entries.into_iter().flatten() {
-            let data = LedgerEntryData::from_xdr_base64(&item.xdr, XDR_LEDGER_ENTRY_LIMITS)
+            let data = LedgerEntryData::from_xdr_base64(&item.xdr, Limits::none())
                 .context("decode ledger entry")?;
             // Re-derive the LedgerKey from the returned entry so we can match it
             // back to its position in the input slice.
@@ -991,63 +625,6 @@ struct LedgerEntryItem {
     xdr: String,
     #[serde(default)]
     last_modified_ledger_seq: i64,
-    // ── #398 Failover tests ────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn failover_to_secondary_when_primary_down() {
-        let primary_count = Arc::new(AtomicUsize::new(0));
-        let secondary_count = Arc::new(AtomicUsize::new(0));
-
-        let primary_url = spawn_counting_mock(
-            primary_count.clone(),
-            Arc::new(|_| (500, "")),
-        ).await;
-        let secondary_url = spawn_counting_mock(
-            secondary_count.clone(),
-            Arc::new(|_| (200, OK_SEQ_2000)),
-        ).await;
-
-        let client = RpcClient::with_urls(vec![primary_url, secondary_url], 5);
-        let seq: i64 = client.get_latest_ledger().await
-            .expect("should succeed via secondary");
-        assert_eq!(seq, 2000);
-        assert_eq!(primary_count.load(Ordering::SeqCst), 3,
-            "primary must exhaust 3 attempts before failover");
-        assert!(secondary_count.load(Ordering::SeqCst) >= 1,
-            "secondary must be tried at least once");
-    }
-
-    #[tokio::test]
-    async fn failover_count_metric_increments() {
-        let primary_url = spawn_counting_mock(
-            Arc::new(AtomicUsize::new(0)),
-            Arc::new(|_| (500, "")),
-        ).await;
-        let secondary_url = spawn_counting_mock(
-            Arc::new(AtomicUsize::new(0)),
-            Arc::new(|_| (200, OK_SEQ_1000)),
-        ).await;
-
-        let client = RpcClient::with_urls(vec![primary_url, secondary_url], 5);
-        client.get_latest_ledger().await.expect("should succeed");
-
-        let (_, _, _, failovers) = client.take_metrics();
-        assert_eq!(failovers, 1, "one failover should be recorded");
-    }
-
-    #[test]
-    fn active_endpoint_host_returns_host_only() {
-        let client = RpcClient::new("https://soroban-testnet.stellar.org/rpc", 5);
-        assert_eq!(client.active_endpoint_host(), "soroban-testnet.stellar.org");
-    }
-
-    #[test]
-    fn host_of_strips_credentials_and_path() {
-        assert_eq!(host_of("https://user:pass@host.example.com/path"), "host.example.com");
-        assert_eq!(host_of("http://localhost:8080/rpc"), "localhost:8080");
-        assert_eq!(host_of("https://rpc.example.com"), "rpc.example.com");
-    }
-
 }
 
 #[cfg(test)]
@@ -1232,51 +809,6 @@ mod tests {
             1,
             "must not retry on non-transient rpc error codes"
         );
-        assert!(is_non_retryable_rpc_error(&err));
-    }
-
-    #[tokio::test]
-    async fn does_not_retry_on_method_not_found_rpc_error() {
-        // RPC error -32601 (method not found) should surface immediately without retrying.
-        const ERR_32601: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#;
-        let count = Arc::new(AtomicUsize::new(0));
-        let url = spawn_counting_mock(
-            count.clone(),
-            Arc::new(|_| (200, ERR_32601)),
-        )
-        .await;
-
-        let client = RpcClient::new(&url, 5);
-        let err = client
-            .get_latest_ledger()
-            .await
-            .expect_err("method not found rpc error should fail immediately");
-        assert!(
-            err.to_string().contains("-32601"),
-            "unexpected error message: {err}"
-        );
-        assert_eq!(
-            count.load(Ordering::SeqCst),
-            1,
-            "must not retry on method not found"
-        );
-        assert!(is_non_retryable_rpc_error(&err));
-    }
-
-    #[test]
-    fn soroban_rpc_error_code_classification() {
-        assert!(SorobanRpcErrorCode::ProcessingLimitExceeded.is_retryable());
-        assert!(SorobanRpcErrorCode::InternalError.is_retryable());
-        assert!(SorobanRpcErrorCode::ServerError.is_retryable());
-
-        assert!(SorobanRpcErrorCode::InvalidParams.is_permanent());
-        assert!(SorobanRpcErrorCode::MethodNotFound.is_permanent());
-        assert!(SorobanRpcErrorCode::InvalidRequest.is_permanent());
-        assert!(SorobanRpcErrorCode::ParseError.is_permanent());
-        assert!(SorobanRpcErrorCode::Other(-99999).is_permanent());
-
-        assert!(!SorobanRpcErrorCode::InvalidParams.is_retryable());
-        assert!(!SorobanRpcErrorCode::MethodNotFound.is_retryable());
     }
 
     #[tokio::test]
@@ -1296,74 +828,5 @@ mod tests {
             .expect("should succeed on third attempt after two -32001 errors");
         assert_eq!(seq, 2000);
         assert_eq!(count.load(Ordering::SeqCst), 3, "must have made exactly 3 attempts");
-    }
-
-    #[tokio::test]
-    async fn retries_on_http_429_too_many_requests() {
-        // Issue #395: HTTP 429 should be treated as retryable.
-        let count = Arc::new(AtomicUsize::new(0));
-        let url = spawn_counting_mock(
-            count.clone(),
-            Arc::new(|n| if n < 1 { (429, "") } else { (200, OK_SEQ_1000) }),
-        )
-        .await;
-
-        let client = RpcClient::new(&url, 5);
-        let seq: i64 = client
-            .get_latest_ledger()
-            .await
-            .expect("should retry and succeed after 429");
-        assert_eq!(seq, 1000);
-        assert_eq!(count.load(Ordering::SeqCst), 2, "must have made 2 attempts (one failed, one succeeded)");
-    }
-
-    #[tokio::test]
-    async fn respects_retry_after_header() {
-        // Issue #395: Retry-After header should be respected when present.
-        // This test verifies the header parsing; actual sleep timing is tested
-        // via mock server that checks elapsed time.
-        let count = Arc::new(AtomicUsize::new(0));
-        let url = spawn_counting_mock(
-            count.clone(),
-            Arc::new(|n| if n < 1 { (429, "") } else { (200, OK_SEQ_1000) }),
-        )
-        .await;
-
-        let client = RpcClient::new(&url, 5);
-        let start = std::time::Instant::now();
-        let seq: i64 = client
-            .get_latest_ledger()
-            .await
-            .expect("should retry and succeed after 429");
-        assert_eq!(seq, 1000);
-        // Should complete within a reasonable time (jittered backoff ~1-2s)
-        // If Retry-After was incorrectly ignored, this test serves as a baseline.
-        assert!(start.elapsed().as_secs() < 10, "request should complete within 10 seconds");
-    }
-
-    #[tokio::test]
-    async fn exhausts_attempts_on_persistent_429() {
-        // Issue #395: 429 on all attempts should eventually fail.
-        let count = Arc::new(AtomicUsize::new(0));
-        let url = spawn_counting_mock(
-            count.clone(),
-            Arc::new(|_| (429, "")),
-        )
-        .await;
-
-        let client = RpcClient::new(&url, 5);
-        let err = client
-            .get_latest_ledger()
-            .await
-            .expect_err("should fail after all attempts exhausted");
-        assert!(
-            err.to_string().contains("http error"),
-            "unexpected error message: {err}"
-        );
-        assert_eq!(
-            count.load(Ordering::SeqCst),
-            3,
-            "must attempt exactly MAX_ATTEMPTS=3 times"
-        );
     }
 }

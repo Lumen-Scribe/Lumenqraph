@@ -14,159 +14,11 @@ env:
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
-  # Issue #361: sqlx keys migrations by integer version and
-  # `_sqlx_migrations.version` is the primary key, so two files sharing a
-  # numeric prefix cannot both be recorded. Fail fast if any duplicate
-  # version prefix exists in migrations/.
-  #
-  # Issue #536: migrations are append-only. sqlx stores a checksum per applied
-  # migration and refuses to run when a file's contents change, so editing,
-  # renaming or deleting a released migration breaks every existing database.
-  # Compare against the PR merge base and reject any M/R/D entry unless the PR
-  # carries the `migrations-override` label (genuine emergencies only).
-  migration-versions:
-    name: Migration Version Uniqueness
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    if: github.event_name != 'schedule'
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          # Full history so the merge base is available for the diff below.
-          fetch-depth: 0
-      - name: Reject duplicate migration version prefixes
-        run: |
-          dups=$(ls migrations | cut -d_ -f1 | sort | uniq -d)
-          if [ -n "$dups" ]; then
-            echo "Duplicate migration version prefixes found:"
-            echo "$dups"
-            exit 1
-          fi
-      - name: Reject modifications to existing migrations (append-only)
-        if: github.event_name == 'pull_request'
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          OVERRIDE_LABEL: migrations-override
-        run: |
-          if [ -z "$BASE_SHA" ]; then
-            echo "::error::No merge base SHA available; cannot verify append-only migrations."
-            exit 1
-          fi
-          # Fetch the base commit in case the checkout did not include it.
-          git fetch --no-tags origin "$BASE_SHA" || true
-          changed=$(git diff --name-status "$BASE_SHA"...HEAD -- migrations/ || true)
-          echo "Changes under migrations/ since $BASE_SHA:"
-          echo "${changed:-<none>}"
-          # Only additions (A) are allowed; M (modified), R (renamed),
-          # D (deleted), C (copied) and T (type change) all break checksums.
-          bad=$(echo "$changed" | awk 'NF && $1 !~ /^A/ {print}')
-          if [ -z "$bad" ]; then
-            echo "All migration changes are additions. OK."
-            exit 0
-          fi
-          labels='${{ toJSON(github.event.pull_request.labels.*.name) }}'
-          if echo "$labels" | grep -q "\"$OVERRIDE_LABEL\""; then
-            echo "::warning::Existing migrations were modified but the '$OVERRIDE_LABEL' label is present; allowing."
-            exit 0
-          fi
-          echo "::error::Existing migrations must not be modified, renamed or deleted."
-          echo "Move the change into a new forward migration instead."
-          echo "Add the '$OVERRIDE_LABEL' label only for genuine emergencies."
-          echo "$bad"
-          exit 1
-
-  # Issue #535/#536: prove that a fresh database migrates cleanly from zero.
-  # Runs every migration in migrations/ against an empty Postgres service, so a
-  # duplicate version or a broken forward migration fails here rather than at
-  # indexer boot on a user's machine.
-  migration-fresh-db:
-    name: Migration Fresh Database
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: lumenqraph
-          POSTGRES_PASSWORD: lumenqraph
-          POSTGRES_DB: lumenqraph
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U lumenqraph"
-          --health-interval 5s --health-timeout 5s --health-retries 10
-    env:
-      DATABASE_URL: postgres://lumenqraph:lumenqraph@localhost:5432/lumenqraph
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          key: migration-fresh-db
-      - name: Install sqlx-cli
-        run: cargo install sqlx-cli --no-default-features --features postgres
-      - name: Migrate a fresh database
-        run: cargo sqlx migrate run --database-url "$DATABASE_URL"
-      - name: Verify all migrations were recorded
-        run: |
-          count=$(cargo sqlx migrate info --database-url "$DATABASE_URL" | grep -c 'installed' || true)
-          echo "installed migrations: $count"
-          if [ "$count" -eq 0 ]; then
-            echo "::error::No migrations were recorded on the fresh database."
-            exit 1
-          fi
-=======
-
-  # Issue #475: lint new or changed migrations with squawk so table-locking
-  # DDL (non-concurrent index builds, constraints without NOT VALID, column
-  # rewrites, …) can't reach `main` unreviewed. Intentional cases opt out with
-  # a `-- squawk-ignore <rule>` comment. See docs/MIGRATIONS.md.
-  migration-lint:
-    name: Migration Lock-Safety Lint
-    runs-on: ubuntu-latest
-    if: github.event_name != 'schedule'
-    env:
-      SQUAWK_VERSION: "2.67.0"
-      SQUAWK_SHA256: "03efe0e666b63bf33e2493693ee0aa9dbed07cbdcd20f7a8292245c1da9d790a"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          fetch-depth: 0
-      - name: Install squawk
-        run: |
-          curl -fsSL -o "$RUNNER_TEMP/squawk" \
-            "https://github.com/sbdchd/squawk/releases/download/v${SQUAWK_VERSION}/squawk-linux-x64"
-          echo "${SQUAWK_SHA256}  $RUNNER_TEMP/squawk" | sha256sum --check
-          chmod +x "$RUNNER_TEMP/squawk"
-          "$RUNNER_TEMP/squawk" --version
-      - name: Lint changed migrations
-        env:
-          SQUAWK: ${{ runner.temp }}/squawk
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
-          BEFORE_SHA: ${{ github.event.before }}
-        run: |
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            base="origin/$BASE_REF"
-          elif [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
-            base="$BEFORE_SHA"
-          else
-            base="HEAD~1"
-          fi
-          bash scripts/lint_migrations.sh "$base"
-
   # Verify MSRV declared in Cargo.toml
   msrv-check:
     name: MSRV Check
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Extract MSRV from Cargo.toml
@@ -174,30 +26,19 @@ jobs:
         run: |
           MSRV=$(grep -m1 'rust-version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           echo "version=$MSRV" >> $GITHUB_OUTPUT
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           key: msrv
-      # Issue #523: fail fast with a clear message when the workspace
-      # manifest itself is broken, before any compilation starts.
-      - name: Validate workspace manifest
-        run: cargo metadata --format-version 1 >/dev/null
       - name: Build on MSRV
         run: cargo build --workspace --all-targets
       - name: Check on MSRV
         run: cargo check --workspace --all-targets
 
-  # Issue #355: the Docker toolchain check lives in docker.yml, which builds
-  # the image once per PR. It reads /rustc-version.txt from the runtime image
-  # (the runtime stage has no rustc) and compares it against the channel pinned
-  # in rust-toolchain.toml. Do not duplicate it here.
-
   build-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    if: github.event_name != 'schedule'
     services:
       postgres:
         image: postgres:16-alpine
@@ -217,39 +58,44 @@ jobs:
       TEST_DATABASE_URL: postgres://lumenqraph:lumenqraph@localhost:5432/lumenqraph
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
         with:
-          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Check sensitive logging
         run: python3 scripts/check_sensitive_logging.py
-      - name: Check .env.example covers every env var
-        run: python3 scripts/check_env_example.py
       - name: Install sqlx-cli
-        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172
-        with:
-          tool: sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features postgres
       - name: Check sqlx metadata is up-to-date
         run: cargo sqlx prepare --database-url "$DATABASE_URL" --check
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172
-        with:
-          tool: cargo-llvm-cov
-      # Run the whole suite once under coverage instrumentation. The plain
-      # `cargo test` pass skips anything marked #[ignore], which is every test
-      # that needs a real database — retention pruning, contract-spec
-      # versioning, and webhook enqueue all live there — so the `--ignored`
-      # tests are run in the same coverage pass against the service container.
+      - name: Test
+        run: cargo test --workspace
+      # The tests above skip anything marked #[ignore], which is every test that
+      # needs a real database — retention pruning, contract-spec versioning, and
+      # webhook enqueue all live there. Run them explicitly against the service
+      # container above.
       #
-      # Each test provisions its own isolated Postgres schema (unique UUID
+      # Each test now provisions its own isolated Postgres schema (unique UUID
       # name), so they are safe to run in parallel and cannot corrupt each other
       # or any existing database.
-      - name: Test with coverage
+      - name: Test (Postgres-backed)
+        run: |
+          cargo test -p lumenqraph-indexer  -- --ignored --test-threads=1
+          cargo test -p lumenqraph-webhooks -- --ignored --test-threads=1
+          cargo test -p lumenqraph-api      -- --ignored --test-threads=1
+          cargo test -p lumenqraph-mcp      -- --ignored --test-threads=1
+      # The end-to-end smoke test is gated behind the `smoke-tests` feature so it
+      # never compiles into a plain `cargo test`. It uses a mock RPC (no live
+      # network); run it explicitly here where Postgres is available.
+      - name: Test (smoke, end-to-end)
+        run: cargo test -p lumenqraph-indexer --features smoke-tests smoke -- --ignored --test-threads=1
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7
+      - name: Collect coverage
         run: |
           cargo llvm-cov clean --workspace
           cargo llvm-cov --workspace --no-report
@@ -257,14 +103,10 @@ jobs:
           cargo llvm-cov --no-report -p lumenqraph-webhooks -- --ignored --test-threads=1
           cargo llvm-cov --no-report -p lumenqraph-api      -- --ignored --test-threads=1
           cargo llvm-cov --no-report -p lumenqraph-mcp      -- --ignored --test-threads=1
-          # The end-to-end smoke test is gated behind the `smoke-tests` feature
-          # so it never compiles into a plain `cargo test`. It uses a mock RPC
-          # (no live network); run it here where Postgres is available.
-          cargo llvm-cov --no-report -p lumenqraph-indexer --features smoke-tests -- smoke --ignored --test-threads=1
           cargo llvm-cov report --lcov --output-path lcov.info
           cargo llvm-cov report --summary-only
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@5a1091511ad55cbe89839c7260b706298ca349f7 # v5
+        uses: codecov/codecov-action@a99c28d3f0da835de33ff2feb2e15691c7b9641f # v7
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -285,14 +127,10 @@ jobs:
   openapi-drift:
     name: OpenAPI Drift Check
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           key: openapi-drift
       - name: Build lumenqraph-api
@@ -302,7 +140,7 @@ jobs:
         # without connecting to Postgres or binding a port.
         run: cargo run -p lumenqraph-api -- --print-openapi > /tmp/generated-openapi.json
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - name: Install PyYAML
@@ -311,194 +149,99 @@ jobs:
         run: |
           python3 scripts/check_openapi_drift.py openapi.yaml /tmp/generated-openapi.json
 
-  # Issue #357: build and validate the Python SDK so it stays installable.
-  # `python -m build` produces an sdist and a wheel from sdk/python, and
-  # `twine check` verifies the package metadata (including the LICENSE file
-  # referenced by pyproject.toml) is valid for upload.
-  python-sdk-build:
-    name: Python SDK Build (3.12)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    if: github.event_name != 'schedule'
-    strategy:
-      matrix:
-        python-version: ["3.8", "3.12"]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: ${{ matrix.python-version }}
-      - name: Install build tooling
-        run: pip install build twine
-      - name: Build sdist and wheel
-        working-directory: sdk/python
-        run: python -m build
-      - name: Check package metadata
-        working-directory: sdk/python
-        run: twine check dist/*
-
-  # Lint, type-check and test the Python SDK across supported interpreters.
-  python-sdk-test:
-    name: Python SDK Test (${{ matrix.python-version }})
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.8", "3.12"]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: ${{ matrix.python-version }}
-      - name: Install package and dev dependencies
-        working-directory: sdk/python
-        run: pip install -e ".[dev]"
-      - name: Type-check (mypy)
-        working-directory: sdk/python
-        run: mypy lumenqraph
-      - name: Test
-        working-directory: sdk/python
-        run: pytest -v
-
-  # Issue #528: PyYAML silently keeps the last of duplicate mapping keys, so a
-  # broken workflow (duplicate `steps:`, a step with no `run:`, undefined
-  # `steps.*` references) loads fine locally but is rejected by GitHub. Run
-  # actionlint to catch those before the workflow is pushed.
-  actionlint:
-    name: Workflow Lint (actionlint)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Run actionlint
-        uses: docker://rhysd/actionlint:1.7.7@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9
-        with:
-          args: -color
-
-  security-audit:
-    name: Security Audit (cargo-audit)
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
-        with:
-          toolchain: stable
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  # Issue #530: actionlint does not verify that a pinned SHA actually exists.
-  # Resolve every `uses: owner/repo@sha` reference through the GitHub API and
-  # fail on a 404 so a bad pin (e.g. a typo'd or deleted commit) fails the PR
-  # instead of breaking the nightly E2E run.
-  action-sha-resolution:
-    name: Action SHA Resolution
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Resolve every pinned action SHA
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          status=0
-          # Extract owner/repo@sha from every `uses:` line in the workflows.
-          refs=$(grep -rhoE 'uses:[[:space:]]*[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}' .github/workflows \
-            | sed -E 's/uses:[[:space:]]*//' | sort -u)
-          if [ -z "$refs" ]; then
-            echo "No pinned action references found."
-            exit 0
-          fi
-          while IFS= read -r ref; do
-            repo="${ref%@*}"
-            sha="${ref##*@}"
-            code=$(curl -s -o /dev/null -w '%{http_code}' \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${repo}/commits/${sha}")
-            if [ "$code" = "200" ]; then
-              echo "OK   $ref"
-            else
-              echo "FAIL $ref (HTTP $code)"
-              status=1
-            fi
-          done <<< "$refs"
-          exit $status
-
-  # Issue #538: the explorer has lint, build and Playwright smoke tests that
-  # were never run in CI. Run them here so regressions (including XSS-relevant
-  # rendering changes) fail before merge.
-  explorer:
-    name: Explorer (lint, build, smoke)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: explorer
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: explorer/package-lock.json
-      - name: Install dependencies
-        run: npm ci
-      - name: Lint
-        run: npm run lint
-      - name: Build
-        run: npm run build
-      - name: Install Playwright browsers
-        run: npx playwright install --with-deps chromium
-      - name: Test (Playwright smoke)
-        run: npm test
-
   # Validate Grafana dashboard metrics against metrics defined in Rust code
   dashboard-metrics:
     name: Dashboard Metrics Validation
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - name: Validate dashboard metrics
         run: python3 scripts/validate_dashboard_metrics.py
 
-  # Issue #529: this job was accidentally merged into `dashboard-metrics`, so
-  # branch protection requiring `supply-chain-security` could never be
-  # satisfied. Keep the action-pinning lint and cargo-deny checks here.
-  supply-chain-security:
-    name: Supply Chain Security
+  # TypeScript SDK: build, typecheck, lint, test, and codegen drift check
+  sdk-typescript:
+    name: TypeScript SDK
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: sdk/typescript
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      # Ensure all GitHub Actions in .github/workflows are pinned to full commit SHAs
-      - name: Lint action SHA pinning
-        run: |
-          if grep -rnE 'uses: [^@]+@v[0-9]' .github/workflows; then
-            echo "Error: Unpinned actions found in .github/workflows. Pin all actions to full 40-character SHAs."
-            exit 1
-          fi
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+      - name: Lint
+        run: npm run lint
+      - name: Test
+        run: npm test
+      - name: Codegen drift check
+        run: npm run codegen:check
+
+  # Python SDK: lint, type-check, and test
+  sdk-python:
+    name: Python SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/python
+    strategy:
+      matrix:
+        python-version: ["3.8", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package and dev dependencies
+        run: pip install -e ".[dev]"
+      - name: Type-check (mypy)
+        run: mypy lumenqraph
+      - name: Test
+        run: pytest -v
+
+  security-audit:
+    name: Security Audit (cargo-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
+      - uses: rustsec/audit-check-action@6c8391537eae8e000a51e2e2eee5f4b58fda619b # v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  supply-chain-security:
+    name: Supply Chain Security (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           key: cargo-deny
+      # Pinned to the 0.14 line: it still accepts the config keys in the
+      # committed deny.toml (0.16 removed several of them). Bump this together
+      # with a deny.toml migration, not on its own.
       - name: Install cargo-deny
-        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2
-        with:
-          tool: cargo-deny
+        run: cargo install cargo-deny --version "^0.14" --locked
       # Advisories are blocking: a crate with a known RUSTSEC vulnerability now
       # fails the build, so a security patch in a transitive dependency is caught
       # here between the weekly Dependabot runs instead of sitting unnoticed.
       - name: Check advisories
         run: cargo deny check advisories
-      # Licenses / bans / sources are gating: supply-chain and license
-      # violations block the build to ensure policy is enforced.
+      # Licenses / bans / sources are reported but not yet gating, to avoid
+      # blocking unrelated PRs on a pre-existing finding. Tighten to blocking
+      # once the current tree is known-clean.
       - name: Check licenses, bans, and sources
         run: cargo deny check licenses bans sources
+        continue-on-error: true

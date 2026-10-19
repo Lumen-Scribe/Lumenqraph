@@ -25,12 +25,13 @@ if [[ -n "${PORT:-}" && -z "${API_BIND_ADDR:-}" ]]; then
 fi
 
 # ---- Run migrations FIRST ---------------------------------------------------
-# Migrations are an explicit prerequisite: the API verifies the schema at
-# startup and refuses to run against an unmigrated database, so apply them
-# before starting anything. If this step fails the whole container exits
-# immediately rather than starting a partially-configured stack.
+# The indexer would eventually run migrations itself, but the API and webhook
+# services start concurrently and may attempt database connections before the
+# schema exists on a fresh database.  Running `sqlx migrate run` here makes
+# migrations an explicit prerequisite: if this step fails the whole container
+# exits immediately rather than starting a partially-configured stack.
 echo "run-all-in-one: running database migrations…" >&2
-if ! lumenqraph-indexer migrate; then
+if ! sqlx migrate run --database-url "${DATABASE_URL}"; then
   echo "run-all-in-one: migrations FAILED — aborting startup" >&2
   exit 1
 fi
@@ -40,15 +41,12 @@ echo "run-all-in-one: migrations complete" >&2
 # services start.
 if [[ -n "${TESTNET_DATABASE_URL:-}" ]]; then
   echo "run-all-in-one: running testnet database migrations…" >&2
-  if ! DATABASE_URL="${TESTNET_DATABASE_URL}" lumenqraph-indexer migrate; then
+  if ! sqlx migrate run --database-url "${TESTNET_DATABASE_URL}"; then
     echo "run-all-in-one: testnet migrations FAILED — aborting startup" >&2
     exit 1
   fi
   echo "run-all-in-one: testnet migrations complete" >&2
 fi
-
-# Migrations have already been applied above; the indexers only verify them.
-export SKIP_MIGRATIONS=true
 
 pids=()
 
@@ -65,7 +63,6 @@ if [[ -n "${TESTNET_DATABASE_URL:-}" ]]; then
   CONTRACT_IDS="${TESTNET_CONTRACT_IDS:-}" \
   RETENTION_LEDGERS="${TESTNET_RETENTION_LEDGERS:-${RETENTION_LEDGERS:-0}}" \
   START_LEDGER=0 \
-  INDEXER_HTTP_BIND_ADDR="127.0.0.1:${TESTNET_INDEXER_HTTP_PORT:-9092}" \
     lumenqraph-indexer &
   pids+=($!)
 
@@ -81,7 +78,9 @@ if [[ -n "${TESTNET_DATABASE_URL:-}" ]]; then
 fi
 
 # ---- Primary pair ------------------------------------------------------------
-lumenqraph-indexer &
+# Migrations have already been applied above; pass SKIP_MIGRATIONS=true so the
+# indexer does not attempt to run them a second time.
+SKIP_MIGRATIONS=true lumenqraph-indexer &
 pids+=($!)
 lumenqraph-api &
 pids+=($!)

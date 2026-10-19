@@ -37,24 +37,17 @@ pub async fn health(State(state): State<AppState>) -> ApiResult<Json<Value>> {
             "network": network,
             "network_passphrase": passphrase,
             "mounts": mounts,
-            "unrecovered_missed_ranges": 0,
             "version": state.build_info.version,
             "commit": state.build_info.commit,
             "build_time": state.build_info.build_time,
         })));
     };
 
-    let unrecovered_missed_ranges: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM missed_ranges WHERE recovered_at IS NULL",
-    )
-    .fetch_one(&state.pool)
-    .await
-    .unwrap_or(0);
-
     let lag_ledgers = (tip - last).max(0);
     let secs_since_update = (chrono::Utc::now() - updated_at).num_seconds();
     // Stale if the cursor hasn't advanced recently, or we're far behind.
-    let healthy = secs_since_update <= state.health_max_stale_secs && lag_ledgers < state.health_max_lag_ledgers;
+    let healthy = secs_since_update <= state.health_max_stale_secs
+        && lag_ledgers < state.health_max_lag_ledgers;
 
     Ok(Json(json!({
         "status": if healthy { "ok" } else { "degraded" },
@@ -67,7 +60,6 @@ pub async fn health(State(state): State<AppState>) -> ApiResult<Json<Value>> {
         "seconds_since_cursor_update": secs_since_update,
         "events_ingested_total": ingested,
         "errors_total": errors,
-        "unrecovered_missed_ranges": unrecovered_missed_ranges,
         "version": state.build_info.version,
         "commit": state.build_info.commit,
         "build_time": state.build_info.build_time,
@@ -83,37 +75,27 @@ pub async fn livez() -> StatusCode {
 /// Readiness probe: returns 200 only when the indexer is caught up and healthy.
 /// Returns 503 if the database is unreachable or lag is too high.
 /// Used by orchestrators to route traffic only to ready instances.
-pub async fn readyz(State(state): State<AppState>) -> (StatusCode, Option<Json<Value>>) {
-    let status: Option<(i64, i64, i64, chrono::DateTime<chrono::Utc>)> = match sqlx::query_as(
+pub async fn readyz(State(state): State<AppState>) -> StatusCode {
+    let row: Option<(i64, i64, i64, chrono::DateTime<chrono::Utc>)> = match sqlx::query_as(
         "SELECT last_processed_ledger, chain_tip_ledger, errors_total, updated_at
          FROM indexer_cursor WHERE id = 1",
     )
     .fetch_optional(&state.pool)
     .await
     {
-        Ok(Some(row)) => Some(row),
-        Ok(None) => {
-            // Cursor not yet created; not ready
-            return (StatusCode::SERVICE_UNAVAILABLE, None);
-        }
-        Err(_) => {
-            // Database error; not ready
-            return (StatusCode::SERVICE_UNAVAILABLE, None);
-        }
+        Ok(row) => row,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE,
     };
 
-    if let Some((last, tip, errors, updated_at)) = status {
-        let lag_ledgers = (tip - last).max(0);
-        let secs_since_update = (chrono::Utc::now() - updated_at).num_seconds();
-
-        // Ready if recent activity and not too far behind
-        if secs_since_update <= state.readyz_max_age_secs && lag_ledgers < state.readyz_lag_threshold {
-            (StatusCode::OK, None)
-        } else {
-            (StatusCode::SERVICE_UNAVAILABLE, None)
-        }
+    let Some((last, tip, _errors, updated_at)) = row else {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
+    let lag_ledgers = (tip - last).max(0);
+    let secs_since_update = (chrono::Utc::now() - updated_at).num_seconds();
+    if secs_since_update <= state.readyz_max_age_secs && lag_ledgers < state.readyz_lag_threshold {
+        StatusCode::OK
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, None)
+        StatusCode::SERVICE_UNAVAILABLE
     }
 }
 

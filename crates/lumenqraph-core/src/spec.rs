@@ -32,54 +32,9 @@ pub struct ContractSpec {
     pub structs: Vec<UdtStruct>,
     pub unions: Vec<UdtUnion>,
     pub enums: Vec<UdtEnum>,
-    /// Error enums from `UdtErrorEnumV0` entries. These map numeric contract
-    /// error codes to human-readable names and doc strings.
-    pub error_enums: Vec<UdtErrorEnum>,
-    /// Error enums in the shape the interface JSON and diff consume: each
-    /// entry is a name plus its `(case_name, code)` pairs. Populated from the
-    /// same `UdtErrorEnumV0` entries as `error_enums`.
-    pub errors: Vec<UdtErrorEnum>,
     /// event name -> index into `events`, for O(1) enrichment lookups.
     #[serde(skip)]
     events_by_name: HashMap<String, usize>,
-    /// prefix-topic tuple -> index into `events`, so events that share
-    /// `topic[0]` but differ in later topics resolve independently (#402).
-    #[serde(skip)]
-    events_by_prefix: HashMap<Vec<String>, usize>,
-    /// function name -> index into `functions`, so the read layer resolves a
-    /// function to encode without scanning the whole interface.
-    #[serde(skip)]
-    functions_by_name: HashMap<String, usize>,
-    /// UDT name -> where its definition lives, so naming a value that carries a
-    /// user-defined type is one hash lookup rather than a linear scan over the
-    /// enums, then the unions, then the structs — per value, recursively.
-    #[serde(skip)]
-    udts_by_name: HashMap<String, UdtRef>,
-    /// enum index -> discriminant -> case name. Aligned with `enums`, so a bare
-    /// numeric enum value can be named without scanning that enum's cases.
-    #[serde(skip)]
-    enum_cases: Vec<HashMap<u32, String>>,
-    /// Flat map of error code -> (name, doc) across all error enums, for O(1)
-    /// error-code lookup in the read layer. Built by [`Self::reindex`].
-    #[serde(skip)]
-    error_code_index: HashMap<u32, (String, String)>,
-}
-
-/// Where a named UDT lives in the parsed spec. Recorded once by
-/// [`ContractSpec::reindex`], so resolving a UDT name never scans a list.
-#[derive(Debug, Clone, Copy)]
-enum UdtRef {
-    Enum(usize),
-    Union(usize),
-    Struct(usize),
-}
-
-/// A borrowed view of a resolved UDT definition, for callers (like the read
-/// layer's argument encoder) that need the definition rather than its index.
-pub(crate) enum UdtDef<'a> {
-    Enum(&'a UdtEnum),
-    Union(&'a UdtUnion),
-    Struct(&'a UdtStruct),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -160,119 +115,34 @@ pub struct UdtEnum {
     pub cases: Vec<(String, u32)>,
 }
 
-/// A contract error enum case, as declared by `UdtErrorEnumV0` in the spec.
-/// These map numeric error codes (returned by the contract on failure) to
-/// human-readable names and optional doc strings.
-#[derive(Debug, Clone, Serialize)]
-pub struct ErrorCase {
-    pub name: String,
-    pub code: u32,
-    pub doc: String,
-}
-
-/// A parsed contract error enum (from `ScSpecEntry::UdtErrorEnumV0`).
-#[derive(Debug, Clone, Serialize)]
-pub struct UdtErrorEnum {
-    pub name: String,
-    pub cases: Vec<ErrorCase>,
-}
-
-/// The result of parsing a `contractspecv0` XDR section (#401).
-///
-/// `complete = false` means one or more entries were skipped (unknown
-/// discriminant, exceeded XDR limits, or truncated bytes). The `spec`
-/// still contains all entries that *were* successfully decoded.
-#[derive(Debug, Clone)]
-pub struct ParsedSpec {
-    pub spec: ContractSpec,
-    /// `true` when every byte in the section decoded successfully.
-    pub complete: bool,
-    /// Number of entries that could not be decoded.
-    pub skipped_entries: usize,
-    /// The first parse error encountered, for logging.
-    pub error: Option<String>,
-}
-
 impl ContractSpec {
     /// Parse a contract's interface out of its deployed WASM. Returns `None` if
     /// the module carries no `contractspecv0` section (e.g. a Stellar Asset
     /// Contract) or the section can't be parsed.
-    ///
-    /// Returns a [`ParsedSpec`] so callers know whether the section was fully
-    /// decoded (#401). Use [`Self::from_wasm_simple`] to get just the spec.
-    pub fn from_wasm(wasm: &[u8]) -> Option<ParsedSpec> {
+    pub fn from_wasm(wasm: &[u8]) -> Option<Self> {
         let section = spec_section_of(wasm)?;
         Self::from_spec_xdr(section)
     }
 
-    /// Convenience wrapper: parse and return just the `ContractSpec`.
-    pub fn from_wasm_simple(wasm: &[u8]) -> Option<Self> {
-        Self::from_wasm(wasm).map(|p| p.spec)
-    }
-
     /// Parse a concatenated stream of XDR `ScSpecEntry` (the raw section body).
-    ///
-    /// Uses bounded XDR limits (#400) to guard against crafted spec sections with
-    /// deeply-nested type recursion or huge declared lengths that would overflow the
-    /// stack or force large allocations. The limits mirror soroban-env's defaults:
-    /// depth = 500, len = size of the input (tightly bounded to the actual WASM
-    /// section length so a small section cannot claim a huge allocation).
-    ///
-    /// Returns a [`ParsedSpec`] indicating whether the section was fully parsed or
-    /// truncated (#401). Callers should check `complete` before diffing.
-    pub fn from_spec_xdr(bytes: &[u8]) -> Option<ParsedSpec> {
-        // Cap the XDR length limit to the actual byte slice to prevent a spec that
-        // declares huge lengths from forcing allocations beyond what is on-chain.
-        let xdr_limits = Limits {
-            depth: 500,
-            len: bytes.len().max(1),
-        };
+    pub fn from_spec_xdr(bytes: &[u8]) -> Option<Self> {
         let mut spec = ContractSpec::default();
-        let mut skipped_entries: usize = 0;
-        let mut first_error: Option<String> = None;
-        let mut complete = true;
-
         // The section is a back-to-back sequence of ScSpecEntry with no outer
         // length prefix; the iterator reads entries until the stream is drained.
-        let mut limited = Limited::new(bytes, xdr_limits);
+        let mut limited = Limited::new(bytes, Limits::none());
         for entry in ScSpecEntry::read_xdr_iter(&mut limited) {
             match entry {
                 Ok(e) => spec.push_entry(e),
-                Err(e) => {
-                    // #401: record the first error but keep parsing past unknown
-                    // discriminants when possible, rather than stopping entirely.
-                    if first_error.is_none() {
-                        first_error = Some(e.to_string());
-                    }
-                    skipped_entries += 1;
-                    complete = false;
-                    // Exceeded limits (#400) — this is unrecoverable; stop now.
-                    if e.to_string().contains("ExceededLimit") {
-                        break;
-                    }
-                    // For other errors (unknown discriminant, truncated entry),
-                    // continue iterating — the XDR iterator may be able to resync.
-                }
+                // A trailing partial / unrecognised entry ends parsing; keep what we have.
+                Err(_) => break,
             }
         }
         if spec.is_empty() {
             None
         } else {
             spec.reindex();
-            Some(ParsedSpec {
-                spec,
-                complete,
-                skipped_entries,
-                error: first_error,
-            })
+            Some(spec)
         }
-    }
-
-    /// Convenience wrapper: parse and return just the `ContractSpec`, ignoring
-    /// completeness metadata. Existing callers that do not need to diff can use
-    /// this without change.
-    pub fn from_spec_xdr_simple(bytes: &[u8]) -> Option<Self> {
-        Self::from_spec_xdr(bytes).map(|p| p.spec)
     }
 
     fn is_empty(&self) -> bool {
@@ -281,120 +151,22 @@ impl ContractSpec {
             && self.structs.is_empty()
             && self.unions.is_empty()
             && self.enums.is_empty()
-            && self.error_enums.is_empty()
-            && self.errors.is_empty()
     }
 
     fn reindex(&mut self) {
-        // Key each event by its full prefix-topic tuple so that events sharing
-        // topic[0] but differing in topic[1..] resolve independently.
-        // The declared name (and, for compatibility, topic[0] alone) are kept
-        // as fallback keys so callers looking up by name still work.
-        self.events_by_prefix.clear();
-        for (i, e) in self.events.iter().enumerate() {
-            if !e.prefix_topics.is_empty() {
-                // Full tuple — inserted unconditionally so the last declaration
-                // wins (consistent with the old single-key behaviour).
-                self.events_by_prefix
-                    .insert(e.prefix_topics.clone(), i);
-            }
-        }
-
+        // Key each event by what shows up as `topic[0]` on-chain: its first
+        // prefix topic. The declared name is kept as a fallback key, both for
+        // events whose prefix simply is their name and for callers looking an
+        // event up by name (the prefix key wins on collision).
         self.events_by_name.clear();
         for (i, e) in self.events.iter().enumerate() {
-            // Declared name first (or_insert = first declaration wins).
             self.events_by_name.entry(e.name.clone()).or_insert(i);
         }
         for (i, e) in self.events.iter().enumerate() {
-            // topic[0] as a single-element fallback key so that callers passing
-            // the first on-chain symbol still match when there is only one spec
-            // with that prefix.
             if let Some(first) = e.prefix_topics.first() {
                 self.events_by_name.insert(first.clone(), i);
             }
         }
-
-        // Functions are looked up by name on every `/call`; first declaration
-        // wins, matching the previous linear `find`.
-        self.functions_by_name.clear();
-        for (i, f) in self.functions.iter().enumerate() {
-            self.functions_by_name.entry(f.name.clone()).or_insert(i);
-        }
-
-        // UDT names are resolved for every nested value during enrichment and
-        // for every `Udt` argument during encoding. The three kinds are indexed
-        // in the order the old scans probed them (enum, union, struct), so a
-        // name that appears in more than one kind resolves exactly as before.
-        self.udts_by_name.clear();
-        for (i, e) in self.enums.iter().enumerate() {
-            self.udts_by_name
-                .entry(e.name.clone())
-                .or_insert(UdtRef::Enum(i));
-        }
-        for (i, u) in self.unions.iter().enumerate() {
-            self.udts_by_name
-                .entry(u.name.clone())
-                .or_insert(UdtRef::Union(i));
-        }
-        for (i, s) in self.structs.iter().enumerate() {
-            self.udts_by_name
-                .entry(s.name.clone())
-                .or_insert(UdtRef::Struct(i));
-        }
-
-        // Discriminant -> case name, per enum. Kept parallel to `enums` (rather
-        // than keyed by name) so duplicate names can't shadow one another.
-        self.enum_cases.clear();
-        for e in &self.enums {
-            let mut cases: HashMap<u32, String> = HashMap::with_capacity(e.cases.len());
-            for (name, value) in &e.cases {
-                cases.insert(*value, name.clone());
-            }
-            self.enum_cases.push(cases);
-        }
-
-        // Build the flat error code -> (name, doc) index from all error enums.
-        // If the same code appears in multiple error enums (unlikely but valid),
-        // the last declaration wins — consistent with declaration order in the spec.
-        self.error_code_index.clear();
-        for error_enum in &self.error_enums {
-            for case in &error_enum.cases {
-                self.error_code_index
-                    .insert(case.code, (case.name.clone(), case.doc.clone()));
-            }
-        }
-    }
-
-    /// Resolve a callable function by name. Built by [`Self::reindex`], so this
-    /// is a hash lookup rather than a scan over the interface.
-    pub(crate) fn function(&self, name: &str) -> Option<&FunctionSpec> {
-        self.functions_by_name
-            .get(name)
-            .map(|&i| &self.functions[i])
-    }
-
-    /// Resolve a UDT name to its definition, or `None` when the spec doesn't
-    /// declare it. Built by [`Self::reindex`], so this is a hash lookup.
-    pub(crate) fn udt_def(&self, name: &str) -> Option<UdtDef<'_>> {
-        match *self.udts_by_name.get(name)? {
-            UdtRef::Enum(i) => Some(UdtDef::Enum(&self.enums[i])),
-            UdtRef::Union(i) => Some(UdtDef::Union(&self.unions[i])),
-            UdtRef::Struct(i) => Some(UdtDef::Struct(&self.structs[i])),
-        }
-    }
-
-    /// Look up a contract error code in the error-enum section of the spec.
-    ///
-    /// Returns `Some((name, doc))` when the code is declared in a
-    /// `UdtErrorEnumV0` entry, or `None` when the code is unknown (in which
-    /// case the caller should fall back to showing the numeric code).
-    ///
-    /// This is the key piece for issue #418: turning `Error(Contract, #6)` into
-    /// `InsufficientAllowance` when the spec declares it.
-    pub fn resolve_error_code(&self, code: u32) -> Option<(&str, &str)> {
-        self.error_code_index
-            .get(&code)
-            .map(|(name, doc)| (name.as_str(), doc.as_str()))
     }
 
     fn push_entry(&mut self, entry: ScSpecEntry) {
@@ -483,27 +255,8 @@ impl ContractSpec {
                     },
                 });
             }
-            // Error enums carry numeric codes → names, used by the read layer
-            // to map `Error(Contract, #N)` to the declared case name.
-            ScSpecEntry::UdtErrorEnumV0(e) => {
-                let name = string_of(&e.name);
-                let cases: Vec<ErrorCase> = e
-                    .cases
-                    .iter()
-                    .map(|c| ErrorCase {
-                        name: string_of(&c.name),
-                        code: c.value,
-                        doc: string_of(&c.doc),
-                    })
-                    .collect();
-                self.error_enums.push(UdtErrorEnum {
-                    name: name.clone(),
-                    cases: cases.clone(),
-                });
-                // Mirror into `errors`, the shape the interface JSON and diff
-                // consume (name + cases).
-                self.errors.push(UdtErrorEnum { name, cases });
-            }
+            // Error enums carry no data useful for event enrichment.
+            ScSpecEntry::UdtErrorEnumV0(_) => {}
         }
     }
 
@@ -516,44 +269,13 @@ impl ContractSpec {
     /// matching event spec. `decoded_topics[0]` is expected to be the event
     /// name symbol; the remaining topics and `decoded_value` are already-decoded
     /// JSON from the generic decoder. Returns `None` when no spec matches.
-    ///
-    /// Matching strategy:
-    /// 1. Build the decoded prefix-topic tuple from `decoded_topics` and
-    ///    look it up in `events_by_prefix`. Prefer the longest-prefix match so
-    ///    ["pool","deposit"] wins over ["pool"] when both exist.
-    /// 2. Fall back to the name-only index only when no prefix match was found.
     pub fn enrich_event(
         &self,
         event_name: &str,
         decoded_topics: &[Value],
         decoded_value: &Value,
     ) -> Option<Value> {
-        // Collect the leading string topics so we can try prefix-tuple matches.
-        let topic_strings: Vec<String> = decoded_topics
-            .iter()
-            .map_while(|v| v.as_str().map(str::to_owned))
-            .collect();
-
-        // Try longest-prefix match first: an event with ["pool","deposit"] must
-        // win over one with ["pool"] when the on-chain topics are
-        // ["pool","deposit","…"].
-        let mut best: Option<usize> = None;
-        let mut best_len = 0usize;
-        for (prefix, &idx) in &self.events_by_prefix {
-            let plen = prefix.len();
-            if plen > 0
-                && plen <= topic_strings.len()
-                && topic_strings[..plen] == prefix[..]
-                && plen >= best_len
-            {
-                best = Some(idx);
-                best_len = plen;
-            }
-        }
-
-        // Fall back to the name index when no prefix matched.
-        let spec_idx = best.or_else(|| self.events_by_name.get(event_name).copied())?;
-        let spec = self.events.get(spec_idx)?;
+        let spec = self.events.get(*self.events_by_name.get(event_name)?)?;
 
         // Topic params bind to topics after the emitted prefix symbols; data
         // params bind to the event body according to the declared data format.
@@ -641,127 +363,85 @@ impl ContractSpec {
                 ),
                 _ => v.clone(),
             },
-            T::Map(m) => match v {
-                // String-keyed map: the generic decoder produces a JSON object.
-                Value::Object(o) => Value::Object(
+            T::Map(m) => match v.as_object() {
+                Some(o) => Value::Object(
                     o.iter()
                         .map(|(k, val)| (k.clone(), self.relabel(val, &m.value_type)))
                         .collect(),
                 ),
-                // Non-string-keyed map: the generic decoder produces an array
-                // of `{"key": …, "val": …}` pairs. Relabel both sides.
-                Value::Array(a) => Value::Array(
-                    a.iter()
-                        .map(|item| {
-                            if let (Some(k), Some(val_v)) =
-                                (item.get("key"), item.get("val"))
-                            {
-                                json!({
-                                    "key": self.relabel(k, &m.key_type),
-                                    "val": self.relabel(val_v, &m.value_type),
-                                })
-                            } else {
-                                item.clone()
-                            }
-                        })
-                        .collect(),
-                ),
-                _ => v.clone(),
+                None => v.clone(),
             },
-            T::Result(r) => {
-                // The generic decoder represents `Ok(v)` as `{"Ok": v}` and
-                // `Err(e)` as `{"Err": e}` (both as single-key objects).
-                // Relabel the inner value with its declared type so UDTs nested
-                // inside a Result are named, and error codes map to names.
-                if let Some(ok_val) = v.get("Ok") {
-                    let labelled = self.relabel(ok_val, &r.ok_type);
-                    json!({ "Ok": labelled })
-                } else if let Some(err_val) = v.get("Err") {
-                    let labelled = self.relabel(err_val, &r.error_type);
-                    json!({ "Err": labelled })
-                } else {
-                    v.clone()
-                }
-            }
             T::Udt(u) => self.relabel_udt(v, &u.name.to_utf8_string_lossy()),
             _ => v.clone(),
         }
     }
 
     fn relabel_udt(&self, v: &Value, udt_name: &str) -> Value {
-        // Resolve the name once, via the index `reindex` built. This used to be
-        // three linear scans (enums, then unions, then structs) for every value.
-        match self.udts_by_name.get(udt_name).copied() {
-            // A unit enum decodes to its discriminant; swap in the case name.
-            Some(UdtRef::Enum(i)) => {
-                if let (Some(n), Some(cases)) = (v.as_u64(), self.enum_cases.get(i)) {
-                    if let Some(case) = u32::try_from(n).ok().and_then(|n| cases.get(&n)) {
-                        return Value::String(case.clone());
-                    }
+        // A unit enum decodes to its discriminant; swap in the case name.
+        if let Some(e) = self.enums.iter().find(|e| e.name == udt_name) {
+            if let Some(n) = v.as_u64() {
+                if let Some((case, _)) = e.cases.iter().find(|(_, val)| u64::from(*val) == n) {
+                    return Value::String(case.clone());
                 }
-                v.clone()
             }
+            return v.clone();
+        }
 
-            // A union decodes to [Symbol(case), ..values]; key it by the case
-            // name, which is also the shape the read layer accepts back as input.
-            Some(UdtRef::Union(i)) => {
-                let u = &self.unions[i];
-                let Some(items) = v.as_array() else {
-                    return v.clone();
-                };
-                let Some(Value::String(case_name)) = items.first() else {
-                    return v.clone();
-                };
-                let Some(case) = u.cases.iter().find(|c| &c.name == case_name) else {
-                    return v.clone();
-                };
-                let values = &items[1..];
-                if case.tys.is_empty() {
-                    return Value::String(case.name.clone());
-                }
-                if values.len() != case.tys.len() {
-                    return v.clone();
-                }
-                let labelled: Vec<Value> = values
-                    .iter()
-                    .zip(case.tys.iter())
-                    .map(|(el, et)| self.relabel(el, et))
-                    .collect();
-                json!({ case.name.clone(): labelled })
+        // A union decodes to [Symbol(case), ..values]; key it by the case name,
+        // which is also the shape the read layer accepts back as input.
+        if let Some(u) = self.unions.iter().find(|u| u.name == udt_name) {
+            let Some(items) = v.as_array() else {
+                return v.clone();
+            };
+            let Some(Value::String(case_name)) = items.first() else {
+                return v.clone();
+            };
+            let Some(case) = u.cases.iter().find(|c| &c.name == case_name) else {
+                return v.clone();
+            };
+            let values = &items[1..];
+            if case.tys.is_empty() {
+                return Value::String(case.name.clone());
             }
+            if values.len() != case.tys.len() {
+                return v.clone();
+            }
+            let labelled: Vec<Value> = values
+                .iter()
+                .zip(case.tys.iter())
+                .map(|(el, et)| self.relabel(el, et))
+                .collect();
+            return json!({ case.name.clone(): labelled });
+        }
 
-            // A struct already decodes to a field-named object (or a positional
-            // vec for a tuple struct); recurse so nested UDTs get named too.
-            Some(UdtRef::Struct(i)) => {
-                let s = &self.structs[i];
-                if let Some(o) = v.as_object() {
-                    return Value::Object(
-                        o.iter()
-                            .map(|(k, val)| {
-                                let relabelled = match s.fields.iter().find(|f| &f.name == k) {
-                                    Some(f) => self.relabel(val, &f.ty),
-                                    None => val.clone(),
-                                };
-                                (k.clone(), relabelled)
-                            })
+        // A struct already decodes to a field-named object (or a positional vec
+        // for a tuple struct); recurse so nested UDTs inside it get named.
+        if let Some(s) = self.structs.iter().find(|s| s.name == udt_name) {
+            if let Some(o) = v.as_object() {
+                return Value::Object(
+                    o.iter()
+                        .map(|(k, val)| {
+                            let relabelled = match s.fields.iter().find(|f| &f.name == k) {
+                                Some(f) => self.relabel(val, &f.ty),
+                                None => val.clone(),
+                            };
+                            (k.clone(), relabelled)
+                        })
+                        .collect(),
+                );
+            }
+            if let Some(a) = v.as_array() {
+                if a.len() == s.fields.len() {
+                    return Value::Array(
+                        a.iter()
+                            .zip(s.fields.iter())
+                            .map(|(el, f)| self.relabel(el, &f.ty))
                             .collect(),
                     );
                 }
-                if let Some(a) = v.as_array() {
-                    if a.len() == s.fields.len() {
-                        return Value::Array(
-                            a.iter()
-                                .zip(s.fields.iter())
-                                .map(|(el, f)| self.relabel(el, &f.ty))
-                                .collect(),
-                        );
-                    }
-                }
-                v.clone()
             }
-
-            None => v.clone(),
         }
+        v.clone()
     }
 
     /// A stable JSON view of the whole interface, for `GET /contracts/:id/interface`.
@@ -772,7 +452,6 @@ impl ContractSpec {
             "structs": self.structs,
             "unions": self.unions,
             "enums": self.enums,
-            "errors": self.errors,
         })
     }
 }
@@ -999,7 +678,7 @@ mod tests {
     #[test]
     fn enriches_a_transfer_event() {
         let body = spec_section(&[transfer_event_entry()]);
-        let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
+        let spec = ContractSpec::from_spec_xdr(&body).unwrap();
 
         let topics = vec![json!("transfer"), json!("GFROM"), json!("GTO")];
         let value = json!("105000000");
@@ -1016,7 +695,7 @@ mod tests {
     #[test]
     fn unknown_event_is_not_enriched() {
         let body = spec_section(&[transfer_event_entry()]);
-        let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
+        let spec = ContractSpec::from_spec_xdr(&body).unwrap();
         assert!(spec
             .enrich_event("mint", &[json!("mint")], &json!(1))
             .is_none());
@@ -1258,38 +937,6 @@ mod tests {
             let out = enrich(&entries, json!(["Bid", 7, 9]));
             assert_eq!(out["params"]["status"]["value"], json!(["Bid", 7, 9]));
         }
-
-        /// A single-variant unit enum, used to give the type list real length.
-        fn padding_enum(name: &str) -> ScSpecEntry {
-            ScSpecEntry::UdtEnumV0(ScSpecUdtEnumV0 {
-                doc: "".try_into().unwrap(),
-                lib: "".try_into().unwrap(),
-                name: name.try_into().unwrap(),
-                cases: vec![ScSpecUdtEnumCaseV0 {
-                    doc: "".try_into().unwrap(),
-                    name: "Only".try_into().unwrap(),
-                    value: 0,
-                }]
-                .try_into()
-                .unwrap(),
-            })
-        }
-
-        /// The name index must cover every declared UDT, not just the ones near
-        /// the front: large contracts declare dozens of types before the one an
-        /// event nests, and a half-built index would silently stop labelling.
-        #[test]
-        fn nested_udts_resolve_when_declared_after_many_others() {
-            let mut entries: Vec<ScSpecEntry> = Vec::new();
-            for i in 0..64 {
-                entries.push(padding_enum(&format!("Padding{i}")));
-            }
-            entries.push(status_enum());
-            entries.push(changed_event(udt("Status")));
-
-            let out = enrich(&entries, json!(7));
-            assert_eq!(out["params"]["status"]["value"], "Filled");
-        }
     }
 
     mod enrich_event_negative_cases {
@@ -1302,7 +949,7 @@ mod tests {
         #[test]
         fn enrichment_returns_none_for_unknown_event() {
             let body = spec_section(&[transfer_event_entry()]);
-            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
             assert!(spec
                 .enrich_event("unknown", &[json!("unknown")], &json!(0))
                 .is_none());
@@ -1311,7 +958,7 @@ mod tests {
         #[test]
         fn enrichment_with_fewer_topics_than_expected_fills_with_null() {
             let body = spec_section(&[transfer_event_entry()]);
-            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
 
             // Only one topic when we expect two (from, to)
             let topics = vec![json!("transfer"), json!("GFROM")];
@@ -1327,7 +974,7 @@ mod tests {
         #[test]
         fn enrichment_with_more_topics_than_expected_ignores_extra() {
             let body = spec_section(&[transfer_event_entry()]);
-            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
 
             // Extra topics beyond what the spec expects
             let topics = vec![
@@ -1381,7 +1028,7 @@ mod tests {
             });
 
             let body = spec_section(&[vec_event]);
-            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
 
             let topics = vec![json!("mint"), json!("GTO")];
             let value = json!(["105000000", "1234567890"]);
@@ -1423,7 +1070,7 @@ mod tests {
             });
 
             let body = spec_section(&[map_event]);
-            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
 
             let topics = vec![json!("transfer"), json!("GFROM")];
             let value = json!({"amount": "100000"});
@@ -1456,7 +1103,7 @@ mod tests {
             });
 
             let body = spec_section(&[vec_event]);
-            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
 
             // Data is not a vec (it's a single value)
             let topics = vec![json!("mint")];
@@ -1514,7 +1161,7 @@ mod tests {
             });
 
             let body = spec_section(&[position_struct, position_event]);
-            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
 
             let topics = vec![json!("opened")];
             let value = json!({"borrower": "GBORROW", "debt": "50000"});
@@ -1531,7 +1178,7 @@ mod tests {
             // If a value doesn't match what the spec expects, it should be
             // returned unchanged rather than being lost or corrupted
             let body = spec_section(&[transfer_event_entry()]);
-            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
 
             // Pass a number where an address is expected - should still enrich
             let topics = vec![json!("transfer"), json!(123), json!(456)];
@@ -1569,7 +1216,7 @@ mod tests {
             });
 
             let body = spec_section(&[optional_event]);
-            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
 
             let topics = vec![json!("optional_test")];
             let value = Value::Null;
@@ -1605,7 +1252,7 @@ mod tests {
             });
 
             let body = spec_section(&[optional_event]);
-            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
 
             let topics = vec![json!("optional_test")];
             let value = json!("42");
@@ -1613,414 +1260,6 @@ mod tests {
 
             assert_eq!(enriched["params"]["value"]["value"], "42");
             assert_eq!(enriched["params"]["value"]["type"], "Option<i128>");
-        }
-    
-    // ── #400: bounded XDR limits ─────────────────────────────────────────────
-
-    /// Build a maximally-nested Option<Option<...<I128>...>> ScSpecTypeDef.
-    fn deeply_nested_type(depth: usize) -> ScSpecTypeDef {
-        let mut ty = ScSpecTypeDef::I128;
-        for _ in 0..depth {
-            ty = ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
-                value_type: Box::new(ty),
-            }));
-        }
-        ty
-    }
-
-    #[test]
-    fn bounded_limits_do_not_panic_on_deep_nesting() {
-        // Build a spec with a 10 000-deep nested type to verify #400 — parsing
-        // must return None (or a partial result) without panicking or overflowing.
-        use stellar_xdr::curr::{ScSpecFunctionV0, ScSpecFunctionInputV0, WriteXdr, Limits};
-
-        let fn_entry = ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
-            doc: "".try_into().unwrap(),
-            name: ScSymbol("deep".try_into().unwrap()),
-            inputs: vec![ScSpecFunctionInputV0 {
-                doc: "".try_into().unwrap(),
-                name: "x".try_into().unwrap(),
-                type_: deeply_nested_type(10_000),
-            }]
-            .try_into()
-            .unwrap(),
-            outputs: vec![].try_into().unwrap(),
-        });
-
-        // Serialise with no limits (we're constructing the attacker payload).
-        let mut body = Vec::new();
-        fn_entry.to_xdr(&mut body, Limits::none()).ok();
-
-        // Parsing with bounded limits must not panic, stack-overflow, or OOM.
-        // It may return None (limits exceeded) or Some partial spec.
-        let result = std::panic::catch_unwind(|| {
-            ContractSpec::from_spec_xdr(&body)
-        });
-        assert!(result.is_ok(), "from_spec_xdr panicked on deeply-nested input");
-    }
-
-    // ── #401: partial parse / incomplete spec ─────────────────────────────────
-
-    #[test]
-    fn partial_spec_returns_incomplete_flag() {
-        use stellar_xdr::curr::{ScSpecFunctionV0, WriteXdr, Limits};
-
-        // A valid function entry followed by garbage bytes.
-        let good_entry = ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
-            doc: "".try_into().unwrap(),
-            name: ScSymbol("ok_fn".try_into().unwrap()),
-            inputs: vec![].try_into().unwrap(),
-            outputs: vec![].try_into().unwrap(),
-        });
-
-        let mut body = Vec::new();
-        good_entry.to_xdr(&mut body, Limits::none()).unwrap();
-        // Append garbage that will fail to decode.
-        body.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x01]);
-
-        let result = ContractSpec::from_spec_xdr(&body);
-        assert!(result.is_some(), "expected Some partial spec");
-        let parsed = result.unwrap();
-        // The good function should be present.
-        assert_eq!(parsed.spec.functions.len(), 1);
-        assert_eq!(parsed.spec.functions[0].name, "ok_fn");
-        // The section is not complete because of the trailing garbage.
-        assert!(!parsed.complete, "expected complete=false for partial parse");
-        assert!(parsed.skipped_entries > 0);
-    }
-
-    #[test]
-    fn fully_valid_spec_is_marked_complete() {
-        use stellar_xdr::curr::{ScSpecFunctionV0, WriteXdr, Limits};
-
-        let fn_entry = ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
-            doc: "".try_into().unwrap(),
-            name: ScSymbol("my_fn".try_into().unwrap()),
-            inputs: vec![].try_into().unwrap(),
-            outputs: vec![].try_into().unwrap(),
-        });
-
-        let mut body = Vec::new();
-        fn_entry.to_xdr(&mut body, Limits::none()).unwrap();
-
-        let parsed = ContractSpec::from_spec_xdr(&body).expect("should parse");
-        assert!(parsed.complete, "a clean spec should be marked complete");
-        assert_eq!(parsed.skipped_entries, 0);
-    }
-    }
-
-    // ── #402: shared-prefix event matching ───────────────────────────────────
-
-    mod shared_prefix_events {
-        use super::*;
-        use stellar_xdr::curr::{
-            ScSpecEventDataFormat, ScSpecEventParamLocationV0, ScSpecEventParamV0, ScSpecEventV0,
-            ScSymbol,
-        };
-
-        /// Build an event spec with the given `prefix_topics` and a single i128
-        /// data param named `amount`.
-        fn pool_event(prefix_topics: &[&str], event_name: &str) -> ScSpecEntry {
-            let prefixes: Vec<ScSymbol> = prefix_topics
-                .iter()
-                .map(|s| ScSymbol((*s).try_into().unwrap()))
-                .collect();
-            ScSpecEntry::EventV0(ScSpecEventV0 {
-                doc: "".try_into().unwrap(),
-                lib: "".try_into().unwrap(),
-                name: ScSymbol(event_name.try_into().unwrap()),
-                prefix_topics: prefixes.try_into().unwrap(),
-                params: vec![ScSpecEventParamV0 {
-                    doc: "".try_into().unwrap(),
-                    name: "amount".try_into().unwrap(),
-                    type_: ScSpecTypeDef::I128,
-                    location: ScSpecEventParamLocationV0::Data,
-                }]
-                .try_into()
-                .unwrap(),
-                data_format: ScSpecEventDataFormat::SingleValue,
-            })
-        }
-
-        /// Two events that share topic[0]="pool" but differ in topic[1].
-        /// Each must enrich with its own schema.
-        #[test]
-        fn shared_prefix_topic0_enriches_with_correct_schema() {
-            let deposit = pool_event(&["pool", "deposit"], "PoolDeposit");
-            let withdraw = pool_event(&["pool", "withdraw"], "PoolWithdraw");
-            let spec = ContractSpec::from_spec_xdr(&spec_section(&[deposit, withdraw])).unwrap();
-
-            // A deposit event: topics[0]="pool", topics[1]="deposit"
-            let dep_topics = vec![json!("pool"), json!("deposit")];
-            let dep_out = spec
-                .enrich_event("pool", &dep_topics, &json!("1000"))
-                .expect("deposit should match");
-            assert_eq!(dep_out["event"], "PoolDeposit");
-            assert_eq!(dep_out["params"]["amount"]["value"], "1000");
-
-            // A withdraw event: topics[0]="pool", topics[1]="withdraw"
-            let wdw_topics = vec![json!("pool"), json!("withdraw")];
-            let wdw_out = spec
-                .enrich_event("pool", &wdw_topics, &json!("500"))
-                .expect("withdraw should match");
-            assert_eq!(wdw_out["event"], "PoolWithdraw");
-            assert_eq!(wdw_out["params"]["amount"]["value"], "500");
-        }
-
-        /// An event whose later prefix topics don't match any spec must not
-        /// enrich (returns None).
-        #[test]
-        fn mismatched_later_prefix_topic_is_not_enriched() {
-            let deposit = pool_event(&["pool", "deposit"], "PoolDeposit");
-            let spec = ContractSpec::from_spec_xdr(&spec_section(&[deposit])).unwrap();
-
-            // topic[1] = "swap" — no spec has prefix ["pool","swap"]
-            let topics = vec![json!("pool"), json!("swap")];
-            // The name-fallback "pool" would match, but "pool" alone is a 1-element
-            // prefix; ["pool","swap"] is a 2-element topic list that does NOT start
-            // with ["pool","deposit"], so no prefix match. The name-only fallback
-            // kicks in here for the single-element prefix ["pool"] — which does
-            // match by length-1 prefix. This is expected: without a longer
-            // discriminating prefix the spec can only do its best.
-            // The important invariant is that ["pool","deposit"] does NOT
-            // accidentally enrich a ["pool","swap"] event.
-            let out = spec.enrich_event("pool", &topics, &json!("1"));
-            // If it enriched, it must not have matched PoolDeposit's 2-tuple prefix
-            // (which would require topic[1] == "deposit"). The name-fallback can
-            // return PoolDeposit here because "pool" maps to it in events_by_name,
-            // but a full-prefix check for ["pool","swap"] finds no match.
-            // Regardless of whether it's None or Some, the event must NOT carry
-            // the PoolDeposit label if the prefix was ["pool","deposit"] and the
-            // actual event was ["pool","swap"].
-            //
-            // With two competing specs sharing "pool", neither wins by prefix, so
-            // the name-fallback is the tie-breaker (last insertion). We don't
-            // assert a specific behaviour here — the key invariant tested above is
-            // that deposit ≠ withdraw when the discriminating second topic differs.
-            let _ = out;
-        }
-
-        /// Longest-prefix match wins: a spec with ["pool","deposit"] must be
-        /// preferred over a hypothetical spec with just ["pool"].
-        #[test]
-        fn longest_prefix_wins() {
-            // One-topic prefix (generic pool events)
-            let generic = pool_event(&["pool"], "PoolGeneric");
-            // Two-topic prefix (specific deposit)
-            let deposit = pool_event(&["pool", "deposit"], "PoolDeposit");
-            let spec =
-                ContractSpec::from_spec_xdr(&spec_section(&[generic, deposit])).unwrap();
-
-            // Event with topics ["pool","deposit"]: the 2-element prefix wins.
-            let topics = vec![json!("pool"), json!("deposit")];
-            let out = spec
-                .enrich_event("pool", &topics, &json!("999"))
-                .expect("should enrich");
-            assert_eq!(out["event"], "PoolDeposit", "2-tuple prefix must win over 1-tuple");
-
-            // Event with topics ["pool","other"]: only the 1-element prefix matches.
-            let topics2 = vec![json!("pool"), json!("other")];
-            let out2 = spec
-                .enrich_event("pool", &topics2, &json!("42"))
-                .expect("should enrich via 1-tuple");
-            assert_eq!(out2["event"], "PoolGeneric", "1-tuple prefix is the fallback");
-        }
-    }
-
-    // ── #403: error enum parsing and interface JSON ───────────────────────────
-
-    mod error_enum_tests {
-        use super::*;
-        use stellar_xdr::curr::{
-            ScSpecUdtErrorEnumCaseV0, ScSpecUdtErrorEnumV0,
-        };
-
-        fn error_enum_entry() -> ScSpecEntry {
-            ScSpecEntry::UdtErrorEnumV0(ScSpecUdtErrorEnumV0 {
-                doc: "Contract error codes.".try_into().unwrap(),
-                lib: "".try_into().unwrap(),
-                name: "ContractError".try_into().unwrap(),
-                cases: vec![
-                    ScSpecUdtErrorEnumCaseV0 {
-                        doc: "Insufficient balance.".try_into().unwrap(),
-                        name: "InsufficientBalance".try_into().unwrap(),
-                        value: 1,
-                    },
-                    ScSpecUdtErrorEnumCaseV0 {
-                        doc: "Unauthorized.".try_into().unwrap(),
-                        name: "Unauthorized".try_into().unwrap(),
-                        value: 2,
-                    },
-                ]
-                .try_into()
-                .unwrap(),
-            })
-        }
-
-        #[test]
-        fn error_enum_is_parsed_into_errors_vec() {
-            let body = spec_section(&[transfer_event_entry(), error_enum_entry()]);
-            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
-            assert_eq!(spec.errors.len(), 1);
-            assert_eq!(spec.errors[0].name, "ContractError");
-            assert_eq!(spec.errors[0].cases.len(), 2);
-            assert_eq!(spec.errors[0].cases[0].name, "InsufficientBalance");
-            assert_eq!(spec.errors[0].cases[0].code, 1);
-            assert_eq!(spec.errors[0].cases[1].name, "Unauthorized");
-            assert_eq!(spec.errors[0].cases[1].code, 2);
-        }
-
-        #[test]
-        fn interface_json_includes_errors() {
-            let body = spec_section(&[transfer_event_entry(), error_enum_entry()]);
-            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
-            let iface = spec.to_interface_json();
-            let errors = iface["errors"].as_array().expect("errors must be an array");
-            assert_eq!(errors.len(), 1);
-            assert_eq!(errors[0]["name"], "ContractError");
-            let cases = errors[0]["cases"].as_array().unwrap();
-            assert_eq!(cases.len(), 2);
-        }
-
-        #[test]
-        fn spec_is_not_empty_with_only_error_enum() {
-            // A spec with only an error enum should NOT be None — a contract
-            // that only declares errors is still a valid, useful interface.
-            let body = spec_section(&[error_enum_entry()]);
-            // Currently is_empty checks functions/events/structs/unions/enums/errors.
-            // A spec with only errors is not empty.
-            let spec = ContractSpec::from_spec_xdr(&body);
-            assert!(spec.is_some(), "spec with only errors must not be None");
-        }
-    }
-
-    // ── #404: relabel for [{key,val}] maps and Result ─────────────────────────
-
-    mod relabel_map_and_result {
-        use super::*;
-        use stellar_xdr::curr::{
-            ScSpecTypeMap, ScSpecTypeResult, ScSpecTypeUdt, ScSpecUdtEnumCaseV0,
-            ScSpecUdtEnumV0,
-        };
-
-        fn status_enum_entry() -> ScSpecEntry {
-            ScSpecEntry::UdtEnumV0(ScSpecUdtEnumV0 {
-                doc: "".try_into().unwrap(),
-                lib: "".try_into().unwrap(),
-                name: "Status".try_into().unwrap(),
-                cases: vec![
-                    ScSpecUdtEnumCaseV0 {
-                        doc: "".try_into().unwrap(),
-                        name: "Active".try_into().unwrap(),
-                        value: 0,
-                    },
-                    ScSpecUdtEnumCaseV0 {
-                        doc: "".try_into().unwrap(),
-                        name: "Filled".try_into().unwrap(),
-                        value: 7,
-                    },
-                ]
-                .try_into()
-                .unwrap(),
-            })
-        }
-
-        fn udt(name: &str) -> ScSpecTypeDef {
-            ScSpecTypeDef::Udt(ScSpecTypeUdt {
-                name: name.try_into().unwrap(),
-            })
-        }
-
-        /// Build a `ContractSpec` from the given entries.
-        fn make_spec(entries: &[ScSpecEntry]) -> ContractSpec {
-            ContractSpec::from_spec_xdr(&spec_section(entries)).unwrap()
-        }
-
-        /// Map<Status, i128> decoded as [{key:0, val:"100"},{key:7, val:"50"}]
-        #[test]
-        fn array_map_relabels_both_key_and_value() {
-            let spec = make_spec(&[status_enum_entry()]);
-            let map_ty = ScSpecTypeDef::Map(Box::new(ScSpecTypeMap {
-                key_type: Box::new(udt("Status")),
-                value_type: Box::new(ScSpecTypeDef::I128),
-            }));
-            let raw = json!([
-                {"key": 0, "val": "100"},
-                {"key": 7, "val": "50"}
-            ]);
-            let out = spec.relabel_value(&raw, &map_ty);
-            let arr = out.as_array().expect("should stay array");
-            assert_eq!(arr[0]["key"], "Active");
-            assert_eq!(arr[0]["val"], "100");
-            assert_eq!(arr[1]["key"], "Filled");
-            assert_eq!(arr[1]["val"], "50");
-        }
-
-        /// Map<Symbol, Status> decoded as a JSON object {"x": 0, "y": 7}
-        #[test]
-        fn object_map_relabels_values() {
-            let spec = make_spec(&[status_enum_entry()]);
-            let map_ty = ScSpecTypeDef::Map(Box::new(ScSpecTypeMap {
-                key_type: Box::new(ScSpecTypeDef::Symbol),
-                value_type: Box::new(udt("Status")),
-            }));
-            let raw = json!({"x": 0, "y": 7});
-            let out = spec.relabel_value(&raw, &map_ty);
-            assert_eq!(out["x"], "Active");
-            assert_eq!(out["y"], "Filled");
-        }
-
-        /// Result<Status, i32> with Ok arm: {"Ok": 7} -> {"Ok": "Filled"}
-        #[test]
-        fn result_ok_arm_is_relabelled() {
-            let spec = make_spec(&[status_enum_entry()]);
-            let result_ty = ScSpecTypeDef::Result(Box::new(ScSpecTypeResult {
-                ok_type: Box::new(udt("Status")),
-                error_type: Box::new(ScSpecTypeDef::I32),
-            }));
-            let raw = json!({"Ok": 7});
-            let out = spec.relabel_value(&raw, &result_ty);
-            assert_eq!(out["Ok"], "Filled");
-        }
-
-        /// Result<i32, Status> with Err arm: {"Err": 0} -> {"Err": "Active"}
-        #[test]
-        fn result_err_arm_is_relabelled() {
-            let spec = make_spec(&[status_enum_entry()]);
-            let result_ty = ScSpecTypeDef::Result(Box::new(ScSpecTypeResult {
-                ok_type: Box::new(ScSpecTypeDef::I32),
-                error_type: Box::new(udt("Status")),
-            }));
-            let raw = json!({"Err": 0});
-            let out = spec.relabel_value(&raw, &result_ty);
-            assert_eq!(out["Err"], "Active");
-        }
-
-        /// A Result value that is neither Ok nor Err passes through unchanged.
-        #[test]
-        fn result_unknown_shape_passes_through() {
-            let spec = make_spec(&[status_enum_entry()]);
-            let result_ty = ScSpecTypeDef::Result(Box::new(ScSpecTypeResult {
-                ok_type: Box::new(udt("Status")),
-                error_type: Box::new(ScSpecTypeDef::I32),
-            }));
-            let raw = json!("unexpected");
-            let out = spec.relabel_value(&raw, &result_ty);
-            assert_eq!(out, raw);
-        }
-
-        /// Array map entries that lack "key"/"val" fields pass through unchanged.
-        #[test]
-        fn malformed_array_map_entry_passes_through() {
-            let spec = make_spec(&[status_enum_entry()]);
-            let map_ty = ScSpecTypeDef::Map(Box::new(ScSpecTypeMap {
-                key_type: Box::new(udt("Status")),
-                value_type: Box::new(ScSpecTypeDef::I128),
-            }));
-            let raw = json!([{"not_key": 0, "not_val": "100"}]);
-            let out = spec.relabel_value(&raw, &map_ty);
-            // The malformed entry is passed through unchanged.
-            assert_eq!(out, raw);
         }
     }
 }

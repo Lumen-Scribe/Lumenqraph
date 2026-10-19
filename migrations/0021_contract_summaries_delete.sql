@@ -13,7 +13,37 @@
 CREATE OR REPLACE FUNCTION update_contract_summary()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF TG_OP = 'INSERT' THEN
+    IF TG_OP = 'DELETE' THEN
+        -- Decrement the count; remove the row when it hits zero so
+        -- list_contracts never shows contracts with 0 events.
+        UPDATE contract_summaries
+           SET event_count       = GREATEST(event_count - 1, 0),
+               -- Re-derive the ledger bounds only if the deleted row was at
+               -- an edge. We use a subquery to stay exact without a full scan
+               -- because the events table has an index on (contract_id, ledger).
+               first_seen_ledger = CASE
+                   WHEN first_seen_ledger = OLD.ledger
+                   THEN (SELECT MIN(ledger) FROM events
+                          WHERE contract_id = OLD.contract_id)
+                   ELSE first_seen_ledger
+               END,
+               last_seen_ledger  = CASE
+                   WHEN last_seen_ledger = OLD.ledger
+                   THEN (SELECT MAX(ledger) FROM events
+                          WHERE contract_id = OLD.contract_id)
+                   ELSE last_seen_ledger
+               END,
+               updated_at        = now()
+         WHERE contract_id = OLD.contract_id;
+
+        -- Remove the summary row when all events for this contract are gone.
+        DELETE FROM contract_summaries
+         WHERE contract_id = OLD.contract_id
+           AND event_count = 0;
+
+        RETURN OLD;
+
+    ELSIF TG_OP = 'INSERT' THEN
         INSERT INTO contract_summaries (
             contract_id,
             event_count,
@@ -35,32 +65,6 @@ BEGIN
                                          EXCLUDED.last_seen_ledger),
             updated_at        = now();
         RETURN NEW;
-
-    ELSIF TG_OP = 'DELETE' THEN
-        UPDATE contract_summaries
-           SET event_count       = GREATEST(event_count - 1, 0),
-               first_seen_ledger = CASE
-                   WHEN first_seen_ledger = OLD.ledger
-                   THEN (SELECT MIN(ledger) FROM events
-                          WHERE contract_id = OLD.contract_id
-                            AND event_id <> OLD.event_id)
-                   ELSE first_seen_ledger
-               END,
-               last_seen_ledger  = CASE
-                   WHEN last_seen_ledger = OLD.ledger
-                   THEN (SELECT MAX(ledger) FROM events
-                          WHERE contract_id = OLD.contract_id
-                            AND event_id <> OLD.event_id)
-                   ELSE last_seen_ledger
-               END,
-               updated_at        = now()
-         WHERE contract_id = OLD.contract_id;
-
-        DELETE FROM contract_summaries
-         WHERE contract_id = OLD.contract_id
-           AND event_count = 0;
-
-        RETURN OLD;
 
     ELSIF TG_OP = 'UPDATE' THEN
         -- Events rarely change their ledger, but guard it anyway.
@@ -118,10 +122,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Replace the INSERT-only trigger with one that fires on all three operations.
 DROP TRIGGER IF EXISTS trg_update_contract_summary ON events;
 
 CREATE TRIGGER trg_update_contract_summary
 AFTER INSERT OR UPDATE OR DELETE ON events
 FOR EACH ROW
 EXECUTE FUNCTION update_contract_summary();
-</｜｜DSML｜｜ parameter>

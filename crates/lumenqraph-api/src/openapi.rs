@@ -4,8 +4,10 @@
 //! that describes all REST endpoints, parameters, and response schemas.
 
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, Modify, ToSchema};
 use utoipa::openapi::{InfoBuilder, OpenApiBuilder as UtoipaOpenApiBuilder};
+use utoipa::{Modify, OpenApi, ToSchema};
+
+use crate::routes::admin::{ApiKeyList, ApiKeyMetadata, CreateApiKey, IssuedApiKey, RotateApiKey};
 
 /// Core data types used in OpenAPI responses
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
@@ -27,9 +29,9 @@ pub struct EventResponse {
 /// message is human-readable prose and may change between releases.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct ErrorResponse {
-    /// Stable machine-readable code. One of: `bad_request`,
-    /// `invalid_contract_id`, `unauthorized`, `not_found`, `rate_limited`,
-    /// `simulation_failed`, `spec_unavailable`, `internal_error`.
+    /// Stable machine-readable code. One of: `bad_request`, `unauthorized`,
+    /// `not_found`, `rate_limited`, `simulation_failed`, `spec_unavailable`,
+    /// `internal_error`.
     pub code: String,
     /// Human-readable description of the error. Do not parse this field.
     pub error: String,
@@ -43,65 +45,6 @@ pub struct TransferResponse {
     pub to_addr: Option<String>,
     pub amount: String,
     pub ledger: i64,
-}
-
-/// Keyset-paginated page of events. Shared envelope of every list endpoint.
-///
-/// Requests that use the deprecated `offset` parameter (capped at 10,000) are
-/// answered with `Deprecation: true` and `Warning` headers.
-#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
-pub struct EventsPageResponse {
-    pub data: Vec<EventResponse>,
-    /// Whether more rows are available after this page.
-    pub has_more: bool,
-    /// Opaque cursor to pass as `after` for the next page; null on the last page.
-    pub next_cursor: Option<String>,
-}
-
-/// Keyset-paginated page of token transfers.
-#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
-pub struct TransfersPageResponse {
-    pub data: Vec<TransferResponse>,
-    pub has_more: bool,
-    pub next_cursor: Option<String>,
-}
-
-/// Keyset-paginated page of materialized rows (swaps, NFT events, liquidity events).
-#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
-pub struct MaterializedPageResponse {
-    pub data: Vec<serde_json::Value>,
-    pub has_more: bool,
-    pub next_cursor: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
-pub struct WebhookDeliveryResponse {
-    pub id: i64,
-    pub status: String,
-    pub attempts: i32,
-    pub last_error: Option<String>,
-    pub last_status_code: Option<i32>,
-    pub last_response_snippet: Option<String>,
-    pub delivered_at: Option<String>,
-    pub created_at: String,
-}
-
-/// Per-status delivery counts, only present with `?include_summary=true`.
-#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
-pub struct DeliverySummaryResponse {
-    pub total: i64,
-    pub delivered: i64,
-    pub failed: i64,
-    pub pending: i64,
-}
-
-/// Keyset-paginated page of webhook deliveries (cursor is the delivery id).
-#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
-pub struct DeliveriesPageResponse {
-    pub data: Vec<WebhookDeliveryResponse>,
-    pub has_more: bool,
-    pub next_cursor: Option<String>,
-    pub summary: Option<DeliverySummaryResponse>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
@@ -133,9 +76,6 @@ pub struct WebhookSubscriptionResponse {
     pub url: String,
     pub contract_id: Option<String>,
     pub event_name: Option<String>,
-    pub contract_ids: Option<Vec<String>>,
-    pub event_names: Option<Vec<String>>,
-    pub filter: Option<serde_json::Value>,
     pub active: bool,
     pub created_at: String,
 }
@@ -168,9 +108,7 @@ impl OpenApiBuilder {
             ))
             .build();
 
-        let mut api = UtoipaOpenApiBuilder::default()
-            .info(info)
-            .build();
+        let mut api = UtoipaOpenApiBuilder::default().info(info).build();
 
         // TODO: Add route-specific OpenAPI documentation via Modify trait
         // The routes will be documented using utoipa attributes on handler functions
@@ -195,18 +133,17 @@ impl OpenApiBuilder {
             EventResponse,
             ErrorResponse,
             TransferResponse,
-            EventsPageResponse,
-            TransfersPageResponse,
-            MaterializedPageResponse,
-            WebhookDeliveryResponse,
-            DeliverySummaryResponse,
-            DeliveriesPageResponse,
             ContractResponse,
             ContractInterfaceResponse,
             ContractDataResponse,
             WebhookSubscriptionResponse,
             HealthResponse,
-            MetricsResponse
+            MetricsResponse,
+            CreateApiKey,
+            RotateApiKey,
+            ApiKeyMetadata,
+            IssuedApiKey,
+            ApiKeyList
         )
     ),
     paths(
@@ -220,15 +157,15 @@ impl OpenApiBuilder {
         get_event_by_id,
         list_transaction_events,
         list_contract_transfers,
-        list_contract_swaps,
-        list_contract_nfts,
-        list_contract_liquidity,
         get_contract_data,
         get_contract_data_history,
         list_webhooks,
         create_webhook,
         delete_webhook,
-        list_webhook_deliveries
+        admin_create_key,
+        admin_list_keys,
+        admin_revoke_key,
+        admin_rotate_key
     ),
     tags(
         (name = "Contracts", description = "Contract discovery and interface endpoints"),
@@ -236,6 +173,7 @@ impl OpenApiBuilder {
         (name = "Transfers", description = "Token transfer tracking"),
         (name = "Data", description = "Per-key contract state snapshots"),
         (name = "Webhooks", description = "Event subscription and delivery management"),
+        (name = "Admin", description = "Privileged API-key lifecycle management"),
         (name = "System", description = "Health and observability endpoints")
     )
 )]
@@ -296,14 +234,11 @@ pub async fn refresh_contract() {}
     params(
         ("contract_id" = String, Path, description = "Soroban contract ID"),
         ("limit" = Option<i64>, Query, description = "Max events to return (1-1000, default 50)"),
-        ("offset" = Option<i64>, Query, description = "Deprecated: pagination offset (max 10000). Use `after`"),
-        ("after" = Option<String>, Query, description = "Opaque cursor from a previous response's `next_cursor`"),
+        ("offset" = Option<i64>, Query, description = "Pagination offset"),
+        ("after" = Option<String>, Query, description = "Cursor for keyset pagination"),
         ("event_name" = Option<String>, Query, description = "Filter by event name")
     ),
-    responses(
-        (status = 200, description = "Contract events, newest first", body = EventsPageResponse),
-        (status = 400, description = "Invalid cursor, contract id, or offset above the cap", body = ErrorResponse)
-    ),
+    responses((status = 200, description = "Contract events", body = Vec<EventResponse>)),
     tag = "Events"
 )]
 pub async fn list_contract_events() {}
@@ -314,78 +249,15 @@ pub async fn list_contract_events() {}
     params(
         ("contract_id" = String, Path, description = "Soroban contract ID"),
         ("limit" = Option<i64>, Query, description = "Max transfers to return (1-1000, default 50)"),
-        ("offset" = Option<i64>, Query, description = "Deprecated: pagination offset (max 10000). Use `after`"),
-        ("after" = Option<String>, Query, description = "Opaque cursor from a previous response's `next_cursor`"),
+        ("offset" = Option<i64>, Query, description = "Pagination offset"),
+        ("after" = Option<String>, Query, description = "Cursor for keyset pagination"),
         ("from" = Option<String>, Query, description = "Filter by sender address"),
         ("to" = Option<String>, Query, description = "Filter by recipient address")
     ),
-    responses(
-        (status = 200, description = "Token transfers for the contract, newest first", body = TransfersPageResponse),
-        (status = 400, description = "Invalid cursor, contract id, or offset above the cap", body = ErrorResponse)
-    ),
+    responses((status = 200, description = "Token transfers for the contract", body = Vec<TransferResponse>)),
     tag = "Transfers"
 )]
 pub async fn list_contract_transfers() {}
-
-#[utoipa::path(
-    get,
-    path = "/contracts/{contract_id}/swaps",
-    params(
-        ("contract_id" = String, Path, description = "Soroban contract ID"),
-        ("limit" = Option<i64>, Query, description = "Max swaps to return (1-1000, default 50)"),
-        ("offset" = Option<i64>, Query, description = "Deprecated: pagination offset (max 10000). Use `after`"),
-        ("after" = Option<String>, Query, description = "Opaque cursor from a previous response's `next_cursor`"),
-        ("sender" = Option<String>, Query, description = "Filter by sender address"),
-        ("sell_token" = Option<String>, Query, description = "Filter by sold token"),
-        ("buy_token" = Option<String>, Query, description = "Filter by bought token")
-    ),
-    responses(
-        (status = 200, description = "AMM swaps for the contract, newest first", body = MaterializedPageResponse),
-        (status = 400, description = "Invalid cursor, contract id, or offset above the cap", body = ErrorResponse)
-    ),
-    tag = "Transfers"
-)]
-pub async fn list_contract_swaps() {}
-
-#[utoipa::path(
-    get,
-    path = "/contracts/{contract_id}/nfts",
-    params(
-        ("contract_id" = String, Path, description = "Soroban contract ID"),
-        ("limit" = Option<i64>, Query, description = "Max NFT events to return (1-1000, default 50)"),
-        ("offset" = Option<i64>, Query, description = "Deprecated: pagination offset (max 10000). Use `after`"),
-        ("after" = Option<String>, Query, description = "Opaque cursor from a previous response's `next_cursor`"),
-        ("kind" = Option<String>, Query, description = "mint | transfer | burn"),
-        ("from" = Option<String>, Query, description = "Filter by sender address"),
-        ("to" = Option<String>, Query, description = "Filter by recipient address"),
-        ("token_id" = Option<String>, Query, description = "Filter by token id")
-    ),
-    responses(
-        (status = 200, description = "NFT events for the contract, newest first", body = MaterializedPageResponse),
-        (status = 400, description = "Invalid cursor, kind, contract id, or offset above the cap", body = ErrorResponse)
-    ),
-    tag = "Transfers"
-)]
-pub async fn list_contract_nfts() {}
-
-#[utoipa::path(
-    get,
-    path = "/contracts/{contract_id}/liquidity",
-    params(
-        ("contract_id" = String, Path, description = "Soroban contract ID"),
-        ("limit" = Option<i64>, Query, description = "Max liquidity events to return (1-1000, default 50)"),
-        ("offset" = Option<i64>, Query, description = "Deprecated: pagination offset (max 10000). Use `after`"),
-        ("after" = Option<String>, Query, description = "Opaque cursor from a previous response's `next_cursor`"),
-        ("kind" = Option<String>, Query, description = "add | remove"),
-        ("provider" = Option<String>, Query, description = "Filter by liquidity provider")
-    ),
-    responses(
-        (status = 200, description = "Liquidity events for the contract, newest first", body = MaterializedPageResponse),
-        (status = 400, description = "Invalid cursor, kind, contract id, or offset above the cap", body = ErrorResponse)
-    ),
-    tag = "Transfers"
-)]
-pub async fn list_contract_liquidity() {}
 
 #[utoipa::path(
     get,
@@ -440,23 +312,57 @@ pub async fn create_webhook() {}
 pub async fn delete_webhook() {}
 
 #[utoipa::path(
-    get,
-    path = "/webhooks/{id}/deliveries",
-    params(
-        ("id" = String, Path, description = "Webhook subscription ID"),
-        ("limit" = Option<i64>, Query, description = "Max deliveries to return (1-500, default 50)"),
-        ("offset" = Option<i64>, Query, description = "Deprecated: pagination offset (max 10000). Use `after`"),
-        ("after" = Option<String>, Query, description = "Opaque cursor from a previous response's `next_cursor`"),
-        ("include_summary" = Option<bool>, Query, description = "Include per-status counts (extra aggregate query; default false)")
-    ),
+    post,
+    path = "/admin/keys",
+    request_body = CreateApiKey,
     responses(
-        (status = 200, description = "Delivery attempts, newest first", body = DeliveriesPageResponse),
-        (status = 400, description = "Invalid cursor or offset above the cap", body = ErrorResponse),
-        (status = 404, description = "Subscription not found", body = ErrorResponse)
+        (status = 201, description = "Key created; plaintext is returned only by this response", body = IssuedApiKey),
+        (status = 400, description = "Invalid key settings", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid ADMIN_TOKEN", body = ErrorResponse)
     ),
-    tag = "Webhooks"
+    tag = "Admin"
 )]
-pub async fn list_webhook_deliveries() {}
+pub async fn admin_create_key() {}
+
+#[utoipa::path(
+    get,
+    path = "/admin/keys",
+    responses(
+        (status = 200, description = "Key metadata only; no plaintext keys", body = ApiKeyList),
+        (status = 401, description = "Missing or invalid ADMIN_TOKEN", body = ErrorResponse)
+    ),
+    tag = "Admin"
+)]
+pub async fn admin_list_keys() {}
+
+#[utoipa::path(
+    post,
+    path = "/admin/keys/{prefix}/revoke",
+    params(("prefix" = String, Path, description = "At least eight hexadecimal hash-prefix characters")),
+    responses(
+        (status = 200, description = "Key metadata after revocation", body = ApiKeyMetadata),
+        (status = 400, description = "Invalid or ambiguous key prefix", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid ADMIN_TOKEN", body = ErrorResponse),
+        (status = 404, description = "Key not found", body = ErrorResponse)
+    ),
+    tag = "Admin"
+)]
+pub async fn admin_revoke_key() {}
+
+#[utoipa::path(
+    post,
+    path = "/admin/keys/{prefix}/rotate",
+    params(("prefix" = String, Path, description = "At least eight hexadecimal hash-prefix characters")),
+    request_body = RotateApiKey,
+    responses(
+        (status = 201, description = "Replacement key created; plaintext is returned only by this response", body = IssuedApiKey),
+        (status = 400, description = "Invalid grace period, prefix, or source key", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid ADMIN_TOKEN", body = ErrorResponse),
+        (status = 404, description = "Key not found", body = ErrorResponse)
+    ),
+    tag = "Admin"
+)]
+pub async fn admin_rotate_key() {}
 
 #[utoipa::path(
     get,

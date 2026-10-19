@@ -60,7 +60,6 @@ const FETCH_ERROR_TTL: Duration = Duration::from_secs(60);
 pub struct SpecCache {
     inner: Mutex<LruCache<String, Cached>>,
     fetch_semaphore: Arc<Semaphore>,
-    cache_size: AtomicUsize,
 }
 
 impl SpecCache {
@@ -70,7 +69,6 @@ impl SpecCache {
                 std::num::NonZeroUsize::new(max_entries).expect("max_entries must be > 0"),
             )),
             fetch_semaphore: Arc::new(Semaphore::new(concurrency)),
-            cache_size: AtomicUsize::new(0),
         }
     }
 
@@ -244,25 +242,10 @@ async fn load(
         }
     };
 
-    let Some(parsed) = ContractSpec::from_wasm(&wasm) else {
-        // Permanent: WASM exists but spec parsing failed entirely.
+    let Some(spec) = ContractSpec::from_wasm(&wasm) else {
+        // Permanent: WASM exists but spec parsing failed.
         return (None, Some(wasm_hash), true);
     };
-
-    // #401: log partial parse so operators can investigate the contract.
-    if !parsed.complete {
-        warn!(
-            contract_id,
-            wasm_hash,
-            skipped_entries = parsed.skipped_entries,
-            first_error = parsed.error.as_deref().unwrap_or("unknown"),
-            "contractspecv0 section is incomplete: some entries could not be decoded;              interface is partial and diffs against it will be skipped"
-        );
-    }
-
-    let spec = parsed.spec;
-    let complete = parsed.complete;
-
     // The raw section (hex) lets the read layer re-parse exact argument types.
     let spec_section = lumenqraph_core::spec::spec_section_of(&wasm)
         .map(hex::encode)
@@ -271,15 +254,14 @@ async fn load(
         contract_id,
         events = spec.events.len(),
         functions = spec.functions.len(),
-        complete,
         "parsed contract interface"
     );
-    if let Err(e) = persist(pool, contract_id, &wasm_hash, &spec_section, &spec, complete).await {
+    if let Err(e) = persist(pool, contract_id, &wasm_hash, &spec_section, &spec).await {
         warn!(contract_id, error = %e, "failed to persist contract spec");
     }
     // Independent of the upsert above: that keeps only the current interface,
     // this appends to the history. A failure here must not cost us the spec.
-    if let Err(e) = record_version(pool, contract_id, &wasm_hash, &spec_section, &spec, complete, ledger).await {
+    if let Err(e) = record_version(pool, contract_id, &wasm_hash, &spec_section, &spec, ledger).await {
         warn!(contract_id, error = %e, "failed to record contract spec version");
     }
     (Some(Arc::new(spec)), Some(wasm_hash), true)
@@ -297,9 +279,6 @@ async fn record_version(
     wasm_hash: &str,
     spec_section: &str,
     spec: &ContractSpec,
-    /// Whether the spec section was fully decoded (#401). When `false`, diffs
-    /// against this version are suppressed to prevent false "removal" alerts.
-    complete: bool,
     ledger: i64,
 ) -> anyhow::Result<()> {
     let previous: Option<(i32, String, String)> = sqlx::query_as(
@@ -314,19 +293,7 @@ async fn record_version(
         // Same executable as the newest version on record: nothing happened.
         Some((_, ref prev_hash, _)) if prev_hash == wasm_hash => return Ok(()),
         Some((prev_version, prev_hash, prev_section)) => {
-            // #401: skip diffing when the new spec is incomplete — a partial
-            // parse would report every missing entry as "removed", triggering
-            // false breaking-change webhooks.
-            let diff = if complete {
-                diff_against(&prev_section, spec)
-            } else {
-                warn!(
-                    contract_id,
-                    version = prev_version + 1,
-                    "skipping interface diff: new spec is incomplete (partial parse)"
-                );
-                None
-            };
+            let diff = diff_against(&prev_section, spec);
             if let Some(d) = &diff {
                 info!(
                     contract_id,
@@ -346,8 +313,8 @@ async fn record_version(
 
     sqlx::query(
         "INSERT INTO contract_spec_versions
-            (contract_id, version, wasm_hash, previous_wasm_hash, interface, spec_section, diff, breaking, ledger, spec_complete)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            (contract_id, version, wasm_hash, previous_wasm_hash, interface, spec_section, diff, breaking, ledger)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (contract_id, version) DO NOTHING",
     )
     .bind(contract_id)
@@ -359,7 +326,6 @@ async fn record_version(
     .bind(diff.as_ref().map(|d| d.to_json()))
     .bind(diff.as_ref().is_some_and(|d| d.breaking))
     .bind(ledger)
-    .bind(complete)
     .execute(pool)
     .await?;
     Ok(())
@@ -371,7 +337,7 @@ async fn record_version(
 /// newly added.
 fn diff_against(previous_section: &str, new_spec: &ContractSpec) -> Option<SpecDiff> {
     let bytes = hex::decode(previous_section).ok()?;
-    let previous = ContractSpec::from_spec_xdr(&bytes).map(|p| p.spec)?;
+    let previous = ContractSpec::from_spec_xdr(&bytes)?;
     Some(SpecDiff::between(&previous, new_spec))
 }
 
@@ -381,27 +347,22 @@ async fn persist(
     wasm_hash: &str,
     spec_section: &str,
     spec: &ContractSpec,
-    /// Whether the spec section was fully decoded (#401). Persisted so the
-    /// API can surface it in the interface response.
-    complete: bool,
 ) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO contract_specs (contract_id, wasm_hash, interface, spec_section, has_events, spec_complete)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        "INSERT INTO contract_specs (contract_id, wasm_hash, interface, spec_section, has_events)
+         VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (contract_id) DO UPDATE
-           SET wasm_hash    = EXCLUDED.wasm_hash,
-               interface    = EXCLUDED.interface,
+           SET wasm_hash = EXCLUDED.wasm_hash,
+               interface = EXCLUDED.interface,
                spec_section = EXCLUDED.spec_section,
-               has_events   = EXCLUDED.has_events,
-               spec_complete = EXCLUDED.spec_complete,
-               fetched_at   = now()",
+               has_events = EXCLUDED.has_events,
+               fetched_at = now()",
     )
     .bind(contract_id)
     .bind(wasm_hash)
     .bind(spec.to_interface_json())
     .bind(spec_section)
     .bind(spec.has_events())
-    .bind(complete)
     .execute(pool)
     .await?;
     Ok(())
@@ -476,7 +437,7 @@ mod tests {
             });
             body.extend(entry.to_xdr(Limits::none()).unwrap());
         }
-        let spec = ContractSpec::from_spec_xdr_simple(&body).expect("test spec should parse");
+        let spec = ContractSpec::from_spec_xdr(&body).expect("test spec should parse");
         (hex::encode(&body), spec)
     }
 

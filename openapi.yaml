@@ -17,6 +17,10 @@ servers:
   - url: http://localhost:8080
     description: Local development
 
+tags:
+  - name: admin
+    description: Privileged API-key lifecycle management. Requires the separately configured ADMIN_TOKEN.
+
 security:
   - ApiKeyHeader: []
   - ApiKeyBearer: []
@@ -34,6 +38,11 @@ components:
     ApiKeyBearer:
       type: http
       scheme: bearer
+    AdminToken:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: "Privileged bootstrap credential. Send as `Bearer <ADMIN_TOKEN>`."
 
   # ---------------------------------------------------------------------------
   # Shared schemas
@@ -379,106 +388,94 @@ components:
         error:
           type: string
 
-    # ---- pagination (#445) ----
-    PageMeta:
+    # ---- admin API-key lifecycle ----
+    CreateApiKey:
       type: object
-      required: [has_more, next_cursor]
+      required: [name, tier, rate_limit_per_min]
       properties:
-        has_more:
-          type: boolean
-          description: Whether more rows are available after this page.
-        next_cursor:
+        name:
           type: string
-          nullable: true
-          description: Opaque cursor to pass as `after` for the next page. Null on the last page.
-
-    EventsPage:
-      allOf:
-        - $ref: "#/components/schemas/PageMeta"
-        - type: object
-          required: [data]
-          properties:
-            data:
-              type: array
-              items:
-                $ref: "#/components/schemas/EventRecord"
-
-    TransfersPage:
-      allOf:
-        - $ref: "#/components/schemas/PageMeta"
-        - type: object
-          required: [data]
-          properties:
-            data:
-              type: array
-              items:
-                $ref: "#/components/schemas/Transfer"
-
-    MaterializedPage:
-      description: Page of materialized swap, NFT or liquidity rows.
-      allOf:
-        - $ref: "#/components/schemas/PageMeta"
-        - type: object
-          required: [data]
-          properties:
-            data:
-              type: array
-              items:
-                type: object
-                additionalProperties: true
-
-    WebhookDelivery:
-      type: object
-      required: [id, status, attempts, created_at]
-      properties:
-        id:
+          minLength: 1
+          maxLength: 128
+        tier:
+          type: string
+          minLength: 1
+          maxLength: 64
+        rate_limit_per_min:
           type: integer
-          format: int64
-        status:
-          type: string
-          enum: [pending, delivered, failed]
-        attempts:
-          type: integer
-        last_error:
-          type: string
-          nullable: true
-        delivered_at:
+          minimum: 1
+          maximum: 1000000
+        scopes:
+          type: array
+          description: Optional authorization scopes; defaults to `[read]`.
+          items:
+            type: string
+          maxItems: 32
+        expires_at:
           type: string
           format: date-time
           nullable: true
+          description: Time after which the key cannot authenticate.
+    RotateApiKey:
+      type: object
+      properties:
+        grace_seconds:
+          type: integer
+          minimum: 0
+          maximum: 31536000
+          default: 0
+          description: How long the old key stays usable after rotation.
+    ApiKeyMetadata:
+      type: object
+      required: [key_hash_prefix, name, tier, rate_limit_per_min, scopes, created_at, revoked]
+      properties:
+        key_hash_prefix:
+          type: string
+          description: First 12 characters of the SHA-256 key hash; never a plaintext key.
+        name:
+          type: string
+        tier:
+          type: string
+        rate_limit_per_min:
+          type: integer
+        scopes:
+          type: array
+          items:
+            type: string
         created_at:
           type: string
           format: date-time
-
-    DeliverySummary:
-      type: object
-      required: [total, delivered, failed, pending]
-      properties:
-        total:
-          type: integer
-          format: int64
-        delivered:
-          type: integer
-          format: int64
-        failed:
-          type: integer
-          format: int64
-        pending:
-          type: integer
-          format: int64
-
-    DeliveriesPage:
+        last_used_at:
+          type: string
+          format: date-time
+          nullable: true
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        revoked:
+          type: boolean
+        revocation_scheduled_at:
+          type: string
+          format: date-time
+          nullable: true
+    IssuedApiKey:
       allOf:
-        - $ref: "#/components/schemas/PageMeta"
+        - $ref: "#/components/schemas/ApiKeyMetadata"
         - type: object
-          required: [data]
+          required: [key]
           properties:
-            data:
-              type: array
-              items:
-                $ref: "#/components/schemas/WebhookDelivery"
-            summary:
-              $ref: "#/components/schemas/DeliverySummary"
+            key:
+              type: string
+              description: Plaintext key. This is the only response in which it is available.
+    ApiKeyList:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/ApiKeyMetadata"
 
   # ---- reusable parameters ----
   parameters:
@@ -508,22 +505,10 @@ components:
     Offset:
       name: offset
       in: query
-      deprecated: true
       schema:
         type: integer
         minimum: 0
-        maximum: 10000
-      description: |
-        Deprecated: number of results to skip. Capped at 10000 (400 above
-        that). Responses to offset requests carry `Deprecation: true` and
-        `Warning` headers. Ignored when `after` is present. Use `after`.
-
-    After:
-      name: after
-      in: query
-      schema:
-        type: string
-      description: Opaque keyset cursor; the `next_cursor` of the previous page.
+      description: Number of results to skip (pagination).
 
   # ---- reusable responses ----
   responses:
@@ -543,13 +528,6 @@ components:
 
     TooManyRequests:
       description: Rate limit exceeded.
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-
-    BadRequest:
-      description: Invalid parameter (e.g. malformed cursor or offset above the cap).
       content:
         application/json:
           schema:
@@ -748,7 +726,6 @@ paths:
         - $ref: "#/components/parameters/ContractId"
         - $ref: "#/components/parameters/Limit"
         - $ref: "#/components/parameters/Offset"
-        - $ref: "#/components/parameters/After"
         - name: event_name
           in: query
           schema:
@@ -760,9 +737,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/EventsPage"
-        "400":
-          $ref: "#/components/responses/BadRequest"
+                type: array
+                items:
+                  $ref: "#/components/schemas/EventRecord"
 
   /contracts/{contract_id}/transfers:
     get:
@@ -773,133 +750,15 @@ paths:
         - $ref: "#/components/parameters/ContractId"
         - $ref: "#/components/parameters/Limit"
         - $ref: "#/components/parameters/Offset"
-        - $ref: "#/components/parameters/After"
-        - name: from
-          in: query
-          schema:
-            type: string
-          description: Filter by sender address.
-        - name: to
-          in: query
-          schema:
-            type: string
-          description: Filter by recipient address.
       responses:
         "200":
           description: OK
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/TransfersPage"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-
-  /contracts/{contract_id}/swaps:
-    get:
-      operationId: listContractSwaps
-      summary: Materialized AMM swaps, newest first.
-      tags: [transfers]
-      parameters:
-        - $ref: "#/components/parameters/ContractId"
-        - $ref: "#/components/parameters/Limit"
-        - $ref: "#/components/parameters/Offset"
-        - $ref: "#/components/parameters/After"
-        - name: sender
-          in: query
-          schema:
-            type: string
-          description: Filter by sender address.
-        - name: sell_token
-          in: query
-          schema:
-            type: string
-          description: Filter by sold token.
-        - name: buy_token
-          in: query
-          schema:
-            type: string
-          description: Filter by bought token.
-      responses:
-        "200":
-          description: OK
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/MaterializedPage"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-
-  /contracts/{contract_id}/nfts:
-    get:
-      operationId: listContractNftEvents
-      summary: Materialized NFT mint/transfer/burn events, newest first.
-      tags: [transfers]
-      parameters:
-        - $ref: "#/components/parameters/ContractId"
-        - $ref: "#/components/parameters/Limit"
-        - $ref: "#/components/parameters/Offset"
-        - $ref: "#/components/parameters/After"
-        - name: kind
-          in: query
-          schema:
-            type: string
-            enum: [mint, transfer, burn]
-          description: Filter by event kind.
-        - name: from
-          in: query
-          schema:
-            type: string
-          description: Filter by sender address.
-        - name: to
-          in: query
-          schema:
-            type: string
-          description: Filter by recipient address.
-        - name: token_id
-          in: query
-          schema:
-            type: string
-          description: Filter by token id.
-      responses:
-        "200":
-          description: OK
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/MaterializedPage"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-
-  /contracts/{contract_id}/liquidity:
-    get:
-      operationId: listContractLiquidityEvents
-      summary: Materialized liquidity add/remove events, newest first.
-      tags: [transfers]
-      parameters:
-        - $ref: "#/components/parameters/ContractId"
-        - $ref: "#/components/parameters/Limit"
-        - $ref: "#/components/parameters/Offset"
-        - $ref: "#/components/parameters/After"
-        - name: kind
-          in: query
-          schema:
-            type: string
-            enum: [add, remove]
-          description: Filter by event kind.
-        - name: provider
-          in: query
-          schema:
-            type: string
-          description: Filter by liquidity provider.
-      responses:
-        "200":
-          description: OK
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/MaterializedPage"
-        "400":
-          $ref: "#/components/responses/BadRequest"
+                type: array
+                items:
+                  $ref: "#/components/schemas/Transfer"
 
   /contracts/{contract_id}/call:
     post:
@@ -1005,36 +864,110 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
-  /webhooks/{id}/deliveries:
-    get:
-      operationId: listWebhookDeliveries
-      summary: Delivery attempts for a subscription, newest first (keyset on delivery id).
-      tags: [webhooks]
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-        - $ref: "#/components/parameters/Limit"
-        - $ref: "#/components/parameters/Offset"
-        - $ref: "#/components/parameters/After"
-        - name: include_summary
-          in: query
-          schema:
-            type: boolean
-            default: false
-          description: Include per-status counts (runs an aggregate over all deliveries).
+  /admin/keys:
+    post:
+      operationId: adminCreateKey
+      summary: Create an API key.
+      description: "Returns the plaintext key exactly once. Requires `Authorization: Bearer <ADMIN_TOKEN>`."
+      tags: [admin]
+      security:
+        - AdminToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateApiKey"
       responses:
-        "200":
-          description: OK
+        "201":
+          description: Key created.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/DeliveriesPage"
+                $ref: "#/components/schemas/IssuedApiKey"
         "400":
-          $ref: "#/components/responses/BadRequest"
+          description: Invalid input.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    get:
+      operationId: adminListKeys
+      summary: List API-key metadata.
+      description: Plaintext key values are never returned.
+      tags: [admin]
+      security:
+        - AdminToken: []
+      responses:
+        "200":
+          description: API-key metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /admin/keys/{prefix}/revoke:
+    post:
+      operationId: adminRevokeKey
+      summary: Revoke an API key immediately.
+      tags: [admin]
+      security:
+        - AdminToken: []
+      parameters:
+        - name: prefix
+          in: path
+          required: true
+          description: At least eight hexadecimal hash-prefix characters. Ambiguous prefixes are rejected.
+          schema:
+            type: string
+            pattern: "^[0-9a-fA-F]{8,64}$"
+      responses:
+        "200":
+          description: Revoked key metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyMetadata"
+        "400":
+          description: Invalid or ambiguous prefix.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /admin/keys/{prefix}/rotate:
+    post:
+      operationId: adminRotateKey
+      summary: Rotate an API key, preserving its settings.
+      description: The source key is revoked immediately or after the optional grace period.
+      tags: [admin]
+      security:
+        - AdminToken: []
+      parameters:
+        - name: prefix
+          in: path
+          required: true
+          description: At least eight hexadecimal hash-prefix characters. Ambiguous prefixes are rejected.
+          schema:
+            type: string
+            pattern: "^[0-9a-fA-F]{8,64}$"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RotateApiKey"
+      responses:
+        "201":
+          description: Replacement key created; plaintext is returned once.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssuedApiKey"
+        "400":
+          description: Invalid input or prefix.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
 

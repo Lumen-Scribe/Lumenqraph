@@ -22,4 +22,3 @@ reqwest.workspace = true
 hex.workspace = true
 chrono.workspace = true
 uuid.workspace = true
-axum.workspace = true
