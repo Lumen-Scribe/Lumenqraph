@@ -156,8 +156,12 @@ async fn main() -> anyhow::Result<()> {
         ip_config: auth::IpConfig::from_env(),
         audit_tx: None,
         audit_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        event_fanout: Arc::new(routes::stream::EventFanout::new()),
         shutdown: tokio_util::sync::CancellationToken::new(),
     };
+
+    // One LISTEN connection for all SSE clients (#569).
+    routes::stream::spawn_listener(state.clone(), state.event_fanout.clone());
 
     let bind_addr = config.bind_addr.clone();
     let max_body_bytes = config.max_body_bytes;

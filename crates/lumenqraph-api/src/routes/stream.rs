@@ -17,11 +17,11 @@ use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
-use tokio::time::{interval, sleep};
+use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::error::ApiResult;
@@ -34,6 +34,14 @@ const SSE_MAX_STREAMS: usize = 1000;
 const SSE_MAX_STREAMS_PER_KEY: usize = 100;
 /// Capacity of the shared broadcast channel.
 const SSE_BROADCAST_CAPACITY: usize = 1024;
+/// Rows fetched per catch-up query on the listener.
+const CATCH_UP_BATCH: i64 = 1000;
+/// Reconnect delay for the shared listener: starts at the minimum and doubles
+/// up to the maximum. A connection that stays up for `LISTENER_STABLE_AFTER`
+/// resets it.
+const LISTENER_MIN_BACKOFF: Duration = Duration::from_secs(1);
+const LISTENER_MAX_BACKOFF: Duration = Duration::from_secs(30);
+const LISTENER_STABLE_AFTER: Duration = Duration::from_secs(30);
 
 /// Global counter of active SSE streams, exposed via metrics.
 static ACTIVE_STREAMS: AtomicUsize = AtomicUsize::new(0);
@@ -53,16 +61,25 @@ pub struct BroadcastEvent {
     pub data: serde_json::Value,
 }
 
-/// Shared fan-out state: a broadcast sender plus the last sequence seen.
-#[derive(Clone)]
+/// Shared fan-out: one broadcast channel that every SSE connection subscribes to,
+/// plus health counters for the listener feeding it.
 pub struct EventFanout {
     tx: broadcast::Sender<BroadcastEvent>,
+    /// True while the shared listener holds a `LISTEN` connection. While it is
+    /// false, SSE connections poll Postgres themselves so no events are missed.
+    listener_up: AtomicBool,
+    /// Messages dropped by slow subscribers (`RecvError::Lagged`), summed.
+    lagged: AtomicU64,
 }
 
 impl EventFanout {
     pub fn new() -> Self {
         let (tx, _rx) = broadcast::channel(SSE_BROADCAST_CAPACITY);
-        Self { tx }
+        Self {
+            tx,
+            listener_up: AtomicBool::new(false),
+            lagged: AtomicU64::new(0),
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<BroadcastEvent> {
@@ -73,6 +90,28 @@ impl EventFanout {
         // Ignore send errors: no subscribers is not an error.
         let _ = self.tx.send(event);
     }
+
+    pub fn set_listener_up(&self, up: bool) {
+        self.listener_up.store(up, Ordering::Relaxed);
+    }
+
+    pub fn listener_up(&self) -> bool {
+        self.listener_up.load(Ordering::Relaxed)
+    }
+
+    fn record_lag(&self, dropped: u64) {
+        self.lagged.fetch_add(dropped, Ordering::Relaxed);
+    }
+
+    /// Total messages dropped by lagging subscribers since startup.
+    pub fn lagged_total(&self) -> u64 {
+        self.lagged.load(Ordering::Relaxed)
+    }
+
+    /// Number of SSE connections currently subscribed.
+    pub fn receivers(&self) -> usize {
+        self.tx.receiver_count()
+    }
 }
 
 impl Default for EventFanout {
@@ -81,47 +120,82 @@ impl Default for EventFanout {
     }
 }
 
-/// Spawns the single shared `PgListener` task. On each `NOTIFY lumenqraph_events`
-/// it fetches new rows once (`seq > last_seen`) and broadcasts them. Falls back to
-/// periodic polling if the listener cannot be established.
-pub async fn spawn_listener(state: AppState, fanout: Arc<EventFanout>) {
-    let mut last_seen: i64 = 0;
-    let mut listener = match sqlx::postgres::PgListener::connect_with(&state.pool).await {
-        Ok(l) => l,
-        Err(e) => {
-            warn!(error = %e, "PgListener unavailable; SSE will fall back to polling");
-            return;
-        }
-    };
+/// Starts the single shared listener task for the process.
+pub fn spawn_listener(state: AppState, fanout: Arc<EventFanout>) {
+    tokio::spawn(run_listener(state, fanout));
+}
 
-    if let Err(e) = listener.listen("lumenqraph_events").await {
-        warn!(error = %e, "failed to LISTEN lumenqraph_events; SSE will fall back to polling");
-        return;
-    }
-
+/// Keeps one `LISTEN lumenqraph_events` connection open, reconnecting with
+/// backoff. Each notification triggers a catch-up read of `seq > last_seen`.
+async fn run_listener(state: AppState, fanout: Arc<EventFanout>) {
+    // `None` until the first successful LISTEN, so the first catch-up starts at the head.
+    let mut last_seen: Option<i64> = None;
+    let mut backoff = LISTENER_MIN_BACKOFF;
     loop {
-        match listener.recv().await {
-            Ok(_notification) => {
-                if let Err(e) = fetch_and_broadcast(&state, &fanout, &mut last_seen).await {
-                    warn!(error = %e, "failed to fetch events after notification");
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "PgListener recv error; retrying");
-                sleep(Duration::from_secs(1)).await;
-            }
+        let started = Instant::now();
+        let result = listen_once(&state, &fanout, &mut last_seen).await;
+        fanout.set_listener_up(false);
+        if let Err(e) = result {
+            warn!(error = %e, "SSE listener lost; SSE clients fall back to polling");
+        }
+        if started.elapsed() >= LISTENER_STABLE_AFTER {
+            backoff = LISTENER_MIN_BACKOFF;
+        }
+        sleep(backoff).await;
+        backoff = (backoff * 2).min(LISTENER_MAX_BACKOFF);
+    }
+}
+
+/// One listener session. Returns only when the connection fails.
+async fn listen_once(
+    state: &AppState,
+    fanout: &EventFanout,
+    last_seen: &mut Option<i64>,
+) -> ApiResult<()> {
+    let mut listener = sqlx::postgres::PgListener::connect_with(&state.pool).await?;
+    listener.listen("lumenqraph_events").await?;
+    let mut cursor = match *last_seen {
+        Some(seq) => seq,
+        None => head_seq(state).await?,
+    };
+    fanout.set_listener_up(true);
+    // Events committed while we were disconnected are picked up here.
+    catch_up(state, fanout, &mut cursor).await?;
+    *last_seen = Some(cursor);
+    loop {
+        listener.recv().await?;
+        catch_up(state, fanout, &mut cursor).await?;
+        *last_seen = Some(cursor);
+    }
+}
+
+/// Highest committed `seq`, or 0 for an empty log.
+async fn head_seq(state: &AppState) -> ApiResult<i64> {
+    let head: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM events")
+        .fetch_one(&state.pool)
+        .await?;
+    Ok(head)
+}
+
+/// Broadcast every row after `last_seen`, in batches, until none are left.
+async fn catch_up(state: &AppState, fanout: &EventFanout, last_seen: &mut i64) -> ApiResult<()> {
+    loop {
+        let fetched = fetch_and_broadcast(state, fanout, last_seen).await?;
+        if fetched < CATCH_UP_BATCH as usize {
+            return Ok(());
         }
     }
 }
 
-/// Fetches rows with `seq > last_seen` once and broadcasts them.
+/// Fetch up to `CATCH_UP_BATCH` rows with `seq > last_seen` and broadcast them.
+/// Returns how many rows were read.
 async fn fetch_and_broadcast(
     state: &AppState,
     fanout: &EventFanout,
     last_seen: &mut i64,
-) -> ApiResult<()> {
-    let rows: Vec<(i64, String, String, Option<String>, String)> = sqlx::query_as(
-        "SELECT seq, contract_id, event_id, event_name,
+) -> ApiResult<usize> {
+    let rows: Vec<(i64, i64, String, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT seq, ledger, contract_id, event_id, event_name,
                 json_build_object(
                     'event_id', event_id,
                     'contract_id', contract_id,
@@ -142,26 +216,28 @@ async fn fetch_and_broadcast(
          FROM events
          WHERE seq > $1
          ORDER BY seq ASC
-         LIMIT 1000",
+         LIMIT $2",
     )
     .bind(*last_seen)
+    .bind(CATCH_UP_BATCH)
     .fetch_all(&state.pool)
     .await?;
 
-    for (seq, contract_id, event_id, event_name, event_data) in rows {
+    let fetched = rows.len();
+    for (seq, ledger, contract_id, event_id, event_name, event_data) in rows {
         *last_seen = seq;
         if let Ok(data) = serde_json::from_str(&event_data) {
             fanout.publish(BroadcastEvent {
                 contract_id,
                 event_name,
-                ledger: seq,
+                ledger,
                 event_id,
                 data,
             });
         }
     }
 
-    Ok(())
+    Ok(fetched)
 }
 
 #[derive(Deserialize)]
@@ -207,6 +283,7 @@ struct StreamState {
     cursor: Cursor,
     buffer: VecDeque<StreamEvent>,
     rx: broadcast::Receiver<BroadcastEvent>,
+    fanout: Arc<EventFanout>,
     poll_secs: u64,
     last_ledger: i64,
 }
@@ -285,7 +362,8 @@ pub async fn stream_events(
 
     // Subscribe to the shared fan-out before constructing the stream so no
     // events published after this point are missed.
-    let rx = state.event_fanout.subscribe();
+    let fanout = state.event_fanout.clone();
+    let rx = fanout.subscribe();
     let last_ledger = initial_cursor.ledger;
 
     let initial = StreamState {
@@ -295,6 +373,7 @@ pub async fn stream_events(
         cursor: initial_cursor,
         buffer: VecDeque::new(),
         rx,
+        fanout,
         poll_secs,
         last_ledger,
     };
@@ -338,8 +417,9 @@ pub async fn stream_events(
                     let sse = StreamState::sse_event(&event)?;
                     return Some((Ok(sse), st));
                 }
-                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                Ok(Err(broadcast::error::RecvError::Lagged(dropped))) => {
                     // Fell behind; fall through to polling to catch up.
+                    st.fanout.record_lag(dropped);
                     match fetch_new_events(
                         &st.state,
                         &st.contract_id,
@@ -369,6 +449,11 @@ pub async fn stream_events(
                     return None;
                 }
                 Err(_elapsed) => {
+                    // Quiet period. While the shared listener is up it wakes us
+                    // on every new event, so idle streams issue no queries.
+                    if st.fanout.listener_up() {
+                        continue;
+                    }
                     // Fallback: poll for new events.
                     match fetch_new_events(
                         &st.state,

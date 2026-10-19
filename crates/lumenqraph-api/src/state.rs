@@ -74,6 +74,8 @@ pub struct AppState {
     pub audit_tx: Option<mpsc::Sender<AuditEvent>>,
     /// Count of audit events dropped because the channel was full (#367).
     pub audit_dropped: Arc<AtomicU64>,
+    /// Shared SSE fan-out fed by the single `LISTEN lumenqraph_events` task (#569).
+    pub event_fanout: Arc<crate::routes::stream::EventFanout>,
     /// Per-client-IP rate limiter for sibling-instance mounts (#442).
     pub proxy_limiter: Arc<RateLimiter>,
     /// Typed configuration, parsed once at startup (#441). Handlers and

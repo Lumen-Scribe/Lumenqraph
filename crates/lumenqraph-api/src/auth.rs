@@ -755,6 +755,7 @@ mod integration_tests {
 
         AppState {
             pool,
+            event_fanout: Arc::new(crate::routes::stream::EventFanout::new()),
             require_auth,
             anon_rate_limit: anon_rate,
             limiter: Arc::new(RateLimiter::new()),

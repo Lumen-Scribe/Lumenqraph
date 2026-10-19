@@ -158,6 +158,11 @@ pub async fn insert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result
         }
     }
 
+    // Wake the API's SSE fan-out. Postgres delivers NOTIFY only on commit, so
+    // it is sent in the same transaction as the rows it announces (#569).
+    sqlx::query("SELECT pg_notify('lumenqraph_events', '')")
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(inserted_count)
 }
@@ -324,6 +329,11 @@ pub async fn upsert_events(
         }
     }
 
+    // Wake the API's SSE fan-out. Postgres delivers NOTIFY only on commit, so
+    // it is sent in the same transaction as the rows it announces (#569).
+    sqlx::query("SELECT pg_notify('lumenqraph_events', '')")
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok((inserted, updated))
 }

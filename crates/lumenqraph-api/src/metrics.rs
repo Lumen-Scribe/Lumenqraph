@@ -43,7 +43,10 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
     let cache_evictions = state.call_cache.evictions();
     let cache_size = state.call_cache.size();
 
-    let sse_active_streams = state.sse_active_streams.load(Ordering::Relaxed);
+    let sse_active_streams = crate::routes::stream::active_streams();
+    let sse_listener_up = u8::from(state.event_fanout.listener_up());
+    let sse_receivers = state.event_fanout.receivers();
+    let sse_lagged = state.event_fanout.lagged_total();
 
     let mut body = format!(
         "# HELP lumenqraph_indexer_last_processed_ledger Last ledger the indexer processed\n\
@@ -105,7 +108,16 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
          lumenqraph_call_cache_size {cache_size}\n\
          # HELP lumenqraph_sse_active_streams Currently open SSE streams\n\
          # TYPE lumenqraph_sse_active_streams gauge\n\
-         lumenqraph_sse_active_streams {sse_active_streams}\n",
+         lumenqraph_sse_active_streams {sse_active_streams}\n\
+         # HELP lumenqraph_sse_listener_up 1 while the shared LISTEN connection is connected\n\
+         # TYPE lumenqraph_sse_listener_up gauge\n\
+         lumenqraph_sse_listener_up {sse_listener_up}\n\
+         # HELP lumenqraph_sse_broadcast_receivers SSE connections subscribed to the fan-out\n\
+         # TYPE lumenqraph_sse_broadcast_receivers gauge\n\
+         lumenqraph_sse_broadcast_receivers {sse_receivers}\n\
+         # HELP lumenqraph_sse_broadcast_lagged_total Events dropped by SSE subscribers that fell behind\n\
+         # TYPE lumenqraph_sse_broadcast_lagged_total counter\n\
+         lumenqraph_sse_broadcast_lagged_total {sse_lagged}\n",
         last = last,
         tip = tip,
         lag = lag,
@@ -126,6 +138,9 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
         cache_evictions = cache_evictions,
         cache_size = cache_size,
         sse_active_streams = sse_active_streams,
+        sse_listener_up = sse_listener_up,
+        sse_receivers = sse_receivers,
+        sse_lagged = sse_lagged,
     );
 
     body.push_str("# HELP lumenqraph_http_request_duration_ms Per-route HTTP request latency\n");
