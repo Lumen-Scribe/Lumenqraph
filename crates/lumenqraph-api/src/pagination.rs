@@ -85,6 +85,12 @@ pub struct PaginationConfig {
     pub after_event_id: Option<String>,
 }
 
+/// A keyset position that round-trips through an opaque `after` string.
+pub trait Cursor: Sized {
+    fn encode(&self) -> String;
+    fn decode(raw: &str) -> Result<Self, &'static str>;
+}
+
 /// `(ledger, event_id)` position, used by all event-derived views.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerCursor {

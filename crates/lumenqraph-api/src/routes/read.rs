@@ -261,7 +261,7 @@ mod tests {
     use axum::Router;
     use serde_json::{json, Value};
     use stellar_xdr::curr::{
-        Limits, ScSpecEntry, ScSpecFunctionV0, ScSpecInputsEntry, ScSpecTypeDef, ScSymbol, WriteXdr,
+        Limits, ScSpecEntry, ScSpecFunctionV0, ScSpecTypeDef, ScSymbol, WriteXdr,
     };
     use tower::ServiceExt;
 
