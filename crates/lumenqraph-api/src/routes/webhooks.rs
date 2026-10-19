@@ -743,37 +743,81 @@ pub async fn list_webhook_deliveries(
 #[derive(Deserialize)]
 pub struct RedriveQuery {
     since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Maximum deliveries to reset in this call. Callers page by calling again
+    /// while `has_more` is true.
+    max: Option<i64>,
 }
 
-/// `POST /webhooks/:id/redrive` — reset failed deliveries (optionally only
-/// those created at or after `since`) back to pending.
+const DEFAULT_REDRIVE_BATCH: i64 = 1_000;
+const MAX_REDRIVE_BATCH: i64 = 10_000;
+/// Redriven deliveries are spread over this many seconds so a recovered
+/// subscriber is not hit by every pending delivery at once.
+const REDRIVE_JITTER_SECS: f64 = 300.0;
+
+/// `POST /webhooks/:id/redrive` — reset up to `max` failed deliveries
+/// (optionally only those created at or after `since`) back to pending.
 pub async fn redrive_webhook(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(query): Query<RedriveQuery>,
 ) -> ApiResult<Json<Value>> {
-    let exists: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id = $1)")
-            .bind(id)
-            .fetch_one(&state.pool)
-            .await?;
-    if !exists {
-        return Err(ApiError::not_found("subscription not found"));
+    let batch = query.max.unwrap_or(DEFAULT_REDRIVE_BATCH);
+    if !(1..=MAX_REDRIVE_BATCH).contains(&batch) {
+        return Err(ApiError::bad_request(format!(
+            "max must be between 1 and {}",
+            MAX_REDRIVE_BATCH
+        )));
     }
 
-    let affected = sqlx::query(
+    let (active, auto_disabled_at): (bool, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as("SELECT active, auto_disabled_at FROM webhook_subscriptions WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await?
+            .ok_or_else(|| ApiError::not_found("subscription not found"))?;
+    if !active || auto_disabled_at.is_some() {
+        return Err(ApiError::conflict(
+            "subscription is inactive or auto-disabled; re-enable it before redriving",
+        ));
+    }
+
+    let redriven = sqlx::query(
         "UPDATE webhook_deliveries
-         SET status = 'pending', attempts = 0, next_attempt_at = now(), last_error = NULL
-         WHERE subscription_id = $1 AND status = 'failed'
-           AND ($2::timestamptz IS NULL OR created_at >= $2)",
+         SET status = 'pending',
+             attempts = 0,
+             next_attempt_at = now() + (random() * $4::float8) * interval '1 second',
+             last_error = NULL,
+             last_status_code = NULL,
+             last_response_snippet = NULL
+         WHERE id IN (
+             SELECT id FROM webhook_deliveries
+             WHERE subscription_id = $1 AND status = 'failed'
+               AND ($2::timestamptz IS NULL OR created_at >= $2)
+             ORDER BY id
+             LIMIT $3
+         )",
     )
     .bind(id)
     .bind(query.since)
+    .bind(batch)
+    .bind(REDRIVE_JITTER_SECS)
     .execute(&state.pool)
     .await?
     .rows_affected();
 
-    Ok(Json(json!({ "redriven": affected })))
+    let has_more: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM webhook_deliveries
+             WHERE subscription_id = $1 AND status = 'failed'
+               AND ($2::timestamptz IS NULL OR created_at >= $2)
+         )",
+    )
+    .bind(id)
+    .bind(query.since)
+    .fetch_one(&state.pool)
+    .await?;
+
+    Ok(Json(json!({ "redriven": redriven, "has_more": has_more })))
 }
 
 /// `POST /webhooks/:id/reenable` — clear an auto-disable and reactivate.
@@ -781,6 +825,15 @@ pub async fn reenable_webhook(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id = $1)")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await?;
+    if !exists {
+        return Err(ApiError::not_found("webhook subscription not found"));
+    }
+
     let affected = sqlx::query(
         "UPDATE webhook_subscriptions
          SET active = true, auto_disabled_at = NULL, auto_disabled_reason = NULL, consecutive_failures = 0
@@ -791,10 +844,9 @@ pub async fn reenable_webhook(
     .await?
     .rows_affected();
 
+    // Not auto-disabled (or cleared concurrently): nothing to do, reported as a no-op.
     if affected == 0 {
-        return Err(ApiError::bad_request(
-            "subscription not found or not auto-disabled",
-        ));
+        return Ok(Json(json!({ "reenabled": false })));
     }
 
     Ok(Json(json!({ "reenabled": true })))
