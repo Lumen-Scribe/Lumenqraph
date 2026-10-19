@@ -444,26 +444,11 @@ pub async fn webhook_manage_auth_and_rate_limit(
         "webhook management routes require an API key regardless of REQUIRE_API_KEY"
     ))?;
 
-    let hash = hash_key(&key);
-    let row: Option<(bool, i32)> = sqlx::query_as(
-        "SELECT revoked, rate_limit_per_min FROM api_keys WHERE key_hash = $1",
-    )
-    .bind(&hash)
-    .fetch_optional(&state.pool)
-    .await?;
-    let limit = match row {
-        Some((false, limit)) => limit,
-        Some((true, _)) => {
-            log_audit_event(&state.pool, &hash, &route, &method, 401).await;
-            return Err(ApiError::unauthorized("API key revoked"));
-        }
-        None => {
-            log_audit_event(&state.pool, &hash, &route, &method, 401).await;
-            return Err(ApiError::unauthorized("invalid API key"));
-        }
-    };
+    // Resolve through the same path as every other route group, so the key
+    // cache (#430) and revocation handling stay in one place (#560).
+    let (identity, limit, _, _) = resolve_key(&state, &key, &route, &method).await?;
+    let hash = identity.trim_start_matches("key:").to_string();
 
-    let identity = format!("key:{hash}");
     let rl_status = state.limiter.check(&identity, limit);
     if !rl_status.allowed {
         let mut response = (StatusCode::TOO_MANY_REQUESTS, crate::error::rate_limit_error()).into_response();
