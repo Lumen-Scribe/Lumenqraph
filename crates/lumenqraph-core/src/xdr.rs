@@ -29,8 +29,8 @@
 //! | `ScvDuration`             | decimal string (same wire as u64)                   |
 //! | `ScvU128`                 | decimal string                                      |
 //! | `ScvI128`                 | decimal string                                      |
-//! | `ScvU256`                 | `{"_u256_hex":"<32 bytes hex>"}`                    |
-//! | `ScvI256`                 | `{"_u256_hex":"<32 bytes hex>"}`                    |
+//! | `ScvU256`                 | decimal string                                      |
+//! | `ScvI256`                 | decimal string                                      |
 //! | `ScvBytes`                | hex string prefixed `0x` (e.g. `"0xdead"`)         |
 //! | `ScvString`               | UTF-8 string, or hex `"0x…"` if invalid UTF-8       |
 //! | `ScvSymbol`               | UTF-8 string, or hex `"0x…"` if invalid UTF-8       |
@@ -43,10 +43,15 @@
 //! | `ScvAddress` (claimable balance) | `B…` strkey                                  |
 //! | `ScvAddress` (liquidity pool)    | `L…` strkey                                  |
 //! | `ScvAddress` (unknown type) | whole value falls back to `{"_type":"unknown",…}` |
-//! | `ScvContractInstance` (19)| `{"_xdr_tag":19}` — payload consumed safely         |
-//! | `ScvLedgerKeyContractInstance` (20) | `{"_xdr_tag":20}` — no payload            |
-//! | `ScvLedgerKeyNonce` (21)  | `{"_xdr_tag":21}` — payload consumed safely         |
+//! | `ScvContractInstance` (19)| `{"_type":"ContractInstance",…}`                    |
+//! | `ScvLedgerKeyContractInstance` (20) | `{"_type":"LedgerKeyContractInstance"}`    |
+//! | `ScvLedgerKeyNonce` (21)  | `{"_type":"LedgerKeyNonce","nonce":<i64>}`          |
 //! | unknown tag               | `{"_xdr_tag":<N>}` fallback; surrounding data intact|
+//!
+//! Both the byte-level decoder ([`decode_scval_base64`]) and the typed decoder
+//! ([`decode_scval`]) produce identical JSON: the byte path parses into a
+//! `stellar_xdr::curr::ScVal` and delegates to [`decode_scval`], so there is a
+//! single source of truth for the dialect.
 //!
 //! **Ambiguities to be aware of:**
 //! - `Symbol("abc")` and `String("abc")` both decode to `"abc"` — the type
@@ -109,19 +114,23 @@ const MAX_DEPTH: u32 = 256;
 /// Returns a fallback `{"_type":"unknown","xdr":"<base64>"}` on any parse
 /// error, including trailing bytes after the top-level value (which would
 /// indicate cursor misalignment and corrupt a sibling value if ignored).
+///
+/// #608: the bytes are parsed into a typed `ScVal` (with `Limits`) and handed
+/// to [`decode_scval`], so the byte path and the typed path can never drift.
 pub fn decode_scval_base64(b64: &str) -> Value {
-    match base64::engine::general_purpose::STANDARD.decode(b64) {
-        Ok(bytes) => {
-            let mut cur = Cursor::new(&bytes);
-            match cur.read_scval(0) {
-                // #410: reject trailing bytes — they indicate a misaligned
-                // cursor that would corrupt siblings in a vec/map context.
-                Some(v) if cur.pos == cur.buf.len() => v,
-                Some(_) => json!({ "_type": "unknown", "xdr": b64 }),
-                None => json!({ "_type": "unknown", "xdr": b64 }),
-            }
-        }
-        Err(_) => json!({ "_type": "unknown", "xdr": b64 }),
+    use stellar_xdr::curr::{Limited, Limits, ReadXdr, ScVal};
+
+    let fallback = || json!({ "_type": "unknown", "xdr": b64 });
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
+        Ok(bytes) => bytes,
+        Err(_) => return fallback(),
+    };
+    // #410: reject trailing bytes — they indicate a misaligned cursor that
+    // would corrupt siblings in a vec/map context.
+    let mut limited = Limited::new(bytes.as_slice(), Limits::none());
+    match ScVal::read_xdr(&mut limited) {
+        Ok(sv) if limited.inner.is_empty() => decode_scval(&sv),
+        _ => fallback(),
     }
 }
 
@@ -153,26 +162,19 @@ pub fn decode_scval(sv: &stellar_xdr::curr::ScVal) -> Value {
             let lo = p.lo as i128;
             Value::String(((hi << 64) | lo).to_string())
         }
-        ScVal::U256(p) => {
-            // Render as hex for now, matching the byte-level decoder.
-            let mut bytes = [0u8; 32];
-            bytes[0..8].copy_from_slice(&p.hi_hi.to_be_bytes());
-            bytes[8..16].copy_from_slice(&p.hi_lo.to_be_bytes());
-            bytes[16..24].copy_from_slice(&p.lo_hi.to_be_bytes());
-            bytes[24..32].copy_from_slice(&p.lo_lo.to_be_bytes());
-            json!({ "_u256_hex": hex(&bytes) })
-        }
-        ScVal::I256(p) => {
-            let mut bytes = [0u8; 32];
-            bytes[0..8].copy_from_slice(&(p.hi_hi as u64).to_be_bytes());
-            bytes[8..16].copy_from_slice(&p.hi_lo.to_be_bytes());
-            bytes[16..24].copy_from_slice(&p.lo_hi.to_be_bytes());
-            bytes[24..32].copy_from_slice(&p.lo_lo.to_be_bytes());
-            json!({ "_u256_hex": hex(&bytes) })
-        }
+        // #409: render 256-bit integers as decimal strings, matching i128.
+        ScVal::U256(p) => Value::String(u256_to_decimal(p)),
+        ScVal::I256(p) => Value::String(i256_to_decimal(p)),
         ScVal::Bytes(b) => Value::String(format!("0x{}", hex(&b.0))),
-        ScVal::String(s) => Value::String(s.to_utf8_string_lossy()),
-        ScVal::Symbol(s) => Value::String(s.to_utf8_string_lossy()),
+        // #608: invalid UTF-8 renders as hex, matching the documented dialect.
+        ScVal::String(s) => match std::str::from_utf8(&s.0) {
+            Ok(text) => Value::String(text.to_string()),
+            Err(_) => Value::String(format!("0x{}", hex(&s.0))),
+        },
+        ScVal::Symbol(s) => match std::str::from_utf8(&s.0) {
+            Ok(text) => Value::String(text.to_string()),
+            Err(_) => Value::String(format!("0x{}", hex(&s.0))),
+        },
         ScVal::Vec(opt) => match opt {
             None => Value::Array(vec![]),
             Some(v) => Value::Array(v.0.iter().map(decode_scval).collect()),
@@ -219,15 +221,89 @@ pub fn decode_scval(sv: &stellar_xdr::curr::ScVal) -> Value {
     }
 }
 
+/// Render a `UInt256Parts` as a decimal string.
+fn u256_to_decimal(p: &stellar_xdr::curr::UInt256Parts) -> String {
+    let mut limbs = [p.hi_hi, p.hi_lo, p.lo_hi, p.lo_lo];
+    // Repeated division by 10^19 (largest power of ten fitting in a u64).
+    const CHUNK: u64 = 10_000_000_000_000_000_000;
+    let mut chunks: Vec<u64> = Vec::new();
+    loop {
+        let mut rem: u128 = 0;
+        let mut all_zero = true;
+        for limb in limbs.iter_mut() {
+            let cur = (rem << 64) | (*limb as u128);
+            *limb = (cur / CHUNK as u128) as u64;
+            rem = cur % CHUNK as u128;
+            if *limb != 0 {
+                all_zero = false;
+            }
+        }
+        chunks.push(rem as u64);
+        if all_zero {
+            break;
+        }
+    }
+    let mut s = chunks.pop().unwrap_or(0).to_string();
+    while let Some(c) = chunks.pop() {
+        s.push_str(&format!("{c:019}"));
+    }
+    s
+}
+
+/// Render an `Int256Parts` as a decimal string (two's complement).
+fn i256_to_decimal(p: &stellar_xdr::curr::Int256Parts) -> String {
+    let negative = (p.hi_hi as i64) < 0;
+    if !negative {
+        let unsigned = stellar_xdr::curr::UInt256Parts {
+            hi_hi: p.hi_hi,
+            hi_lo: p.hi_lo,
+            lo_hi: p.lo_hi,
+            lo_lo: p.lo_lo,
+        };
+        return u256_to_decimal(&unsigned);
+    }
+    // Negate via two's complement: invert all bits then add one.
+    let mut limbs = [p.hi_hi, p.hi_lo, p.lo_hi, p.lo_lo];
+    for limb in limbs.iter_mut() {
+        *limb = !*limb;
+    }
+    let mut carry = 1u128;
+    for limb in limbs.iter_mut().rev() {
+        let sum = (*limb as u128) + carry;
+        *limb = sum as u64;
+        carry = sum >> 64;
+    }
+    let unsigned = stellar_xdr::curr::UInt256Parts {
+        hi_hi: limbs[0],
+        hi_lo: limbs[1],
+        lo_hi: limbs[2],
+        lo_lo: limbs[3],
+    };
+    format!("-{}", u256_to_decimal(&unsigned))
+}
+
 /// Decode each base64 topic into friendly JSON.
 pub fn decode_topics(topics: &[String]) -> Vec<Value> {
     topics.iter().map(|t| decode_scval_base64(t)).collect()
 }
 
 /// Best-effort event name: `topic[0]` decoded as a Symbol/String.
+///
+/// #609: only `SCV_SYMBOL` (and `SCV_STRING`) first topics yield a name.
+/// Addresses, integers, bytes and other variants return `None` so that
+/// event-name filters and stats are not polluted with addresses/numbers.
 pub fn event_name_from_topic(topic_b64: &str) -> Option<String> {
-    match decode_scval_base64(topic_b64) {
-        Value::String(s) => Some(s),
+    use stellar_xdr::curr::{Limited, Limits, ReadXdr, ScVal};
+
+    let bytes = base64::engine::general_purpose::STANDARD.decode(topic_b64).ok()?;
+    let mut limited = Limited::new(bytes.as_slice(), Limits::none());
+    let sv = ScVal::read_xdr(&mut limited).ok()?;
+    if !limited.inner.is_empty() {
+        return None;
+    }
+    match sv {
+        ScVal::Symbol(s) => std::str::from_utf8(&s.0).ok().map(str::to_string),
+        ScVal::String(s) => std::str::from_utf8(&s.0).ok().map(str::to_string),
         _ => None,
     }
 }
@@ -633,6 +709,68 @@ mod tests {
         );
     }
 
+    // ── #609: event name only from symbol/string first topics ────────────
+
+    #[test]
+    fn event_name_from_symbol_topic() {
+        // ScVal::Symbol("transfer")
+        let mut bytes = SCV_SYMBOL.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&8u32.to_be_bytes());
+        bytes.extend_from_slice(b"transfer");
+        let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        assert_eq!(event_name_from_topic(&raw).as_deref(), Some("transfer"));
+    }
+
+    #[test]
+    fn event_name_from_string_topic() {
+        // ScVal::String("hello")
+        let mut bytes = SCV_STRING.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&5u32.to_be_bytes());
+        bytes.extend_from_slice(b"hello");
+        bytes.extend_from_slice(&[0u8; 3]); // pad
+        let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        assert_eq!(event_name_from_topic(&raw).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn event_name_none_for_address_topic() {
+        // ScVal::Address(Account(...)) decodes to a G-strkey but is not a name.
+        let raw = "AAAAEgAAAAAAAAAAZnYwtpgeUB4mlva1EnnCVBm0hGxbz5B5Zl89BaJLufM=";
+        assert_eq!(event_name_from_topic(raw), None);
+    }
+
+    #[test]
+    fn event_name_none_for_u64_topic() {
+        // ScVal::U64(12345) decodes to "12345" but is not a name.
+        let mut bytes = SCV_U64.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&12345u64.to_be_bytes());
+        let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        assert_eq!(event_name_from_topic(&raw), None);
+    }
+
+    #[test]
+    fn event_name_none_for_i128_topic() {
+        // ScVal::I128(300) decodes to "300" but is not a name.
+        let raw = "AAAACgAAAAAAAAAAAAAAAAAAASw=";
+        assert_eq!(event_name_from_topic(raw), None);
+    }
+
+    #[test]
+    fn event_name_none_for_bytes_topic() {
+        // ScVal::Bytes([0xde,0xad]) decodes to "0xdead" but is not a name.
+        let mut bytes = SCV_BYTES.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        bytes.extend_from_slice(&[0xde, 0xad]);
+        bytes.extend_from_slice(&[0u8; 2]); // pad
+        let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        assert_eq!(event_name_from_topic(&raw), None);
+    }
+
+    #[test]
+    fn event_name_none_for_malformed_topic() {
+        assert_eq!(event_name_from_topic("not-base64!!"), None);
+    }
+
     #[test]
     fn decodes_i128_amount() {
         // ScVal::I128 captured from a fee event (a small positive amount).
@@ -773,9 +911,8 @@ mod tests {
 
     #[test]
     fn scv_contract_instance_tag_19_is_safe() {
-        // #410: ScvContractInstance (tag 19) with a WASM executable and no
-        // storage must decode to {"_xdr_tag":19} without leaving trailing bytes
-        // that would corrupt siblings.
+        // #410/#608: ScvContractInstance (tag 19) with a WASM executable and
+        // no storage decodes to the typed ContractInstance shape.
         // Wire: [tag=19][exec_kind=0][wasm_hash: 32 zero bytes][storage_present=0]
         let mut bytes = SCV_CONTRACT_INSTANCE.to_be_bytes().to_vec();
         bytes.extend_from_slice(&0u32.to_be_bytes()); // exec_kind = Wasm
@@ -784,37 +921,80 @@ mod tests {
         let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let result = decode_scval_base64(&raw);
         assert_eq!(
-            result.get("_xdr_tag").and_then(|v| v.as_u64()),
-            Some(19),
-            "tag 19 should produce _xdr_tag:19, got {result:?}"
+            result.get("_type").and_then(|v| v.as_str()),
+            Some("ContractInstance"),
+            "tag 19 should produce a ContractInstance, got {result:?}"
         );
     }
 
     #[test]
     fn scv_ledger_key_contract_instance_tag_20_is_safe() {
-        // #410: ScvLedgerKeyContractInstance (tag 20) has no payload.
+        // #410/#608: ScvLedgerKeyContractInstance (tag 20) has no payload.
         let mut bytes = SCV_LEDGER_KEY_CONTRACT_INSTANCE.to_be_bytes().to_vec();
         let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let result = decode_scval_base64(&raw);
         assert_eq!(
-            result.get("_xdr_tag").and_then(|v| v.as_u64()),
-            Some(20),
-            "tag 20 should produce _xdr_tag:20, got {result:?}"
+            result.get("_type").and_then(|v| v.as_str()),
+            Some("LedgerKeyContractInstance"),
+            "tag 20 should produce a LedgerKeyContractInstance, got {result:?}"
         );
     }
 
     #[test]
     fn scv_ledger_key_nonce_tag_21_is_safe() {
-        // #410: ScvLedgerKeyNonce (tag 21) payload = ScNonceKey { nonce: i64 }.
+        // #410/#608: ScvLedgerKeyNonce (tag 21) payload = ScNonceKey { nonce: i64 }.
         let mut bytes = SCV_LEDGER_KEY_NONCE.to_be_bytes().to_vec();
         bytes.extend_from_slice(&42i64.to_be_bytes()); // nonce value
         let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let result = decode_scval_base64(&raw);
         assert_eq!(
-            result.get("_xdr_tag").and_then(|v| v.as_u64()),
-            Some(21),
-            "tag 21 should produce _xdr_tag:21, got {result:?}"
+            result.get("_type").and_then(|v| v.as_str()),
+            Some("LedgerKeyNonce"),
+            "tag 21 should produce a LedgerKeyNonce, got {result:?}"
         );
+        assert_eq!(result.get("nonce").and_then(|v| v.as_i64()), Some(42));
+    }
+
+    #[test]
+    fn scv_error_renders_structured_error() {
+        // #608: ScVal::Error(Contract(7)) -> {"error":{"type":"Contract","code":7}}
+        let mut bytes = SCV_ERROR.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // Contract
+        bytes.extend_from_slice(&7u32.to_be_bytes()); // code
+        let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = decode_scval_base64(&raw);
+        assert_eq!(
+            result,
+            serde_json::json!({ "error": { "type": "Contract", "code": 7 } })
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_string_renders_as_hex() {
+        // #608: invalid UTF-8 in a String renders as hex, not lossy U+FFFD.
+        let bad_utf8: &[u8] = &[0xFF, 0xFE];
+        let mut bytes = SCV_STRING.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&(bad_utf8.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(bad_utf8);
+        bytes.extend(std::iter::repeat(0u8).take(2)); // pad
+        let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        assert_eq!(decode_scval_base64(&raw), Value::String("0xfffe".into()));
+    }
+
+    #[test]
+    fn u256_and_i256_render_as_decimal() {
+        // #409: U256(1) -> "1"
+        let mut bytes = SCV_U256.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&[0u8; 31]);
+        bytes.push(1);
+        let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        assert_eq!(decode_scval_base64(&raw), Value::String("1".into()));
+
+        // I256(-1) -> "-1" (all bits set)
+        let mut bytes = SCV_I256.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&[0xFFu8; 32]);
+        let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        assert_eq!(decode_scval_base64(&raw), Value::String("-1".into()));
     }
 
     // ── #411: map key collisions ─────────────────────────────────────────
@@ -1346,6 +1526,89 @@ mod prop_tests {
                 }
                 other => prop_assert!(false, "expected object or array, got {other:?}"),
             }
+        }
+
+        // #608: the byte path and the typed path must agree for every ScVal.
+        /// For any typed ScVal, `decode_scval_base64(b64(v)) == decode_scval(v)`.
+        #[test]
+        fn byte_and_typed_decoders_agree(sv in arb_scval(0)) {
+            use stellar_xdr::curr::WriteXdr;
+            let bytes = sv.to_xdr(Limits::none()).expect("ScVal should encode");
+            let b64 = encode(&bytes);
+            let via_bytes = decode_scval_base64(&b64);
+            let via_typed = decode_scval(&sv);
+            prop_assert_eq!(via_bytes, via_typed);
+        }
+    }
+
+    // ---- #608: arbitrary ScVal generator ---------------------------------
+
+    use stellar_xdr::curr::{
+        Int128Parts, Int256Parts, ScAddress, ScBytes, ScMap, ScMapEntry, ScString, ScSymbol,
+        ScVal, ScVec, UInt128Parts, UInt256Parts,
+    };
+
+    fn arb_scval(depth: u32) -> BoxedStrategy<ScVal> {
+        let leaf = prop_oneof![
+            Just(ScVal::Void),
+            any::<bool>().prop_map(ScVal::Bool),
+            any::<u32>().prop_map(ScVal::U32),
+            any::<i32>().prop_map(ScVal::I32),
+            any::<u64>().prop_map(ScVal::U64),
+            any::<i64>().prop_map(ScVal::I64),
+            any::<u64>().prop_map(|n| ScVal::Timepoint(stellar_xdr::curr::TimePoint(n))),
+            any::<u64>().prop_map(|n| ScVal::Duration(stellar_xdr::curr::Duration(n))),
+            (any::<u64>(), any::<u64>()).prop_map(|(hi, lo)| ScVal::U128(UInt128Parts { hi, lo })),
+            (any::<i64>(), any::<u64>()).prop_map(|(hi, lo)| ScVal::I128(Int128Parts { hi, lo })),
+            (any::<u64>(), any::<u64>(), any::<u64>(), any::<u64>()).prop_map(
+                |(hi_hi, hi_lo, lo_hi, lo_lo)| {
+                    ScVal::U256(UInt256Parts { hi_hi, hi_lo, lo_hi, lo_lo })
+                }
+            ),
+            (any::<i64>(), any::<u64>(), any::<u64>(), any::<u64>()).prop_map(
+                |(hi_hi, hi_lo, lo_hi, lo_lo)| {
+                    ScVal::I256(Int256Parts { hi_hi, hi_lo, lo_hi, lo_lo })
+                }
+            ),
+            proptest::collection::vec(any::<u8>(), 0..=16)
+                .prop_map(|b| ScVal::Bytes(ScBytes(b.try_into().unwrap()))),
+            "[a-zA-Z0-9_]{0,16}".prop_map(|s| ScVal::Symbol(ScSymbol(s.try_into().unwrap()))),
+            "[a-zA-Z0-9_]{0,16}".prop_map(|s| ScVal::String(ScString(s.try_into().unwrap()))),
+            any::<[u8; 32]>().prop_map(|raw| {
+                ScVal::Address(ScAddress::Contract(stellar_xdr::curr::ContractId(
+                    stellar_xdr::curr::Hash(raw),
+                )))
+            }),
+            any::<[u8; 32]>().prop_map(|raw| {
+                ScVal::Address(ScAddress::Account(stellar_xdr::curr::AccountId(
+                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(raw)),
+                )))
+            }),
+            Just(ScVal::LedgerKeyContractInstance),
+            any::<i64>().prop_map(|nonce| {
+                ScVal::LedgerKeyNonce(stellar_xdr::curr::ScNonceKey { nonce })
+            }),
+        ];
+
+        if depth >= 3 {
+            leaf.boxed()
+        } else {
+            let nested = prop_oneof![
+                proptest::collection::vec(arb_scval(depth + 1), 0..=4)
+                    .prop_map(|v| ScVal::Vec(Some(ScVec(v.try_into().unwrap())))),
+                proptest::collection::vec(
+                    (arb_scval(depth + 1), arb_scval(depth + 1)),
+                    0..=4,
+                )
+                .prop_map(|entries| {
+                    let entries: Vec<ScMapEntry> = entries
+                        .into_iter()
+                        .map(|(key, val)| ScMapEntry { key, val })
+                        .collect();
+                    ScVal::Map(Some(ScMap(entries.try_into().unwrap())))
+                }),
+            ];
+            prop_oneof![leaf, nested].boxed()
         }
     }
 }

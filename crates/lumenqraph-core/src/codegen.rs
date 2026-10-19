@@ -265,7 +265,11 @@ impl Gen<'_> {
         let mut out = String::new();
         for (name, def, doc) in ALIASES {
             if self.used.contains(name) {
-                let _ = write!(out, "\n/** {doc} */\nexport type {name} = {def};\n");
+                let _ = write!(
+                    out,
+                    "\n/** {} */\nexport type {name} = {def};\n",
+                    ts_doc(doc)
+                );
             }
         }
         out
@@ -279,11 +283,12 @@ impl Gen<'_> {
 
         for s in &spec.structs {
             out.push('\n');
+            let type_name = ts_type_name(&s.name);
             if is_tuple_struct(s) {
                 let tys: Vec<String> = s.fields.iter().map(|f| self.ts(&f.ty, Pos::Ret)).collect();
-                let _ = writeln!(out, "export type {} = [{}];", s.name, tys.join(", "));
+                let _ = writeln!(out, "export type {} = [{}];", type_name, tys.join(", "));
             } else {
-                let _ = writeln!(out, "export interface {} {{", s.name);
+                let _ = writeln!(out, "export interface {} {{", type_name);
                 for f in &s.fields {
                     let ty = self.ts(&f.ty, Pos::Ret);
                     let _ = writeln!(out, "  {}: {};", ts_key(&f.name), ty);
@@ -296,7 +301,7 @@ impl Gen<'_> {
             let cases: Vec<String> = e
                 .cases
                 .iter()
-                .map(|(name, value)| format!("{name} = {value}"))
+                .map(|(name, value)| format!("{} = {value}", ts_case_name(name)))
                 .collect();
             let names: Vec<String> = e
                 .cases
@@ -305,9 +310,12 @@ impl Gen<'_> {
                 .collect();
             let _ = write!(
                 out,
-                "\n/** Unit enum ({}). Values decode to the case name. */\nexport type {} = {} | number;\n",
-                cases.join(", "),
-                e.name,
+                "\n/** {} */\nexport type {} = {} | number;\n",
+                ts_doc(&format!(
+                    "Unit enum ({}). Values decode to the case name.",
+                    cases.join(", ")
+                )),
+                ts_type_name(&e.name),
                 names.join(" | "),
             );
         }
@@ -325,7 +333,7 @@ impl Gen<'_> {
             let _ = write!(
                 out,
                 "\nexport type {} =\n  | {};\n",
-                u.name,
+                ts_type_name(&u.name),
                 cases.join("\n  | "),
             );
         }
@@ -339,13 +347,13 @@ impl Gen<'_> {
             let cases: Vec<String> = e
                 .cases
                 .iter()
-                .map(|c| format!("  {} = {},", c.name, c.code))
+                .map(|c| format!("  {} = {},", ts_case_name(&c.name), c.code))
                 .collect();
-            let doc = format!("Error codes for `{}`.", e.name);
+            let doc = ts_doc(&format!("Error codes for `{}`.", e.name));
             let _ = write!(
                 out,
                 "\n/** {doc} */\nexport enum {} {{\n{}\n}}\n",
-                e.name,
+                ts_type_name(&e.name),
                 cases.join("\n"),
             );
         }
@@ -369,9 +377,8 @@ impl Gen<'_> {
 
         if !f.doc.trim().is_empty() {
             out.push_str("  /**\n");
-            for line in f.doc.trim().lines() {
-                // A `*/` in the doc must not terminate the comment early.
-                let _ = writeln!(out, "   * {}", line.replace("*/", "*\\/"));
+            for line in ts_doc(f.doc.trim()).lines() {
+                let _ = writeln!(out, "   * {line}");
             }
             out.push_str("   */\n");
         }
@@ -452,28 +459,31 @@ INT = Union[int, str]  # large integers as decimal strings
     for s in &spec.structs {
         out.push('\n');
         let _ = writeln!(out, "@dataclass");
-        let _ = writeln!(out, "class {}:", s.name);
+        let _ = writeln!(out, "class {}:", py_type_name(&s.name));
         if s.fields.is_empty() {
             out.push_str("    pass\n");
         } else {
-            for f in &s.fields {
+            for (i, f) in s.fields.iter().enumerate() {
                 let ty = py_type(&f.ty);
-                let _ = writeln!(out, "    {}: {}", py_ident(&f.name), ty);
+                let _ = writeln!(
+                    out,
+                    "    {}: {}",
+                    py_ident(&f.name, "field", i),
+                    ty
+                );
             }
         }
     }
 
     // Emit simple str enums
     for e in &spec.enums {
-        let cases: Vec<String> = e.cases.iter().map(|(n, _)| format!("    {} = {:?}", n, n)).collect();
         out.push('\n');
-        let _ = writeln!(out, "class {}:", e.name);
-        if cases.is_empty() {
+        let _ = writeln!(out, "class {}:", py_type_name(&e.name));
+        if e.cases.is_empty() {
             out.push_str("    pass\n");
         } else {
-            for c in &cases {
-                out.push_str(c);
-                out.push('\n');
+            for (i, (n, _)) in e.cases.iter().enumerate() {
+                let _ = writeln!(out, "    {} = {:?}", py_ident(n, "case", i), n);
             }
         }
     }
@@ -506,30 +516,23 @@ class ContractClient:
     );
 
     // Emit one method per function
-    for f in &spec.functions {
+    for (fi, f) in spec.functions.iter().enumerate() {
         out.push('\n');
         let ret = py_return_type(f.output_tys.first());
+        let method = py_ident(&f.name, "function", fi);
         if f.inputs.is_empty() {
-            let _ = writeln!(
-                out,
-                "    def {}(self) -> {ret}:",
-                py_ident(&f.name)
-            );
+            let _ = writeln!(out, "    def {method}(self) -> {ret}:");
         } else {
             let params: Vec<String> = f
                 .inputs
                 .iter()
-                .map(|i| format!("{}: {}", py_ident(&i.name), py_type(&i.ty)))
+                .enumerate()
+                .map(|(i, inp)| format!("{}: {}", py_ident(&inp.name, "arg", i), py_type(&inp.ty)))
                 .collect();
-            let _ = writeln!(
-                out,
-                "    def {}(self, {}) -> {ret}:",
-                py_ident(&f.name),
-                params.join(", ")
-            );
+            let _ = writeln!(out, "    def {method}(self, {}) -> {ret}:", params.join(", "));
         }
         if !f.doc.trim().is_empty() {
-            let _ = writeln!(out, "        \"\"\"{}\"\"\"", f.doc.trim().replace("\"\"\"", "\\\"\\\"\\\""));
+            let _ = writeln!(out, "        {}", py_doc(f.doc.trim()));
         }
         if f.inputs.is_empty() {
             let _ = writeln!(out, "        return self._call({:?}, {{}})", f.name);
@@ -537,7 +540,8 @@ class ContractClient:
             let arg_pairs: Vec<String> = f
                 .inputs
                 .iter()
-                .map(|i| format!("{:?}: {}", i.name, py_ident(&i.name)))
+                .enumerate()
+                .map(|(i, inp)| format!("{:?}: {}", inp.name, py_ident(&inp.name, "arg", i)))
                 .collect();
             let _ = writeln!(
                 out,
@@ -572,7 +576,7 @@ fn py_type(ty: &ScSpecTypeDef) -> String {
         T::Map(m) => format!("dict[str, {}]", py_type(&m.value_type)),
         T::Result(r) => py_type(&r.ok_type),
         T::Val | T::Error | T::MuxedAddress => "Any".into(),
-        T::Udt(u) => u.name.to_utf8_string_lossy(),
+        T::Udt(u) => py_type_name(&u.name.to_utf8_string_lossy()),
     }
 }
 
@@ -580,15 +584,64 @@ fn py_return_type(ty: Option<&ScSpecTypeDef>) -> String {
     ty.map_or_else(|| "None".into(), py_type)
 }
 
-fn py_ident(name: &str) -> String {
-    // Python keywords that must be escaped
-    match name {
-        "from" | "class" | "import" | "return" | "def" | "lambda" | "pass" | "in" | "is"
-        | "not" | "and" | "or" | "else" | "if" | "for" | "while" | "with" | "yield"
-        | "raise" | "try" | "except" | "finally" | "del" | "global" | "nonlocal"
-        | "assert" | "break" | "continue" | "as" | "type" => format!("{name}_"),
-        _ => name.replace('-', "_"),
+/// A Python class name for a spec type. Invalid identifiers are mapped to a
+/// deterministic safe name so contract-controlled names can't break the module.
+fn py_type_name(name: &str) -> String {
+    if is_valid_ident(name) {
+        name.to_string()
+    } else {
+        format!("Type_{}", sanitize_ident(name))
     }
+}
+
+/// A Python identifier for a spec name. Invalid names (and keywords) map to a
+/// deterministic `<fallback_prefix>_<index>` so the generated module always
+/// compiles; the original name is preserved wherever it's emitted as a string.
+fn py_ident(name: &str, fallback_prefix: &str, index: usize) -> String {
+    if is_valid_ident(name) && !is_py_keyword(name) {
+        name.to_string()
+    } else {
+        format!("{fallback_prefix}_{index}")
+    }
+}
+
+fn is_py_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "from"
+            | "class"
+            | "import"
+            | "return"
+            | "def"
+            | "lambda"
+            | "pass"
+            | "in"
+            | "is"
+            | "not"
+            | "and"
+            | "or"
+            | "else"
+            | "if"
+            | "for"
+            | "while"
+            | "with"
+            | "yield"
+            | "raise"
+            | "try"
+            | "except"
+            | "finally"
+            | "del"
+            | "global"
+            | "nonlocal"
+            | "assert"
+            | "break"
+            | "continue"
+            | "as"
+            | "type"
+            | "None"
+            | "True"
+            | "False"
+    )
 }
 
 // ── Rust codegen ──────────────────────────────────────────────────────────────
@@ -618,10 +671,14 @@ pub const CONTRACT_ID: &str = {contract_id:?};
     // Emit one struct per UDT struct
     for s in &spec.structs {
         let _ = writeln!(out, "#[derive(Debug, Clone, Serialize, Deserialize)]");
-        let _ = writeln!(out, "pub struct {} {{", s.name);
-        for f in &s.fields {
+        let _ = writeln!(out, "pub struct {} {{", rust_type_name(&s.name));
+        for (i, f) in s.fields.iter().enumerate() {
             let ty = rust_type(&f.ty);
-            let _ = writeln!(out, "    pub {}: {ty},", rust_ident(&f.name));
+            let _ = writeln!(
+                out,
+                "    pub {}: {ty},",
+                rust_ident(&f.name, "field", i)
+            );
         }
         out.push_str("}\n\n");
     }
@@ -629,9 +686,9 @@ pub const CONTRACT_ID: &str = {contract_id:?};
     // Emit one enum per UDT enum
     for e in &spec.enums {
         let _ = writeln!(out, "#[derive(Debug, Clone, Serialize, Deserialize)]");
-        let _ = writeln!(out, "pub enum {} {{", e.name);
-        for (name, _) in &e.cases {
-            let _ = writeln!(out, "    {name},");
+        let _ = writeln!(out, "pub enum {} {{", rust_type_name(&e.name));
+        for (i, (name, _)) in e.cases.iter().enumerate() {
+            let _ = writeln!(out, "    {},", rust_ident(name, "case", i));
         }
         out.push_str("}\n\n");
     }
@@ -640,16 +697,17 @@ pub const CONTRACT_ID: &str = {contract_id:?};
     for u in &spec.unions {
         let _ = writeln!(out, "#[derive(Debug, Clone, Serialize, Deserialize)]");
         let _ = writeln!(out, "#[serde(untagged)]");
-        let _ = writeln!(out, "pub enum {} {{", u.name);
-        for c in &u.cases {
+        let _ = writeln!(out, "pub enum {} {{", rust_type_name(&u.name));
+        for (i, c) in u.cases.iter().enumerate() {
+            let case = rust_ident(&c.name, "case", i);
             if c.tys.is_empty() {
-                let _ = writeln!(out, "    {},", c.name);
+                let _ = writeln!(out, "    {case},");
             } else if c.tys.len() == 1 {
                 let ty = rust_type(&c.tys[0]);
-                let _ = writeln!(out, "    {}({}),", c.name, ty);
+                let _ = writeln!(out, "    {case}({ty}),");
             } else {
                 let tys: Vec<String> = c.tys.iter().map(rust_type).collect();
-                let _ = writeln!(out, "    {}({}),", c.name, tys.join(", "));
+                let _ = writeln!(out, "    {case}({}),", tys.join(", "));
             }
         }
         out.push_str("}\n\n");
@@ -709,19 +767,19 @@ impl ContractClient {{
     );
 
     // Emit one method per function
-    for f in &spec.functions {
+    for (fi, f) in spec.functions.iter().enumerate() {
         out.push('\n');
         if !f.doc.trim().is_empty() {
-            for line in f.doc.trim().lines() {
-                let _ = writeln!(out, "    /// {}", line.replace("*/", "* /"));
+            for line in rust_doc(f.doc.trim()).lines() {
+                let _ = writeln!(out, "    /// {line}");
             }
         }
         let ret = rust_return_type(f.output_tys.first());
+        let method = rust_ident(&f.name, "function", fi);
         if f.inputs.is_empty() {
             let _ = writeln!(
                 out,
-                "    pub async fn {}(&self) -> Result<{ret}, reqwest::Error> {{",
-                rust_ident(&f.name)
+                "    pub async fn {method}(&self) -> Result<{ret}, reqwest::Error> {{"
             );
             let _ = writeln!(
                 out,
@@ -732,21 +790,22 @@ impl ContractClient {{
             let params: Vec<String> = f
                 .inputs
                 .iter()
-                .map(|i| {
-                    let ty = rust_type(&i.ty);
-                    format!("{}: {ty}", rust_ident(&i.name))
+                .enumerate()
+                .map(|(i, inp)| {
+                    let ty = rust_type(&inp.ty);
+                    format!("{}: {ty}", rust_ident(&inp.name, "arg", i))
                 })
                 .collect();
             let _ = writeln!(
                 out,
-                "    pub async fn {}(&self, {}) -> Result<{ret}, reqwest::Error> {{",
-                rust_ident(&f.name),
+                "    pub async fn {method}(&self, {}) -> Result<{ret}, reqwest::Error> {{",
                 params.join(", ")
             );
             let arg_pairs: Vec<String> = f
                 .inputs
                 .iter()
-                .map(|i| format!("{:?}: {}", i.name, rust_ident(&i.name)))
+                .enumerate()
+                .map(|(i, inp)| format!("{:?}: {}", inp.name, rust_ident(&inp.name, "arg", i)))
                 .collect();
             let _ = writeln!(
                 out,
@@ -792,7 +851,7 @@ fn rust_type(ty: &ScSpecTypeDef) -> String {
         ),
         T::Result(r) => rust_type(&r.ok_type),
         T::Val | T::Error | T::MuxedAddress => "serde_json::Value".into(),
-        T::Udt(u) => u.name.to_utf8_string_lossy(),
+        T::Udt(u) => rust_type_name(&u.name.to_utf8_string_lossy()),
     }
 }
 
@@ -800,16 +859,71 @@ fn rust_return_type(ty: Option<&ScSpecTypeDef>) -> String {
     ty.map_or_else(|| "()".into(), rust_type)
 }
 
-fn rust_ident(name: &str) -> String {
-    // Rust keywords
-    match name {
-        "type" | "self" | "fn" | "let" | "mut" | "use" | "mod" | "pub" | "impl" | "struct"
-        | "enum" | "trait" | "match" | "if" | "else" | "for" | "while" | "loop" | "return"
-        | "break" | "continue" | "where" | "as" | "in" | "ref" | "move" | "async" | "await"
-        | "dyn" | "unsafe" | "extern" | "crate" | "super" | "static" | "const" | "box"
-        | "true" | "false" => format!("r#{name}"),
-        _ => name.replace('-', "_"),
+/// A Rust type name for a spec type. Invalid identifiers map to a deterministic
+/// safe name so contract-controlled names can't break the generated crate.
+fn rust_type_name(name: &str) -> String {
+    if is_valid_ident(name) {
+        name.to_string()
+    } else {
+        format!("Type_{}", sanitize_ident(name))
     }
+}
+
+/// A Rust identifier for a spec name. Invalid names map to a deterministic
+/// `<fallback_prefix>_<index>`; keywords are raw-escaped.
+fn rust_ident(name: &str, fallback_prefix: &str, index: usize) -> String {
+    if !is_valid_ident(name) {
+        return format!("{fallback_prefix}_{index}");
+    }
+    if is_rust_keyword(name) {
+        format!("r#{name}")
+    } else {
+        name.to_string()
+    }
+}
+
+fn is_rust_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "type"
+            | "self"
+            | "fn"
+            | "let"
+            | "mut"
+            | "use"
+            | "mod"
+            | "pub"
+            | "impl"
+            | "struct"
+            | "enum"
+            | "trait"
+            | "match"
+            | "if"
+            | "else"
+            | "for"
+            | "while"
+            | "loop"
+            | "return"
+            | "break"
+            | "continue"
+            | "where"
+            | "as"
+            | "in"
+            | "ref"
+            | "move"
+            | "async"
+            | "await"
+            | "dyn"
+            | "unsafe"
+            | "extern"
+            | "crate"
+            | "super"
+            | "static"
+            | "const"
+            | "box"
+            | "true"
+            | "false"
+    )
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -839,6 +953,88 @@ fn ts_key(name: &str) -> String {
     } else {
         format!("{name:?}")
     }
+}
+
+/// A TS type name for a spec type. Invalid identifiers map to a deterministic
+/// safe name so contract-controlled names can't break the generated module.
+fn ts_type_name(name: &str) -> String {
+    if is_ts_ident(name) {
+        name.to_string()
+    } else {
+        format!("Type_{}", sanitize_ident(name))
+    }
+}
+
+/// A TS enum case name. Invalid identifiers map to a deterministic safe name.
+fn ts_case_name(name: &str) -> String {
+    if is_ts_ident(name) {
+        name.to_string()
+    } else {
+        format!("Case_{}", sanitize_ident(name))
+    }
+}
+
+/// `^[A-Za-z_][A-Za-z0-9_]*$` — the identifier shape shared by Python and Rust.
+fn is_valid_ident(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Turn an arbitrary name into an identifier-safe suffix: ASCII alphanumerics
+/// are kept, everything else becomes `_`. Deterministic for a given input.
+fn sanitize_ident(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push('_');
+    }
+    out
+}
+
+/// Escape a doc string for a TypeScript `/** … */` block comment: `*/` can't
+/// terminate the comment early, and line separators can't break the line.
+fn ts_doc(doc: &str) -> String {
+    doc.replace("*/", "*\\/")
+        .replace('\r', "\n")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+/// Escape a doc string for a Rust `///` line comment: keep it on one line and
+/// neutralise block-comment terminators.
+fn rust_doc(doc: &str) -> String {
+    doc.replace("*/", "* /")
+        .replace('\r', "\n")
+        .replace('\u{2028}', "\\u{2028}")
+        .replace('\u{2029}', "\\u{2029}")
+}
+
+/// Render a doc string as a Python `#` comment line (repr-style escaping of
+/// control characters and line separators so it stays on one line).
+fn py_doc(doc: &str) -> String {
+    let mut out = String::from("# ");
+    for c in doc.chars() {
+        match c {
+            '\n' | '\r' => out.push_str("\\n"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\x{:02x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1346,8 +1542,25 @@ mod tests {
     fn python_client_handles_keyword_names() {
         let s = spec(&[function("from", "", vec![], Some(ScSpecTypeDef::U32))]);
         let py = python_client(C, &s);
-        // "from" is a Python keyword; should be escaped to "from_"
-        assert!(py.contains("def from_("));
+        // "from" is a Python keyword; it maps to a safe generated name.
+        assert!(py.contains("def function_0("), "{py}");
+        assert!(!py.contains("def from("));
+    }
+
+    #[test]
+    fn python_client_neutralises_hostile_names_and_docs() {
+        let s = spec(&[function(
+            "x): import os; os.system(\"id\")  # ",
+            "say \"hi\"\\",
+            vec![("a): pass #", ScSpecTypeDef::U32)],
+            Some(ScSpecTypeDef::U32),
+        )]);
+        let py = python_client(C, &s);
+        assert!(py.contains("def function_0("), "{py}");
+        assert!(py.contains("arg_0: int"), "{py}");
+        // Doc is emitted as a comment, never as a raw docstring.
+        assert!(!py.contains("\"\"\""), "{py}");
+        assert!(py.contains("# say"), "{py}");
     }
 
     #[test]

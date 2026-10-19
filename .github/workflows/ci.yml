@@ -277,6 +277,60 @@ jobs:
       - name: Build (release)
         run: cargo build --workspace --release
 
+  # Issues #606/#607: codegen emits TypeScript and Python from contract-controlled
+  # on-chain specs (docs and names). Prove hostile docs/names stay syntactically
+  # inert by compiling the generated output: `tsc --noEmit` for TypeScript and
+  # `python -m py_compile` for Python. The codegen tests write the hostile
+  # fixtures to $CODEGEN_DUMP_DIR when that env var is set.
+  codegen-output-compile:
+    name: Codegen Output Compile (tsc, py_compile)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: codegen-output-compile
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install TypeScript
+        run: npm install --no-save --no-package-lock typescript@5
+      - name: Generate hostile codegen fixtures
+        env:
+          CODEGEN_DUMP_DIR: ${{ runner.temp }}/codegen-out
+        run: |
+          mkdir -p "$CODEGEN_DUMP_DIR"
+          cargo test -p lumenqraph-core codegen -- --nocapture
+          echo "Generated files:"
+          find "$CODEGEN_DUMP_DIR" -type f -print
+      - name: Type-check generated TypeScript
+        run: |
+          shopt -s nullglob
+          files=("$RUNNER_TEMP"/codegen-out/*.ts)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::No generated TypeScript fixtures were produced."
+            exit 1
+          fi
+          npx tsc --noEmit --strict --target ES2020 --module ES2020 "${files[@]}"
+      - name: Compile generated Python
+        run: |
+          shopt -s nullglob
+          files=("$RUNNER_TEMP"/codegen-out/*.py)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::No generated Python fixtures were produced."
+            exit 1
+          fi
+          python -m py_compile "${files[@]}"
+
   # Issue #222: OpenAPI spec drift check.
   # Generates the spec from utoipa annotations (via --print-openapi) and
   # compares it against the committed openapi.yaml.  Fails the build if any
