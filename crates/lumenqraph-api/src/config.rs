@@ -12,6 +12,8 @@ use std::time::Duration;
 use anyhow::Context;
 pub use lumenqraph_core::db::DbConfig;
 
+use crate::rate_limit::RateLimitSettings;
+
 /// GraphQL schema limits.
 #[derive(Debug, Clone)]
 pub struct GraphqlConfig {
@@ -74,6 +76,8 @@ pub struct ApiConfig {
 
     pub require_auth: bool,
     pub anon_rate_limit: i32,
+    /// Backend, Redis URL and failure mode for every limiter (#554).
+    pub rate_limit: RateLimitSettings,
     pub rpc_require_auth: bool,
     pub rpc_anon_rate_limit: i32,
     pub metrics_require_auth: bool,
@@ -141,6 +145,11 @@ impl ApiConfig {
 
             require_auth: env_bool("REQUIRE_API_KEY", false)?,
             anon_rate_limit: env_parse("ANON_RATE_LIMIT_PER_MIN", 60)?,
+            rate_limit: RateLimitSettings::parse(
+                &env_string("RATE_LIMIT_BACKEND", "memory"),
+                std::env::var("REDIS_URL").ok().as_deref(),
+                &env_string("RATE_LIMIT_FAIL_MODE", "open"),
+            )?,
             rpc_require_auth: env_bool("RPC_REQUIRE_API_KEY", false)?,
             rpc_anon_rate_limit: env_parse("RPC_ROUTE_RATE_LIMIT_PER_MIN", 10)?,
             metrics_require_auth: env_bool("METRICS_REQUIRE_API_KEY", false)?,
@@ -217,6 +226,7 @@ impl ApiConfig {
             explorer_dir: "explorer".into(),
             require_auth: false,
             anon_rate_limit: 60,
+            rate_limit: RateLimitSettings::default(),
             rpc_require_auth: false,
             rpc_anon_rate_limit: 10,
             metrics_require_auth: false,
@@ -261,6 +271,8 @@ impl fmt::Debug for ApiConfig {
             .field("explorer_dir", &self.explorer_dir)
             .field("require_auth", &self.require_auth)
             .field("anon_rate_limit", &self.anon_rate_limit)
+            .field("rate_limit_backend", &self.rate_limit.backend)
+            .field("rate_limit_fail_mode", &self.rate_limit.fail_mode)
             .field("rpc_require_auth", &self.rpc_require_auth)
             .field("rpc_anon_rate_limit", &self.rpc_anon_rate_limit)
             .field("metrics_require_auth", &self.metrics_require_auth)

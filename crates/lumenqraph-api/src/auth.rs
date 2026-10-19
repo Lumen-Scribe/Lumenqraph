@@ -312,7 +312,7 @@ pub async fn auth_and_rate_limit(
         }
     };
 
-    let rl_status = state.limiter.check(&identity, limit);
+    let rl_status = state.limiter.check(&identity, limit).await;
     if !rl_status.allowed {
         if is_authenticated {
             let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
@@ -367,7 +367,7 @@ pub async fn rpc_auth_and_rate_limit(
         }
     };
 
-    let rl_status = state.rpc_limiter.check(&identity, limit);
+    let rl_status = state.rpc_limiter.check(&identity, limit).await;
     if !rl_status.allowed {
         if is_authenticated {
             let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
@@ -419,7 +419,7 @@ pub async fn webhook_auth_and_rate_limit(
         }
     };
 
-    let rl_status = state.webhook_limiter.check(&identity, limit);
+    let rl_status = state.webhook_limiter.check(&identity, limit).await;
     if !rl_status.allowed {
         if is_authenticated {
             let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
@@ -499,7 +499,7 @@ pub async fn webhook_manage_auth_and_rate_limit(
     };
 
     let identity = format!("key:{hash}");
-    let rl_status = state.limiter.check(&identity, limit);
+    let rl_status = state.limiter.check(&identity, limit).await;
     if !rl_status.allowed {
         let mut response = (StatusCode::TOO_MANY_REQUESTS, crate::error::rate_limit_error()).into_response();
         if let Some(retry_after) = rl_status.retry_after_secs {
@@ -785,7 +785,7 @@ pub async fn proxy_rate_limit(
     let client_ip = extract_client_ip(&headers, Some(socket_addr), &state.ip_config);
     let rl_status = state
         .proxy_limiter
-        .check(&format!("proxy:{client_ip}"), state.config.proxy.rate_limit_per_min);
+        .check(&format!("proxy:{client_ip}"), state.config.proxy.rate_limit_per_min).await;
     if !rl_status.allowed {
         return Err(ApiError::too_many_requests(rl_status.retry_after_secs));
     }
@@ -858,12 +858,12 @@ mod integration_tests {
             pool,
             require_auth,
             anon_rate_limit: anon_rate,
-            limiter: Arc::new(RateLimiter::new()),
+            limiter: Arc::new(RateLimiter::memory()),
             http_requests: Arc::new(AtomicU64::new(0)),
             rpc: RpcClient::new("http://127.0.0.1:26657", 30),
             specs: Arc::new(SpecCache::new()),
             mounts: Arc::new(vec![]),
-            rpc_limiter: Arc::new(RateLimiter::new()),
+            rpc_limiter: Arc::new(RateLimiter::memory()),
             rpc_require_auth: false,
             rpc_anon_rate_limit: 100,
             metrics: Arc::new(MetricsCollector::new()),
@@ -881,8 +881,8 @@ mod integration_tests {
             health_max_lag_ledgers: 100,
             health_max_stale_secs: 120,
             metrics_require_auth: false,
-            proxy_limiter: Arc::new(RateLimiter::new()),
-            webhook_limiter: Arc::new(RateLimiter::new()),
+            proxy_limiter: Arc::new(RateLimiter::memory()),
+            webhook_limiter: Arc::new(RateLimiter::memory()),
             config: Arc::new(crate::config::ApiConfig::test_default()),
             key_cache: Arc::new(KeyCache::new(256)),
             ip_config: IpConfig { trusted_proxy_hops: 0, platform_header: None },

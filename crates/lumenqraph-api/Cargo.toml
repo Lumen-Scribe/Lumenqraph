@@ -16,3 +16,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1"
 anyhow = "1"
+lru = "0.12"
+redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
