@@ -158,8 +158,13 @@ services:
       DATABASE_URL: postgres://lumenqraph:lumenqraph@postgres:5432/lumenqraph
       RPC_URL: ${RPC_URL:-https://soroban-testnet.stellar.org}
       MCP_HTTP_BIND: 0.0.0.0:8090
-      # Passed through only when set in your shell; unset means no auth.
-      MCP_AUTH_TOKEN:
+      # MCP_AUTH_TOKEN is REQUIRED to start the HTTP transport. Pass it from
+      # your shell or .env file:  export MCP_AUTH_TOKEN=$(openssl rand -hex 32)
+      # If you intentionally run without auth (e.g. behind an authenticating
+      # reverse proxy), set MCP_HTTP_ALLOW_ANONYMOUS=true instead.
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN}
+      # Optional: comma-separated Origin allowlist for DNS-rebinding protection.
+      # MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
       RUST_LOG: ${RUST_LOG:-info}
     healthcheck:
       test: ["CMD", "lumenqraph-mcp", "healthcheck"]

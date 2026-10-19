@@ -30,9 +30,13 @@ use axum::{
 };
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use std::str::FromStr;
+use std::{
+    collections::HashSet,
+    str::FromStr,
+    sync::{Arc, Mutex},
+};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tracing::info;
+use tracing::{info, warn};
 
 use rpc::RpcClient;
 
@@ -67,6 +71,36 @@ pub struct State {
     pub rpc: RpcClient,
     pub rpc_limiter: rpc::RpcRateLimiter,
     pub auth_token: Option<String>,
+    /// HTTP transport only: live `Mcp-Session-Id` values issued by this server.
+    /// `None` for stdio (no session management). The Mutex is cheap to hold for
+    /// the duration of a request and lets `serve_io` tests skip it entirely.
+    pub sessions: Option<Arc<Mutex<HashSet<String>>>>,
+}
+
+impl State {
+    /// Issue a fresh session id, store it, and return it. Returns `None` when
+    /// this state is for stdio (no session tracking).
+    fn issue_session(&self) -> Option<String> {
+        let sessions = self.sessions.as_ref()?;
+        let id = uuid::Uuid::new_v4().to_string();
+        sessions
+            .lock()
+            .expect("sessions mutex poisoned")
+            .insert(id.clone());
+        Some(id)
+    }
+
+    /// Return `true` if `id` matches a previously issued session id.
+    /// Always `true` when this state is for stdio (no session tracking).
+    fn session_valid(&self, id: &str) -> bool {
+        match &self.sessions {
+            None => true,
+            Some(sessions) => sessions
+                .lock()
+                .expect("sessions mutex poisoned")
+                .contains(id),
+        }
+    }
 }
 
 #[tokio::main]
@@ -99,7 +133,25 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(60);
-    let auth_token = std::env::var("MCP_AUTH_TOKEN").ok();
+    let auth_token = std::env::var("MCP_AUTH_TOKEN")
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty());
+    let http_bind = std::env::var("MCP_HTTP_BIND").ok();
+    let allow_anon = std::env::var("MCP_HTTP_ALLOW_ANONYMOUS")
+        .ok()
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if http_bind.is_some() {
+        validate_http_auth(auth_token.as_deref(), allow_anon)?;
+        if allow_anon && auth_token.is_none() {
+            warn!(
+                "MCP HTTP transport is starting WITHOUT authentication \
+                 (MCP_HTTP_ALLOW_ANONYMOUS=true). Bind to localhost and \
+                 restrict network access."
+            );
+        }
+    }
 
     // Validate CONTRACT_IDS at startup so a misconfigured address is caught
     // immediately rather than silently ignored.
@@ -116,19 +168,120 @@ async fn main() -> anyhow::Result<()> {
         connect_retries: db_setting("MCP_DATABASE_CONNECT_RETRIES", "DATABASE_CONNECT_RETRIES", 30u32)?,
     };
     let pool = lumenqraph_core::db::connect_with_retry(&database_url, &db).await?;
+
     let state = State {
         pool,
         rpc: RpcClient::new(rpc_url, rpc_timeout_secs),
         rpc_limiter: rpc::RpcRateLimiter::new(rpc_rate_limit_per_min),
         auth_token,
+        sessions: http_bind
+            .as_ref()
+            .map(|_| Arc::new(Mutex::new(HashSet::new()))),
     };
 
-    if let Ok(http_bind) = std::env::var("MCP_HTTP_BIND") {
-        return serve_http(state, http_bind).await;
+    if let Some(bind) = http_bind {
+        let http_config = HttpConfig::from_env();
+        return serve_http(state, bind, http_config).await;
     }
 
     info!("lumenqraph MCP server ready (stdio)");
     serve(state).await
+}
+
+fn validate_http_auth(auth_token: Option<&str>, allow_anonymous: bool) -> anyhow::Result<()> {
+    if auth_token.is_some_and(|token| !token.trim().is_empty()) || allow_anonymous {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "MCP_HTTP_BIND is set but MCP_AUTH_TOKEN is unset. The HTTP \
+         transport is unauthenticated by default — anyone who can reach \
+         the port can call tools and read the index. Set MCP_AUTH_TOKEN, \
+         or set MCP_HTTP_ALLOW_ANONYMOUS=true to accept this risk and \
+         start anyway."
+    ))
+}
+
+/// HTTP transport security configuration, parsed from the environment once at
+/// startup (#622).
+#[derive(Clone)]
+struct HttpConfig {
+    /// Allowlist of `Origin` headers that may call `/mcp`. An empty set means
+    /// "reject any request that carries an Origin header". Requests with no
+    /// `Origin` header (CLI clients) are always allowed — Origin is set by
+    /// browsers only.
+    allowed_origins: HashSet<String>,
+    /// When true, skip Origin validation entirely. Opt-in escape hatch for
+    /// operators behind a reverse proxy that strips/normalizes Origin.
+    allow_any_origin: bool,
+}
+
+impl HttpConfig {
+    fn from_env() -> Self {
+        let allow_any_origin = std::env::var("MCP_ALLOW_ANY_ORIGIN")
+            .ok()
+            .map(|v| v.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        let allowed_origins: HashSet<String> = std::env::var("MCP_ALLOWED_ORIGINS")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if allow_any_origin {
+            warn!(
+                "MCP_ALLOW_ANY_ORIGIN=true — Origin header validation is \
+                 DISABLED. This is only safe behind an authenticating reverse \
+                 proxy."
+            );
+        } else if allowed_origins.is_empty() {
+            info!(
+                "MCP_ALLOWED_ORIGINS is unset; browsers carrying any Origin \
+                 header will be rejected with 403 (DNS-rebinding protection). \
+                 CLI clients without an Origin header are unaffected."
+            );
+        } else {
+            info!(origins = ?allowed_origins, "MCP HTTP Origin allowlist");
+        }
+
+        HttpConfig {
+            allowed_origins,
+            allow_any_origin,
+        }
+    }
+
+    /// Test-only constructor (bypasses env var parsing).
+    #[cfg(test)]
+    fn for_testing(allowed_origins: &[&str], allow_any_origin: bool) -> Self {
+        HttpConfig {
+            allowed_origins: allowed_origins.iter().map(|s| s.to_string()).collect(),
+            allow_any_origin,
+        }
+    }
+
+    /// Validate an `Origin` header value. Returns `Ok(())` if the request may
+    /// proceed, or `Err(reason)` if it must be rejected with 403.
+    fn validate_origin(&self, origin: Option<&str>) -> Result<(), String> {
+        if self.allow_any_origin {
+            return Ok(());
+        }
+        // No Origin header → not a browser request (CLI, curl, etc.). Allow.
+        let origin = match origin {
+            None => return Ok(()),
+            Some(o) => o.trim(),
+        };
+        if origin.is_empty() {
+            return Ok(());
+        }
+        if self.allowed_origins.contains(origin) {
+            return Ok(());
+        }
+        Err(format!("origin not allowed: {origin}"))
+    }
 }
 
 /// The stdio JSON-RPC loop: read a message per line, dispatch, write responses.
@@ -136,16 +289,117 @@ async fn serve(state: State) -> anyhow::Result<()> {
     serve_io(state, tokio::io::stdin(), tokio::io::stdout()).await
 }
 
-async fn serve_http(state: State, bind: String) -> anyhow::Result<()> {
+async fn serve_http(state: State, bind: String, http_config: HttpConfig) -> anyhow::Result<()> {
     let app = Router::new()
-        .route("/mcp", post(handle_http_request))
+        // The MCP endpoint accepts POST (JSON-RPC) and DELETE (session teardown).
+        // GET returns 405 — we do not implement a server-initiated SSE stream
+        // (see handle_get_mcp).
+        .route(
+            "/mcp",
+            post(handle_http_request).delete(handle_delete_mcp).get(handle_get_mcp),
+        )
         .route("/healthz", get(|| async { "ok" }))
-        .with_state(state);
+        .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(
+            http_config,
+            origin_guard,
+        ));
+
+    // Default to 127.0.0.1 when the operator did not specify a host. The MCP
+    // spec for Streamable HTTP recommends binding to localhost to prevent
+    // DNS-rebinding attacks from browsers (#622). We only rewrite bare port
+    // forms like ":8090" — explicit 0.0.0.0 binds are honoured (the operator
+    // asked for them).
+    let bind = normalize_bind(&bind);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     info!(bind = %bind, "lumenqraph MCP server ready (streamable HTTP)");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Rewrite a bare `:port` or `port` bind to `127.0.0.1:port`. If the operator
+/// passed an explicit host (including `0.0.0.0`), leave it alone — they
+/// opted in.
+fn normalize_bind(bind: &str) -> String {
+    let trimmed = bind.trim();
+    // Already has a host portion (e.g. "127.0.0.1:8090", "0.0.0.0:8090", "[::1]:8090").
+    if trimmed.contains(':') && !trimmed.starts_with(':') {
+        return trimmed.to_string();
+    }
+    // Bare port forms: ":8090" or "8090".
+    let port = trimmed.trim_start_matches(':');
+    format!("127.0.0.1:{port}")
+}
+
+/// axum middleware that rejects browser requests whose `Origin` header is not
+/// in the configured allowlist (#622). Returns 403 with an empty JSON-RPC
+/// error body (no id) per the MCP spec.
+async fn origin_guard(
+    AxumState(http_config): AxumState<HttpConfig>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Err(reason) = http_config.validate_origin(headers.get("origin").and_then(|v| v.to_str().ok())) {
+        warn!(reason = %reason, "rejecting MCP request: Origin validation failed");
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "error": { "code": -32000, "message": "Forbidden: Origin not allowed" }
+        });
+        return (
+            StatusCode::FORBIDDEN,
+            [("content-type", "application/json")],
+            Json(body),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// `GET /mcp` — the MCP spec says the server MUST either open an SSE stream or
+/// return 405 Method Not Allowed. We do not implement server-initiated
+/// streaming; return 405 so spec-compliant clients fall back to POST-only.
+async fn handle_get_mcp() -> Response {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [("allow", "POST, DELETE")],
+        "GET /mcp is not supported; this server does not serve an SSE stream. Use POST.",
+    )
+        .into_response()
+}
+
+/// `DELETE /mcp` — tear down an MCP session. Per spec, the server MAY respond
+/// with 405; we honour it so clients can clean up. Responds 404 if the session
+/// id is unknown, 200 if it was dropped, and 400 if the header is missing.
+async fn handle_delete_mcp(
+    AxumState(state): AxumState<State>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(sessions) = &state.sessions else {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    };
+    let Some(id) = headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Mcp-Session-Id header required",
+        )
+            .into_response();
+    };
+    let dropped = sessions
+        .lock()
+        .expect("sessions mutex poisoned")
+        .remove(id);
+    if dropped {
+        StatusCode::OK.into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
 }
 
 async fn handle_http_request(
@@ -167,6 +421,19 @@ async fn handle_http_request(
         msg["authorization"] = Value::String(auth.to_string());
     }
 
+    let method = msg
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    // The MCP spec requires clients to send MCP-Protocol-Version on all
+    // requests after initialize. We accept any of the supported versions
+    // here; an unknown version (post-initialize) yields 400.
+    let client_version = headers
+        .get("mcp-protocol-version")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim);
+
     let authenticated = state.auth_token.as_ref().map_or(true, |token| {
         msg.get("authorization")
             .and_then(Value::as_str)
@@ -174,10 +441,88 @@ async fn handle_http_request(
             .unwrap_or(false)
     });
 
-    match handle(&state, msg, authenticated).await {
-        Some((resp, _)) => Json(resp).into_response(),
-        None => StatusCode::NO_CONTENT.into_response(),
+    let is_initialize = method == "initialize";
+    // initialize always issues a session id and must not require one.
+    if !is_initialize {
+        // Validate the session id if this server tracks sessions.
+        if state.sessions.is_some() {
+            match headers
+                .get("mcp-session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+            {
+                Some(id) if !id.is_empty() => {
+                    if !state.session_valid(id) {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({
+                                "jsonrpc": "2.0",
+                                "error": { "code": -32000, "message": "Unknown or expired Mcp-Session-Id" }
+                            })),
+                        )
+                            .into_response();
+                    }
+                }
+                _ => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "jsonrpc": "2.0",
+                            "error": { "code": -32000, "message": "Mcp-Session-Id header required" }
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        // Validate the protocol version header (post-initialize only).
+        if let Some(v) = client_version {
+            if !SUPPORTED_PROTOCOL_VERSIONS.contains(&v) && !v.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "error": { "code": -32602, "message": format!("unsupported MCP-Protocol-Version: {v}") }
+                    })),
+                )
+                    .into_response();
+            }
+        }
     }
+
+    let (resp, _newly_auth) = match handle(&state, msg, authenticated).await {
+        Some((resp, newly_auth)) => (resp, newly_auth),
+        None => return StatusCode::NO_CONTENT.into_response(),
+    };
+
+    // On a successful initialize, issue and stash a Mcp-Session-Id and echo
+    // the negotiated protocol version in the response headers.
+    let successful_initialize = is_initialize && resp.get("result").is_some();
+    let protocol_version = resp
+        .get("result")
+        .and_then(|result| result.get("protocolVersion"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mut response = Json(resp).into_response();
+    if successful_initialize {
+        if let Some(version) = protocol_version {
+            if let Ok(hv) = axum::http::HeaderValue::from_str(&version) {
+                response
+                    .headers_mut()
+                    .insert("mcp-protocol-version", hv);
+            }
+        }
+        if let Some(id) = state.issue_session() {
+            if let Ok(hv) =
+                axum::http::HeaderValue::from_str(&id).map_err(|e| warn!(error = %e, "session id not a valid header value"))
+            {
+                response
+                    .headers_mut()
+                    .insert("mcp-session-id", hv);
+            }
+        }
+    }
+    response
 }
 
 /// Protocol loop over any `AsyncRead` / `AsyncWrite` pair (stdin/stdout in
@@ -469,6 +814,7 @@ mod tests {
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
             rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
+            sessions: None,
         };
         let resp = handle(&state, msg, true).await;
         assert!(resp.is_none(), "notifications should not produce a response");
@@ -484,6 +830,7 @@ mod tests {
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
             rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
+            sessions: None,
         };
         let msg = json!({ "jsonrpc": "2.0", "id": 1, "method": "unknown/method" });
         let (resp, _) = handle(&state, msg, true).await.unwrap();
@@ -501,6 +848,7 @@ mod tests {
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
             rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
+            sessions: None,
         };
         let msg = json!({ "jsonrpc": "2.0", "id": 42, "method": "ping" });
         let (resp, _) = handle(&state, msg, true).await.unwrap();
@@ -520,6 +868,7 @@ mod tests {
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
             rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: Some("secret123".to_string()),
+            sessions: None,
         };
         let msg = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} });
         let (resp, is_auth) = handle(&state, msg, false).await.unwrap();
@@ -541,6 +890,7 @@ mod tests {
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
             rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: Some("secret123".to_string()),
+            sessions: None,
         };
         let msg = json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -563,6 +913,7 @@ mod tests {
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
             rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
+            sessions: None,
         };
         let msg = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
         let (resp, _) = handle(&state, msg, true).await.unwrap();
@@ -595,6 +946,7 @@ mod tests {
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
             rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
+            sessions: None,
         };
         let msg = json!({
             "jsonrpc": "2.0", "id": 1,
@@ -672,6 +1024,7 @@ mod tests {
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
             rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
+            sessions: None,
         };
         let msg = json!({
             "jsonrpc": "2.0", "id": 5,
@@ -722,6 +1075,7 @@ mod tests {
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
             rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
+            sessions: None,
         }
     }
 
@@ -804,6 +1158,7 @@ mod protocol_tests {
             rpc: RpcClient::new("http://127.0.0.1:0", 30),
             rpc_limiter: rpc::RpcRateLimiter::new(60),
             auth_token: None,
+            sessions: None,
         }
     }
 
@@ -1082,6 +1437,568 @@ mod contract_ids_startup_validation {
         assert!(
             err.contains("invalid CONTRACT_ID"),
             "a G-strkey mixed with a valid C-strkey should be rejected: {err}"
+        );
+    }
+}
+
+/// Tests for the HTTP transport security hardening from #622:
+///   - Origin header validation (DNS-rebinding protection)
+///   - normalize_bind() defaulting bare ports to 127.0.0.1
+///   - Mcp-Session-Id issuance and validation
+#[cfg(test)]
+mod http_security_tests {
+    use super::*;
+
+    #[test]
+    fn http_auth_requires_token_unless_anonymous_is_explicitly_allowed() {
+        assert!(validate_http_auth(None, false).is_err());
+        assert!(validate_http_auth(Some("  "), false).is_err());
+        assert!(validate_http_auth(None, true).is_ok());
+        assert!(validate_http_auth(Some("secret"), false).is_ok());
+    }
+
+    // ── Origin header validation ──────────────────────────────────────────
+
+    #[test]
+    fn no_origin_header_is_allowed_regardless_of_allowlist() {
+        let config = HttpConfig::for_testing(&[], false);
+        assert!(
+            config.validate_origin(None).is_ok(),
+            "requests with no Origin (CLI/curl) must always be allowed"
+        );
+    }
+
+    #[test]
+    fn empty_origin_is_allowed() {
+        let config = HttpConfig::for_testing(&[], false);
+        assert!(
+            config.validate_origin(Some("")).is_ok(),
+            "empty Origin string must not be rejected"
+        );
+    }
+
+    #[test]
+    fn origin_in_allowlist_is_accepted() {
+        let config = HttpConfig::for_testing(&["https://app.example.com"], false);
+        assert!(
+            config
+                .validate_origin(Some("https://app.example.com"))
+                .is_ok(),
+            "an Origin that is exactly in the allowlist must be accepted"
+        );
+    }
+
+    #[test]
+    fn foreign_origin_is_rejected_when_allowlist_is_empty() {
+        let config = HttpConfig::for_testing(&[], false);
+        let result = config.validate_origin(Some("https://evil.example.com"));
+        assert!(
+            result.is_err(),
+            "a foreign Origin must be rejected when allowlist is empty (DNS-rebinding protection)"
+        );
+    }
+
+    #[test]
+    fn foreign_origin_is_rejected_even_when_allowlist_has_other_entries() {
+        let config = HttpConfig::for_testing(&["https://safe.example.com"], false);
+        let result = config.validate_origin(Some("https://evil.example.com"));
+        assert!(
+            result.is_err(),
+            "a foreign Origin not in the allowlist must be rejected"
+        );
+    }
+
+    #[test]
+    fn allow_any_origin_bypasses_validation() {
+        let config = HttpConfig::for_testing(&[], true);
+        assert!(
+            config
+                .validate_origin(Some("https://anything.attacker.example"))
+                .is_ok(),
+            "MCP_ALLOW_ANY_ORIGIN=true must bypass Origin checks"
+        );
+    }
+
+    #[test]
+    fn origin_matching_is_exact_not_substring() {
+        // Ensure "https://safe.example.com.evil.example.com" doesn't sneak past
+        // by matching on a substring.
+        let config =
+            HttpConfig::for_testing(&["https://safe.example.com"], false);
+        let result = config.validate_origin(Some(
+            "https://safe.example.com.evil.example.com",
+        ));
+        assert!(
+            result.is_err(),
+            "Origin matching must be exact, not a substring match"
+        );
+    }
+
+    // ── normalize_bind ────────────────────────────────────────────────────
+
+    #[test]
+    fn bare_colon_port_defaults_to_localhost() {
+        assert_eq!(normalize_bind(":8090"), "127.0.0.1:8090");
+    }
+
+    #[test]
+    fn bare_port_number_defaults_to_localhost() {
+        assert_eq!(normalize_bind("8090"), "127.0.0.1:8090");
+    }
+
+    #[test]
+    fn explicit_0_0_0_0_is_preserved() {
+        assert_eq!(normalize_bind("0.0.0.0:8090"), "0.0.0.0:8090");
+    }
+
+    #[test]
+    fn explicit_127_0_0_1_is_preserved() {
+        assert_eq!(normalize_bind("127.0.0.1:8090"), "127.0.0.1:8090");
+    }
+
+    // ── session id management ─────────────────────────────────────────────
+
+    async fn http_state_with_sessions() -> State {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://test:test@localhost/test")
+            .expect("connect_lazy");
+        State {
+            pool,
+            rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            rpc_limiter: rpc::RpcRateLimiter::new(60),
+            auth_token: None,
+            sessions: Some(Arc::new(Mutex::new(HashSet::new()))),
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_session_returns_unique_ids() {
+        let state = http_state_with_sessions().await;
+        let id1 = state.issue_session().expect("should issue a session id");
+        let id2 = state.issue_session().expect("should issue a session id");
+        assert_ne!(id1, id2, "each session id must be unique");
+    }
+
+    #[tokio::test]
+    async fn issued_session_is_valid() {
+        let state = http_state_with_sessions().await;
+        let id = state.issue_session().expect("should issue a session id");
+        assert!(
+            state.session_valid(&id),
+            "a freshly issued session id must be recognised as valid"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_session_is_invalid() {
+        let state = http_state_with_sessions().await;
+        assert!(
+            !state.session_valid("not-a-real-session-id"),
+            "an unknown session id must not be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_session_is_invalid() {
+        let state = http_state_with_sessions().await;
+        let id = state.issue_session().expect("should issue a session id");
+        let dropped = state
+            .sessions
+            .as_ref()
+            .unwrap()
+            .lock()
+            .expect("poisoned")
+            .remove(&id);
+        assert!(dropped, "session id should have been in the set");
+        assert!(
+            !state.session_valid(&id),
+            "a deleted session id must not be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_state_session_valid_always_true() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://test:test@localhost/test")
+            .expect("connect_lazy");
+        // sessions: None is the stdio mode; session_valid must not reject.
+        let state = State {
+            pool,
+            rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            rpc_limiter: rpc::RpcRateLimiter::new(60),
+            auth_token: None,
+            sessions: None,
+        };
+        assert!(
+            state.session_valid("any-id-at-all"),
+            "stdio state must not enforce session ids"
+        );
+    }
+}
+
+/// End-to-end tests for the Streamable HTTP transport (#622): spin up the
+/// actual axum `Router` and drive it with `tower::ServiceExt::oneshot` to
+/// verify the full request/response cycle, including middleware.
+#[cfg(test)]
+mod http_e2e_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    /// Build the same `Router` used by `serve_http`, wrapped with the Origin
+    /// guard middleware, for in-process testing.
+    fn test_router(http_config: HttpConfig) -> (Router, State) {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://test:test@localhost/test")
+            .expect("connect_lazy");
+        let state = State {
+            pool,
+            rpc: RpcClient::new("http://127.0.0.1:0", 30),
+            rpc_limiter: rpc::RpcRateLimiter::new(60),
+            auth_token: None,
+            sessions: Some(Arc::new(Mutex::new(HashSet::new()))),
+        };
+        let app = Router::new()
+            .route(
+                "/mcp",
+                post(handle_http_request)
+                    .delete(handle_delete_mcp)
+                    .get(handle_get_mcp),
+            )
+            .route("/healthz", get(|| async { "ok" }))
+            .with_state(state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                http_config,
+                origin_guard,
+            ));
+        (app, state)
+    }
+
+    async fn body_text(resp: axum::response::Response) -> String {
+        let bytes = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap_or_default()
+    }
+
+    fn json_rpc(request: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(request.to_string()))
+            .expect("build request")
+    }
+
+    // ── GET /mcp ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_mcp_returns_405_method_not_allowed() {
+        // The spec says the server MUST either open an SSE stream OR return
+        // 405. We do not implement server-initiated streaming → 405.
+        let (app, _state) = test_router(HttpConfig::for_testing(&[], false));
+        let resp = app
+            .oneshot(Request::builder().method("GET").uri("/mcp").body(Body::empty()).unwrap())
+            .await
+            .expect("router");
+        assert_eq!(
+            resp.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "GET /mcp must return 405 (we do not serve an SSE stream)"
+        );
+        // The Allow header should advertise what IS supported.
+        let allow = resp
+            .headers()
+            .get("allow")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            allow.contains("POST"),
+            "Allow header should advertise POST: {allow}"
+        );
+    }
+
+    // ── Origin validation ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn foreign_origin_is_rejected_with_403_before_handler_runs() {
+        // A browser carrying an Origin not in the allowlist must be rejected
+        // with 403 before the request reaches the JSON-RPC handler.
+        let (app, _state) = test_router(HttpConfig::for_testing(&[], false));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("origin", "https://evil.example.com")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.expect("router");
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a foreign Origin must be rejected with 403"
+        );
+        // The body should be a JSON-RPC error with no id (per spec).
+        let body = body_text(resp).await;
+        assert!(
+            body.contains("Origin not allowed") || body.contains("Forbidden"),
+            "403 body should explain the rejection: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_origin_is_accepted() {
+        let (app, _state) =
+            test_router(HttpConfig::for_testing(&["https://app.example.com"], false));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("origin", "https://app.example.com")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.expect("router");
+        assert_ne!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "an allowlisted Origin must NOT be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_origin_header_is_allowed_for_cli_clients() {
+        // curl / a CLI MCP client sends no Origin header; must pass through.
+        let (app, _state) = test_router(HttpConfig::for_testing(&[], false));
+        let req = json_rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+        let resp = app.oneshot(req).await.expect("router");
+        assert_ne!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "requests without an Origin header must pass the origin guard"
+        );
+    }
+
+    // ── Mcp-Session-Id ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn initialize_response_issues_mcp_session_id_header() {
+        let (app, _state) = test_router(HttpConfig::for_testing(&[], false));
+        let resp = app
+            .oneshot(json_rpc(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            ))
+            .await
+            .expect("router");
+        assert!(
+            resp.status().is_success(),
+            "initialize must succeed: {}",
+            resp.status()
+        );
+        let session_id = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        assert!(
+            session_id.is_some(),
+            "a successful initialize must issue an Mcp-Session-Id header"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("mcp-protocol-version")
+                .and_then(|v| v.to_str().ok()),
+            Some(DEFAULT_PROTOCOL_VERSION),
+            "initialize must echo the negotiated protocol version in a header"
+        );
+        let id = session_id.unwrap();
+        // Must be visible ASCII (0x21–0x7E) per spec; our UUIDs satisfy this.
+        assert!(
+            id.chars().all(|c| (0x21u8..=0x7Eu8).contains(&(c as u8))),
+            "Mcp-Session-Id must be visible ASCII only: {id:?}"
+        );
+        assert!(!id.is_empty(), "session id must not be empty");
+    }
+
+    #[tokio::test]
+    async fn post_initialize_request_without_session_id_is_400() {
+        let (app, _state) = test_router(HttpConfig::for_testing(&[], false));
+        // Skip initialize; go straight to ping. The server tracks sessions
+        // (it's an HTTP state), so a missing Mcp-Session-Id must yield 400.
+        let resp = app
+            .oneshot(json_rpc(r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#))
+            .await
+            .expect("router");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "post-initialize requests without an Mcp-Session-Id must return 400"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_initialize_request_with_unknown_session_id_is_404() {
+        let (app, _state) = test_router(HttpConfig::for_testing(&[], false));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("mcp-session-id", "never-issued-by-this-server")
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.expect("router");
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "an unknown/expired Mcp-Session-Id must return 404"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_initialize_then_ping_round_trip_with_session_id() {
+        let (app, state) = test_router(HttpConfig::for_testing(&[], false));
+
+        // 1. initialize → captures session id from response header.
+        let init_resp = app
+            .clone()
+            .oneshot(json_rpc(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            ))
+            .await
+            .expect("router");
+        let session_id = init_resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .expect("initialize must issue a session id");
+        // The session id must be registered in the server's session set.
+        assert!(
+            state.session_valid(&session_id),
+            "issued session id must be valid in the server state"
+        );
+
+        // 2. ping with the session id must succeed (200 with a result).
+        let ping_req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("mcp-session-id", &session_id)
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#))
+            .unwrap();
+        let ping_resp = app.oneshot(ping_req).await.expect("router");
+        assert!(
+            ping_resp.status().is_success(),
+            "ping with a valid session id must succeed: {}",
+            ping_resp.status()
+        );
+        let body = body_text(ping_resp).await;
+        assert!(
+            body.contains(r#""id":2"#),
+            "ping response should echo id 2: {body}"
+        );
+    }
+
+    // ── DELETE /mcp ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_without_session_id_header_is_400() {
+        let (app, _state) = test_router(HttpConfig::for_testing(&[], false));
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/mcp")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.expect("router");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "DELETE without Mcp-Session-Id must return 400"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_unknown_session_id_is_404() {
+        let (app, _state) = test_router(HttpConfig::for_testing(&[], false));
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/mcp")
+            .header("mcp-session-id", "never-issued")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.expect("router");
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "DELETE of an unknown session id must return 404"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_valid_session_id_is_200_and_invalidates_it() {
+        let (app, state) = test_router(HttpConfig::for_testing(&[], false));
+        // Issue a real session id by calling issue_session directly.
+        let id = state.issue_session().expect("issue session");
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/mcp")
+            .header("mcp-session-id", &id)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.expect("router");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "DELETE of a valid session id must return 200"
+        );
+        assert!(
+            !state.session_valid(&id),
+            "after DELETE, the session id must no longer be valid"
+        );
+    }
+
+    // ── MCP-Protocol-Version header ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn unsupported_protocol_version_header_post_initialize_is_400() {
+        let (app, _state) = test_router(HttpConfig::for_testing(&[], false));
+        // First issue a session via initialize (no version check on init).
+        let init_resp = app
+            .clone()
+            .oneshot(json_rpc(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            ))
+            .await
+            .expect("router");
+        let session_id = init_resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .expect("session id");
+
+        // Now send a ping with a bogus protocol version → 400.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("mcp-session-id", &session_id)
+            .header("mcp-protocol-version", "2099-99-99")
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.expect("router");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an unsupported MCP-Protocol-Version must return 400"
         );
     }
 }

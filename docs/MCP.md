@@ -45,11 +45,13 @@ You should see three responses: an `initialize` result, the tool list, and your 
 MCP_AUTH_TOKEN=secret \
 DATABASE_URL='postgres://lumenqraph:lumenqraph@localhost:5432/lumenqraph' \
 RPC_URL='https://soroban-testnet.stellar.org' \
-MCP_HTTP_BIND='0.0.0.0:8090' \
+MCP_HTTP_BIND='127.0.0.1:8090' \
 ./target/release/lumenqraph-mcp
 ```
 
-Then connect over HTTPS to `http://<host>:8090/mcp` with an `Authorization: Bearer secret` header and JSON-RPC requests.
+Then connect to `http://127.0.0.1:8090/mcp` with an `Authorization: Bearer secret` header and JSON-RPC requests.
+
+For remote (non-localhost) deployments, add `MCP_ALLOWED_ORIGINS` so only your front-end's origin is accepted:
 
 ## Transport & Environment
 
@@ -62,6 +64,36 @@ The server supports two transports:
 
 For stdio mode, log messages go to stderr so stdout stays a clean protocol channel. For HTTP mode, send `Authorization: Bearer <token>` when `MCP_AUTH_TOKEN` is configured and use `Mcp-Session-Id` for session continuity.
 
+### HTTP transport security
+
+The Streamable HTTP transport is hardened against the DNS-rebinding and open-proxy attacks described in the [MCP spec](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports):
+
+1. **Authentication is required by default.** The HTTP transport refuses to start when `MCP_HTTP_BIND` is set and `MCP_AUTH_TOKEN` is unset, because anyone who can reach the port can call `call_contract` / `simulate_call` (spending upstream RPC quota) and read the whole index. Set `MCP_AUTH_TOKEN`, or explicitly opt into anonymous access with `MCP_HTTP_ALLOW_ANONYMOUS=true` if you accept that risk (e.g. behind an authenticating reverse proxy).
+
+2. **Binds to `127.0.0.1` by default.** A bare port (`MCP_HTTP_BIND=:8090` or `MCP_HTTP_BIND=8090`) is rewritten to `127.0.0.1:8090` so a misconfigured bind cannot expose the server to the network. Pass an explicit `0.0.0.0:8090` only if you intend to expose it and have set `MCP_AUTH_TOKEN` plus a network firewall.
+
+3. **Origin header validation (DNS-rebinding protection).** Browsers send an `Origin` header on cross-origin requests; the server rejects any `Origin` that is not in `MCP_ALLOWED_ORIGINS` with HTTP 403 before the request reaches the JSON-RPC handler. Requests with no `Origin` header (CLI clients like `curl` and most MCP clients) are always allowed. Set `MCP_ALLOWED_ORIGINS=https://app.example.com,https://staging.example.com` (comma-separated). If unset, every browser Origin is rejected. `MCP_ALLOW_ANY_ORIGIN=true` disables the check entirely — only do this behind an authenticating reverse proxy that strips Origin.
+
+4. **Session management.** A successful `initialize` issues an `Mcp-Session-Id` response header (a UUID). All subsequent requests from the client MUST include that `Mcp-Session-Id` header; the server rejects requests without it with `400 Bad Request` and requests with an unknown/expired id with `404 Not Found`. `DELETE /mcp` with the session id tears down the session.
+
+5. **`MCP-Protocol-Version` header.** After `initialize`, requests should carry the negotiated `MCP-Protocol-Version` header. An unsupported version is rejected with `400 Bad Request`.
+
+6. **`GET /mcp` returns `405 Method Not Allowed`.** This server does not implement a server-initiated SSE stream, so per the spec it returns 405 (with an `Allow: POST, DELETE` header) rather than opening a stream. Clients use POST for all JSON-RPC messages.
+
+### Remote deployment model
+
+For a shared, remote deployment (e.g. a team sharing one indexer's MCP endpoint):
+
+```bash
+MCP_AUTH_TOKEN=$(openssl rand -hex 32) \
+MCP_ALLOWED_ORIGINS=https://your-app.example.com \
+MCP_HTTP_BIND=0.0.0.0:8090 \
+DATABASE_URL='postgres://...' RPC_URL='https://...' \
+./target/release/lumenqraph-mcp
+```
+
+Put it behind TLS (a reverse proxy or a load balancer) — the transport itself is plain HTTP. The reverse proxy should forward `Authorization`, `Origin`, `Mcp-Session-Id`, and `MCP-Protocol-Version` headers unchanged. If the proxy authenticates callers itself and you want to skip Origin validation, set `MCP_ALLOW_ANY_ORIGIN=true` (do NOT unset `MCP_AUTH_TOKEN` — the proxy should inject it).
+
 ### Environment Variables
 
 | Variable | Required | Default | Notes |
@@ -69,7 +101,12 @@ For stdio mode, log messages go to stderr so stdout stays a clean protocol chann
 | `DATABASE_URL` | ✅ | — | Postgres connection string, e.g. `postgres://user:pass@host:5432/db` |
 | `RPC_URL` | ❌ | `https://soroban-testnet.stellar.org` | Stellar RPC endpoint for `call_contract` and `simulate_call` |
 | `RPC_TIMEOUT_SECS` | ❌ | `30` | Timeout for RPC calls in seconds |
-| `MCP_AUTH_TOKEN` | ❌ | — | Optional auth token required in `Authorization` field during `initialize` |
+| `MCP_AUTH_TOKEN` | ❌ (stdio) / ✅ (HTTP) | — | Bearer token required in `Authorization` field during `initialize`. **Required to start the HTTP transport** unless `MCP_HTTP_ALLOW_ANONYMOUS=true`. |
+| `MCP_HTTP_BIND` | ❌ | unset (stdio) | Address to bind the HTTP transport. Bare ports (`:8090` or `8090`) default to `127.0.0.1`. Use `0.0.0.0:8090` to expose on all interfaces (requires `MCP_AUTH_TOKEN`). |
+| `MCP_HTTP_ALLOW_ANONYMOUS` | ❌ | `false` | Explicit opt-in to start the HTTP transport without `MCP_AUTH_TOKEN`. Use only behind an authenticating reverse proxy. |
+| `MCP_ALLOWED_ORIGINS` | ❌ | unset (deny all browser Origins) | Comma-separated allowlist of `Origin` headers accepted by the HTTP transport (DNS-rebinding protection). Requests with no `Origin` header are always allowed. |
+| `MCP_ALLOW_ANY_ORIGIN` | ❌ | `false` | Disable Origin validation entirely. Only safe behind an authenticating reverse proxy that strips `Origin`. |
+| `MCP_RPC_RATE_LIMIT_PER_MIN` | ❌ | `60` | Requests/min allowed for MCP tools that call the RPC |
 
 Example `.env` file for local testing:
 
@@ -78,6 +115,10 @@ DATABASE_URL=postgres://lumenqraph:lumenqraph@localhost:5432/lumenqraph
 RPC_URL=https://soroban-testnet.stellar.org
 RPC_TIMEOUT_SECS=30
 MCP_AUTH_TOKEN=your-secret-token
+# Optional: set a bind address for the HTTP transport (default: stdio)
+# MCP_HTTP_BIND=127.0.0.1:8090
+# Optional: restrict which browser Origins may call the HTTP transport
+# MCP_ALLOWED_ORIGINS=https://your-app.example.com
 ```
 
 ## Tools
