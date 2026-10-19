@@ -20,13 +20,21 @@ Use the `code` field — not the `error` string — to branch in SDKs and integr
 Error messages are intended for humans and may change between versions; codes are
 stable and will not be renamed or removed.
 
+**Concurrency limit:** each client IP may have at most `MAX_CONCURRENT_PER_IP` requests in flight.
+A request over that limit gets `429 rate_limited` with `Retry-After: 1`. A slot is released when the
+response is produced, or when the request is cancelled or times out. Server-Sent Event streams
+(`/contracts/:contract_id/events/stream`) release their concurrency slot once the response headers are sent, so they do not
+count toward `MAX_CONCURRENT_PER_IP`. They are capped separately: 1000 streams in total and 100 per
+key (`routes/stream.rs`).
+
 | Code                | HTTP status | When                                                                  |
+|---------------------|-------------|-----------------------------------------------------------------------|
 |---------------------|-------------|-----------------------------------------------------------------------|
 | `bad_request`       | 400         | Malformed input, invalid parameter value, or wrong argument type.    |
 | `invalid_contract_id` | 400       | The `:contract_id` path segment is not a valid `C…` contract strkey. |
 | `unauthorized`      | 401         | Missing, invalid, or revoked API key.                                 |
 | `not_found`         | 404         | The requested resource does not exist.                                |
-| `rate_limited`      | 429         | Caller exceeded the requests-per-minute limit.                        |
+| `rate_limited`      | 429         | Caller exceeded the requests-per-minute or concurrent-request limit. Concurrency rejections carry `Retry-After: 1` and `X-Concurrency-Limit`. |
 | `simulation_failed` | 400         | RPC simulation returned an error (contract trap, bad call, etc.).    |
 | `spec_unavailable`  | 404         | Contract has not been indexed yet. The indexer fetches the interface on first sighting — retry after the contract has been seen. |
 | `sac_not_supported` | 422         | The contract is a Stellar Asset Contract (or has no WASM spec). Retrying will never help; use the token metadata endpoints instead of `/call` or `/simulate`. |

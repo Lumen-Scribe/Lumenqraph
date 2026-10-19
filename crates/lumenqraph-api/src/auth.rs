@@ -10,7 +10,6 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::warn;
@@ -250,6 +249,18 @@ fn rate_limited_response(limit: i32, retry_after_secs: Option<u64>, tokens_remai
         response.headers_mut().insert("X-RateLimit-Remaining", val);
     }
 
+    response
+}
+
+/// Response for a request over the per-IP concurrency limit. This is a client-side
+/// limit, so it is a 429 with a retry hint, not a 503, which clients and load
+/// balancers read as the server being unhealthy.
+fn concurrency_limited_response(limit: usize) -> Response {
+    let limit = i32::try_from(limit).unwrap_or(i32::MAX);
+    let mut response = rate_limited_response(limit, Some(1), 0);
+    if let Ok(val) = limit.to_string().parse() {
+        response.headers_mut().insert("X-Concurrency-Limit", val);
+    }
     response
 }
 
@@ -509,14 +520,7 @@ pub async fn concurrency_limit(
         .concurrency_limiter
         .try_acquire(&client_ip, state.max_concurrent_per_ip)
     else {
-        let body = json!({
-            "code": "rate_limited",
-            "error": format!(
-                "too many concurrent requests from this IP (limit: {})",
-                state.max_concurrent_per_ip
-            )
-        });
-        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+        return concurrency_limited_response(state.max_concurrent_per_ip);
     };
 
     // Insert the client IP into extensions so release middleware can access it.
@@ -664,6 +668,14 @@ mod tests {
                 "rightmost entry must be stable regardless of spoofed leftmost: {xff}"
             );
         }
+    }
+
+    #[test]
+    fn concurrency_rejection_is_429_with_retry_after() {
+        let resp = concurrency_limited_response(4);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers()["retry-after"], "1");
+        assert_eq!(resp.headers()["x-concurrency-limit"], "4");
     }
 }
 
