@@ -49,9 +49,13 @@ pub fn parse_contract_error_code(error_text: &str) -> Option<u32> {
 /// - control characters (incl. embedded newlines, tabs, NUL, ESC) are dropped,
 /// - runs of whitespace are collapsed to a single space,
 /// - **internal-leakage redaction**: endpoint URLs (`http(s)://…`) and
-///   long base64/XDR-style blobs (alphanumeric `+/=`-only runs of 16+ chars,
-///   e.g. encoded ledger entries, resource internals) are replaced with a
-///   `[redacted:…]` placeholder so they never reach an unauthenticated caller,
+///   base64/XDR-style blobs are replaced with a `[redacted:…]` placeholder so
+///   they never reach an unauthenticated caller. Public on-chain identifiers
+///   are preserved: valid strkeys (`C…`/`G…`, validated with
+///   `stellar_strkey`) and identifier-like tokens (`^[A-Za-z][A-Za-z0-9_]*$`,
+///   up to 64 chars, e.g. `InsufficientAllowance`) survive intact. Only tokens
+///   that look like base64 (contain `+`, `/` or `=`, or mix upper/lower case
+///   with digits above an entropy threshold) or exceed 64 chars are redacted,
 /// - the result is truncated to [`MAX_SIMULATION_ERROR_LEN`] characters,
 ///   with a `…` ellipsis appended when text was cut.
 ///
@@ -86,19 +90,21 @@ pub fn sanitize_simulation_error(raw: &str) -> String {
     out
 }
 
-/// Replace endpoint URLs and long base64/XDR-style blobs with redaction
+/// Replace endpoint URLs and base64/XDR-style blobs with redaction
 /// placeholders. Operates token-by-token so normal prose (e.g. "contract
 /// trapped: arithmetic overflow") is left intact.
+///
+/// Public identifiers are deliberately preserved: strkeys (validated with
+/// `stellar_strkey`) and identifier-like tokens up to 64 chars are the most
+/// useful part of an auth or trap error and are not internal detail.
 fn redact_internal_detail(s: &str) -> String {
     s.split_whitespace()
         .map(|tok| {
             if tok.starts_with("http://") || tok.starts_with("https://") {
                 "[redacted:url]".to_string()
-            } else if tok.chars().count() >= 16
-                && tok
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '+' || c == '/' || c == '=')
-            {
+            } else if is_public_identifier(tok) {
+                tok.to_string()
+            } else if looks_like_base64(tok) || tok.chars().count() > 64 {
                 "[redacted:blob]".to_string()
             } else {
                 tok.to_string()
@@ -106,6 +112,47 @@ fn redact_internal_detail(s: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Whether `tok` is a public on-chain identifier that must survive
+/// sanitisation: a valid strkey (`C…`/`G…`/etc.) or an identifier-like token
+/// (`^[A-Za-z][A-Za-z0-9_]*$`) of at most 64 characters.
+fn is_public_identifier(tok: &str) -> bool {
+    if is_strkey(tok) {
+        return true;
+    }
+    let len = tok.chars().count();
+    if len == 0 || len > 64 {
+        return false;
+    }
+    let mut chars = tok.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Validate `tok` as a Stellar strkey (account, contract, muxed account, …).
+fn is_strkey(tok: &str) -> bool {
+    stellar_strkey::Strkey::from_string(tok).is_ok()
+}
+
+/// Heuristic for base64/XDR-style blobs: tokens containing base64-only
+/// punctuation (`+`, `/`, `=`) are treated as blobs, as are long tokens that
+/// mix upper and lower case with digits (high entropy, unlike identifiers).
+fn looks_like_base64(tok: &str) -> bool {
+    if tok.contains('+') || tok.contains('/') || tok.contains('=') {
+        return true;
+    }
+    let len = tok.chars().count();
+    if len < 16 {
+        return false;
+    }
+    let has_upper = tok.chars().any(|c| c.is_ascii_uppercase());
+    let has_lower = tok.chars().any(|c| c.is_ascii_lowercase());
+    let has_digit = tok.chars().any(|c| c.is_ascii_digit());
+    has_upper && has_lower && has_digit
 }
 
 #[cfg(test)]
@@ -165,5 +212,59 @@ mod tests {
     fn whitespace_runs_collapse() {
         let msg = "  too    many     spaces  ";
         assert_eq!(sanitize_simulation_error(msg), "too many spaces");
+    }
+
+    #[test]
+    fn strkeys_survive_sanitisation() {
+        // Real testnet contract and account strkeys captured from RPC errors.
+        let contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let account = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+        let msg = format!("Error(Auth, InvalidAction) address {account} contract {contract}");
+        let out = sanitize_simulation_error(&msg);
+        assert!(out.contains(contract), "contract strkey lost: {out}");
+        assert!(out.contains(account), "account strkey lost: {out}");
+        assert!(!out.contains("[redacted:blob]"), "strkey redacted: {out}");
+    }
+
+    #[test]
+    fn long_error_names_survive_sanitisation() {
+        let msg = "HostError: Error(Contract, #1) InsufficientAllowance ExceededMaxSupplyLimit";
+        let out = sanitize_simulation_error(msg);
+        assert!(out.contains("InsufficientAllowance"), "name lost: {out}");
+        assert!(out.contains("ExceededMaxSupplyLimit"), "name lost: {out}");
+        assert!(!out.contains("[redacted:blob]"), "name redacted: {out}");
+    }
+
+    #[test]
+    fn real_testnet_rpc_error_keeps_identifiers() {
+        // Shape of a real testnet simulateTransaction error string.
+        let msg = "HostError: Error(Auth, InvalidAction) \
+                   contract: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM \
+                   address: GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF \
+                   event: InsufficientAllowance";
+        let out = sanitize_simulation_error(msg);
+        assert!(out.contains("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"));
+        assert!(out.contains("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"));
+        assert!(out.contains("InsufficientAllowance"));
+        assert!(out.contains("Error(Auth, InvalidAction)"));
+    }
+
+    #[test]
+    fn base64_blobs_and_urls_are_redacted() {
+        let blob = "SGVsbG8gV29ybGQhIFRoaXMgaXMgYSBiYXNlNjQgYmxvYg==";
+        let msg = format!("call failed at https://internal.rpc/simulate XDR={blob} trapped");
+        let out = sanitize_simulation_error(&msg);
+        assert!(!out.contains("https://internal.rpc"), "url leaked: {out}");
+        assert!(!out.contains(blob), "blob leaked: {out}");
+        assert!(out.contains("[redacted:url]"));
+        assert!(out.contains("[redacted:blob]"));
+        assert!(out.contains("trapped"), "prose lost: {out}");
+    }
+
+    #[test]
+    fn overlong_token_is_redacted() {
+        let long = "A".repeat(65);
+        let out = sanitize_simulation_error(&long);
+        assert_eq!(out, "[redacted:blob]");
     }
 }
