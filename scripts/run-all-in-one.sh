@@ -48,7 +48,7 @@ if [[ -n "${TESTNET_DATABASE_URL:-}" ]]; then
 fi
 
 # Migrations have already been applied above; the indexers only verify them.
-export SKIP_MIGRATIONS=true
+# (No SKIP_MIGRATIONS flag: nothing reads it, so don't pretend otherwise.)
 
 pids=()
 

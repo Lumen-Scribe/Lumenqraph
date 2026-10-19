@@ -47,7 +47,9 @@ The backfill migration reads the key from the Postgres session setting
 `app.webhook_encryption_key`, which the webhooks service sets at startup from
 the `WEBHOOK_ENCRYPTION_KEY` environment variable. **If this variable is not
 set before the indexer runs migrations, the backfill will silently skip
-existing rows and they will be undeliverable until re-created.**
+existing rows and they will be undeliverable until re-created.** The API and
+webhooks service also require the same non-empty key at startup and now fail
+fast when it is missing.
 
 **Action required — before deploying:**
 
@@ -152,7 +154,7 @@ All new variables have safe defaults and are **optional** unless marked
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `WEBHOOK_ENCRYPTION_KEY` | *(none)* | **Required for webhooks.** Generate with `openssl rand -hex 32`. See breaking change #1 above. |
+| `WEBHOOK_ENCRYPTION_KEY` | *(none)* | **Required for the API and webhooks service.** Generate with `openssl rand -hex 32`; both fail to start if missing or empty. See breaking change #1 above. |
 | `CORS_ALLOWED_ORIGINS` | *(unset — same-origin)* | Comma-separated origins, `*`, or unset. See breaking change #5 above. |
 | `GRAPHQL_MAX_DEPTH` | `12` | GraphQL query depth limit. Prevents deeply nested DoS queries. |
 | `GRAPHQL_MAX_COMPLEXITY` | `1000` | GraphQL query complexity limit. |

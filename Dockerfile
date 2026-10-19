@@ -64,6 +64,8 @@ COPY --from=builder /rustc-version.txt /rustc-version.txt
 COPY explorer /app/explorer
 # Entrypoint for single-slot hosts that run the indexer + API as one process
 # (Render's free tier has no worker type). Unused by compose/Fly.
+# Migrations are applied by the indexer binary's own `migrate` subcommand
+# (embedded via sqlx::migrate!), so the runtime image needs no sqlx-cli.
 COPY scripts/run-all-in-one.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/run-all-in-one.sh
 # Create a non-root user and group for running services

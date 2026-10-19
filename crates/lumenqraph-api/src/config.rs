@@ -107,9 +107,17 @@ pub struct ApiConfig {
 
     pub graphql: GraphqlConfig,
 
+
+    /// Required `pgp_sym_encrypt` key for webhook secrets. Read and validated
+    /// once at startup; handlers never consult the environment directly.
+    pub webhook_encryption_key: String,
+    /// Retention for delivered/failed webhook deliveries. `0` disables pruning.
+    pub webhook_delivery_retention_days: i64,
+
     /// `pgp_sym_encrypt` key for webhook secrets. `None` falls back to the
     /// legacy insecure test key (a warning is logged at startup).
     pub webhook_encryption_key: Option<String>,
+
 
     /// Sibling instances mounted under a path prefix (`INSTANCE_MOUNTS`).
     pub mounts: Vec<(String, String)>,
@@ -126,6 +134,9 @@ impl ApiConfig {
             env_parse("API_MAX_BODY_BYTES", 65536u64)?
         };
 
+
+        let webhook_encryption_key = required_env("WEBHOOK_ENCRYPTION_KEY")?;
+
         // Reject bad origins at startup, naming the entry, rather than letting
         // CORS silently never match a browser's Origin header (#581).
         let cors_allowed_origins = env_string("CORS_ALLOWED_ORIGINS", "");
@@ -134,6 +145,7 @@ impl ApiConfig {
         let webhook_encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY")
             .ok()
             .filter(|k| !k.trim().is_empty());
+
 
         let proxy_defaults = ProxyConfig::default();
 
@@ -215,6 +227,24 @@ impl ApiConfig {
     }
 }
 
+/// Read a required, non-empty environment value. In particular, the API must
+/// never silently encrypt webhook secrets with a built-in fallback key.
+fn required_env(key: &str) -> anyhow::Result<String> {
+    required_env_value(key, std::env::var(key).ok())
+}
+
+fn required_env_value(key: &str, value: Option<String>) -> anyhow::Result<String> {
+    let value = value.ok_or_else(|| {
+        anyhow::anyhow!("{key} is required; generate a strong value with `openssl rand -hex 32`")
+    })?;
+    if value.trim().is_empty() {
+        anyhow::bail!(
+            "{key} must not be empty; generate a strong value with `openssl rand -hex 32`"
+        );
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 impl ApiConfig {
     /// Built-in defaults with no environment lookups, for tests that need an
@@ -262,7 +292,14 @@ impl ApiConfig {
                 max_complexity: 1000,
                 introspection_enabled: false,
             },
+
+            // Test-only value; production config always reads a required key
+            // from the environment.
+            webhook_encryption_key: "test-only-webhook-key".into(),
+            webhook_delivery_retention_days: 14,
+
             webhook_encryption_key: None,
+
             mounts: Vec::new(),
             proxy: ProxyConfig::default(),
         }
@@ -307,9 +344,16 @@ impl fmt::Debug for ApiConfig {
             .field("api_key_cache_ttl_secs", &self.api_key_cache_ttl_secs)
             .field("api_key_cache_neg_ttl_secs", &self.api_key_cache_neg_ttl_secs)
             .field("graphql", &self.graphql)
+
+            .field("webhook_encryption_key", &"[REDACTED]")
+            .field(
+                "webhook_delivery_retention_days",
+                &self.webhook_delivery_retention_days,
+
             .field(
                 "webhook_encryption_key",
                 &self.webhook_encryption_key.as_ref().map(|_| "[REDACTED]"),
+
             )
             .field("mounts", &self.mounts)
             .field("proxy", &self.proxy)
@@ -426,6 +470,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn required_webhook_encryption_key_rejects_missing_or_empty_values() {
+        for value in [None, Some(String::new()), Some(" \t\n".to_string())] {
+            let err = required_env_value("WEBHOOK_ENCRYPTION_KEY", value)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("WEBHOOK_ENCRYPTION_KEY"),
+                "error should name the variable: {err}"
+            );
+        }
+
+        assert_eq!(
+            required_env_value("WEBHOOK_ENCRYPTION_KEY", Some("secret".into())).unwrap(),
+            "secret"
+        );
+    }
+
+    #[test]
     fn parse_bool_accepts_common_spellings() {
         for v in ["1", "true", "TRUE", "yes", "on", " True "] {
             assert_eq!(parse_bool(v), Some(true), "{v:?}");
@@ -461,6 +523,12 @@ mod tests {
             "postgres://db:5432"
         );
         assert_eq!(redact_url("https://rpc.example"), "https://rpc.example");
+
+        let mut config = ApiConfig::test_default();
+        config.webhook_encryption_key = "super-secret-webhook-key".into();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("super-secret-webhook-key"));
     }
 }
 

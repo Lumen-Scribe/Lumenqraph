@@ -120,14 +120,21 @@ When a contract's WASM executable changes and matches an `kind = 'upgrade'` subs
 Each webhook includes a cryptographic signature in the `X-Lumenqraph-Signature` header:
 
 ```
-X-Lumenqraph-Signature: sha256=abc123def456...
+X-Lumenqraph-Signature: t=1700000000,v1=abc123def456...
 ```
 
-The signature is computed as HMAC-SHA256 over the **raw request body** (before any JSON parsing) using your subscription's secret.
+The header is a comma-separated list of `key=value` pairs:
+
+- `t` — Unix timestamp (seconds) at which the delivery was signed.
+- `v1` — HMAC-SHA256 signature, hex-encoded. There may be **more than one** `v1` value (e.g. during secret rotation); the delivery is valid if **any** `v1` matches.
 
 ### Bytes Signed
 
-The HMAC is computed over the exact bytes sent in the HTTP POST body. No whitespace normalization or canonicalization occurs — sign the raw bytes as-is.
+The HMAC is computed over the string `"{t}.{body}"`, where `{t}` is the timestamp from the header and `{body}` is the exact bytes sent in the HTTP POST body. No whitespace normalization or canonicalization occurs — sign the raw bytes as-is.
+
+### Replay Protection
+
+Reject deliveries whose `t` is too far from the current time (a tolerance of 5 minutes / 300 seconds is typical). This prevents an attacker from replaying a previously captured, validly signed request. You should also deduplicate on `X-Lumenqraph-Delivery-Id`.
 
 ### Verification Examples
 
@@ -138,23 +145,44 @@ Use the built-in `crypto.timingSafeEqual()` for constant-time comparison to prev
 ```javascript
 const crypto = require("crypto");
 
-function verifyWebhookSignature(rawBody, signatureHeader, secret) {
-  // Compute the expected signature
-  const expected = "sha256=" + 
-    crypto.createHmac("sha256", secret)
-      .update(rawBody)
-      .digest("hex");
+const TOLERANCE_SECS = 300;
 
-  // Use timing-safe comparison to prevent timing attacks
-  try {
-    return crypto.timingSafeEqual(
-      Buffer.from(signatureHeader),
-      Buffer.from(expected)
-    );
-  } catch {
-    // Buffers have different lengths
+function verifyWebhookSignature(rawBody, signatureHeader, secret) {
+  // Parse "t=<ts>,v1=<hex>[,v1=<hex>...]"
+  let timestamp = null;
+  const signatures = [];
+  for (const part of signatureHeader.split(",")) {
+    const idx = part.indexOf("=");
+    if (idx === -1) continue;
+    const key = part.slice(0, idx).trim();
+    const value = part.slice(idx + 1).trim();
+    if (key === "t") timestamp = Number(value);
+    else if (key === "v1") signatures.push(value);
+  }
+
+  if (!Number.isFinite(timestamp) || signatures.length === 0) {
     return false;
   }
+
+  // Reject stale or future-dated deliveries (replay protection)
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - timestamp) > TOLERANCE_SECS) {
+    return false;
+  }
+
+  // HMAC-SHA256 over "{t}.{body}"
+  const signedPayload = `${timestamp}.${rawBody}`;
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(signedPayload)
+    .digest("hex");
+
+  // Accept if any v1 matches (supports secret rotation)
+  return signatures.some((sig) => {
+    const a = Buffer.from(sig.toLowerCase(), "hex");
+    const b = Buffer.from(expected, "hex");
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  });
 }
 
 // Usage in Express.js
@@ -162,7 +190,7 @@ app.post("/webhooks/lumenqraph", express.raw({ type: "application/json" }), (req
   const signature = req.headers["x-lumenqraph-signature"];
   const secret = process.env.LUMENQRAPH_WEBHOOK_SECRET;
 
-  if (!verifyWebhookSignature(req.body, signature, secret)) {
+  if (!signature || !verifyWebhookSignature(req.body, signature, secret)) {
     return res.status(401).json({ error: "Invalid signature" });
   }
 
@@ -175,32 +203,31 @@ app.post("/webhooks/lumenqraph", express.raw({ type: "application/json" }), (req
 
 #### Rust
 
-Use the `lumenqraph_core::crypto::verify_hmac_signature()` function (constant-time by default):
+Use `lumenqraph_core::crypto::verify_webhook()`, which parses `t=`/`v1=`, enforces the timestamp tolerance, computes the HMAC over `{t}.{body}`, decodes hex case-insensitively, and compares in constant time:
 
 ```rust
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use lumenqraph_core::crypto::verify_hmac_signature;
+use std::time::Duration;
+use lumenqraph_core::crypto::{verify_webhook, VerifyError};
 
-type HmacSha256 = Hmac<Sha256>;
-
-fn verify_webhook(raw_body: &[u8], signature_header: &str, secret: &str) -> bool {
-    // Compute expected signature
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("invalid secret");
-    mac.update(raw_body);
-    let expected = hex::encode(mac.finalize().into_bytes());
-
-    // Use constant-time comparison
-    verify_hmac_signature(&expected, signature_header)
+fn check_webhook(raw_body: &[u8], signature_header: &str, secret: &str) -> bool {
+    match verify_webhook(secret, signature_header, raw_body, Duration::from_secs(300)) {
+        Ok(()) => true,
+        Err(VerifyError::StaleTimestamp) => {
+            // Replayed or delayed delivery — reject
+            false
+        }
+        Err(_) => false,
+    }
 }
 ```
 
 For production Rust servers (e.g., Axum), capture the raw body before JSON parsing:
 
 ```rust
-use axum::extract::RawBody;
-use bytes::Bytes;
+use std::time::Duration;
+use axum::body::Bytes;
+use axum::http::HeaderMap;
+use lumenqraph_core::crypto::verify_webhook;
 
 async fn webhook_handler(
     body: Bytes,
@@ -214,9 +241,8 @@ async fn webhook_handler(
     let secret = std::env::var("LUMENQRAPH_WEBHOOK_SECRET")
         .expect("LUMENQRAPH_WEBHOOK_SECRET");
 
-    if !verify_webhook(&body, signature, &secret) {
-        return Err(anyhow::anyhow!("invalid signature"));
-    }
+    verify_webhook(&secret, signature, &body, Duration::from_secs(300))
+        .map_err(|e| anyhow::anyhow!("invalid signature: {e}"))?;
 
     let payload: serde_json::Value = serde_json::from_slice(&body)?;
     // Process webhook...
@@ -230,7 +256,7 @@ Every webhook delivery includes these headers:
 
 | Header | Example | Purpose |
 |--------|---------|---------|
-| `X-Lumenqraph-Signature` | `sha256=abc123...` | HMAC-SHA256 signature over the request body |
+| `X-Lumenqraph-Signature` | `t=1700000000,v1=abc123...` | HMAC-SHA256 signature over `{t}.{body}` (see [Signature Verification](#signature-verification)) |
 | `X-Lumenqraph-Delivery-Id` | `12345` | Unique delivery attempt ID (deduplication key) |
 | `X-Lumenqraph-Timestamp` | `2025-01-15T10:30:00Z` | RFC3339 UTC timestamp of delivery |
 | `X-Lumenqraph-Attempt` | `1` | Attempt number (1 = first, incremented on retry) |
@@ -410,9 +436,11 @@ Use a tool like [RequestBin](https://requestbin.com/) or [Webhook.cool](https://
 ### Signature Verification Fails
 
 1. Ensure you're signing the **raw request body bytes**, not a normalized JSON string
-2. Extract the signature from the `X-Lumenqraph-Signature` header (not from the body)
-3. Use constant-time comparison (`crypto.timingSafeEqual` in Node, `verify_hmac_signature()` in Rust)
-4. Verify the secret matches the one in your subscription
+2. Sign the string `"{t}.{body}"` (timestamp from the header, then a literal `.`, then the raw body)
+3. Extract the signature from the `X-Lumenqraph-Signature` header (not from the body) and accept any `v1` value
+4. Check the `t` timestamp is within your tolerance (e.g. 300 seconds) — stale deliveries are rejected
+5. Use constant-time comparison (`crypto.timingSafeEqual` in Node, `verify_webhook()` in Rust)
+6. Verify the secret matches the one in your subscription
 
 ### Deliveries Stuck in Pending
 

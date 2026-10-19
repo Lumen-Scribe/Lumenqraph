@@ -204,6 +204,18 @@ impl LeaderLock {
     }
 }
 
+/// Returns true when `SKIP_MIGRATIONS` is set to a truthy value.
+fn skip_migrations() -> bool {
+    matches!(
+        std::env::var("SKIP_MIGRATIONS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 async fn run_migrations(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     let mut conn = pool
         .acquire()
@@ -295,7 +307,13 @@ async fn main() -> anyhow::Result<()> {
         _ => {}
     }
 
-    run_migrations(&pool).await?;
+    // SKIP_MIGRATIONS lets the all-in-one entrypoint skip the migrator when it
+    // has already run `lumenqraph-indexer migrate` (#603).
+    if !skip_migrations() {
+        run_migrations(&pool).await?;
+    } else {
+        info!("SKIP_MIGRATIONS is set; skipping database migrations");
+    }
     match command {
         Command::Backfill { ledger } => {
             backfill::run(pool, rpc, config, ledger.map(i64::from).unwrap_or(0)).await
@@ -319,8 +337,11 @@ async fn main() -> anyhow::Result<()> {
                 config.spec_fetch_concurrency,
             ));
             let pool_for_http = Arc::new(pool.clone());
+            // Default to loopback so /health and /metrics are not exposed on
+            // public interfaces (#605). Set INDEXER_HTTP_BIND_ADDR=0.0.0.0:9090
+            // (or the private network address) to allow Prometheus scraping.
             let bind_addr = std::env::var("INDEXER_HTTP_BIND_ADDR")
-                .unwrap_or_else(|_| "0.0.0.0:9090".to_string());
+                .unwrap_or_else(|_| "127.0.0.1:9090".to_string());
             http::start_http_server(pool_for_http, Arc::clone(&specs), &bind_addr).await?;
             poller::run(pool, rpc, config, specs).await
         }
@@ -337,8 +358,11 @@ async fn main() -> anyhow::Result<()> {
 
     let pool_arc = std::sync::Arc::new(pool.clone());
     let specs_arc = std::sync::Arc::new(specs);
+    // Default to loopback so /health and /metrics are not exposed on public
+    // interfaces (#605). Set INDEXER_HTTP_BIND_ADDR=0.0.0.0:9090 (or the
+    // private network address) to allow Prometheus scraping.
     let bind_addr = std::env::var("INDEXER_HTTP_BIND_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:9090".to_string());
+        .unwrap_or_else(|_| "127.0.0.1:9090".to_string());
     http::start_http_server(pool_arc, specs_arc.clone(), &bind_addr).await?;
 
     poller::run(pool, rpc, config, specs_arc).await

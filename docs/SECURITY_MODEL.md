@@ -68,9 +68,9 @@ This document outlines Lumenqraph's security posture, including trust boundaries
    - Keys can be revoked without database resets
 
 4. **Webhook Secret Encryption**
-   - Secrets can be encrypted at rest using pgcrypto (AES-128-CBC)
-   - Set `WEBHOOK_ENCRYPTION_KEY` to enable encryption
-   - Decryption happens only during delivery
+   - Webhook signing secrets are encrypted at rest using pgcrypto
+   - `WEBHOOK_ENCRYPTION_KEY` is required by the API and webhooks service
+   - Both services fail to start if it is missing or empty
 
 ### ✓ RATE LIMITING
 
@@ -153,12 +153,12 @@ If the PostgreSQL server is compromised:
 - **Impact:** Incorrect index state, webhook secret disclosure
 - **Mitigation:**
   - Strong database password (min 32 chars, random)
-  - Enable at-rest encryption: `WEBHOOK_ENCRYPTION_KEY` (pgcrypto)
+  - Keep the required shared at-rest encryption key secure: `WEBHOOK_ENCRYPTION_KEY` (pgcrypto)
   - Network isolation: database inside private VPC, no public IP
   - Regular backups, tested restoration
 
 ```bash
-# Enable webhook secret encryption
+# Generate the required shared key for the API and webhooks service
 WEBHOOK_ENCRYPTION_KEY="$(openssl rand -hex 32)"
 
 # Rotate regularly
@@ -297,7 +297,7 @@ DATABASE_URL="postgres://user:pass@host:5432/db?sslmode=require"
 
 - [ ] **Authentication & Secrets**
   - [ ] Strong database password (min 32 chars)
-  - [ ] Enable webhook secret encryption: `WEBHOOK_ENCRYPTION_KEY=<random-hex>`
+  - [ ] Set the required shared webhook encryption key: `WEBHOOK_ENCRYPTION_KEY=<random-hex>`
   - [ ] Require API keys: `REQUIRE_API_KEY=true`
   - [ ] Disable GraphQL introspection: `GRAPHQL_INTROSPECTION_ENABLED=false`
 

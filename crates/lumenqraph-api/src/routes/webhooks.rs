@@ -199,13 +199,8 @@ pub async fn create_webhook(
         (0, None)
     };
 
-    // Read once at startup (#441); an unset key keeps the legacy test fallback
-    // and is warned about in `main`.
-    let encryption_key = state
-        .config
-        .webhook_encryption_key
-        .as_deref()
-        .unwrap_or("default-key-for-testing");
+    // The required key is validated and loaded once at API startup.
+    let encryption_key = state.config.webhook_encryption_key.as_str();
 
     // Set owner_key_hash from the authenticated caller (#421). Anonymous callers
     // (no API key) create subscriptions with NULL owner, which are only accessible
@@ -949,12 +944,17 @@ pub async fn rotate_webhook_secret(
         .unwrap_or_else(default_grace_seconds);
     validate_grace_seconds(grace_seconds)?;
 
+
+    // The required key is validated and loaded once at API startup.
+    let encryption_key = state.config.webhook_encryption_key.as_str();
+
     // Same key source as create_webhook (#441); no public fallback is read from the environment.
     let encryption_key = state
         .config
         .webhook_encryption_key
         .as_deref()
         .unwrap_or("default-key-for-testing");
+
 
     let new_secret = random_secret();
 

@@ -24,11 +24,14 @@ services:
     dockerfilePath: ./Dockerfile
     dockerContext: .
     # Overrides the image's default CMD (api only) to run indexer + api together.
-    # run-all-in-one.sh applies migrations (`lumenqraph-indexer migrate`) before
-    # starting anything, because the free plan has no pre-deploy step.
+    # run-all-in-one.sh applies migrations via the indexer's own migrator
+    # (`lumenqraph-indexer migrate`) before starting anything, because the free
+    # plan has no pre-deploy step. The image does not ship sqlx-cli, and
+    # SKIP_MIGRATIONS is not read by anything — don't rely on either.
     dockerCommand: run-all-in-one.sh
     # On a paid instance type, run migrations as a pre-deploy step instead, so a
-    # failed migration aborts the deploy before the running service is replaced:
+    # failed migration aborts the deploy before the running service is replaced
+    # (run-all-in-one.sh then finds the schema already up to date):
     # preDeployCommand: lumenqraph-indexer migrate
     healthCheckPath: /health
 
@@ -78,10 +81,10 @@ services:
         value: "true"
 
       # ---- Security --------------------------------------------------------
-      # Encryption key used to sign and verify webhook payloads (HMAC-SHA256).
-      # Generate before deploying: openssl rand -hex 32
-      # Leave the value blank here — Render will prompt you to set it as a
-      # secret. Never commit a real value to source control.
+      # Required by the API and webhooks service to encrypt/decrypt webhook
+      # signing secrets at rest (pgcrypto). Both services fail to start if it
+      # is missing or empty. Generate before deploying: openssl rand -hex 32
+      # Render prompts for it as a secret; never commit the real value here.
       - key: WEBHOOK_ENCRYPTION_KEY
         sync: false
 

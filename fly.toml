@@ -4,7 +4,12 @@
 #
 #   fly launch --no-deploy --copy-config   # reuse this file
 #   fly secrets set DATABASE_URL=... RPC_URL=...
+#   fly secrets set WEBHOOK_ENCRYPTION_KEY="$(openssl rand -hex 32)"
 #   fly deploy
+#
+# WEBHOOK_ENCRYPTION_KEY is required by both the API and webhooks process
+# groups. Keep it as a Fly secret (not in [env]); both services fail to start
+# if it is missing or empty.
 #
 # Rename `app` to your own app before deploying.
 app = "lumenqraph"

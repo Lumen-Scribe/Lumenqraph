@@ -142,13 +142,18 @@ fn is_address(s: &str) -> bool {
     (s.starts_with('G') || s.starts_with('C')) && ScAddress::from_str(s).is_ok()
 }
 
-/// Parse a durability config string. Anything other than "temporary" (case
-/// insensitive) is treated as persistent — the common case for balances.
-pub fn parse_durability(s: &str) -> ContractDataDurability {
-    if s.trim().eq_ignore_ascii_case("temporary") {
-        ContractDataDurability::Temporary
-    } else {
-        ContractDataDurability::Persistent
+/// Parse a durability config string strictly. Only `persistent` or `temporary`
+/// (case-insensitive, surrounding whitespace ignored) are accepted; anything
+/// else — including typos like `instance` or `temp` — is an error, so a
+/// misconfigured key template fails startup instead of silently reading the
+/// wrong storage.
+pub fn parse_durability(s: &str) -> anyhow::Result<ContractDataDurability> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "persistent" => Ok(ContractDataDurability::Persistent),
+        "temporary" => Ok(ContractDataDurability::Temporary),
+        _ => anyhow::bail!(
+            "invalid durability {s:?}: expected \"persistent\" or \"temporary\""
+        ),
     }
 }
 
@@ -221,6 +226,37 @@ mod tests {
         );
         let holders = holders_in_event(&e);
         assert_eq!(holders, vec![from, to]);
+    }
+
+    #[test]
+    fn parse_durability_accepts_valid_values() {
+        assert_eq!(
+            parse_durability("persistent").expect("valid"),
+            ContractDataDurability::Persistent
+        );
+        assert_eq!(
+            parse_durability("temporary").expect("valid"),
+            ContractDataDurability::Temporary
+        );
+        // Case-insensitive and trimmed.
+        assert_eq!(
+            parse_durability("  Persistent ").expect("valid"),
+            ContractDataDurability::Persistent
+        );
+        assert_eq!(
+            parse_durability("TEMPORARY").expect("valid"),
+            ContractDataDurability::Temporary
+        );
+    }
+
+    #[test]
+    fn parse_durability_rejects_invalid_values() {
+        for bad in ["instance", "temp", "", "  ", "persistant", "temporarily"] {
+            let err = parse_durability(bad).expect_err("should reject");
+            let msg = err.to_string();
+            assert!(msg.contains("persistent"), "message: {msg}");
+            assert!(msg.contains("temporary"), "message: {msg}");
+        }
     }
 
     #[test]

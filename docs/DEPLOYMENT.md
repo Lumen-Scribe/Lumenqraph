@@ -234,8 +234,8 @@ openssl rand -hex 32
 > [!IMPORTANT]
 > Never commit this value to source control. The `WEBHOOK_ENCRYPTION_KEY` entry in
 > `render.yaml` intentionally has no default. Render will prompt you to set it during
-> Blueprint setup. Deployments that skip this step fall back to the hardcoded
-> `"default-key-for-testing"` value, which is insecure.
+> Blueprint setup. Both the API and webhooks service fail to start if the secret is
+> missing or empty, rather than falling back to a public key.
 
 #### 3. Deploy Blueprint on Render
 1. Fork the Lumenqraph repository on GitHub.
@@ -274,7 +274,7 @@ When ready to move to separate, robust services:
 ## Production Checklist
 
 - [ ] `DATABASE_URL` → managed Postgres with TLS (`sslmode=require`).
-- [ ] `WEBHOOK_ENCRYPTION_KEY` → 256-bit random hex secret (`openssl rand -hex 32`). **Never** use the default testing key in production.
+- [ ] `WEBHOOK_ENCRYPTION_KEY` → required, non-empty 256-bit random hex secret (`openssl rand -hex 32`), shared by the API and webhooks service.
 - [ ] `RPC_URL` set (paid/retaining RPC if you need backfill or higher limits).
 - [ ] `CONTRACT_IDS` = your allowlist, or intentionally empty to index all.
 - [ ] `REQUIRE_API_KEY=true` to require `x-api-key` on data routes (`/health` +

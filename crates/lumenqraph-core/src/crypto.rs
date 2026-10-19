@@ -3,7 +3,13 @@
 //! All functions in this module use constant-time comparison to prevent timing
 //! attacks on sensitive data like HMAC signatures, API keys, and secrets.
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use subtle::ConstantTimeEq;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Placeholder stored in the plaintext `secret` column once a secret has been
 /// encrypted into `encrypted_secret`.
@@ -31,53 +37,122 @@ pub const BACKFILL_WEBHOOK_SECRETS_SQL: &str = "UPDATE webhook_subscriptions \
      WHERE encrypted_secret IS NULL \
        AND secret <> '[encrypted]'";
 
-/// Verify an HMAC-SHA256 signature using constant-time comparison.
+/// Errors returned by [`verify_webhook`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyError {
+    /// The signature header did not contain a `t=` timestamp.
+    MissingTimestamp,
+    /// The `t=` value was not a valid Unix timestamp.
+    InvalidTimestamp,
+    /// The timestamp was outside the allowed tolerance (stale or replayed).
+    StaleTimestamp,
+    /// The header did not contain any `v1=` signature values.
+    MissingSignature,
+    /// A `v1=` value was not valid hex.
+    InvalidHex,
+    /// None of the provided signatures matched the computed HMAC.
+    Mismatch,
+}
+
+impl std::fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let msg = match self {
+            VerifyError::MissingTimestamp => "signature header is missing the timestamp",
+            VerifyError::InvalidTimestamp => "signature header has an invalid timestamp",
+            VerifyError::StaleTimestamp => "signature timestamp is outside the tolerance",
+            VerifyError::MissingSignature => "signature header is missing a v1 signature",
+            VerifyError::InvalidHex => "signature contains invalid hex",
+            VerifyError::Mismatch => "signature does not match",
+        };
+        f.write_str(msg)
+    }
+}
+
+impl std::error::Error for VerifyError {}
+
+/// Verify an `X-Lumenqraph-Signature` webhook header.
 ///
-/// This function compares the provided signature with the expected signature
-/// using a constant-time algorithm, preventing timing attacks.
+/// The header has the form `t=<unix_ts>,v1=<hex>[,v1=<hex>...]`. The signature
+/// is an HMAC-SHA256 over `"{t}.{body}"`, where `{t}` is the timestamp string
+/// exactly as it appeared in the header and `{body}` is the raw request body.
 ///
-/// # Arguments
-///
-/// * `expected` - The expected signature (e.g., from HMAC calculation)
-/// * `provided` - The provided signature (e.g., from HTTP header)
-///
-/// # Returns
-///
-/// `true` if the signatures match (in constant time), `false` otherwise.
+/// The timestamp must be within `tolerance` of the current time, which rejects
+/// stale and replayed deliveries. Multiple `v1` values are supported (for
+/// secret rotation); verification succeeds if any of them matches. Hex decoding
+/// is case-insensitive and the comparison is constant time.
 ///
 /// # Example
 ///
 /// ```ignore
-/// use lumenqraph_core::crypto::verify_hmac_signature;
-/// use hmac::{Hmac, Mac};
-/// use sha2::Sha256;
+/// use std::time::Duration;
+/// use lumenqraph_core::crypto::verify_webhook;
 ///
-/// type HmacSha256 = Hmac<Sha256>;
-///
-/// let secret = b"my-secret";
+/// let secret = "my-secret";
+/// let header = "t=1700000000,v1=abc123...";
 /// let body = b"webhook payload";
 ///
-/// let mut mac = HmacSha256::new_from_slice(secret).unwrap();
-/// mac.update(body);
-/// let expected = hex::encode(mac.finalize().into_bytes());
-///
-/// let provided = "sha256=abc123...";
-/// if verify_hmac_signature(&expected, provided) {
-///     // Signature is valid
-/// } else {
-///     // Signature is invalid
+/// match verify_webhook(secret, header, body, Duration::from_secs(300)) {
+///     Ok(()) => { /* signature is valid */ }
+///     Err(_) => { /* signature is invalid */ }
 /// }
 /// ```
-pub fn verify_hmac_signature(expected: &str, provided: &str) -> bool {
-    // Extract the hex part after "sha256=" if present
-    let provided_hex = if let Some(hex) = provided.strip_prefix("sha256=") {
-        hex
-    } else {
-        provided
-    };
+pub fn verify_webhook(
+    secret: &str,
+    header: &str,
+    body: &[u8],
+    tolerance: Duration,
+) -> Result<(), VerifyError> {
+    let mut timestamp: Option<&str> = None;
+    let mut signatures: Vec<&str> = Vec::new();
 
-    // Use constant-time comparison on the hex strings
-    bool::from(expected.as_bytes().ct_eq(provided_hex.as_bytes()))
+    for part in header.split(',') {
+        let part = part.trim();
+        if let Some(value) = part.strip_prefix("t=") {
+            timestamp = Some(value);
+        } else if let Some(value) = part.strip_prefix("v1=") {
+            signatures.push(value);
+        }
+    }
+
+    let timestamp = timestamp.ok_or(VerifyError::MissingTimestamp)?;
+    let ts: i64 = timestamp
+        .parse()
+        .map_err(|_| VerifyError::InvalidTimestamp)?;
+
+    if signatures.is_empty() {
+        return Err(VerifyError::MissingSignature);
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let tolerance_secs = tolerance.as_secs() as i64;
+    if (now - ts).abs() > tolerance_secs {
+        return Err(VerifyError::StaleTimestamp);
+    }
+
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).map_err(|_| VerifyError::Mismatch)?;
+    mac.update(timestamp.as_bytes());
+    mac.update(b".");
+    mac.update(body);
+    let expected = mac.finalize().into_bytes();
+
+    let mut saw_candidate = false;
+    for sig in signatures {
+        let decoded = hex::decode(sig).map_err(|_| VerifyError::InvalidHex)?;
+        saw_candidate = true;
+        if bool::from(expected.as_slice().ct_eq(decoded.as_slice())) {
+            return Ok(());
+        }
+    }
+
+    if saw_candidate {
+        Err(VerifyError::Mismatch)
+    } else {
+        Err(VerifyError::MissingSignature)
+    }
 }
 
 /// Verify that two byte slices are equal using constant-time comparison.
@@ -99,32 +174,132 @@ pub fn verify_bytes_equal(expected: &[u8], provided: &[u8]) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_verify_hmac_signature_with_prefix() {
-        let expected = "abc123def456";
-        let provided = "sha256=abc123def456";
-        assert!(verify_hmac_signature(expected, provided));
+    fn now_ts() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    fn sign(secret: &str, ts: &str, body: &[u8]) -> String {
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(ts.as_bytes());
+        mac.update(b".");
+        mac.update(body);
+        hex::encode(mac.finalize().into_bytes())
     }
 
     #[test]
-    fn test_verify_hmac_signature_without_prefix() {
-        let expected = "abc123def456";
-        let provided = "abc123def456";
-        assert!(verify_hmac_signature(expected, provided));
+    fn test_verify_webhook_accepts_real_header() {
+        let secret = "my-secret";
+        let body = b"webhook payload";
+        let ts = now_ts().to_string();
+        let sig = sign(secret, &ts, body);
+        let header = format!("t={ts},v1={sig}");
+        assert_eq!(
+            verify_webhook(secret, &header, body, Duration::from_secs(300)),
+            Ok(())
+        );
     }
 
     #[test]
-    fn test_verify_hmac_signature_mismatch() {
-        let expected = "abc123def456";
-        let provided = "sha256=abc123def457"; // Last digit differs
-        assert!(!verify_hmac_signature(expected, provided));
+    fn test_verify_webhook_accepts_uppercase_hex() {
+        let secret = "my-secret";
+        let body = b"webhook payload";
+        let ts = now_ts().to_string();
+        let sig = sign(secret, &ts, body).to_uppercase();
+        let header = format!("t={ts},v1={sig}");
+        assert_eq!(
+            verify_webhook(secret, &header, body, Duration::from_secs(300)),
+            Ok(())
+        );
     }
 
     #[test]
-    fn test_verify_hmac_signature_missing_prefix() {
-        let expected = "abc123def456";
-        let provided = "sha256=different";
-        assert!(!verify_hmac_signature(expected, provided));
+    fn test_verify_webhook_accepts_any_of_multiple_v1() {
+        let secret = "my-secret";
+        let body = b"webhook payload";
+        let ts = now_ts().to_string();
+        let good = sign(secret, &ts, body);
+        let bad = "0".repeat(64);
+        let header = format!("t={ts},v1={bad},v1={good}");
+        assert_eq!(
+            verify_webhook(secret, &header, body, Duration::from_secs(300)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_verify_webhook_rejects_mismatch() {
+        let secret = "my-secret";
+        let body = b"webhook payload";
+        let ts = now_ts().to_string();
+        let sig = sign("other-secret", &ts, body);
+        let header = format!("t={ts},v1={sig}");
+        assert_eq!(
+            verify_webhook(secret, &header, body, Duration::from_secs(300)),
+            Err(VerifyError::Mismatch)
+        );
+    }
+
+    #[test]
+    fn test_verify_webhook_rejects_stale_timestamp() {
+        let secret = "my-secret";
+        let body = b"webhook payload";
+        let ts = (now_ts() - 3600).to_string();
+        let sig = sign(secret, &ts, body);
+        let header = format!("t={ts},v1={sig}");
+        assert_eq!(
+            verify_webhook(secret, &header, body, Duration::from_secs(300)),
+            Err(VerifyError::StaleTimestamp)
+        );
+    }
+
+    #[test]
+    fn test_verify_webhook_rejects_replayed_old_timestamp() {
+        let secret = "my-secret";
+        let body = b"webhook payload";
+        let ts = (now_ts() - 10).to_string();
+        let sig = sign(secret, &ts, body);
+        let header = format!("t={ts},v1={sig}");
+        // Within a 300s tolerance it is accepted...
+        assert_eq!(
+            verify_webhook(secret, &header, body, Duration::from_secs(300)),
+            Ok(())
+        );
+        // ...but a tighter tolerance treats it as a replay.
+        assert_eq!(
+            verify_webhook(secret, &header, body, Duration::from_secs(5)),
+            Err(VerifyError::StaleTimestamp)
+        );
+    }
+
+    #[test]
+    fn test_verify_webhook_missing_timestamp() {
+        let header = format!("v1={}", "0".repeat(64));
+        assert_eq!(
+            verify_webhook("secret", &header, b"body", Duration::from_secs(300)),
+            Err(VerifyError::MissingTimestamp)
+        );
+    }
+
+    #[test]
+    fn test_verify_webhook_invalid_timestamp() {
+        let header = format!("t=abc,v1={}", "0".repeat(64));
+        assert_eq!(
+            verify_webhook("secret", &header, b"body", Duration::from_secs(300)),
+            Err(VerifyError::InvalidTimestamp)
+        );
+    }
+
+    #[test]
+    fn test_verify_webhook_invalid_hex() {
+        let ts = now_ts().to_string();
+        let header = format!("t={ts},v1=zzzz");
+        assert_eq!(
+            verify_webhook("secret", &header, b"body", Duration::from_secs(300)),
+            Err(VerifyError::InvalidHex)
+        );
     }
 
     #[test]

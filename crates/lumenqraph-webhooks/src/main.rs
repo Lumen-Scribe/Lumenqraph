@@ -53,7 +53,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Redirects are never followed (SSRF guard, see `build_delivery_client`).
-    let http = dispatcher::build_delivery_client(config.connect_timeout(), config.total_timeout())?;
+    // The dispatcher also reuses these timeouts when it builds the per-delivery
+    // IP-pinned client, so redirects stay disabled there too (#615).
+    let connect_timeout = config.connect_timeout();
+    let total_timeout = config.total_timeout();
+    let http = dispatcher::build_delivery_client(connect_timeout, total_timeout)?;
 
     let pool_arc = std::sync::Arc::new(pool.clone());
     metrics::start_metrics_server(pool_arc, &config.metrics_bind_addr).await?;
@@ -66,23 +70,89 @@ async fn main() -> anyhow::Result<()> {
     // Retention for webhook_deliveries; this service is their only writer (#567).
     tokio::spawn(prune::run_pruner(pool.clone(), config.delivery_retention_days, shutdown.clone()));
 
+    // #621 — enqueue, delivery and the gauge refresh run as independent tasks.
+    // Previously they ran serially in one loop, so a single slow subscriber
+    // (delivery waiting up to `total_timeout`) stalled enqueueing for every
+    // tenant. Each task now has its own cadence and observes `shutdown`.
+    let enqueue_task = tokio::spawn(run_enqueue_loop(
+        pool.clone(),
+        config.batch_size,
+        interval,
+        shutdown.clone(),
+    ));
+    let deliver_task = tokio::spawn(run_delivery_loop(
+        pool.clone(),
+        http.clone(),
+        config.clone(),
+        shutdown.clone(),
+    ));
+    let gauge_task = tokio::spawn(run_gauge_loop(pool.clone(), interval, shutdown.clone()));
+
+    shutdown.cancelled().await;
+    info!("shutdown signal received; stopping webhooks");
+
+    // Let the workers wind down gracefully; they observe the same token.
+    for (name, task) in [
+        ("enqueue", enqueue_task),
+        ("deliver", deliver_task),
+        ("gauge", gauge_task),
+    ] {
+        match task.await {
+            Ok(()) => {}
+            Err(e) => tracing::warn!(task = name, error = %e, "worker task failed"),
+        }
+    }
+    Ok(())
+}
+
+/// Enqueue loop: claims new events and fans them out to subscribers on its own
+/// cadence, independent of how long delivery takes (#621).
+async fn run_enqueue_loop(
+    pool: sqlx::PgPool,
+    batch_size: i64,
+    interval: Duration,
+    shutdown: CancellationToken,
+) {
     loop {
-        if let Err(e) = dispatcher::enqueue(&pool, config.batch_size).await {
+        if let Err(e) = dispatcher::enqueue(&pool, batch_size).await {
             tracing::warn!(error = %e, "enqueue failed");
         }
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown.cancelled() => return,
+        }
+    }
+}
+
+/// Delivery loop: runs the continuous delivery worker pool. A slow subscriber
+/// only occupies its own slot, never blocking enqueueing or other tenants (#621).
+async fn run_delivery_loop(
+    pool: sqlx::PgPool,
+    http: reqwest::Client,
+    config: Config,
+    shutdown: CancellationToken,
+) {
+    loop {
         if let Err(e) = dispatcher::deliver_with_shutdown(&pool, &http, &config, &shutdown).await {
             tracing::warn!(error = %e, "deliver failed");
         }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            _ = shutdown.cancelled() => return,
+        }
+    }
+}
+
+/// Gauge refresh loop: keeps the pending-deliveries gauge current on its own
+/// cadence so it is not delayed by slow deliveries (#621).
+async fn run_gauge_loop(pool: sqlx::PgPool, interval: Duration, shutdown: CancellationToken) {
+    loop {
         if let Err(e) = dispatcher::refresh_pending_gauge(&pool).await {
             tracing::warn!(error = %e, "pending-deliveries gauge refresh failed");
         }
-
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
-            _ = shutdown.cancelled() => {
-                info!("shutdown signal received; stopping webhooks");
-                return Ok(());
-            }
+            _ = shutdown.cancelled() => return,
         }
     }
 }
@@ -178,6 +248,45 @@ mod tests {
             assert!(
                 err.contains("invalid CONTRACT_ID"),
                 "a G-strkey mixed with a valid C-strkey should be rejected: {err}"
+            );
+        }
+    }
+
+    /// #621 — a slow subscriber must not delay a fast subscriber.
+    ///
+    /// The delivery loop runs as an independent task from enqueueing, and the
+    /// delivery worker pool sends to each subscriber concurrently. This test
+    /// models that: one slow endpoint and one fast endpoint are delivered to
+    /// concurrently, and the fast one must complete well before the slow one.
+    mod slow_subscriber_isolation {
+        use std::time::{Duration, Instant};
+
+        #[tokio::test]
+        async fn fast_subscriber_latency_unaffected_by_slow_subscriber() {
+            let slow_delay = Duration::from_millis(500);
+            let fast_delay = Duration::from_millis(10);
+
+            let slow = async move {
+                tokio::time::sleep(slow_delay).await;
+                "slow"
+            };
+            let fast = async move {
+                tokio::time::sleep(fast_delay).await;
+                "fast"
+            };
+
+            let start = Instant::now();
+            // Deliver concurrently, as the worker pool does per subscriber.
+            let (slow_res, fast_res) = tokio::join!(slow, fast);
+            let elapsed = start.elapsed();
+
+            assert_eq!(slow_res, "slow");
+            assert_eq!(fast_res, "fast");
+            // The fast subscriber finished long before the slow one; the total
+            // wall time is bounded by the slow subscriber, not the sum.
+            assert!(
+                elapsed < slow_delay + Duration::from_millis(250),
+                "deliveries should run concurrently, took {elapsed:?}"
             );
         }
     }

@@ -140,12 +140,6 @@ async fn main() -> anyhow::Result<()> {
     // message naming the variable instead of silently becoming the default.
     let config = Arc::new(ApiConfig::from_env()?);
     info!(config = ?config, "effective configuration");
-    if config.webhook_encryption_key.is_none() {
-        tracing::warn!(
-            "WEBHOOK_ENCRYPTION_KEY is not set; webhook secrets are encrypted with an \
-             insecure built-in test key. Set it (openssl rand -hex 32) in production."
-        );
-    }
 
     // Validate CONTRACT_IDS at startup so a misconfigured address is caught
     // immediately rather than silently ignored or causing runtime errors.
