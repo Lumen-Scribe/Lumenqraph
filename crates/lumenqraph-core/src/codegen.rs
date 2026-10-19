@@ -339,7 +339,7 @@ impl Gen<'_> {
             let cases: Vec<String> = e
                 .cases
                 .iter()
-                .map(|(name, value)| format!("  {name} = {value},"))
+                .map(|c| format!("  {} = {},", c.name, c.code))
                 .collect();
             let doc = if e.doc.trim().is_empty() {
                 format!("Error codes for `{}`.", e.name)
