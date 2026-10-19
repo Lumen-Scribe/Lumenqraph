@@ -286,6 +286,15 @@ The API service serves indexed data over HTTP, with rate limiting and optional A
 | **Services** | API |
 | **Tradeoff** | **Proxy-behind Setup** vs **Security**: When ON, uses the **right-most** `X-Forwarded-For` entry (the one appended by the proxy in front of this instance) to identify the client IP — i.e. exactly one trusted hop. Necessary when behind nginx/HAProxy or when this instance is mounted by a sibling via `INSTANCE_MOUNTS`. When OFF, uses connection source IP. **Only enable if behind a trusted proxy**; otherwise attackers can forge IPs and bypass rate limits. Recommended: `true` if behind reverse proxy, `false` otherwise |
 
+#### `TRUSTED_PROXY_HOPS`
+| Property | Value |
+|----------|-------|
+| **Default** | `0` |
+| **Example** | `1` |
+| **Valid Range** | Non-negative integer |
+| **Services** | API |
+| **Tradeoff** | **Proxy-behind Setup** vs **Security**: The number of trusted proxies appending to `X-Forwarded-For`. `0` ignores the header and uses the socket peer, so a directly exposed API cannot be spoofed. `1` uses the right-most entry. If the header has fewer entries than hops, it is ignored and the socket peer is used. Unparseable values fall back to `0`. The resolved mode is logged at startup. Recommended: `1` behind a single proxy, `0` otherwise |
+
 ### CORS
 
 #### `CORS_ALLOWED_ORIGINS`

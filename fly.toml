@@ -31,6 +31,8 @@ primary_region = "iad"
 # events; set it to a comma-separated allowlist for a focused, cheaper index.
 [env]
   API_BIND_ADDR = "0.0.0.0:8080"
+  # Fly's edge proxy appends the client IP to X-Forwarded-For: trust exactly one hop.
+  TRUSTED_PROXY_HOPS = "1"
   RPC_URL = "https://mainnet.sorobanrpc.com"
   RUST_LOG = "info"
   STATE_INDEXING = "true"

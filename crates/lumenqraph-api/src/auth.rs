@@ -57,7 +57,7 @@ fn extract_key(headers: &HeaderMap) -> Option<String> {
 #[derive(Clone, Debug)]
 pub struct IpConfig {
     /// Number of trusted reverse-proxy hops sitting in front of the API
-    /// (controlled by `TRUSTED_PROXY_HOPS`, default 1).
+    /// (controlled by `TRUSTED_PROXY_HOPS`, default 0).
     ///
     /// With `hops = 1`, the rightmost entry in `X-Forwarded-For` that was
     /// **not** added by the trusted proxy is the client IP. Proxies append on
@@ -72,18 +72,28 @@ pub struct IpConfig {
     pub platform_header: Option<String>,
 }
 
+/// Parse `TRUSTED_PROXY_HOPS`. Unset or unparseable values mean zero hops, so
+/// a directly exposed API never trusts a client-supplied `X-Forwarded-For`.
+fn parse_trusted_proxy_hops(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0)
+}
+
 impl IpConfig {
     /// Read configuration from the environment. Called once at startup.
     pub fn from_env() -> Self {
-        let trusted_proxy_hops = std::env::var("TRUSTED_PROXY_HOPS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(1);
+        let trusted_proxy_hops =
+            parse_trusted_proxy_hops(std::env::var("TRUSTED_PROXY_HOPS").ok().as_deref());
 
         let platform_header = std::env::var("CLIENT_IP_HEADER").ok().and_then(|v| {
             let v = v.trim().to_lowercase();
             if v.is_empty() { None } else { Some(v) }
         });
+
+        tracing::info!(
+            trusted_proxy_hops,
+            platform_header = platform_header.as_deref().unwrap_or("none"),
+            "client IP resolution configured"
+        );
 
         IpConfig {
             trusted_proxy_hops,
@@ -128,13 +138,13 @@ pub fn extract_client_ip(headers: &HeaderMap, socket_addr: Option<SocketAddr>, c
         if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
             let parts: Vec<&str> = xff.split(',').map(|s| s.trim()).collect();
             // `parts.len() - hops` gives the index of the real client entry.
-            // If there are fewer entries than hops (misconfigured / no proxy),
-            // fall back to the leftmost entry rather than panicking.
-            if !parts.is_empty() {
-                let idx = parts.len().saturating_sub(cfg.trusted_proxy_hops);
-                let ip = parts[idx].to_string();
+            // Fewer entries than trusted hops means the header did not pass
+            // through the proxies we expect, so its leftmost entry is entirely
+            // client-controlled. Ignore it and use the socket address instead.
+            if parts.len() >= cfg.trusted_proxy_hops {
+                let ip = parts[parts.len() - cfg.trusted_proxy_hops];
                 if !ip.is_empty() {
-                    return ip;
+                    return ip.to_string();
                 }
             }
         }
@@ -623,6 +633,31 @@ mod tests {
     }
 
     #[test]
+    fn unset_trusted_proxy_hops_defaults_to_zero() {
+        assert_eq!(parse_trusted_proxy_hops(None), 0);
+        assert_eq!(parse_trusted_proxy_hops(Some("not-a-number")), 0);
+        assert_eq!(parse_trusted_proxy_hops(Some(" 2 ")), 2);
+    }
+
+    #[test]
+    fn default_config_ignores_spoofed_xff_when_exposed_directly() {
+        let cfg = IpConfig {
+            trusted_proxy_hops: parse_trusted_proxy_hops(None),
+            platform_header: None,
+        };
+        let peer: SocketAddr = "10.0.0.5:4321".parse().unwrap();
+        let h = make_headers("x-forwarded-for", "9.9.9.9");
+        assert_eq!(extract_client_ip(&h, Some(peer), &cfg), "10.0.0.5");
+    }
+
+    #[test]
+    fn fewer_xff_entries_than_hops_falls_back_to_socket() {
+        let peer: SocketAddr = "10.0.0.5:4321".parse().unwrap();
+        let h = make_headers("x-forwarded-for", "1.2.3.4");
+        assert_eq!(extract_client_ip(&h, Some(peer), &cfg(2)), "10.0.0.5");
+    }
+
+    #[test]
     fn platform_header_takes_priority_over_xff() {
         let mut h = HeaderMap::new();
         h.insert(
@@ -663,7 +698,7 @@ mod tests {
             );
         }
     }
-
+}
 
 /// Per-client-IP rate limiting for sibling-instance mounts (#442).
 ///
