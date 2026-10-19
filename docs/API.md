@@ -145,9 +145,15 @@ Offset pagination is **deprecated** due to linear performance degradation and is
 capped at 10,000 rows. For deeper pages, use the `next_cursor` from the previous
 response as the `after` parameter.
 
-**Filtering:** The `param` filter matches against the `enriched` JSON field using
-containment queries (e.g., `?param={"from":"GXXX"}`). The enriched column has a
-GIN index for efficient filtering.
+**Filtering:**
+- `param` matches a field of the `enriched` JSON as `name:value`, e.g. `?param=from:GXXX`.
+  The name is split at the first `:`, so the value may contain colons. The value is matched as a
+  string. A value without a `:` or with an empty name returns `400 bad_request`.
+- `topic0`–`topic3` match the event's topic at that position (`topic1` is the second topic).
+  A bare value is a string: `?topic0=transfer`, `?topic1=GXXX`. A value starting with `"`, `[`
+  or `{` must be JSON, e.g. `?topic2=%22GXXX%22`. Invalid JSON returns `400 bad_request`.
+
+The enriched column has a GIN index for efficient filtering.
 
 Each row has raw base64 (`topics`, `value`) **and** decoded JSON
 (`decoded_topics`, `decoded_value`), plus `event_name`, `tx_hash`, `ledger`, …

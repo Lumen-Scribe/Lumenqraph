@@ -37,15 +37,18 @@ pub struct EventsQuery {
     since: Option<String>,
     /// Optional time range filter: maximum timestamp (RFC3339).
     until: Option<String>,
-    /// Optional topic filter: filter by decoded_topics[0] value (e.g., topic0=transfer).
+    /// Optional topic filter: match decoded_topics[0]. A bare value such as
+    /// `topic0=transfer` is a string; a value starting with `"`, `[` or `{` must be
+    /// JSON, e.g. `topic0=%22transfer%22`.
     topic0: Option<String>,
-    /// Optional topic filter: filter by decoded_topics[1] value.
+    /// Optional topic filter: match decoded_topics[1]. Same format as `topic0`.
     topic1: Option<String>,
-    /// Optional topic filter: filter by decoded_topics[2] value.
+    /// Optional topic filter: match decoded_topics[2]. Same format as `topic0`.
     topic2: Option<String>,
-    /// Optional topic filter: filter by decoded_topics[3] value.
+    /// Optional topic filter: match decoded_topics[3]. Same format as `topic0`.
     topic3: Option<String>,
-    /// Optional parameter filter: filter by parameter name:value (e.g., from=GXXXX).
+    /// Optional parameter filter as `name:value`, e.g. `param=from:GXXXX`. The name
+    /// is split at the first `:`, so the value may contain colons.
     param: Option<String>,
     /// Optional filter to return only events from successful contract calls (default: false, returns all).
     successful_only: Option<bool>,
@@ -53,6 +56,41 @@ pub struct EventsQuery {
 
 fn default_limit() -> i64 {
     50
+}
+
+/// Parse a `topicN` filter into the JSON literal compared with `decoded_topics -> N`.
+///
+/// A value starting with `"`, `[` or `{` must be valid JSON. Any other value is a
+/// bare string and is matched as a JSON string, so `topic0=transfer` works without
+/// quoting. Numbers are strings too: `topic2=1000` matches the string `"1000"`,
+/// which is how i128 amounts are encoded.
+fn parse_topic_filter(raw: Option<&str>) -> ApiResult<Option<String>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let value = if raw.starts_with(['"', '[', '{']) {
+        serde_json::from_str::<serde_json::Value>(raw)
+            .map_err(|_| ApiError::bad_request("topic filter is not valid JSON"))?
+    } else {
+        serde_json::Value::String(raw.to_string())
+    };
+    Ok(Some(value.to_string()))
+}
+
+/// Parse the `param` filter (`name:value`) into a JSON object for `enriched @>`.
+fn parse_param_filter(raw: Option<&str>) -> ApiResult<Option<String>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let (name, value) = raw
+        .split_once(':')
+        .filter(|(name, _)| !name.is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request("param must be in the form name:value, e.g. param=from:GABC...")
+        })?;
+    let mut object = serde_json::Map::new();
+    object.insert(name.to_string(), serde_json::Value::String(value.to_string()));
+    Ok(Some(serde_json::Value::Object(object).to_string()))
 }
 
 /// Response envelope for `GET /contracts/:contract_id/events`.
@@ -64,6 +102,12 @@ pub async fn list_events(
     Query(q): Query<EventsQuery>,
 ) -> ApiResult<Json<EventsResponse>> {
     let limit = q.limit.clamp(1, 1000);
+
+    let topic0 = parse_topic_filter(q.topic0.as_deref())?;
+    let topic1 = parse_topic_filter(q.topic1.as_deref())?;
+    let topic2 = parse_topic_filter(q.topic2.as_deref())?;
+    let topic3 = parse_topic_filter(q.topic3.as_deref())?;
+    let param = parse_param_filter(q.param.as_deref())?;
 
     let page = PageRequest::<LedgerCursor>::parse(q.limit, 1000, q.offset, q.after.as_deref())?;
     let (after_ledger, after_event_id) = match page.after {
@@ -137,11 +181,11 @@ pub async fn list_events(
     .bind(q.to_ledger)
     .bind(since_datetime)
     .bind(until_datetime)
-    .bind(&q.topic0)
-    .bind(&q.topic1)
-    .bind(&q.topic2)
-    .bind(&q.topic3)
-    .bind(&q.param)
+    .bind(&topic0)
+    .bind(&topic1)
+    .bind(&topic2)
+    .bind(&topic3)
+    .bind(&param)
     .bind(after_ledger)
     .bind(after_event_id)
     .bind(page.fetch_limit())
@@ -309,5 +353,51 @@ mod tests {
             2,
             "topic0=transfer matches every transfer event"
         );
+    }
+
+    #[test]
+    fn bare_topic_values_are_json_strings() {
+        assert_eq!(
+            super::parse_topic_filter(Some("transfer")).unwrap().as_deref(),
+            Some(r#""transfer""#)
+        );
+        assert_eq!(
+            super::parse_topic_filter(Some("1000")).unwrap().as_deref(),
+            Some(r#""1000""#)
+        );
+        assert_eq!(super::parse_topic_filter(None).unwrap(), None);
+    }
+
+    #[test]
+    fn json_topic_values_are_parsed() {
+        assert_eq!(
+            super::parse_topic_filter(Some(r#"["a","b"]"#)).unwrap().as_deref(),
+            Some(r#"["a","b"]"#)
+        );
+        assert_eq!(
+            super::parse_topic_filter(Some(r#""transfer""#)).unwrap().as_deref(),
+            Some(r#""transfer""#)
+        );
+    }
+
+    #[test]
+    fn malformed_topic_json_is_rejected() {
+        assert!(super::parse_topic_filter(Some(r#""unterminated"#)).is_err());
+        assert!(super::parse_topic_filter(Some(r#"{"sym":"#)).is_err());
+    }
+
+    #[test]
+    fn param_splits_on_first_colon() {
+        assert_eq!(
+            super::parse_param_filter(Some("from:GA:1")).unwrap().as_deref(),
+            Some(r#"{"from":"GA:1"}"#)
+        );
+        assert_eq!(super::parse_param_filter(None).unwrap(), None);
+    }
+
+    #[test]
+    fn malformed_param_is_rejected() {
+        assert!(super::parse_param_filter(Some("from")).is_err());
+        assert!(super::parse_param_filter(Some(":GA")).is_err());
     }
 }
