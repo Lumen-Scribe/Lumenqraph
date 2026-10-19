@@ -43,6 +43,13 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
+    // Encrypt secrets stored in plaintext before #194 (#566). Without this,
+    // those subscriptions could never be signed and would silently stop.
+    let backfilled = dispatcher::backfill_encrypted_secrets(&pool, &config.encryption_key).await?;
+    if backfilled > 0 {
+        info!(rows = backfilled, "encrypted legacy plaintext webhook secrets");
+    }
+
     // Redirects are never followed (SSRF guard, see `build_delivery_client`).
     let http = dispatcher::build_delivery_client(config.connect_timeout(), config.total_timeout())?;
 

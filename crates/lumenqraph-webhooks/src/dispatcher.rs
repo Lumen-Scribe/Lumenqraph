@@ -69,6 +69,29 @@ pub async fn refresh_pending_gauge(pool: &PgPool) -> anyhow::Result<i64> {
     Ok(pending)
 }
 
+/// Advisory-lock key serialising the legacy secret backfill across replicas (#566).
+const WEBHOOK_SECRET_BACKFILL_LOCK: i64 = 566_001;
+
+/// Encrypt legacy plaintext subscription secrets into `encrypted_secret` (#566).
+///
+/// Runs in a transaction holding a transaction-scoped advisory lock, so
+/// replicas starting together do not race. The statement is idempotent: rows
+/// already encrypted no longer match. Returns the number of rows migrated.
+pub async fn backfill_encrypted_secrets(pool: &PgPool, encryption_key: &str) -> anyhow::Result<u64> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(WEBHOOK_SECRET_BACKFILL_LOCK)
+        .execute(&mut *tx)
+        .await?;
+    let migrated = sqlx::query(lumenqraph_core::crypto::BACKFILL_WEBHOOK_SECRETS_SQL)
+        .bind(encryption_key)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+    Ok(migrated)
+}
+
 /// Enqueue deliveries for everything new in both streams, and advance any
 /// per-subscription backfill cursors. Returns how many delivery rows were
 /// created (live + backfill combined).
@@ -867,6 +890,12 @@ mod tests {
             .connect(&url)
             .await
             .expect("connect to TEST_DATABASE_URL");
+        // pgcrypto is database-wide: install it once in `public` so every test
+        // schema resolves `pgp_sym_*` through its search_path (#566).
+        sqlx::query("CREATE EXTENSION IF NOT EXISTS pgcrypto SCHEMA public")
+            .execute(&admin)
+            .await
+            .expect("create pgcrypto");
         sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
             .execute(&admin)
             .await
@@ -941,6 +970,44 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert event");
+    }
+
+    /// #566 — a plaintext secret from before encryption is encrypted by the
+    /// backfill, and deliveries are still signed with the original secret.
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn legacy_plaintext_secret_is_encrypted_and_still_signs_deliveries() {
+        let pool = fixture().await;
+        sqlx::query(
+            "INSERT INTO webhook_subscriptions (url, kind, secret)
+             VALUES ('https://example.test/hook', 'upgrade', 'legacy-plain')",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert legacy subscription");
+        add_version(&pool, 1, false).await;
+        add_version(&pool, 2, true).await;
+
+        assert_eq!(backfill_encrypted_secrets(&pool, "test-key").await.unwrap(), 1);
+        assert_eq!(
+            backfill_encrypted_secrets(&pool, "test-key").await.unwrap(),
+            0,
+            "a second run finds nothing left to encrypt"
+        );
+
+        let unencrypted: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM webhook_subscriptions
+             WHERE encrypted_secret IS NULL AND secret IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unencrypted, 0);
+
+        assert_eq!(enqueue(&pool, 100).await.unwrap(), 1);
+        let due = fetch_due(&pool, 100, "test-key").await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].secret.as_deref(), Some("legacy-plain"));
     }
 
     #[tokio::test]
