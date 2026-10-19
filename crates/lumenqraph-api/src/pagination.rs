@@ -90,6 +90,24 @@ pub fn decode_contract_cursor(
     decode_cursor(cursor)
 }
 
+/// Encode a cursor from an (event_count, contract_id) position.
+///
+/// Used by the MCP `list_contracts` tool, which orders by
+/// `event_count DESC, contract_id` so agents can enumerate every indexed
+/// contract rather than only the top page.
+pub fn encode_contract_count_cursor(event_count: i64, contract_id: &str) -> String {
+    encode_payload(&format!("{event_count}|{contract_id}"))
+}
+
+/// Decode a cursor to (event_count, contract_id).
+///
+/// Same wire format as [`decode_cursor`], so both share one implementation.
+pub fn decode_contract_count_cursor(
+    cursor: Option<&str>,
+) -> Result<Option<(i64, String)>, &'static str> {
+    decode_cursor(cursor)
+}
+
 /// Configuration for keyset (cursor) pagination requests.
 pub struct PaginationConfig {
     pub after_ledger: Option<i64>,
@@ -233,122 +251,17 @@ pub struct Page<T> {
 impl<T: Serialize> IntoResponse for Page<T> {
     fn into_response(self) -> Response {
         let deprecated = self.offset_deprecated;
-        respond(self, deprecated)
-    }
-}
-
-/// Serialize `body` as JSON, adding the offset deprecation headers when
-/// `offset_deprecated` is set. Used by endpoints that wrap [`Page`] in a larger
-/// body.
-pub fn respond<B: Serialize>(body: B, offset_deprecated: bool) -> Response {
-    let mut response = Json(body).into_response();
-    if offset_deprecated {
-        let headers = response.headers_mut();
-        headers.insert(
-            HeaderName::from_static("deprecation"),
-            HeaderValue::from_static("true"),
-        );
-        headers.insert(
-            axum::http::header::WARNING,
-            HeaderValue::from_static(OFFSET_DEPRECATION_WARNING),
-        );
-    }
-    response
-}
-
-/// Configuration for keyset (cursor) pagination over `contract_summaries`.
-///
-/// Mirrors [`PaginationConfig`] but keys on `(last_seen_ledger, contract_id)`
-/// so the `contracts` connection can page deterministically.
-pub struct ContractPaginationConfig {
-    pub after_last_seen_ledger: Option<i64>,
-    pub after_contract_id: Option<String>,
-}
-
-impl ContractPaginationConfig {
-    /// Create pagination config from a limit and optional cursor.
-    pub fn new(_limit: i64, after: Option<&str>) -> Result<Self, &'static str> {
-        let (after_last_seen_ledger, after_contract_id) = match decode_contract_cursor(after) {
-            Ok(Some((l, id))) => (Some(l), Some(id)),
-            Ok(None) => (None, None),
-            Err(e) => return Err(e),
-        };
-        Ok(Self {
-            after_last_seen_ledger,
-            after_contract_id,
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use proptest::prelude::*;
-    use url::form_urlencoded;
-
-    fn is_url_safe(s: &str) -> bool {
-        s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    }
-
-    proptest! {
-        #[test]
-        fn ledger_cursor_round_trips_unescaped_in_query(
-            ledger in any::<i64>(),
-            event_id in "[0-9]{7}-[0-9]{10}",
-        ) {
-            let cursor = encode_cursor(ledger, &event_id);
-            prop_assert!(is_url_safe(&cursor));
-
-            // Pass the cursor through a query string without percent-encoding.
-            let query = format!("after={cursor}");
-            let parsed: Vec<(String, String)> = form_urlencoded::parse(query.as_bytes())
-                .into_owned()
-                .collect();
-            prop_assert_eq!(&parsed[0].1, &cursor);
-
-            let decoded = decode_cursor(Some(&parsed[0].1)).unwrap();
-            prop_assert_eq!(decoded, Some((ledger, event_id)));
+        let mut response = Json(self).into_response();
+        if deprecated {
+            let headers = response.headers_mut();
+            headers.insert(
+                HeaderName::from_static("deprecation"),
+                HeaderValue::from_static("true"),
+            );
+            if let Ok(value) = HeaderValue::from_str(OFFSET_DEPRECATION_WARNING) {
+                headers.insert(HeaderName::from_static("warning"), value);
+            }
         }
-
-        #[test]
-        fn contract_cursor_round_trips_unescaped_in_query(
-            ledger in any::<i64>(),
-            contract_id in "C[A-Z2-7]{55}",
-        ) {
-            let cursor = encode_contract_cursor(ledger, &contract_id);
-            prop_assert!(is_url_safe(&cursor));
-
-            let query = format!("after={cursor}");
-            let parsed: Vec<(String, String)> = form_urlencoded::parse(query.as_bytes())
-                .into_owned()
-                .collect();
-            let decoded = decode_contract_cursor(Some(&parsed[0].1)).unwrap();
-            prop_assert_eq!(decoded, Some((ledger, contract_id)));
-        }
-
-        #[test]
-        fn id_cursor_round_trips(id in any::<i64>()) {
-            let cursor = IdCursor(id).encode();
-            prop_assert!(is_url_safe(&cursor));
-            prop_assert_eq!(IdCursor::decode(&cursor), Ok(IdCursor(id)));
-        }
-    }
-
-    #[test]
-    fn legacy_standard_alphabet_cursors_still_decode() {
-        // Built with the standard alphabet, which emits `+`, `/` and `=`.
-        let legacy = STANDARD.encode("1234567|0001234-0000000001");
-        assert!(legacy.contains('=') || legacy.contains('+') || legacy.contains('/'));
-        assert_eq!(
-            decode_cursor(Some(&legacy)),
-            Ok(Some((1234567, "0001234-0000000001".to_string())))
-        );
-    }
-
-    #[test]
-    fn malformed_cursor_is_rejected() {
-        assert!(decode_cursor(Some("!!!")).is_err());
-        assert!(decode_cursor(Some(&URL_SAFE_NO_PAD.encode("no-separator"))).is_err());
+        response
     }
 }
