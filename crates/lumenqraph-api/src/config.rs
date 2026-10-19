@@ -95,6 +95,12 @@ pub struct ApiConfig {
     /// does not take every API replica out of rotation; #579).
     pub readyz_require_fresh_index: bool,
 
+    /// API key lookup cache (`key_cache.rs`): entry capacity, positive-entry
+    /// TTL and negative-entry TTL. Lower the TTL for faster revocation.
+    pub api_key_cache_capacity: usize,
+    pub api_key_cache_ttl_secs: u64,
+    pub api_key_cache_neg_ttl_secs: u64,
+
     pub graphql: GraphqlConfig,
 
     /// `pgp_sym_encrypt` key for webhook secrets. `None` falls back to the
@@ -160,6 +166,10 @@ impl ApiConfig {
             health_max_lag_ledgers: env_parse("HEALTH_MAX_LAG_LEDGERS", 100)?,
             health_max_stale_secs: env_parse("HEALTH_MAX_STALE_SECS", 120)?,
             readyz_require_fresh_index: env_bool("READYZ_REQUIRE_FRESH_INDEX", false)?,
+
+            api_key_cache_capacity: env_positive("API_KEY_CACHE_CAPACITY", 2000)?,
+            api_key_cache_ttl_secs: env_parse("API_KEY_CACHE_TTL_SECS", 30)?,
+            api_key_cache_neg_ttl_secs: env_parse("API_KEY_CACHE_NEG_TTL_SECS", 5)?,
 
             graphql: GraphqlConfig {
                 max_depth: env_parse("GRAPHQL_MAX_DEPTH", 12)?,
@@ -235,6 +245,9 @@ impl ApiConfig {
             health_max_lag_ledgers: 100,
             health_max_stale_secs: 120,
             readyz_require_fresh_index: false,
+            api_key_cache_capacity: 2000,
+            api_key_cache_ttl_secs: 30,
+            api_key_cache_neg_ttl_secs: 5,
             graphql: GraphqlConfig {
                 max_depth: 12,
                 max_complexity: 1000,
@@ -280,6 +293,9 @@ impl fmt::Debug for ApiConfig {
             .field("health_max_lag_ledgers", &self.health_max_lag_ledgers)
             .field("health_max_stale_secs", &self.health_max_stale_secs)
             .field("readyz_require_fresh_index", &self.readyz_require_fresh_index)
+            .field("api_key_cache_capacity", &self.api_key_cache_capacity)
+            .field("api_key_cache_ttl_secs", &self.api_key_cache_ttl_secs)
+            .field("api_key_cache_neg_ttl_secs", &self.api_key_cache_neg_ttl_secs)
             .field("graphql", &self.graphql)
             .field(
                 "webhook_encryption_key",
@@ -335,6 +351,13 @@ where
             .map_err(|e| anyhow::anyhow!("invalid {key}={v:?}: {e}")),
         _ => Ok(default),
     }
+}
+
+/// Like `env_parse`, but rejects zero (used for sizes that must be non-empty).
+fn env_positive(key: &str, default: usize) -> anyhow::Result<usize> {
+    let value: usize = env_parse(key, default)?;
+    anyhow::ensure!(value > 0, "invalid {key}=0: must be at least 1");
+    Ok(value)
 }
 
 /// Parse a boolean `key`, or return `default` when unset/empty. Anything other

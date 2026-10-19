@@ -152,7 +152,11 @@ async fn main() -> anyhow::Result<()> {
         metrics_require_auth: config.metrics_require_auth,
         proxy_limiter: Arc::new(RateLimiter::new()),
         config: Arc::clone(&config),
-        key_cache: Arc::new(KeyCache::new(2000)),
+        key_cache: Arc::new(KeyCache::new(
+            config.api_key_cache_capacity,
+            std::time::Duration::from_secs(config.api_key_cache_ttl_secs),
+            std::time::Duration::from_secs(config.api_key_cache_neg_ttl_secs),
+        )),
         ip_config: auth::IpConfig::from_env(),
         audit_tx: None,
         audit_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
