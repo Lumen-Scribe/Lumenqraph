@@ -11,6 +11,16 @@ mod reenrich_cli_flags_tests {
     use chrono::Utc;
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
+    use stellar_strkey::Contract;
+
+    /// Build a valid contract strkey (`C...`) from a single seed byte.
+    ///
+    /// Issue #599: tests previously used fake IDs like `CCONTRACT_XXXX`, which
+    /// fail `is_valid_contract_id`. Deriving real strkeys keeps these tests
+    /// valid once contract-ID validation runs on these paths.
+    fn contract_id(seed: u8) -> String {
+        Contract([seed; 32]).to_string()
+    }
 
     async fn setup_test_db() -> sqlx::PgPool {
         let database_url = std::env::var("DATABASE_URL")
@@ -61,18 +71,19 @@ mod reenrich_cli_flags_tests {
     async fn test_contract_flag_filters_correctly() {
         // Issue #389: `--contract` flag should restrict re-enrichment to one contract
         let pool = setup_test_db().await;
-        let contract_1 = "CCONTRACT1_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
-        let contract_2 = "CCONTRACT2_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+        let contract_1 = contract_id(1);
+        let contract_2 = contract_id(2);
 
-        cleanup_test_data(&pool, contract_1).await;
-        cleanup_test_data(&pool, contract_2).await;
+        cleanup_test_data(&pool, &contract_1).await;
+        cleanup_test_data(&pool, &contract_2).await;
 
         let now = Utc::now();
         let decoded_topics = json!(["transfer"]);
         let decoded_value = json!("1000");
 
         // Insert events for both contracts
-        for (i, contract) in [contract_1, contract_2].iter().enumerate() {
+        for (i, contract) in [&contract_1, &contract_2].iter().enumerate()
+        {
             for j in 0..3 {
                 let event_id = format!("event_{}_{}", i, j);
                 sqlx::query(
@@ -132,8 +143,8 @@ mod reenrich_cli_flags_tests {
 
         assert_eq!(total_count.0, 6, "Total should be 6 events");
 
-        cleanup_test_data(&pool, contract_1).await;
-        cleanup_test_data(&pool, contract_2).await;
+        cleanup_test_data(&pool, &contract_1).await;
+        cleanup_test_data(&pool, &contract_2).await;
     }
 
     #[tokio::test]
@@ -141,9 +152,9 @@ mod reenrich_cli_flags_tests {
     async fn test_force_flag_selects_enriched_events() {
         // Issue #389: `--force` flag should allow re-enriching already-enriched events
         let pool = setup_test_db().await;
-        let contract_id = "CCONTRACT_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+        let contract_id = contract_id(3);
 
-        cleanup_test_data(&pool, contract_id).await;
+        cleanup_test_data(&pool, &contract_id).await;
 
         let now = Utc::now();
         let decoded_topics = json!(["transfer"]);
@@ -166,7 +177,7 @@ mod reenrich_cli_flags_tests {
                  VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10::jsonb, $11, $12, $13, $14)",
             )
             .bind(&event_id)
-            .bind(contract_id)
+            .bind(&contract_id)
             .bind(1000i64 + i)
             .bind(now)
             .bind("contract")
@@ -189,7 +200,7 @@ mod reenrich_cli_flags_tests {
             "SELECT COUNT(*) FROM events
              WHERE contract_id = $1 AND enriched IS NULL AND event_name IS NOT NULL",
         )
-        .bind(contract_id)
+        .bind(&contract_id)
         .fetch_one(&pool)
         .await
         .expect("Failed to count");
@@ -200,7 +211,7 @@ mod reenrich_cli_flags_tests {
         let count_with_force: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM events WHERE contract_id = $1 AND event_name IS NOT NULL",
         )
-        .bind(contract_id)
+        .bind(&contract_id)
         .fetch_one(&pool)
         .await
         .expect("Failed to count");
@@ -210,7 +221,7 @@ mod reenrich_cli_flags_tests {
             "With --force, all 5 events would be re-enriched"
         );
 
-        cleanup_test_data(&pool, contract_id).await;
+        cleanup_test_data(&pool, &contract_id).await;
     }
 
     #[tokio::test]
@@ -218,9 +229,9 @@ mod reenrich_cli_flags_tests {
     async fn test_ledger_range_flags_filter_correctly() {
         // Issue #389: `--from-ledger` and `--to-ledger` should scope the run to a range
         let pool = setup_test_db().await;
-        let contract_id = "CCONTRACT_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+        let contract_id = contract_id(4);
 
-        cleanup_test_data(&pool, contract_id).await;
+        cleanup_test_data(&pool, &contract_id).await;
 
         let now = Utc::now();
         let decoded_topics = json!(["transfer"]);
@@ -236,7 +247,7 @@ mod reenrich_cli_flags_tests {
                  VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10::jsonb, $11, $12, $13)",
             )
             .bind(&event_id)
-            .bind(contract_id)
+            .bind(&contract_id)
             .bind(ledger)
             .bind(now)
             .bind("contract")
@@ -257,7 +268,7 @@ mod reenrich_cli_flags_tests {
         let count_full_range: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM events WHERE contract_id = $1 AND enriched IS NULL",
         )
-        .bind(contract_id)
+        .bind(&contract_id)
         .fetch_one(&pool)
         .await
         .expect("Failed to count");
@@ -268,7 +279,7 @@ mod reenrich_cli_flags_tests {
             "SELECT COUNT(*) FROM events
              WHERE contract_id = $1 AND enriched IS NULL AND ledger >= $2 AND ledger <= $3",
         )
-        .bind(contract_id)
+        .bind(&contract_id)
         .bind(1020i64)
         .bind(1050i64)
         .fetch_one(&pool)
@@ -280,7 +291,7 @@ mod reenrich_cli_flags_tests {
             "Should have 31 events (1020-1050 inclusive)"
         );
 
-        cleanup_test_data(&pool, contract_id).await;
+        cleanup_test_data(&pool, &contract_id).await;
     }
 
     #[tokio::test]
@@ -288,9 +299,9 @@ mod reenrich_cli_flags_tests {
     async fn test_dry_run_counts_without_writing() {
         // Issue #389: `--dry-run` should report counts without modifying the database
         let pool = setup_test_db().await;
-        let contract_id = "CCONTRACT_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+        let contract_id = contract_id(5);
 
-        cleanup_test_data(&pool, contract_id).await;
+        cleanup_test_data(&pool, &contract_id).await;
 
         let now = Utc::now();
         let decoded_topics = json!(["transfer"]);
@@ -306,7 +317,7 @@ mod reenrich_cli_flags_tests {
                  VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10::jsonb, $11, $12, $13)",
             )
             .bind(&event_id)
-            .bind(contract_id)
+            .bind(&contract_id)
             .bind(1000i64 + i)
             .bind(now)
             .bind("contract")
@@ -327,7 +338,7 @@ mod reenrich_cli_flags_tests {
         let count_before: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM events WHERE contract_id = $1 AND enriched IS NULL",
         )
-        .bind(contract_id)
+        .bind(&contract_id)
         .fetch_one(&pool)
         .await
         .expect("Failed to count");
@@ -340,7 +351,7 @@ mod reenrich_cli_flags_tests {
             "SELECT COUNT(*) FROM events
              WHERE contract_id = $1 AND enriched IS NULL AND event_name IS NOT NULL",
         )
-        .bind(contract_id)
+        .bind(&contract_id)
         .fetch_one(&pool)
         .await
         .expect("Failed to count");
@@ -349,7 +360,7 @@ mod reenrich_cli_flags_tests {
         let count_after: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM events WHERE contract_id = $1 AND enriched IS NULL",
         )
-        .bind(contract_id)
+        .bind(&contract_id)
         .fetch_one(&pool)
         .await
         .expect("Failed to count");
@@ -360,7 +371,7 @@ mod reenrich_cli_flags_tests {
         );
         assert_eq!(would_update.0, 5, "Dry-run would report 5 rows to update");
 
-        cleanup_test_data(&pool, contract_id).await;
+        cleanup_test_data(&pool, &contract_id).await;
     }
 
     #[tokio::test]
@@ -368,11 +379,11 @@ mod reenrich_cli_flags_tests {
     async fn test_combined_flags_contract_and_force() {
         // Issue #389: Test combination of --contract and --force flags
         let pool = setup_test_db().await;
-        let contract_1 = "CCONTRACT1_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
-        let contract_2 = "CCONTRACT2_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+        let contract_1 = contract_id(6);
+        let contract_2 = contract_id(7);
 
-        cleanup_test_data(&pool, contract_1).await;
-        cleanup_test_data(&pool, contract_2).await;
+        cleanup_test_data(&pool, &contract_1).await;
+        cleanup_test_data(&pool, &contract_2).await;
 
         let now = Utc::now();
         let decoded_topics = json!(["transfer"]);
@@ -380,7 +391,8 @@ mod reenrich_cli_flags_tests {
         let enrichment = json!({"old": "value"});
 
         // Insert events for both contracts (some enriched, some not)
-        for (i, contract) in [contract_1, contract_2].iter().enumerate() {
+        for (i, contract) in [&contract_1, &contract_2].iter().enumerate()
+        {
             for j in 0..4 {
                 let event_id = format!("event_{}_{}", i, j);
                 let enriched = if j % 2 == 0 {
@@ -429,7 +441,7 @@ mod reenrich_cli_flags_tests {
             "SELECT COUNT(*) FROM events
              WHERE contract_id = $1 AND enriched IS NULL AND event_name IS NOT NULL",
         )
-        .bind(contract_1)
+        .bind(&contract_1)
         .fetch_one(&pool)
         .await
         .expect("Failed to count");
@@ -439,7 +451,7 @@ mod reenrich_cli_flags_tests {
         let contract_force: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM events WHERE contract_id = $1 AND event_name IS NOT NULL",
         )
-        .bind(contract_1)
+        .bind(&contract_1)
         .fetch_one(&pool)
         .await
         .expect("Failed to count");
@@ -448,7 +460,7 @@ mod reenrich_cli_flags_tests {
             "With --contract C1 --force: all 4 events"
         );
 
-        cleanup_test_data(&pool, contract_1).await;
-        cleanup_test_data(&pool, contract_2).await;
+        cleanup_test_data(&pool, &contract_1).await;
+        cleanup_test_data(&pool, &contract_2).await;
     }
 }

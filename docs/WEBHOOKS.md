@@ -315,7 +315,7 @@ Outgoing delivery queue with retry state:
 CREATE TABLE webhook_deliveries (
   id                BIGSERIAL PRIMARY KEY,
   subscription_id   UUID NOT NULL REFERENCES webhook_subscriptions(id) ON DELETE CASCADE,
-  event_id          TEXT REFERENCES events(event_id) ON DELETE CASCADE,
+  event_id          TEXT REFERENCES events(event_id) ON DELETE RESTRICT,
   upgrade_id        BIGINT REFERENCES contract_spec_versions(id) ON DELETE CASCADE,
   status            TEXT NOT NULL DEFAULT 'pending',  -- pending | delivered | failed
   attempts          INTEGER NOT NULL DEFAULT 0,
@@ -327,6 +327,9 @@ CREATE TABLE webhook_deliveries (
   UNIQUE (subscription_id, upgrade_id) WHERE upgrade_id IS NOT NULL
 );
 ```
+
+`event_id` uses `ON DELETE RESTRICT` rather than `ON DELETE CASCADE` so that deleting an
+event can never silently remove a delivery row. See [Retention and Event Pruning](#retention-and-event-pruning).
 
 ### `webhook_state`
 
@@ -340,6 +343,30 @@ CREATE TABLE webhook_state (
   CONSTRAINT single_row_state CHECK (id = 1)
 );
 ```
+
+## Retention and Event Pruning
+
+When `RETENTION_LEDGERS` is configured, the indexer periodically prunes old rows from the
+`events` table in batches. Webhook deliveries reference events, so pruning interacts with the
+delivery queue as follows:
+
+- **Pending deliveries are never pruned away.** The pruner skips any event that still has a
+  `webhook_deliveries` row in `pending` status (including deliveries waiting on retry backoff,
+  and deliveries for subscriptions that are down or auto-disabled). Those events stay in the
+  database until the delivery is resolved, so at-least-once delivery is preserved even if a
+  subscriber is unreachable for longer than the retention window.
+- **`ON DELETE RESTRICT` is a safety net.** Because `webhook_deliveries.event_id` is declared
+  `ON DELETE RESTRICT`, any attempt to delete an event that still has a delivery row fails
+  rather than cascading. This guarantees that a bug in the pruner cannot silently drop delivery
+  history.
+- **Delivered/failed history is pruned with the event.** Once a delivery is no longer pending
+  (`delivered` or `failed`), it no longer blocks pruning. When the event is eventually pruned,
+  the corresponding delivery rows are deleted along with it — the pruner removes them explicitly
+  (it does not rely on a cascade). If you need to audit or redrive failed deliveries, do so
+  before the event falls outside the retention window, or increase `RETENTION_LEDGERS`.
+
+> **Note:** Retention is opt-in. With `RETENTION_LEDGERS` unset, events and delivery history are
+> kept indefinitely.
 
 ## Encryption at Rest
 
@@ -420,6 +447,9 @@ Use a tool like [RequestBin](https://requestbin.com/) or [Webhook.cool](https://
 2. Verify the webhook URL is reachable
 3. Check for network/firewall issues
 4. Monitor `webhook_deliveries` for timeout or DNS errors in `last_error`
+5. If a subscription is down for a long time, pending deliveries will keep their source events
+   from being pruned (see [Retention and Event Pruning](#retention-and-event-pruning)). Resolve
+   or delete the stuck deliveries to allow retention to proceed.
 
 ## See Also
 

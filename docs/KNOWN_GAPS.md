@@ -6,7 +6,7 @@ If you fix one of these, update this table in the same PR, and include the behav
 
 | Closed issue | What's on `main` | Open tracking issue |
 | --- | --- | --- |
-| #86, #87, #88: swap, NFT and liquidity verticals | Tables and endpoints exist; nothing in the indexer writes to them, so they always return empty results | [#599](https://github.com/Lumen-Scribe/Lumenqraph/issues/599) |
+| #86, #87, #88: swap, NFT and liquidity verticals | Tables and endpoints exist; the indexer now writes to them for the well-known event shapes (Soroswap/Aquarius `swap`, SEP-50 NFT `mint`/`transfer`/`burn`, `deposit`/`withdraw`), but coverage is narrow and the endpoints remain experimental | [#599](https://github.com/Lumen-Scribe/Lumenqraph/issues/599) |
 | #91: admin API for API keys | No key-management routes exist; keys are still minted with `scripts/gen_api_key.sh` | [#431](https://github.com/Lumen-Scribe/Lumenqraph/issues/431) |
 | #116: backfill a new webhook subscription | `since` is stored but never read by the enqueuer | None yet: [#116](https://github.com/Lumen-Scribe/Lumenqraph/issues/116) should be reopened |
 | #117: prune `webhook_deliveries` | The prune function exists but is never spawned | [#567](https://github.com/Lumen-Scribe/Lumenqraph/issues/567), [#568](https://github.com/Lumen-Scribe/Lumenqraph/issues/568) |
@@ -17,6 +17,8 @@ If you fix one of these, update this table in the same PR, and include the behav
 | #106, #233: re-enrichment and its progress | `reenrich` panics on JSONB decoding, skips rows (OFFSET paging over a predicate it mutates), and ignores `--force` and `--contract` | [#597](https://github.com/Lumen-Scribe/Lumenqraph/issues/597) |
 | #264: webhook secret rotation | `rotate-secret` writes columns that don't exist, and the dispatcher never signs with the previous secret | [#564](https://github.com/Lumen-Scribe/Lumenqraph/issues/564) |
 | #73: MSRV | The workspace doesn't compile on the declared MSRV (1.84); `Cargo.lock` needs 1.85 | [#532](https://github.com/Lumen-Scribe/Lumenqraph/issues/532) |
+| #277: Horizon deep-backfill source | The Horizon source is removed: Horizon transaction records carry no contract events, and `order=asc` paging starts at genesis, so it never inserted anything. Use Galexie/data-lake or `stellar-rpc` for history | [#598](https://github.com/Lumen-Scribe/Lumenqraph/issues/598) |
+| #385: token-transfer projection | `extract_transfer` now projects only SEP-41/SAC-shaped events and skips (and counts) non-conforming ones; rows written before the change may still contain non-token data | [#600](https://github.com/Lumen-Scribe/Lumenqraph/issues/600) |
 
 The broader "`main` doesn't compile and CI hasn't passed" situation is tracked in [#522](https://github.com/Lumen-Scribe/Lumenqraph/issues/522).
 

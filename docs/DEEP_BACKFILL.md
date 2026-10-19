@@ -82,10 +82,17 @@ The two paths write to the same tables. `INSERT … ON CONFLICT DO NOTHING` on
 | Source | Flag | Description |
 |---|---|---|
 | Galexie / Stellar CDP | `--source galexie` | Newline-delimited JSON export |
-| Stellar Horizon | `--source horizon` | Historical events from Horizon `/transactions` endpoint |
 
 New sources can be added by implementing the `HistoricalSource` trait in
 `crates/lumenqraph-indexer/src/deep_backfill.rs`.
+
+> **Note (issue #598):** Horizon is **not** a supported deep-history source.
+> Horizon's transaction resource carries no Soroban contract events — they
+> exist only inside `result_meta_xdr` (and Horizon is deprecating Soroban
+> data). A Horizon-based source therefore yields zero events, and paging it
+> from genesis to a recent ledger is impractical. For history older than the
+> RPC retention window, use the Galexie / data-lake path below, or a
+> `stellar-rpc` instance configured with long retention.
 
 ## Obtaining a Galexie export
 
@@ -130,13 +137,6 @@ gsutil cat gs://my-bucket/events-*.ndjson | \
   ./target/release/lumenqraph-indexer deep-backfill \
     --from 1000000 \
     --input -
-
-# From a Horizon endpoint:
-./target/release/lumenqraph-indexer deep-backfill \
-  --from   1000000 \
-  --to     2000000 \
-  --source horizon \
-  --input  https://horizon.stellar.org
 ```
 
 ## HistoricalSource Trait Contract
@@ -183,7 +183,7 @@ pub struct HistoricalEvent {
 
 ## Extension Guide: Writing a New Source
 
-To implement an archive source (e.g. Horizon, Stellar Core DB, BigQuery, AWS S3 / GCS bucket):
+To implement an archive source (e.g. Stellar Core DB, BigQuery, AWS S3 / GCS bucket):
 
 1. **Define your source struct:**
    Store configuration such as database connection pools, HTTP client endpoints, or credentials.
@@ -196,13 +196,13 @@ To implement an archive source (e.g. Horizon, Stellar Core DB, BigQuery, AWS S3 
 
 ## Reference Implementations
 
-Lumenqraph provides two reference implementations:
+Lumenqraph provides one reference implementation:
 
-### 1. `GalexieSource` (Data-Lake NDJSON Exports)
+### `GalexieSource` (Data-Lake NDJSON Exports)
 Reads newline-delimited JSON exports produced by Galexie or stellar-etl. Supports both native per-ledger envelopes and flat per-event records. Stream-reads from files or stdin (`--input -`).
 
-### 2. `HorizonSource` (REST API Client)
-Connects to a Stellar Horizon endpoint (e.g. `https://horizon.stellar.org/transactions`), paginates through transactions via HTTP query parameters (`order=asc`, `limit=200`, `cursor=...`), extracts contract events, and filters them against the requested ledger and contract bounds.
+The former `HorizonSource` was removed (issue #598): Horizon transaction
+records do not expose Soroban contract events, so it could never produce any.
 
 
 ## Seam / hand-off to the live poller

@@ -235,15 +235,7 @@ async fn run_deep_backfill(
         "galexie" => Box::new(GalexieSource::new(
             input.iter().map(PathBuf::from).collect(),
         )),
-        "horizon" => {
-            let base_url = input
-                .first()
-                .filter(|value| value.as_str() != "-")
-                .map(String::as_str)
-                .unwrap_or("https://horizon.stellar.org");
-            Box::new(deep_backfill::HorizonSource::new(base_url))
-        }
-        other => anyhow::bail!("unknown source type '{other}'; supported: galexie, horizon"),
+        other => anyhow::bail!("unknown source type '{other}'; supported: galexie"),
     };
     deep_backfill::run(
         pool,

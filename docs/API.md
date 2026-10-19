@@ -248,6 +248,11 @@ Materialized SEP-41 transfers. Query: `limit`, `offset`, `from`, `to`.
 ```
 
 ### `GET /contracts/:id/swaps`
+> **Experimental.** Populated by the indexer's projection path (#599), which
+> recognises a fixed set of well-known swap event shapes (Soroswap, Aquarius).
+> Contracts emitting other shapes will not produce rows. The response shape may
+> change until the writers are validated in production.
+
 Materialized AMM swap events, newest first. Query: `limit` (1–1000, default 50),
 `offset`, `after` (cursor), `sender`, `sell_token`, `buy_token`.
 ```json
@@ -264,6 +269,11 @@ Materialized AMM swap events, newest first. Query: `limit` (1–1000, default 50
 ```
 
 ### `GET /contracts/:id/nfts`
+> **Experimental.** Populated by the indexer's projection path (#599), which
+> recognises OpenZeppelin/SEP-50 `mint`/`transfer`/`burn` event shapes. Contracts
+> emitting other shapes will not produce rows. The response shape may change
+> until the writers are validated in production.
+
 Materialized NFT events (mint/transfer/burn), newest first. Query: `limit`
 (1–1000, default 50), `offset`, `after` (cursor), `kind` (`mint`|`transfer`|`burn`),
 `from`, `to`, `token_id`.
@@ -280,6 +290,11 @@ Materialized NFT events (mint/transfer/burn), newest first. Query: `limit`
 ```
 
 ### `GET /contracts/:id/liquidity`
+> **Experimental.** Populated by the indexer's projection path (#599), which
+> recognises `deposit`/`withdraw` event shapes. Contracts emitting other shapes
+> will not produce rows. The response shape may change until the writers are
+> validated in production.
+
 Materialized liquidity events (add/remove), newest first. Query: `limit`
 (1–1000, default 50), `offset`, `after` (cursor), `kind` (`add`|`remove`),
 `provider`.

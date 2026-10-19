@@ -12,6 +12,14 @@
 //! `token_transfers` cascades from `events` (FK `ON DELETE CASCADE`), so pruning
 //! events prunes the projection with it.
 //!
+//! `webhook_deliveries` also cascades from `events`, but webhooks promise
+//! at-least-once delivery with retries and redrive — so an event that still has
+//! a *pending* delivery is skipped by the pruner, however far outside the window
+//! it is. A subscriber that is down, auto-disabled, or backlogged therefore never
+//! silently loses events. If a delivery is dropped anyway (e.g. a non-pending
+//! delivery cascading away with its event), the count is reported in the
+//! `lumenqraph_webhook_deliveries_dropped_by_retention_total` counter and logged.
+//!
 //! The versioned tables (`contract_state`, `contract_data`) are per-key time
 //! series, so their *newest* row per key is current state, not history — it is
 //! kept however old it is, and only superseded versions are pruned. Otherwise a
@@ -20,6 +28,17 @@
 
 use sqlx::PgPool;
 use tracing::{info, warn};
+
+/// Cumulative count of `webhook_deliveries` rows removed as a side effect of
+/// retention pruning (via the `events` FK cascade). Exposed as the
+/// `lumenqraph_webhook_deliveries_dropped_by_retention_total` metric.
+static WEBHOOK_DELIVERIES_DROPPED_BY_RETENTION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Total `webhook_deliveries` rows dropped by retention since process start.
+pub fn webhook_deliveries_dropped_by_retention_total() -> u64 {
+    WEBHOOK_DELIVERIES_DROPPED_BY_RETENTION.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Rows per DELETE. Small enough that each transaction is short.
 const BATCH: i64 = 5_000;
@@ -42,14 +61,37 @@ pub async fn prune(pool: &PgPool, tip: i64, retention_ledgers: i64) -> anyhow::R
         return Ok(0);
     }
 
+    // Skip events that still have a pending webhook delivery: deleting them would
+    // cascade the delivery away and break the at-least-once promise. Such events
+    // stay until their delivery is delivered or dropped by the webhook layer.
     let events = prune_batched(
         pool,
         "DELETE FROM events WHERE event_id IN (
-             SELECT event_id FROM events WHERE ledger < $1 ORDER BY ledger LIMIT $2
+             SELECT e.event_id FROM events e
+              WHERE e.ledger < $1
+                AND NOT EXISTS (
+                    SELECT 1 FROM webhook_deliveries wd
+                     WHERE wd.event_id = e.event_id AND wd.status = 'pending'
+                )
+              ORDER BY e.ledger
+              LIMIT $2
          )",
         cutoff,
     )
     .await?;
+
+    // Count deliveries that were dropped anyway (non-pending deliveries whose
+    // event was pruned). Pending ones are protected above, so this is normally 0.
+    let dropped = count_dropped_deliveries(pool, cutoff).await?;
+    if dropped > 0 {
+        WEBHOOK_DELIVERIES_DROPPED_BY_RETENTION
+            .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+        warn!(
+            cutoff_ledger = cutoff,
+            dropped,
+            "retention dropped webhook deliveries (non-pending) with their events"
+        );
+    }
 
     // `ledger < MAX(ledger) for this key` is what spares the current version:
     // the newest row can never satisfy it.
@@ -193,6 +235,24 @@ pub async fn prune_spec_versions(
         );
     }
     Ok(deleted)
+}
+
+/// Count `webhook_deliveries` rows that retention is about to drop: deliveries
+/// whose event is outside the window and which are not pending (pending ones are
+/// skipped by the event pruner). Must run *before* the events DELETE.
+async fn count_dropped_deliveries(pool: &PgPool, cutoff: i64) -> anyhow::Result<u64> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM webhook_deliveries wd
+          WHERE wd.status <> 'pending'
+            AND EXISTS (
+                SELECT 1 FROM events e
+                 WHERE e.event_id = wd.event_id AND e.ledger < $1
+            )",
+    )
+    .bind(cutoff)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0 as u64)
 }
 
 /// Run `sql` (bound: $1 = cutoff ledger, $2 = batch size) until it stops
@@ -423,6 +483,63 @@ mod tests {
             count(&pool, "SELECT count(*) FROM token_transfers").await,
             2,
             "only the pruned event's transfer cascades away; in-window transfers survive"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #601: retention must not drop pending webhook deliveries
+    // -------------------------------------------------------------------------
+
+    async fn insert_delivery(pool: &PgPool, id: &str, event_id: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (delivery_id, subscription_id, event_id, status)
+             VALUES ($1, 'sub1', $2, $3)",
+        )
+        .bind(id)
+        .bind(event_id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("insert delivery");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn pruning_keeps_events_with_pending_deliveries() {
+        let pool = fixture().await;
+        insert_event(&pool, "pending_evt", 100).await;
+        insert_event(&pool, "plain_evt", 150).await;
+        insert_delivery(&pool, "d1", "pending_evt", "pending").await;
+
+        // tip 1000, keep 500 => cutoff 500; both events are outside the window.
+        let deleted = prune(&pool, 1000, 500).await.expect("prune");
+
+        assert_eq!(
+            deleted, 1,
+            "only the event without a pending delivery should be pruned"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM events WHERE event_id = 'pending_evt'"
+            )
+            .await,
+            1,
+            "an event with a pending delivery must survive retention"
+        );
+        assert_eq!(
+            count(&pool, "SELECT count(*) FROM webhook_deliveries").await,
+            1,
+            "the pending delivery must not be cascaded away"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM webhook_deliveries WHERE status = 'pending'"
+            )
+            .await,
+            1,
+            "the surviving delivery must still be pending"
         );
     }
 

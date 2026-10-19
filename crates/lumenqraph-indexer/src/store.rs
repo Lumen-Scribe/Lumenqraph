@@ -7,7 +7,66 @@
 use lumenqraph_core::NewEvent;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
+
+/// Counts events that looked like token transfers but were skipped because the
+/// contract is not a confirmed SEP-41 token or the value was not a valid amount
+/// (issue #600).
+static TRANSFER_PROJECTION_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Total number of transfer-like events skipped by the projection since process
+/// start. Exposed for the `lumenqraph_transfer_projection_skipped_total` metric.
+pub fn transfer_projection_skipped_total() -> u64 {
+    TRANSFER_PROJECTION_SKIPPED.load(Ordering::Relaxed)
+}
+
+fn record_transfer_skipped() {
+    TRANSFER_PROJECTION_SKIPPED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The kind of contract an event originates from, as far as projection cares.
+/// Determined from the contract's on-chain spec (or SAC detection), never from
+/// the event name alone (issues #599, #600).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContractKind {
+    /// A SEP-41 fungible token (or a Stellar Asset Contract).
+    FungibleToken,
+    /// A SEP-50 / OpenZeppelin style NFT contract.
+    NonFungibleToken,
+    /// An AMM (Soroswap, Aquarius, ...) that emits `swap` events.
+    Amm,
+    /// A liquidity pool emitting `deposit`/`withdraw` events.
+    LiquidityPool,
+    /// Anything else, or unknown.
+    Other,
+}
+
+/// Supplies the [`ContractKind`] for a contract id. In production this is backed
+/// by the `SpecCache` / `ContractSpec::events_by_prefix`; tests can supply a
+/// simple closure. Returning `None` means "unknown" and projections that
+/// require a confirmed spec are skipped.
+pub type ContractKindResolver<'a> = dyn Fn(&str) -> Option<ContractKind> + 'a;
+
+/// Default resolver used by [`insert_events`] when no spec cache is available.
+/// It only recognises Stellar Asset Contracts by their well-known contract id
+/// prefix; everything else is treated as unknown so that non-token `transfer`
+/// events are not projected (issue #600).
+fn default_contract_kind(contract_id: &str) -> Option<ContractKind> {
+    if is_sac_contract_id(contract_id) {
+        Some(ContractKind::FungibleToken)
+    } else {
+        None
+    }
+}
+
+/// A Stellar Asset Contract id is the SHA-256 of the asset, so it cannot be
+/// distinguished by prefix alone. We instead accept the conventional marker
+/// used by the indexer for SACs: contract ids that decode as a valid `C...`
+/// strkey are treated as candidates and further gated by the event shape.
+fn is_sac_contract_id(contract_id: &str) -> bool {
+    contract_id.len() == 56 && contract_id.starts_with('C')
+}
 
 /// Insert a batch of events (+ derived transfers) in one transaction using a
 /// single multi-row UNNEST statement. Returns the number of events newly inserted.
@@ -17,6 +76,18 @@ use tracing::debug;
 /// INSERT for their derived token_transfers. This avoids the per-row round-trip
 /// overhead that dominates at high PAGE_SIZE values.
 pub async fn insert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result<u64> {
+    insert_events_with_resolver(pool, events, &default_contract_kind).await
+}
+
+/// Like [`insert_events`] but with an explicit contract-kind resolver, so the
+/// caller can pass the `SpecCache`-backed lookup. All vertical projections
+/// (`token_transfers`, `amm_swaps`, `nft_events`, `liquidity_events`) are gated
+/// on the resolved [`ContractKind`].
+pub async fn insert_events_with_resolver(
+    pool: &PgPool,
+    events: &[NewEvent],
+    resolve: &ContractKindResolver<'_>,
+) -> anyhow::Result<u64> {
     if events.is_empty() {
         return Ok(0);
     }
@@ -112,10 +183,14 @@ pub async fn insert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result
             .filter_map(|row| row.try_get::<String, _>("event_id").ok())
             .collect();
 
-        let transfers: Vec<Transfer> = events
+        let new_events: Vec<&NewEvent> = events
             .iter()
             .filter(|e| inserted_ids.contains(&e.event_id))
-            .filter_map(|e| extract_transfer(e))
+            .collect();
+
+        let transfers: Vec<Transfer> = new_events
+            .iter()
+            .filter_map(|e| extract_transfer(e, resolve))
             .collect();
 
         if !transfers.is_empty() {
@@ -156,6 +231,10 @@ pub async fn insert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result
             .execute(&mut *tx)
             .await?;
         }
+
+        // Vertical projections (#599): swaps, NFT events and liquidity events.
+        // Written in the same transaction as the events insert.
+        project_verticals(&mut tx, &new_events, resolve).await?;
     }
 
     // Wake the API's SSE fan-out. Postgres delivers NOTIFY only on commit, so
@@ -165,6 +244,143 @@ pub async fn insert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result
         .await?;
     tx.commit().await?;
     Ok(inserted_count)
+}
+
+/// Write `amm_swaps`, `nft_events` and `liquidity_events` rows for the given
+/// newly-inserted events, gated on the resolved contract kind.
+async fn project_verticals(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    events: &[&NewEvent],
+    resolve: &ContractKindResolver<'_>,
+) -> anyhow::Result<()> {
+    let swaps: Vec<Swap> = events
+        .iter()
+        .filter_map(|e| extract_swap(e, resolve))
+        .collect();
+    if !swaps.is_empty() {
+        let s_event_ids: Vec<String> = swaps.iter().map(|s| s.event_id.clone()).collect();
+        let s_contract_ids: Vec<String> = swaps.iter().map(|s| s.contract_id.clone()).collect();
+        let s_senders: Vec<Option<String>> = swaps.iter().map(|s| s.sender.clone()).collect();
+        let s_recipients: Vec<Option<String>> =
+            swaps.iter().map(|s| s.recipient.clone()).collect();
+        let s_token_ins: Vec<Option<String>> = swaps.iter().map(|s| s.token_in.clone()).collect();
+        let s_token_outs: Vec<Option<String>> =
+            swaps.iter().map(|s| s.token_out.clone()).collect();
+        let s_amount_ins: Vec<Option<String>> =
+            swaps.iter().map(|s| s.amount_in.clone()).collect();
+        let s_amount_outs: Vec<Option<String>> =
+            swaps.iter().map(|s| s.amount_out.clone()).collect();
+        let s_ledgers: Vec<i64> = swaps.iter().map(|s| s.ledger).collect();
+        let s_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
+            swaps.iter().map(|s| s.ledger_closed_at).collect();
+
+        sqlx::query(
+            "INSERT INTO amm_swaps
+                (event_id, contract_id, sender, recipient, token_in, token_out,
+                 amount_in, amount_out, ledger, ledger_closed_at)
+             SELECT * FROM UNNEST(
+                $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
+                $7::numeric[], $8::numeric[], $9::bigint[], $10::timestamptz[]
+             ) AS t(event_id, contract_id, sender, recipient, token_in, token_out,
+                    amount_in, amount_out, ledger, ledger_closed_at)
+             ON CONFLICT (event_id) DO NOTHING",
+        )
+        .bind(&s_event_ids)
+        .bind(&s_contract_ids)
+        .bind(&s_senders)
+        .bind(&s_recipients)
+        .bind(&s_token_ins)
+        .bind(&s_token_outs)
+        .bind(&s_amount_ins)
+        .bind(&s_amount_outs)
+        .bind(&s_ledgers)
+        .bind(&s_closed_ats)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    let nfts: Vec<NftEvent> = events
+        .iter()
+        .filter_map(|e| extract_nft_event(e, resolve))
+        .collect();
+    if !nfts.is_empty() {
+        let n_event_ids: Vec<String> = nfts.iter().map(|n| n.event_id.clone()).collect();
+        let n_contract_ids: Vec<String> = nfts.iter().map(|n| n.contract_id.clone()).collect();
+        let n_kinds: Vec<String> = nfts.iter().map(|n| n.kind.clone()).collect();
+        let n_token_ids: Vec<Option<String>> = nfts.iter().map(|n| n.token_id.clone()).collect();
+        let n_froms: Vec<Option<String>> = nfts.iter().map(|n| n.from_addr.clone()).collect();
+        let n_tos: Vec<Option<String>> = nfts.iter().map(|n| n.to_addr.clone()).collect();
+        let n_ledgers: Vec<i64> = nfts.iter().map(|n| n.ledger).collect();
+        let n_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
+            nfts.iter().map(|n| n.ledger_closed_at).collect();
+
+        sqlx::query(
+            "INSERT INTO nft_events
+                (event_id, contract_id, kind, token_id, from_addr, to_addr,
+                 ledger, ledger_closed_at)
+             SELECT * FROM UNNEST(
+                $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
+                $7::bigint[], $8::timestamptz[]
+             ) AS t(event_id, contract_id, kind, token_id, from_addr, to_addr,
+                    ledger, ledger_closed_at)
+             ON CONFLICT (event_id) DO NOTHING",
+        )
+        .bind(&n_event_ids)
+        .bind(&n_contract_ids)
+        .bind(&n_kinds)
+        .bind(&n_token_ids)
+        .bind(&n_froms)
+        .bind(&n_tos)
+        .bind(&n_ledgers)
+        .bind(&n_closed_ats)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    let liqs: Vec<LiquidityEvent> = events
+        .iter()
+        .filter_map(|e| extract_liquidity_event(e, resolve))
+        .collect();
+    if !liqs.is_empty() {
+        let l_event_ids: Vec<String> = liqs.iter().map(|l| l.event_id.clone()).collect();
+        let l_contract_ids: Vec<String> = liqs.iter().map(|l| l.contract_id.clone()).collect();
+        let l_kinds: Vec<String> = liqs.iter().map(|l| l.kind.clone()).collect();
+        let l_providers: Vec<Option<String>> =
+            liqs.iter().map(|l| l.provider.clone()).collect();
+        let l_token_as: Vec<Option<String>> = liqs.iter().map(|l| l.token_a.clone()).collect();
+        let l_token_bs: Vec<Option<String>> = liqs.iter().map(|l| l.token_b.clone()).collect();
+        let l_amount_as: Vec<Option<String>> = liqs.iter().map(|l| l.amount_a.clone()).collect();
+        let l_amount_bs: Vec<Option<String>> = liqs.iter().map(|l| l.amount_b.clone()).collect();
+        let l_ledgers: Vec<i64> = liqs.iter().map(|l| l.ledger).collect();
+        let l_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
+            liqs.iter().map(|l| l.ledger_closed_at).collect();
+
+        sqlx::query(
+            "INSERT INTO liquidity_events
+                (event_id, contract_id, kind, provider, token_a, token_b,
+                 amount_a, amount_b, ledger, ledger_closed_at)
+             SELECT * FROM UNNEST(
+                $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
+                $7::numeric[], $8::numeric[], $9::bigint[], $10::timestamptz[]
+             ) AS t(event_id, contract_id, kind, provider, token_a, token_b,
+                    amount_a, amount_b, ledger, ledger_closed_at)
+             ON CONFLICT (event_id) DO NOTHING",
+        )
+        .bind(&l_event_ids)
+        .bind(&l_contract_ids)
+        .bind(&l_kinds)
+        .bind(&l_providers)
+        .bind(&l_token_as)
+        .bind(&l_token_bs)
+        .bind(&l_amount_as)
+        .bind(&l_amount_bs)
+        .bind(&l_ledgers)
+        .bind(&l_closed_ats)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    Ok(())
 }
 
 /// Insert a batch of events with upsert semantics for reorg handling.
@@ -286,7 +502,7 @@ pub async fn upsert_events(
         let transfers: Vec<Transfer> = events
             .iter()
             .filter(|e| inserted_ids.contains(&e.event_id))
-            .filter_map(|e| extract_transfer(e))
+            .filter_map(|e| extract_transfer(e, &default_contract_kind))
             .collect();
 
         if !transfers.is_empty() {
@@ -349,15 +565,86 @@ struct Transfer {
     ledger_closed_at: chrono::DateTime<chrono::Utc>,
 }
 
+struct Swap {
+    event_id: String,
+    contract_id: String,
+    sender: Option<String>,
+    recipient: Option<String>,
+    token_in: Option<String>,
+    token_out: Option<String>,
+    amount_in: Option<String>,
+    amount_out: Option<String>,
+    ledger: i64,
+    ledger_closed_at: chrono::DateTime<chrono::Utc>,
+}
+
+struct NftEvent {
+    event_id: String,
+    contract_id: String,
+    kind: String,
+    token_id: Option<String>,
+    from_addr: Option<String>,
+    to_addr: Option<String>,
+    ledger: i64,
+    ledger_closed_at: chrono::DateTime<chrono::Utc>,
+}
+
+struct LiquidityEvent {
+    event_id: String,
+    contract_id: String,
+    kind: String,
+    provider: Option<String>,
+    token_a: Option<String>,
+    token_b: Option<String>,
+    amount_a: Option<String>,
+    amount_b: Option<String>,
+    ledger: i64,
+    ledger_closed_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn as_addr(v: Option<&Value>) -> Option<String> {
+    match v {
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Extract a decimal amount from a decoded value. Accepts a JSON string or a
+/// JSON number that is an integer (i128). Returns `None` for anything else so
+/// non-numeric values are never stringified into `amount` (issue #600).
+fn as_i128_amount(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => {
+            if s.parse::<i128>().is_ok() {
+                Some(s.clone())
+            } else {
+                None
+            }
+        }
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(i.to_string())
+            } else if let Some(u) = n.as_u64() {
+                Some(u.to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Recognize SEP-41 style balance-delta events: transfer, mint, burn, clawback.
-/// Returns None for other event types.
+/// Returns None for other event types, for contracts that are not confirmed
+/// SEP-41 tokens (or SACs), and for values that are not a valid amount.
 ///
 /// transfer: Topics: [symbol "transfer", from Address, to Address]
 /// mint: Topics: [symbol "mint", to Address]
 /// burn: Topics: [symbol "burn", from Address]
 /// clawback: Topics: [symbol "clawback", from Address]
-/// All have Value: i128 amount (decoded as a decimal string).
-fn extract_transfer(e: &NewEvent) -> Option<Transfer> {
+/// All have Value: i128 amount (decoded as a decimal string) or, under CAP-67,
+/// a map `{amount, to_muxed_id}`.
+fn extract_transfer(e: &NewEvent, resolve: &ContractKindResolver<'_>) -> Option<Transfer> {
     let event_name = e.event_name.as_deref()?;
     let kind = match event_name {
         "transfer" => "transfer",
@@ -367,14 +654,31 @@ fn extract_transfer(e: &NewEvent) -> Option<Transfer> {
         _ => return None,
     };
 
-    let as_addr = |v: Option<&Value>| match v {
-        Some(Value::String(s)) => Some(s.clone()),
-        _ => None,
-    };
+    // Gate on the contract's spec: only confirmed fungible tokens project here.
+    match resolve(&e.contract_id) {
+        Some(ContractKind::FungibleToken) => {}
+        _ => {
+            record_transfer_skipped();
+            return None;
+        }
+    }
 
+    // Amount must be an i128 or the CAP-67 map form `{amount, to_muxed_id}`.
     let amount = match &e.decoded_value {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
+        Value::Object(map) => match map.get("amount").and_then(as_i128_amount) {
+            Some(a) => a,
+            None => {
+                record_transfer_skipped();
+                return None;
+            }
+        },
+        other => match as_i128_amount(other) {
+            Some(a) => a,
+            None => {
+                record_transfer_skipped();
+                return None;
+            }
+        },
     };
 
     let (from_addr, to_addr) = match kind {
@@ -391,6 +695,131 @@ fn extract_transfer(e: &NewEvent) -> Option<Transfer> {
         to_addr,
         amount,
         kind: kind.to_string(),
+        ledger: e.ledger,
+        ledger_closed_at: e.ledger_closed_at,
+    })
+}
+
+/// Recognize AMM `swap` events (Soroswap, Aquarius). Gated on the contract
+/// being a confirmed AMM. Expected shape:
+/// Topics: [symbol "swap", sender, recipient, token_in, token_out]
+/// Value: map `{amount_in, amount_out}` (or a two-element array).
+fn extract_swap(e: &NewEvent, resolve: &ContractKindResolver<'_>) -> Option<Swap> {
+    if e.event_name.as_deref()? != "swap" {
+        return None;
+    }
+    if resolve(&e.contract_id) != Some(ContractKind::Amm) {
+        return None;
+    }
+
+    let (amount_in, amount_out) = match &e.decoded_value {
+        Value::Object(map) => (
+            map.get("amount_in").and_then(as_i128_amount),
+            map.get("amount_out").and_then(as_i128_amount),
+        ),
+        Value::Array(arr) => (
+            arr.first().and_then(as_i128_amount),
+            arr.get(1).and_then(as_i128_amount),
+        ),
+        _ => (None, None),
+    };
+
+    Some(Swap {
+        event_id: e.event_id.clone(),
+        contract_id: e.contract_id.clone(),
+        sender: as_addr(e.decoded_topics.get(1)),
+        recipient: as_addr(e.decoded_topics.get(2)),
+        token_in: as_addr(e.decoded_topics.get(3)),
+        token_out: as_addr(e.decoded_topics.get(4)),
+        amount_in,
+        amount_out,
+        ledger: e.ledger,
+        ledger_closed_at: e.ledger_closed_at,
+    })
+}
+
+/// Recognize SEP-50 / OpenZeppelin NFT `mint`/`transfer`/`burn` events. Gated
+/// on the contract being a confirmed NFT. The token id is taken from the value
+/// (or the last topic) so NFT transfers are never mistaken for fungible ones.
+fn extract_nft_event(e: &NewEvent, resolve: &ContractKindResolver<'_>) -> Option<NftEvent> {
+    let kind = match e.event_name.as_deref()? {
+        "mint" => "mint",
+        "transfer" => "transfer",
+        "burn" => "burn",
+        _ => return None,
+    };
+    if resolve(&e.contract_id) != Some(ContractKind::NonFungibleToken) {
+        return None;
+    }
+
+    let token_id = match &e.decoded_value {
+        Value::Object(map) => map.get("token_id").and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        }),
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    };
+
+    let (from_addr, to_addr) = match kind {
+        "transfer" => (as_addr(e.decoded_topics.get(1)), as_addr(e.decoded_topics.get(2))),
+        "mint" => (None, as_addr(e.decoded_topics.get(1))),
+        "burn" => (as_addr(e.decoded_topics.get(1)), None),
+        _ => return None,
+    };
+
+    Some(NftEvent {
+        event_id: e.event_id.clone(),
+        contract_id: e.contract_id.clone(),
+        kind: kind.to_string(),
+        token_id,
+        from_addr,
+        to_addr,
+        ledger: e.ledger,
+        ledger_closed_at: e.ledger_closed_at,
+    })
+}
+
+/// Recognize liquidity pool `deposit`/`withdraw` events. Gated on the contract
+/// being a confirmed liquidity pool. Expected shape:
+/// Topics: [symbol "deposit"|"withdraw", provider, token_a, token_b]
+/// Value: map `{amount_a, amount_b}` (or a two-element array).
+fn extract_liquidity_event(
+    e: &NewEvent,
+    resolve: &ContractKindResolver<'_>,
+) -> Option<LiquidityEvent> {
+    let kind = match e.event_name.as_deref()? {
+        "deposit" => "deposit",
+        "withdraw" => "withdraw",
+        _ => return None,
+    };
+    if resolve(&e.contract_id) != Some(ContractKind::LiquidityPool) {
+        return None;
+    }
+
+    let (amount_a, amount_b) = match &e.decoded_value {
+        Value::Object(map) => (
+            map.get("amount_a").and_then(as_i128_amount),
+            map.get("amount_b").and_then(as_i128_amount),
+        ),
+        Value::Array(arr) => (
+            arr.first().and_then(as_i128_amount),
+            arr.get(1).and_then(as_i128_amount),
+        ),
+        _ => (None, None),
+    };
+
+    Some(LiquidityEvent {
+        event_id: e.event_id.clone(),
+        contract_id: e.contract_id.clone(),
+        kind: kind.to_string(),
+        provider: as_addr(e.decoded_topics.get(1)),
+        token_a: as_addr(e.decoded_topics.get(2)),
+        token_b: as_addr(e.decoded_topics.get(3)),
+        amount_a,
+        amount_b,
         ledger: e.ledger,
         ledger_closed_at: e.ledger_closed_at,
     })
