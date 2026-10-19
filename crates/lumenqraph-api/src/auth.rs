@@ -3,7 +3,7 @@
 //! and only their SHA-256 hash is ever compared against the database.
 //! Anonymous requests are rate limited per client IP address.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 
 use axum::extract::{ConnectInfo, Request, State};
@@ -102,6 +102,29 @@ impl IpConfig {
     }
 }
 
+/// Parse a client-supplied IP candidate into its canonical text form.
+///
+/// Accepts a bare IPv4 or IPv6 address, an IPv4 address with a port, or a
+/// bracketed IPv6 address with an optional port. Anything else, including
+/// over-long strings, returns `None`.
+fn parse_client_ip(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    let addr = if let Some(rest) = s.strip_prefix('[') {
+        let (inner, after) = rest.split_once(']')?;
+        if !after.is_empty() {
+            after.strip_prefix(':')?.parse::<u16>().ok()?;
+        }
+        inner.parse::<IpAddr>().ok()?
+    } else if let Ok(ip) = s.parse::<IpAddr>() {
+        ip
+    } else {
+        let (host, port) = s.rsplit_once(':')?;
+        port.parse::<u16>().ok()?;
+        host.parse::<IpAddr>().ok()?
+    };
+    Some(addr.to_string())
+}
+
 /// Extract the real client IP address from an incoming request (#428).
 ///
 /// Resolution order:
@@ -115,19 +138,22 @@ impl IpConfig {
 ///    Proxies *append* the peer address to XFF, so the rightmost entry is the
 ///    one the outermost trusted proxy actually saw. We skip `hops` entries from
 ///    the right (one per trusted proxy layer) to land on the real client IP.
-///    With `hops = 1` (default): `X-Forwarded-For: 1.2.3.4, 5.6.7.8` yields
+///    With `hops = 1`: `X-Forwarded-For: 1.2.3.4, 5.6.7.8` yields
 ///    `5.6.7.8` — the attacker's leftmost spoofed entries are ignored.
 ///    With `hops = 0`: XFF is not consulted.
 ///
 /// 3. **TCP peer address** — used when no proxy configuration is trusted.
+///
+/// A candidate from either header is used only if it parses as an IP address.
+/// Otherwise the next source is tried, so arbitrary strings never become
+/// rate-limit, concurrency or log keys.
 pub fn extract_client_ip(headers: &HeaderMap, socket_addr: Option<SocketAddr>, cfg: &IpConfig) -> String {
     // 1. Platform-specific single-value header (Fly, Cloudflare, nginx real_ip…).
     if let Some(ref header_name) = cfg.platform_header {
         if let Some(ip) = headers
             .get(header_name.as_str())
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+            .and_then(parse_client_ip)
         {
             return ip;
         }
@@ -142,9 +168,8 @@ pub fn extract_client_ip(headers: &HeaderMap, socket_addr: Option<SocketAddr>, c
             // through the proxies we expect, so its leftmost entry is entirely
             // client-controlled. Ignore it and use the socket address instead.
             if parts.len() >= cfg.trusted_proxy_hops {
-                let ip = parts[parts.len() - cfg.trusted_proxy_hops];
-                if !ip.is_empty() {
-                    return ip.to_string();
+                if let Some(ip) = parse_client_ip(parts[parts.len() - cfg.trusted_proxy_hops]) {
+                    return ip;
                 }
             }
         }
@@ -655,6 +680,47 @@ mod tests {
         let peer: SocketAddr = "10.0.0.5:4321".parse().unwrap();
         let h = make_headers("x-forwarded-for", "1.2.3.4");
         assert_eq!(extract_client_ip(&h, Some(peer), &cfg(2)), "10.0.0.5");
+    }
+
+    #[test]
+    fn parse_client_ip_accepts_ip_forms_and_strips_port() {
+        assert_eq!(parse_client_ip("1.2.3.4"), Some("1.2.3.4".into()));
+        assert_eq!(parse_client_ip(" 1.2.3.4:5555 "), Some("1.2.3.4".into()));
+        assert_eq!(parse_client_ip("2001:db8::1"), Some("2001:db8::1".into()));
+        assert_eq!(parse_client_ip("[2001:db8::1]:443"), Some("2001:db8::1".into()));
+        assert_eq!(parse_client_ip("[2001:db8::1]"), Some("2001:db8::1".into()));
+    }
+
+    #[test]
+    fn parse_client_ip_rejects_non_ip_values() {
+        assert_eq!(parse_client_ip(""), None);
+        assert_eq!(parse_client_ip("unknown"), None);
+        assert_eq!(parse_client_ip("1.2.3.4:notaport"), None);
+        assert_eq!(parse_client_ip("1.2.3.4:99999"), None);
+        assert_eq!(parse_client_ip("[2001:db8::1]x"), None);
+        assert_eq!(parse_client_ip(&"x".repeat(4096)), None);
+    }
+
+    #[test]
+    fn invalid_xff_entry_falls_back_to_socket() {
+        let peer: SocketAddr = "10.0.0.5:4321".parse().unwrap();
+        let h = make_headers("x-forwarded-for", "1.2.3.4, not-an-ip");
+        assert_eq!(extract_client_ip(&h, Some(peer), &cfg(1)), "10.0.0.5");
+    }
+
+    #[test]
+    fn invalid_platform_header_falls_back_to_xff() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            HeaderName::from_bytes(b"fly-client-ip").unwrap(),
+            HeaderValue::from_str("x".repeat(256).as_str()).unwrap(),
+        );
+        h.insert(
+            HeaderName::from_bytes(b"x-forwarded-for").unwrap(),
+            HeaderValue::from_str("1.2.3.4, 5.6.7.8").unwrap(),
+        );
+        let ip = extract_client_ip(&h, None, &cfg_with_platform(1, "fly-client-ip"));
+        assert_eq!(ip, "5.6.7.8");
     }
 
     #[test]
