@@ -14,7 +14,7 @@ use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::Extension;
-use futures::stream::{self, Stream};
+use futures::stream::{self, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::VecDeque;
@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::time::{interval, sleep};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::error::ApiResult;
@@ -311,6 +312,7 @@ pub async fn stream_events(
     // Subscribe to the shared fan-out before constructing the stream so no
     // events published after this point are missed.
     let rx = state.event_fanout.subscribe();
+    let shutdown = state.shutdown.clone();
     let last_ledger = initial_cursor.ledger;
 
     let initial = StreamState {
@@ -420,34 +422,33 @@ pub async fn stream_events(
         }
     });
 
+    let stream = end_on_shutdown(stream, shutdown);
+
     // Emit a keep-alive comment at least every 15 s so idle streams aren't
     // closed by proxies/load balancers with 60–100 s idle timeouts.
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// #570 — SSE error frames must not leak driver or infrastructure error text.
-    #[test]
-    fn error_frame_carries_only_code_and_request_id() {
-        let data: serde_json::Value =
-            serde_json::from_str(&error_frame_data("req-123")).unwrap();
-        assert_eq!(data["code"], "internal_error");
-        assert_eq!(data["request_id"], "req-123");
-        assert_eq!(data.as_object().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn error_frame_never_contains_driver_error_text() {
-        let driver_error = "connection to server at 10.0.3.4 failed: relation \"events\" does not exist";
-        let data = error_frame_data("req-456");
-        assert!(!data.contains("10.0.3.4"));
-        assert!(!data.contains("relation"));
-        assert!(!data.contains(driver_error));
-    }
+/// Ends an SSE stream once the server starts shutting down. A final
+/// `event: shutdown` frame is sent first so the client reconnects, with
+/// `Last-Event-ID`, to another instance. Without this, open streams keep
+/// graceful shutdown waiting until the hard timeout (#571).
+fn end_on_shutdown<S>(
+    events: S,
+    shutdown: CancellationToken,
+) -> impl Stream<Item = Result<Event, Infallible>>
+where
+    S: Stream<Item = Result<Event, Infallible>>,
+{
+    events
+        .take_until(async move { shutdown.cancelled().await })
+        .chain(stream::once(async {
+            Ok(Event::default()
+                .event("shutdown")
+                .data(json!({ "reason": "server_shutdown" }).to_string()))
+        }))
 }
+
 
 /// Resolve the current head of the event log for a contract, used as the
 /// starting cursor for a fresh stream with no resume position.
@@ -523,4 +524,44 @@ async fn fetch_new_events(
     }
 
     Ok(events)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #570 — SSE error frames must not leak driver or infrastructure error text.
+    #[test]
+    fn error_frame_carries_only_code_and_request_id() {
+        let data: serde_json::Value =
+            serde_json::from_str(&error_frame_data("req-123")).unwrap();
+        assert_eq!(data["code"], "internal_error");
+        assert_eq!(data["request_id"], "req-123");
+        assert_eq!(data.as_object().unwrap().len(), 2);
+    }
+
+    /// #571 — an open stream ends with a single shutdown frame once the token is
+    /// cancelled, instead of holding the server open.
+    #[tokio::test]
+    async fn stream_ends_with_one_shutdown_frame_when_cancelled() {
+        let shutdown = CancellationToken::new();
+        let open_stream = stream::pending::<Result<Event, Infallible>>();
+        let mut ended = Box::pin(end_on_shutdown(open_stream, shutdown.clone()));
+
+        shutdown.cancel();
+
+        let frames: Vec<_> = tokio::time::timeout(Duration::from_secs(1), ended.collect())
+            .await
+            .expect("stream should end promptly after cancellation");
+        assert_eq!(frames.len(), 1);
+    }
+
+    #[test]
+    fn error_frame_never_contains_driver_error_text() {
+        let driver_error = "connection to server at 10.0.3.4 failed: relation \"events\" does not exist";
+        let data = error_frame_data("req-456");
+        assert!(!data.contains("10.0.3.4"));
+        assert!(!data.contains("relation"));
+        assert!(!data.contains(driver_error));
+    }
 }

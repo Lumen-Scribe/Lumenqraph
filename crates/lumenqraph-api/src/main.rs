@@ -124,6 +124,10 @@ async fn main() -> anyhow::Result<()> {
             .to_string(),
     });
 
+    // Cancelled by `shutdown_signal`; long-lived SSE streams watch it so they end
+    // promptly instead of holding graceful shutdown until the hard timeout (#571).
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
     let state = AppState {
         pool,
         require_auth: config.require_auth,
@@ -156,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
         ip_config: auth::IpConfig::from_env(),
         audit_tx: None,
         audit_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        shutdown: tokio_util::sync::CancellationToken::new(),
+        shutdown: shutdown.clone(),
     };
 
     let bind_addr = config.bind_addr.clone();
@@ -182,7 +186,7 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(shutdown_timeout_secs));
+    .with_graceful_shutdown(shutdown_signal(shutdown_timeout_secs, shutdown));
 
     // Wrap the graceful shutdown in a hard timeout so a slow or stuck client
     // cannot keep the process alive indefinitely during a rolling restart.
@@ -203,7 +207,10 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn shutdown_signal(shutdown_timeout_secs: u64) {
+async fn shutdown_signal(
+    shutdown_timeout_secs: u64,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -222,6 +229,8 @@ async fn shutdown_signal(shutdown_timeout_secs: u64) {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
+    // End long-lived streams now so axum's graceful shutdown can finish.
+    shutdown.cancel();
     info!(
         "shutdown signal received; draining in-flight requests (up to {}s)",
         shutdown_timeout_secs
