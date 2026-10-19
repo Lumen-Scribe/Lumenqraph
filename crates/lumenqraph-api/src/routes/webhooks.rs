@@ -9,7 +9,7 @@
 //! callers with the "admin" role (not yet implemented) — they are simply
 //! unreachable from normal keys.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::response::Response;
 use axum::Json;
 use lumenqraph_core::WebhookSubscription;
@@ -440,11 +440,17 @@ type WebhookListRow = (
 );
 
 /// List subscriptions without exposing their secrets.
-pub async fn list_webhooks(State(state): State<AppState>) -> ApiResult<Json<Vec<Value>>> {
+///
+/// Only subscriptions owned by the caller's key are returned (#561).
+pub async fn list_webhooks(
+    State(state): State<AppState>,
+    Extension(caller): Extension<CallerKeyHash>,
+) -> ApiResult<Json<Vec<Value>>> {
     let rows: Vec<WebhookListRow> = sqlx::query_as(
         "SELECT id, url, kind, contract_id, event_name, contract_ids, event_names, filter, active, created_at, auto_disabled_at, auto_disabled_reason
-             FROM webhook_subscriptions ORDER BY created_at DESC",
+             FROM webhook_subscriptions WHERE owner_key_hash = $1 ORDER BY created_at DESC",
     )
+    .bind(&caller.0)
     .fetch_all(&state.pool)
     .await?;
 
@@ -474,6 +480,7 @@ pub async fn list_webhooks(State(state): State<AppState>) -> ApiResult<Json<Vec<
 
 pub async fn update_webhook(
     State(state): State<AppState>,
+    Extension(caller): Extension<CallerKeyHash>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateWebhook>,
 ) -> ApiResult<Json<Value>> {
@@ -486,9 +493,10 @@ pub async fn update_webhook(
     }
 
     let current: (String, bool, Option<String>, Option<String>, Option<Vec<String>>, Option<Vec<String>>, Option<Value>) = sqlx::query_as(
-        "SELECT kind, active, contract_id, event_name, contract_ids, event_names, filter FROM webhook_subscriptions WHERE id = $1",
+        "SELECT kind, active, contract_id, event_name, contract_ids, event_names, filter FROM webhook_subscriptions WHERE id = $1 AND owner_key_hash = $2",
     )
     .bind(id)
+    .bind(&caller.0)
     .fetch_optional(&state.pool)
     .await?
     .ok_or_else(|| ApiError::not_found("webhook subscription not found"))?;
@@ -537,7 +545,7 @@ pub async fn update_webhook(
                 contract_ids = COALESCE($5, contract_ids),
                 event_names = COALESCE($6, event_names),
                 filter      = COALESCE($7, filter)
-          WHERE id = $1
+          WHERE id = $1 AND owner_key_hash = $8
           RETURNING id, url, kind, contract_id, event_name, contract_ids, event_names, filter, active, created_at",
     )
     .bind(id)
@@ -547,6 +555,7 @@ pub async fn update_webhook(
     .bind(&next_contract_ids)
     .bind(&next_event_names)
     .bind(&next_filter)
+    .bind(&caller.0)
     .fetch_one(&state.pool)
     .await?;
 
@@ -568,10 +577,12 @@ pub async fn update_webhook(
 
 pub async fn delete_webhook(
     State(state): State<AppState>,
+    Extension(caller): Extension<CallerKeyHash>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let result = sqlx::query("DELETE FROM webhook_subscriptions WHERE id = $1")
+    let result = sqlx::query("DELETE FROM webhook_subscriptions WHERE id = $1 AND owner_key_hash = $2")
         .bind(id)
+        .bind(&caller.0)
         .execute(&state.pool)
         .await?;
 
@@ -637,14 +648,16 @@ fn default_deliveries_limit() -> i64 {
 /// paginated on the delivery `id`.
 pub async fn list_webhook_deliveries(
     State(state): State<AppState>,
+    Extension(caller): Extension<CallerKeyHash>,
     Path(id): Path<Uuid>,
     Query(q): Query<DeliveriesQuery>,
 ) -> ApiResult<Response> {
     let page = PageRequest::<IdCursor>::parse(q.limit, 500, q.offset, q.after.as_deref())?;
 
     let exists: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id = $1)")
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id = $1 AND owner_key_hash = $2)")
             .bind(id)
+            .bind(&caller.0)
             .fetch_one(&state.pool)
             .await?;
     if !exists {
@@ -702,12 +715,14 @@ pub struct RedriveQuery {
 /// those created at or after `since`) back to pending.
 pub async fn redrive_webhook(
     State(state): State<AppState>,
+    Extension(caller): Extension<CallerKeyHash>,
     Path(id): Path<Uuid>,
     Query(query): Query<RedriveQuery>,
 ) -> ApiResult<Json<Value>> {
     let exists: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id = $1)")
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id = $1 AND owner_key_hash = $2)")
             .bind(id)
+            .bind(&caller.0)
             .fetch_one(&state.pool)
             .await?;
     if !exists {
@@ -732,14 +747,16 @@ pub async fn redrive_webhook(
 /// `POST /webhooks/:id/reenable` — clear an auto-disable and reactivate.
 pub async fn reenable_webhook(
     State(state): State<AppState>,
+    Extension(caller): Extension<CallerKeyHash>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     let affected = sqlx::query(
         "UPDATE webhook_subscriptions
          SET active = true, auto_disabled_at = NULL, auto_disabled_reason = NULL, consecutive_failures = 0
-         WHERE id = $1 AND auto_disabled_at IS NOT NULL",
+         WHERE id = $1 AND owner_key_hash = $2 AND auto_disabled_at IS NOT NULL",
     )
     .bind(id)
+    .bind(&caller.0)
     .execute(&state.pool)
     .await?
     .rows_affected();
@@ -772,6 +789,7 @@ fn default_grace_seconds() -> i64 {
 /// `lumenqraph-webhooks::dispatcher::send`.
 pub async fn rotate_webhook_secret(
     State(state): State<AppState>,
+    Extension(caller): Extension<CallerKeyHash>,
     Path(id): Path<Uuid>,
     body: Option<Json<RotateSecret>>,
 ) -> ApiResult<Json<Value>> {
@@ -792,13 +810,14 @@ pub async fn rotate_webhook_secret(
             SET previous_encrypted_secret  = encrypted_secret,
                 previous_secret_expires_at = now() + ($1 * interval '1 second'),
                 encrypted_secret           = pgp_sym_encrypt($2, $3)
-          WHERE id = $4
+          WHERE id = $4 AND owner_key_hash = $5
           RETURNING id",
     )
     .bind(grace_seconds)
     .bind(&new_secret)
     .bind(&encryption_key)
     .bind(id)
+    .bind(&caller.0)
     .fetch_optional(&state.pool)
     .await?;
 
