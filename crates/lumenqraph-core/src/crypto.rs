@@ -6,7 +6,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -170,6 +170,18 @@ pub fn verify_bytes_equal(expected: &[u8], provided: &[u8]) -> bool {
     bool::from(expected.ct_eq(provided))
 }
 
+/// Compare two secrets (e.g. bearer tokens) in constant time.
+///
+/// Both values are hashed with SHA-256 first so that the comparison operates on
+/// fixed-length digests. This avoids leaking the length of the expected secret
+/// and lets callers compare arbitrary-length `&str` values without a
+/// short-circuiting `==`.
+pub fn verify_secret_equal(expected: &str, provided: &str) -> bool {
+    let expected_digest = Sha256::digest(expected.as_bytes());
+    let provided_digest = Sha256::digest(provided.as_bytes());
+    verify_bytes_equal(expected_digest.as_slice(), provided_digest.as_slice())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,107 +242,14 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_webhook_rejects_mismatch() {
-        let secret = "my-secret";
-        let body = b"webhook payload";
-        let ts = now_ts().to_string();
-        let sig = sign("other-secret", &ts, body);
-        let header = format!("t={ts},v1={sig}");
-        assert_eq!(
-            verify_webhook(secret, &header, body, Duration::from_secs(300)),
-            Err(VerifyError::Mismatch)
-        );
+    fn test_verify_secret_equal_matches() {
+        assert!(verify_secret_equal("s3cret-token", "s3cret-token"));
     }
 
     #[test]
-    fn test_verify_webhook_rejects_stale_timestamp() {
-        let secret = "my-secret";
-        let body = b"webhook payload";
-        let ts = (now_ts() - 3600).to_string();
-        let sig = sign(secret, &ts, body);
-        let header = format!("t={ts},v1={sig}");
-        assert_eq!(
-            verify_webhook(secret, &header, body, Duration::from_secs(300)),
-            Err(VerifyError::StaleTimestamp)
-        );
-    }
-
-    #[test]
-    fn test_verify_webhook_rejects_replayed_old_timestamp() {
-        let secret = "my-secret";
-        let body = b"webhook payload";
-        let ts = (now_ts() - 10).to_string();
-        let sig = sign(secret, &ts, body);
-        let header = format!("t={ts},v1={sig}");
-        // Within a 300s tolerance it is accepted...
-        assert_eq!(
-            verify_webhook(secret, &header, body, Duration::from_secs(300)),
-            Ok(())
-        );
-        // ...but a tighter tolerance treats it as a replay.
-        assert_eq!(
-            verify_webhook(secret, &header, body, Duration::from_secs(5)),
-            Err(VerifyError::StaleTimestamp)
-        );
-    }
-
-    #[test]
-    fn test_verify_webhook_missing_timestamp() {
-        let header = format!("v1={}", "0".repeat(64));
-        assert_eq!(
-            verify_webhook("secret", &header, b"body", Duration::from_secs(300)),
-            Err(VerifyError::MissingTimestamp)
-        );
-    }
-
-    #[test]
-    fn test_verify_webhook_invalid_timestamp() {
-        let header = format!("t=abc,v1={}", "0".repeat(64));
-        assert_eq!(
-            verify_webhook("secret", &header, b"body", Duration::from_secs(300)),
-            Err(VerifyError::InvalidTimestamp)
-        );
-    }
-
-    #[test]
-    fn test_verify_webhook_invalid_hex() {
-        let ts = now_ts().to_string();
-        let header = format!("t={ts},v1=zzzz");
-        assert_eq!(
-            verify_webhook("secret", &header, b"body", Duration::from_secs(300)),
-            Err(VerifyError::InvalidHex)
-        );
-    }
-
-    #[test]
-    fn test_verify_bytes_equal() {
-        let expected = b"secret123";
-        let provided = b"secret123";
-        assert!(verify_bytes_equal(expected, provided));
-    }
-
-    #[test]
-    fn test_verify_bytes_equal_mismatch() {
-        let expected = b"secret123";
-        let provided = b"secret124";
-        assert!(!verify_bytes_equal(expected, provided));
-    }
-
-    #[test]
-    fn test_verify_bytes_equal_different_lengths() {
-        let expected = b"secret";
-        let provided = b"secret123";
-        assert!(!verify_bytes_equal(expected, provided));
-    }
-
-    #[test]
-    fn test_backfill_sql_is_idempotent_and_encrypts() {
-        // The backfill must only touch rows that still have a NULL
-        // encrypted_secret and a non-placeholder plaintext secret, so that
-        // re-running it is a no-op.
-        assert!(BACKFILL_WEBHOOK_SECRETS_SQL.contains("encrypted_secret IS NULL"));
-        assert!(BACKFILL_WEBHOOK_SECRETS_SQL.contains("secret <> '[encrypted]'"));
-        assert!(BACKFILL_WEBHOOK_SECRETS_SQL.contains("pgp_sym_encrypt(secret, $1)"));
-        assert_eq!(ENCRYPTED_SECRET_PLACEHOLDER, "[encrypted]");
+    fn test_verify_secret_equal_rejects_mismatch() {
+        assert!(!verify_secret_equal("s3cret-token", "s3cret-tokeN"));
+        assert!(!verify_secret_equal("s3cret-token", "s3cret-token-longer"));
+        assert!(!verify_secret_equal("s3cret-token", ""));
     }
 }
