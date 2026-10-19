@@ -16,6 +16,7 @@ use lumenqraph_core::read::{self, EncodeError};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::call_cache::CallScope;
 use crate::error::{ApiError, ApiResult};
 use crate::extract::ValidContractId;
 use crate::read_cost_limit::validate_call_request;
@@ -72,12 +73,19 @@ pub async fn call_function(
         ));
     }
 
+    let spec = state.specs.current(&state.pool, &contract_id).await?;
+
+    // The cache key includes the simulation's source account and the WASM hash
+    // the spec came from, so another caller's result, or one computed against
+    // an older interface, is never served (#575).
+    let scope = CallScope {
+        source_account: req.source_account.as_deref(),
+        wasm_hash: &spec.wasm_hash,
+    };
     // Check the read-through cache before hitting RPC.
-    if let Some(cached) = state.call_cache.get(&contract_id, &req.function, &req.args) {
+    if let Some(cached) = state.call_cache.get(&contract_id, &req.function, &req.args, scope) {
         return Ok(Json(cached));
     }
-
-    let spec = state.specs.current(&state.pool, &contract_id).await?;
 
     // Encode against the cached, name-indexed parse: the spec section is never
     // re-parsed per request, and UDTs resolve in a hash lookup.
@@ -108,7 +116,7 @@ pub async fn call_function(
                 "result": read::decode_result(&result_xdr, &call, Some(parsed)),
                 "simulated_at_ledger": latest_ledger,
             });
-            state.call_cache.insert(&contract_id, &req.function, &req.args, response.clone());
+            state.call_cache.insert(&contract_id, &req.function, &req.args, scope, response.clone());
             Ok(Json(response))
         }
         // A trap / bad call is the caller's problem, not a 500.
@@ -316,6 +324,7 @@ mod tests {
             CachedSpec {
                 parsed: lumenqraph_core::ContractSpec::from_spec_xdr(&spec_section).map(|p| p.spec),
                 section: spec_section,
+                wasm_hash: "test-hash".to_string(),
             },
         );
 

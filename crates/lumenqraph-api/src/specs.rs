@@ -58,6 +58,9 @@ const MAX_ENTRIES: usize = 256;
 pub struct CachedSpec {
     pub section: Vec<u8>,
     pub parsed: Option<ContractSpec>,
+    /// Hash of the WASM this interface was parsed from. Part of the `/call`
+    /// result-cache key, so an upgrade invalidates cached results.
+    pub wasm_hash: String,
 }
 
 #[derive(Default)]
@@ -142,7 +145,7 @@ impl SpecCache {
                  equivalent). Retrying will not help; use token metadata endpoints instead of \
                  /call or /simulate."
             ))?;
-        let entry = Arc::new(parse(&hex_section)?);
+        let entry = Arc::new(parse(&hex_section, &wasm_hash)?);
 
         let mut map = self.current.write().unwrap();
         if map.len() >= MAX_ENTRIES {
@@ -165,18 +168,18 @@ impl SpecCache {
             return Ok(Arc::clone(spec));
         }
 
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT spec_section FROM contract_spec_versions
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT wasm_hash, spec_section FROM contract_spec_versions
              WHERE contract_id = $1 AND version = $2",
         )
         .bind(contract_id)
         .bind(version)
         .fetch_optional(pool)
         .await?;
-        let hex_section = row.map(|r| r.0).ok_or_else(|| {
+        let (wasm_hash, hex_section) = row.ok_or_else(|| {
             ApiError::not_found(format!("no version {version} recorded for this contract"))
         })?;
-        let entry = Arc::new(parse(&hex_section)?);
+        let entry = Arc::new(parse(&hex_section, &wasm_hash)?);
 
         let mut map = self.versions.write().unwrap();
         if map.len() >= MAX_ENTRIES {
@@ -207,11 +210,15 @@ impl SpecCache {
 
 /// Hex-decode and parse a stored section. A section we wrote but can't read back
 /// is our bug, not the caller's, so it's a 500.
-fn parse(hex_section: &str) -> ApiResult<CachedSpec> {
+fn parse(hex_section: &str, wasm_hash: &str) -> ApiResult<CachedSpec> {
     let section = hex::decode(hex_section)
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("corrupt stored spec: {e}")))?;
     let parsed = ContractSpec::from_spec_xdr(&section).map(|p| p.spec);
-    Ok(CachedSpec { section, parsed })
+    Ok(CachedSpec {
+        section,
+        parsed,
+        wasm_hash: wasm_hash.to_string(),
+    })
 }
 
 fn not_indexed() -> ApiError {

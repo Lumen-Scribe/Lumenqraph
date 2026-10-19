@@ -18,6 +18,19 @@ use std::time::{Duration, Instant};
 use lru::LruCache;
 use serde_json::Value;
 
+/// Everything besides `(contract, function, args)` that can change a `/call`
+/// result. Both fields are part of the cache key.
+#[derive(Clone, Copy, Debug)]
+pub struct CallScope<'a> {
+    /// The simulation's source account. Contracts that check `env.invoker()` or
+    /// auth return different results per source, so each source gets its own
+    /// entries. `None` (the default zero account) is a distinct case.
+    pub source_account: Option<&'a str>,
+    /// Hash of the WASM the spec was parsed from. An upgrade changes it, so
+    /// results computed against the old interface stop matching.
+    pub wasm_hash: &'a str,
+}
+
 #[derive(Hash, PartialEq, Eq, Clone)]
 struct Key {
     contract_id: String,
@@ -26,6 +39,8 @@ struct Key {
     /// key. serde_json preserves insertion order so identical request bodies
     /// produce identical strings.
     args: String,
+    source_account: Option<String>,
+    wasm_hash: String,
 }
 
 pub struct CallCache {
@@ -49,11 +64,17 @@ impl CallCache {
     }
 
     /// Return a cached result if one exists and has not expired.
-    pub fn get(&self, contract_id: &str, function: &str, args: &Value) -> Option<Value> {
+    pub fn get(
+        &self,
+        contract_id: &str,
+        function: &str,
+        args: &Value,
+        scope: CallScope<'_>,
+    ) -> Option<Value> {
         if self.ttl.is_zero() {
             return None;
         }
-        let key = self.make_key(contract_id, function, args);
+        let key = self.make_key(contract_id, function, args, scope);
         let mut cache = self.inner.lock().unwrap();
         match cache.get(&key) {
             Some((value, inserted_at)) if inserted_at.elapsed() < self.ttl => {
@@ -74,11 +95,18 @@ impl CallCache {
     }
 
     /// Store a successful call result. No-op when the cache is disabled (TTL == 0).
-    pub fn insert(&self, contract_id: &str, function: &str, args: &Value, result: Value) {
+    pub fn insert(
+        &self,
+        contract_id: &str,
+        function: &str,
+        args: &Value,
+        scope: CallScope<'_>,
+        result: Value,
+    ) {
         if self.ttl.is_zero() {
             return;
         }
-        let key = self.make_key(contract_id, function, args);
+        let key = self.make_key(contract_id, function, args, scope);
         let evicted = self.inner
             .lock()
             .unwrap()
@@ -108,11 +136,19 @@ impl CallCache {
         self.inner.lock().unwrap().len()
     }
 
-    fn make_key(&self, contract_id: &str, function: &str, args: &Value) -> Key {
+    fn make_key(
+        &self,
+        contract_id: &str,
+        function: &str,
+        args: &Value,
+        scope: CallScope<'_>,
+    ) -> Key {
         Key {
             contract_id: contract_id.to_string(),
             function: function.to_string(),
             args: normalize_json(args),
+            source_account: scope.source_account.map(str::to_string),
+            wasm_hash: scope.wasm_hash.to_string(),
         }
     }
 }
@@ -144,46 +180,51 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const SCOPE: CallScope<'static> = CallScope {
+        source_account: None,
+        wasm_hash: "hash-v1",
+    };
+
     #[test]
     fn hit_within_ttl() {
         let cache = CallCache::new(10, 60);
-        cache.insert("C1", "balance", &json!({"addr": "G1"}), json!(100));
-        let result = cache.get("C1", "balance", &json!({"addr": "G1"}));
+        cache.insert("C1", "balance", &json!({"addr": "G1"}), SCOPE, json!(100));
+        let result = cache.get("C1", "balance", &json!({"addr": "G1"}), SCOPE);
         assert_eq!(result, Some(json!(100)));
     }
 
     #[test]
     fn miss_on_different_args() {
         let cache = CallCache::new(10, 60);
-        cache.insert("C1", "balance", &json!({"addr": "G1"}), json!(100));
-        assert!(cache.get("C1", "balance", &json!({"addr": "G2"})).is_none());
+        cache.insert("C1", "balance", &json!({"addr": "G1"}), SCOPE, json!(100));
+        assert!(cache.get("C1", "balance", &json!({"addr": "G2"}), SCOPE).is_none());
     }
 
     #[test]
     fn disabled_when_ttl_zero() {
         let cache = CallCache::new(10, 0);
-        cache.insert("C1", "fn", &json!({}), json!("result"));
-        assert!(cache.get("C1", "fn", &json!({})).is_none());
+        cache.insert("C1", "fn", &json!({}), SCOPE, json!("result"));
+        assert!(cache.get("C1", "fn", &json!({}), SCOPE).is_none());
     }
 
     #[test]
     fn lru_evicts_oldest_on_capacity() {
         let cache = CallCache::new(2, 60);
-        cache.insert("C1", "a", &json!({}), json!(1));
-        cache.insert("C1", "b", &json!({}), json!(2));
-        cache.insert("C1", "c", &json!({}), json!(3)); // evicts "a"
-        assert!(cache.get("C1", "a", &json!({})).is_none());
-        assert!(cache.get("C1", "b", &json!({})).is_some());
-        assert!(cache.get("C1", "c", &json!({})).is_some());
+        cache.insert("C1", "a", &json!({}), SCOPE, json!(1));
+        cache.insert("C1", "b", &json!({}), SCOPE, json!(2));
+        cache.insert("C1", "c", &json!({}), SCOPE, json!(3)); // evicts "a"
+        assert!(cache.get("C1", "a", &json!({}), SCOPE).is_none());
+        assert!(cache.get("C1", "b", &json!({}), SCOPE).is_some());
+        assert!(cache.get("C1", "c", &json!({}), SCOPE).is_some());
     }
 
     #[test]
     fn identical_args_with_different_key_ordering_produce_cache_hit() {
         let cache = CallCache::new(10, 60);
         // Insert with one key order
-        cache.insert("C1", "transfer", &json!({"from": "G1", "to": "G2"}), json!(true));
+        cache.insert("C1", "transfer", &json!({"from": "G1", "to": "G2"}), SCOPE, json!(true));
         // Retrieve with different key order - should hit cache
-        let result = cache.get("C1", "transfer", &json!({"to": "G2", "from": "G1"}));
+        let result = cache.get("C1", "transfer", &json!({"to": "G2", "from": "G1"}), SCOPE);
         assert_eq!(result, Some(json!(true)), "cache should hit for args with different key order");
     }
 
@@ -192,7 +233,35 @@ mod tests {
         let cache = CallCache::new(10, 60);
         let args1 = json!({"outer": {"b": 2, "a": 1}, "x": 10});
         let args2 = json!({"x": 10, "outer": {"a": 1, "b": 2}});
-        cache.insert("C1", "fn", &args1, json!("result"));
-        assert_eq!(cache.get("C1", "fn", &args2), Some(json!("result")));
+        cache.insert("C1", "fn", &args1, SCOPE, json!("result"));
+        assert_eq!(cache.get("C1", "fn", &args2, SCOPE), Some(json!("result")));
+    }
+
+    #[test]
+    fn different_source_accounts_do_not_share_entries() {
+        let cache = CallCache::new(10, 60);
+        let alice = CallScope { source_account: Some("GALICE"), wasm_hash: "hash-v1" };
+        let bob = CallScope { source_account: Some("GBOB"), wasm_hash: "hash-v1" };
+        cache.insert("C1", "whoami", &json!({}), alice, json!("alice"));
+        assert!(cache.get("C1", "whoami", &json!({}), bob).is_none());
+        assert_eq!(cache.get("C1", "whoami", &json!({}), alice), Some(json!("alice")));
+    }
+
+    #[test]
+    fn default_source_is_distinct_from_an_explicit_account() {
+        let cache = CallCache::new(10, 60);
+        let default = CallScope { source_account: None, wasm_hash: "hash-v1" };
+        let explicit = CallScope { source_account: Some("GALICE"), wasm_hash: "hash-v1" };
+        cache.insert("C1", "whoami", &json!({}), default, json!("zero"));
+        assert!(cache.get("C1", "whoami", &json!({}), explicit).is_none());
+    }
+
+    #[test]
+    fn upgrade_to_new_wasm_hash_invalidates_entries() {
+        let cache = CallCache::new(10, 60);
+        let v1 = CallScope { source_account: None, wasm_hash: "hash-v1" };
+        let v2 = CallScope { source_account: None, wasm_hash: "hash-v2" };
+        cache.insert("C1", "balance", &json!({"addr": "G1"}), v1, json!(100));
+        assert!(cache.get("C1", "balance", &json!({"addr": "G1"}), v2).is_none());
     }
 }
