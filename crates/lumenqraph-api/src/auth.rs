@@ -663,7 +663,7 @@ mod tests {
             );
         }
     }
-
+}
 
 /// Per-client-IP rate limiting for sibling-instance mounts (#442).
 ///
@@ -707,7 +707,7 @@ pub async fn proxy_rate_limit(
 // schema, which would race with any parallel test.
 
 #[cfg(test)]
-mod integration_tests {
+pub(crate) mod integration_tests {
     use std::net::SocketAddr;
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
@@ -726,7 +726,7 @@ mod integration_tests {
 
     // ---- test fixtures ----
 
-    async fn db_pool() -> PgPool {
+    pub(crate) async fn db_pool() -> PgPool {
         let url =
             std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL must be set");
         let pool = PgPoolOptions::new()
@@ -747,7 +747,7 @@ mod integration_tests {
         pool
     }
 
-    fn make_state(pool: PgPool, require_auth: bool, anon_rate: i32) -> AppState {
+    pub(crate) fn make_state(pool: PgPool, require_auth: bool, anon_rate: i32) -> AppState {
         use crate::concurrency_limit::ConcurrencyLimiter;
         use crate::metrics_middleware::MetricsCollector;
         use crate::call_cache::CallCache;
@@ -790,7 +790,7 @@ mod integration_tests {
         }
     }
 
-    async fn spawn_server(state: AppState) -> String {
+    pub(crate) async fn spawn_server(state: AppState) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");

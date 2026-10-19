@@ -117,15 +117,14 @@ pub async fn list_events(
            AND ($4::bigint IS NULL OR ledger <= $4)
            AND ($5::timestamp IS NULL OR ledger_closed_at >= $5)
            AND ($6::timestamp IS NULL OR ledger_closed_at <= $6)
-           -- Topic filtering: decoded_topics is a JSONB array. To filter by position,
-           -- we use JSONB containment (@>) with null padding. For example, to match
-           -- decoded_topics[1], we build an array [null, value] and check containment.
-           -- This works because JSONB containment checks if the right side is a subset
-           -- of the left side, preserving position for array elements.
-           AND ($7::text IS NULL OR decoded_topics @> jsonb_build_array($7::jsonb))
-           AND ($8::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, $8::jsonb))
-           AND ($9::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, $9::jsonb))
-           AND ($10::text IS NULL OR decoded_topics @> jsonb_build_array(jsonb_null::jsonb, jsonb_null::jsonb, jsonb_null::jsonb, $10::jsonb))
+           -- Topic filtering is positional: `decoded_topics -> n` extracts the element
+           -- at index n, so `topic1=X` matches only events whose second topic is X.
+           -- JSONB `@>` on arrays is set membership and ignores position, so it must
+           -- not be used here.
+           AND ($7::text IS NULL OR decoded_topics -> 0 = $7::jsonb)
+           AND ($8::text IS NULL OR decoded_topics -> 1 = $8::jsonb)
+           AND ($9::text IS NULL OR decoded_topics -> 2 = $9::jsonb)
+           AND ($10::text IS NULL OR decoded_topics -> 3 = $10::jsonb)
            AND ($11::text IS NULL OR enriched @> ($11::jsonb))
            AND ($15::boolean IS NULL OR in_successful_call = $15)
            AND ($12::bigint IS NULL OR ledger < $12 OR (ledger = $12 AND event_id < $13))
@@ -242,4 +241,73 @@ pub struct TxEventsResponse {
     pub has_more: bool,
     /// The event rows, ordered by ledger and event_id ascending.
     pub data: Vec<EventRow>,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::auth::integration_tests::{db_pool, make_state, spawn_server};
+    use sqlx::PgPool;
+
+    const CONTRACT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+
+    async fn insert_event(pool: &PgPool, event_id: &str, decoded_topics: &str) {
+        sqlx::query(
+            "INSERT INTO events (event_id, contract_id, ledger, ledger_closed_at, event_type,
+                topics, decoded_topics, event_name, value, tx_hash, in_successful_call, paging_token)
+             VALUES ($1, $2, 1, NOW(), 'contract', '[]'::jsonb, $3::jsonb, 'transfer', '', 'tx', true, $1)",
+        )
+        .bind(event_id)
+        .bind(CONTRACT)
+        .bind(decoded_topics)
+        .execute(pool)
+        .await
+        .expect("insert event");
+    }
+
+    async fn event_ids(base: &str, query: &str) -> Vec<String> {
+        let body: serde_json::Value =
+            reqwest::get(format!("{base}/contracts/{CONTRACT}/events?{query}"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["event_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn topic_filters_match_by_position() {
+        let pool = db_pool().await;
+        // transfer(from=GA, to=GB): GA is topic1, GB is topic2.
+        insert_event(&pool, "transfer_ga_gb", r#"["transfer","GA","GB"]"#).await;
+        // transfer(from=GB, to=GA): GA is topic2.
+        insert_event(&pool, "transfer_gb_ga", r#"["transfer","GB","GA"]"#).await;
+        let base = spawn_server(make_state(pool, false, 60)).await;
+
+        assert_eq!(
+            event_ids(&base, "topic1=%22GA%22").await,
+            vec!["transfer_ga_gb"],
+            "topic1=GA must match only the event whose second topic is GA"
+        );
+        assert_eq!(
+            event_ids(&base, "topic2=%22GA%22").await,
+            vec!["transfer_gb_ga"],
+            "topic2=GA must match only the event whose third topic is GA"
+        );
+        assert!(
+            event_ids(&base, "topic0=%22GA%22").await.is_empty(),
+            "topic0=GA must not match GA appearing in other positions"
+        );
+        assert_eq!(
+            event_ids(&base, "topic0=%22transfer%22").await.len(),
+            2,
+            "topic0=transfer matches every transfer event"
+        );
+    }
 }
