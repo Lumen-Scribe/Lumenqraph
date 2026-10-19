@@ -184,14 +184,45 @@ pub async fn get_event(
 /// `GET /transactions/:tx_hash/events` — all indexed events for a transaction.
 ///
 /// Returns events ordered by `(ledger ASC, event_id ASC)` — the same order
-/// they were emitted on-chain. Supports an optional `limit` query parameter
-/// (1–1000, default 100).
+/// they were emitted on-chain. Paginates with the same keyset `after` cursor
+/// as the other event lists: pass the previous response's `next_cursor` to
+/// fetch the rest of a transaction with more events than `limit`.
+///
+/// `tx_hash` must be 64 hexadecimal characters and is matched case-insensitively
+/// (it is normalised to lowercase); anything else is rejected with `400`.
 pub async fn transaction_events(
     State(state): State<AppState>,
     Path(tx_hash): Path<String>,
     Query(q): Query<TxEventsQuery>,
 ) -> ApiResult<Json<TxEventsResponse>> {
-    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let tx_hash = normalize_tx_hash(&tx_hash)?;
+    let page = PageRequest::<LedgerCursor>::parse(
+        q.limit.unwrap_or(100),
+        1000,
+        0,
+        q.after.as_deref(),
+    )?;
+    let page = page_transaction_events(&state.pool, &tx_hash, &page, q.successful_only).await?;
+    Ok(Json(TxEventsResponse {
+        tx_hash,
+        count: page.data.len(),
+        has_more: page.has_more,
+        next_cursor: page.next_cursor,
+        data: page.data,
+    }))
+}
+
+/// One keyset page of a transaction's events, ordered `(ledger, event_id)` ascending.
+async fn page_transaction_events(
+    pool: &sqlx::PgPool,
+    tx_hash: &str,
+    request: &PageRequest<LedgerCursor>,
+    successful_only: Option<bool>,
+) -> ApiResult<Page<EventRow>> {
+    let (after_ledger, after_event_id) = match request.after {
+        Some(ref c) => (Some(c.ledger), Some(c.event_id.as_str())),
+        None => (None, None),
+    };
 
     let events: Vec<EventRow> = sqlx::query_as(
         "SELECT event_id, contract_id, ledger, ledger_closed_at, event_type,
@@ -199,35 +230,39 @@ pub async fn transaction_events(
                 enriched, tx_hash, in_successful_call, paging_token, created_at
          FROM events
          WHERE tx_hash = $1
-           AND ($3::boolean IS NULL OR in_successful_call = $3)
+           AND ($2::boolean IS NULL OR in_successful_call = $2)
+           AND ($3::bigint IS NULL OR ledger > $3 OR (ledger = $3 AND event_id > $4))
          ORDER BY ledger ASC, event_id ASC
-         LIMIT $2",
+         LIMIT $5",
     )
-    .bind(&tx_hash)
-    .bind(limit + 1)
-    .bind(q.successful_only)
-    .fetch_all(&state.pool)
+    .bind(tx_hash)
+    .bind(successful_only)
+    .bind(after_ledger)
+    .bind(after_event_id)
+    .bind(request.fetch_limit())
+    .fetch_all(pool)
     .await?;
 
-    let has_more = events.len() as i64 > limit;
-    let result_events = if has_more {
-        events.into_iter().take(limit as usize).collect()
-    } else {
-        events
-    };
+    Ok(request.finish(events, |e| LedgerCursor::new(e.ledger, &e.event_id)))
+}
 
-    Ok(Json(TxEventsResponse {
-        tx_hash,
-        count: result_events.len(),
-        has_more,
-        data: result_events,
-    }))
+/// Validate a transaction hash and normalise it to lowercase hex.
+fn normalize_tx_hash(raw: &str) -> ApiResult<String> {
+    if raw.len() == 64 && raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(raw.to_ascii_lowercase())
+    } else {
+        Err(ApiError::bad_request(
+            "tx_hash must be 64 hexadecimal characters",
+        ))
+    }
 }
 
 #[derive(Deserialize)]
 pub struct TxEventsQuery {
     /// Maximum events to return (1–1000, default 100).
     limit: Option<i64>,
+    /// Opaque cursor from a previous response's `next_cursor`.
+    after: Option<String>,
     /// Optional filter to return only events from successful contract calls (default: false, returns all).
     successful_only: Option<bool>,
 }
@@ -240,6 +275,100 @@ pub struct TxEventsResponse {
     pub count: usize,
     /// Whether there are more results available (if limit was reached).
     pub has_more: bool,
+    /// Opaque cursor to pass as `after` for the next page; null on the last page.
+    pub next_cursor: Option<String>,
     /// The event rows, ordered by ledger and event_id ascending.
     pub data: Vec<EventRow>,
+}
+
+#[cfg(test)]
+mod tests {
+    //! The DB-backed test needs a throwaway Postgres:
+    //!
+    //!   TEST_DATABASE_URL=postgres://…/lumenqraph \
+    //!     cargo test -p lumenqraph-api -- --ignored
+    //!
+    //! Unit tests run without one.
+
+    use super::*;
+
+    #[test]
+    fn tx_hash_accepts_64_hex_and_lowercases() {
+        let upper = "ABCDEF0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789";
+        assert_eq!(
+            normalize_tx_hash(upper).unwrap(),
+            upper.to_ascii_lowercase()
+        );
+    }
+
+    #[test]
+    fn tx_hash_rejects_wrong_length_and_non_hex() {
+        assert!(normalize_tx_hash("abc").is_err());
+        assert!(normalize_tx_hash(&"a".repeat(65)).is_err());
+        assert!(normalize_tx_hash(&format!("{}g", "a".repeat(63))).is_err());
+        assert!(normalize_tx_hash(&"z".repeat(64)).is_err());
+    }
+
+    async fn fixture() -> sqlx::PgPool {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect to test database");
+        for stmt in ["DROP SCHEMA public CASCADE", "CREATE SCHEMA public"] {
+            sqlx::query(stmt).execute(&pool).await.expect("reset schema");
+        }
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        pool
+    }
+
+    #[tokio::test]
+    #[ignore = "needs TEST_DATABASE_URL"]
+    async fn paging_a_large_transaction_returns_every_event_once() {
+        const TOTAL: i64 = 1_205;
+        let pool = fixture().await;
+        let tx = "a".repeat(64);
+        sqlx::query(
+            "INSERT INTO events (event_id, contract_id, ledger, ledger_closed_at, event_type,
+                                 topics, event_name, value, tx_hash, in_successful_call, paging_token)
+             SELECT lpad(i::text, 8, '0'), 'C1', 100 + i / 50, now(), 'contract', '[]', 'transfer',
+                    'v', $1, true, lpad(i::text, 8, '0')
+             FROM generate_series(1, $2) AS i",
+        )
+        .bind(&tx)
+        .bind(TOTAL)
+        .execute(&pool)
+        .await
+        .expect("insert events");
+
+        let mut seen = Vec::new();
+        let mut after = None;
+        loop {
+            let request = PageRequest::<LedgerCursor>::parse(
+                1000,
+                1000,
+                0,
+                after.as_deref(),
+            )
+            .unwrap();
+            let page = page_transaction_events(&pool, &tx, &request, None)
+                .await
+                .unwrap();
+            seen.extend(page.data.iter().map(|e| e.event_id.clone()));
+            match page.next_cursor {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+
+        assert_eq!(seen.len() as i64, TOTAL, "every event returned");
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), seen.len(), "no event returned twice");
+    }
 }
