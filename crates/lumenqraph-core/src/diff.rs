@@ -590,7 +590,7 @@ fn type_sigs(spec: &ContractSpec) -> BTreeMap<String, String> {
         let cases: Vec<String> = e
             .cases
             .iter()
-            .map(|(name, value)| format!("{name} = {value}"))
+            .map(|c| format!("{} = {}", c.name, c.code))
             .collect();
         out.insert(
             e.name.clone(),
