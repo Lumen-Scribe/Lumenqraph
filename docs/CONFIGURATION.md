@@ -467,11 +467,11 @@ The webhook service delivers indexed data to subscriber URLs with HMAC-SHA256 si
 #### `WEBHOOK_ENCRYPTION_KEY`
 | Property | Value |
 |----------|-------|
-| **Default** | `default-key-for-testing` (insecure!) |
+| **Default** | None — required; API and webhooks fail to start if missing or empty |
 | **Example** | `$(openssl rand -hex 32)` |
-| **Valid Range** | Any string (recommend 32+ random hex chars) |
-| **Services** | Webhooks |
-| **Tradeoff** | **At-Rest Security** vs **Complexity**: When set, webhook secrets are encrypted in database using pgcrypto AES-128. Enables secure secret storage. **Strongly recommended for production**. If changed, previously-encrypted secrets cannot be decrypted; rotate keys with caution |
+| **Valid Range** | Non-empty string (recommend 32+ random hex chars) |
+| **Services** | API, Webhooks |
+| **Tradeoff** | **At-Rest Security** vs **Complexity**: Webhook secrets are encrypted in PostgreSQL using pgcrypto. The API reads this key once at startup and uses it for creation and rotation; the webhooks service uses the same value for decryption. If changed, previously-encrypted secrets cannot be decrypted; rotate keys with caution |
 
 **Production Setup:**
 ```bash

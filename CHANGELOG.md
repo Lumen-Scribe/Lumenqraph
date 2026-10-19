@@ -28,11 +28,11 @@ Breaking changes will be documented in the changelog with migration guidance whe
 
 **Breaking changes requiring action before deploy:**
 
-- **`WEBHOOK_ENCRYPTION_KEY` is now required** for the webhooks service.
-  Webhook secrets are encrypted at rest using `pgcrypto`. Generate the key
-  with `openssl rand -hex 32` and set it before deploying — migration
-  `0020` backfills existing subscriptions using this key. Deployments
-  without it fall back to the insecure hardcoded default.
+- **`WEBHOOK_ENCRYPTION_KEY` is required** by both the API and webhooks service.
+  Webhook secrets are encrypted at rest using `pgcrypto`; both services fail
+  to start if the shared key is missing or empty. Generate it with
+  `openssl rand -hex 32` and set it before deploying — migration `0020`
+  backfills existing subscriptions using this key.
   See [docs/UPGRADING.md](docs/UPGRADING.md#1-webhook-secrets-are-now-encrypted-at-rest--webhook_encryption_key-required).
 
 - **`token_transfers.kind` column added** (`transfer` | `mint` | `burn` |

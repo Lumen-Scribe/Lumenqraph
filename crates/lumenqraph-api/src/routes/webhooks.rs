@@ -250,13 +250,8 @@ pub async fn create_webhook(
         (0, None)
     };
 
-    // Read once at startup (#441); an unset key keeps the legacy test fallback
-    // and is warned about in `main`.
-    let encryption_key = state
-        .config
-        .webhook_encryption_key
-        .as_deref()
-        .unwrap_or("default-key-for-testing");
+    // The required key is validated and loaded once at API startup.
+    let encryption_key = state.config.webhook_encryption_key.as_str();
 
     // Set owner_key_hash from the authenticated caller (#421). Anonymous callers
     // (no API key) create subscriptions with NULL owner, which are only accessible
@@ -782,8 +777,8 @@ pub async fn rotate_webhook_secret(
         return Err(ApiError::bad_request("grace_seconds must be non-negative"));
     }
 
-    let encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY")
-        .unwrap_or_else(|_| "default-key-for-testing".to_string());
+    // The required key is validated and loaded once at API startup.
+    let encryption_key = state.config.webhook_encryption_key.as_str();
 
     let new_secret = random_secret();
 
@@ -797,7 +792,7 @@ pub async fn rotate_webhook_secret(
     )
     .bind(grace_seconds)
     .bind(&new_secret)
-    .bind(&encryption_key)
+    .bind(encryption_key)
     .bind(id)
     .fetch_optional(&state.pool)
     .await?;

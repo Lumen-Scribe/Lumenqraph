@@ -74,10 +74,10 @@ services:
         value: "true"
 
       # ---- Security --------------------------------------------------------
-      # Encryption key used to sign and verify webhook payloads (HMAC-SHA256).
-      # Generate before deploying: openssl rand -hex 32
-      # Leave the value blank here — Render will prompt you to set it as a
-      # secret. Never commit a real value to source control.
+      # Required by the API and webhooks service to encrypt/decrypt webhook
+      # signing secrets at rest (pgcrypto). Both services fail to start if it
+      # is missing or empty. Generate before deploying: openssl rand -hex 32
+      # Render prompts for it as a secret; never commit the real value here.
       - key: WEBHOOK_ENCRYPTION_KEY
         sync: false
 

@@ -160,6 +160,8 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for details.
 git clone https://github.com/Lumen-Scribe/Lumenqraph.git
 cd Lumenqraph
 cp .env.example .env                 # defaults target Stellar testnet
+# Generate one shared key, then set WEBHOOK_ENCRYPTION_KEY in .env:
+openssl rand -hex 32
 
 docker compose up -d                 # local Postgres (bound to 127.0.0.1)
 cargo run -p lumenqraph-indexer -- migrate   # apply database migrations
@@ -784,7 +786,7 @@ Contributions toward any of these are very welcome — see [Contributing](#contr
 - **Run exactly one webhooks dispatcher.** Enqueueing, delivery and metrics run serially in one loop in a single process ([#621](https://github.com/Lumen-Scribe/Lumenqraph/issues/621)); scale it vertically, not horizontally.
 - **Only the indexer applies migrations.** The API and webhooks services assume the schema is current, so start (or upgrade) the indexer first ([#473](https://github.com/Lumen-Scribe/Lumenqraph/issues/473)). Some released migrations take long locks on large tables; see [docs/MIGRATIONS.md](docs/MIGRATIONS.md#historical-migrations-that-lock-large-tables) before upgrading a busy instance.
 - **Swap, NFT and liquidity endpoints always return empty results** until an indexer writer exists ([#599](https://github.com/Lumen-Scribe/Lumenqraph/issues/599)).
-- **`WEBHOOK_ENCRYPTION_KEY` must be set.** Without it the API falls back to a public test key ([#422](https://github.com/Lumen-Scribe/Lumenqraph/issues/422)).
+- **`WEBHOOK_ENCRYPTION_KEY` is required.** The API and webhooks service both fail to start if it is missing or empty; generate a shared key with `openssl rand -hex 32`.
 - **No API-key management API.** Mint keys with `scripts/gen_api_key.sh` ([#431](https://github.com/Lumen-Scribe/Lumenqraph/issues/431)).
 
 ## Contributing
