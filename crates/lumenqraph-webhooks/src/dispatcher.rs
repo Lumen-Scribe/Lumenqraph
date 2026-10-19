@@ -865,7 +865,7 @@ async fn check_and_auto_disable(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     //! Enqueue + payload tests. These need a throwaway Postgres:
     //!
     //!   TEST_DATABASE_URL=postgres://…/lumenqraph \
@@ -879,7 +879,7 @@ mod tests {
     use sqlx::postgres::PgPoolOptions;
 
     /// Fresh, isolated schema per test — safe for parallel execution.
-    async fn fixture() -> PgPool {
+    pub(crate) async fn fixture() -> PgPool {
         let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL");
         // Each test gets a unique schema so concurrent tests never interfere.
         let schema = format!("test_{}", uuid::Uuid::new_v4().simple());

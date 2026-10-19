@@ -5,9 +5,11 @@
 mod config;
 mod dispatcher;
 mod metrics;
+mod prune;
 
 use anyhow::Context;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use config::Config;
@@ -60,6 +62,9 @@ async fn main() -> anyhow::Result<()> {
     let interval = Duration::from_secs(config.tick_secs.max(1));
     let shutdown = CancellationToken::new();
     tokio::spawn(wait_for_shutdown(shutdown.clone()));
+
+    // Retention for webhook_deliveries; this service is their only writer (#567).
+    tokio::spawn(prune::run_pruner(pool.clone(), config.delivery_retention_days, shutdown.clone()));
 
     loop {
         if let Err(e) = dispatcher::enqueue(&pool, config.batch_size).await {

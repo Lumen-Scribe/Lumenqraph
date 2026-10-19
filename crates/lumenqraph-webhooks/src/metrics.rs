@@ -93,6 +93,12 @@ async fn metrics(State(state): State<MetricsState>) -> impl IntoResponse {
         "lumenqraph_webhooks_pending_deliveries {}\n",
         PENDING_DELIVERIES.load(Ordering::Relaxed)
     ));
+    body.push_str("# HELP lumenqraph_webhook_deliveries_pruned_total Delivery rows removed by retention since start\n");
+    body.push_str("# TYPE lumenqraph_webhook_deliveries_pruned_total counter\n");
+    body.push_str(&format!(
+        "lumenqraph_webhook_deliveries_pruned_total {}\n",
+        crate::prune::DELIVERIES_PRUNED.load(Ordering::Relaxed)
+    ));
 
     match gather_metrics(&state.pool).await {
         Ok(metrics) => {
