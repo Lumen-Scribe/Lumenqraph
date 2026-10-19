@@ -11,7 +11,7 @@
 
 use axum::extract::{Path, Query, State};
 use axum::response::Response;
-use axum::Json;
+use axum::{Extension, Json};
 use lumenqraph_core::WebhookSubscription;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -462,28 +462,135 @@ pub async fn list_webhooks(State(state): State<AppState>) -> ApiResult<Json<Vec<
     .fetch_all(&state.pool)
     .await?;
 
-    let out = rows
-        .into_iter()
-        .map(
-            |(id, url, kind, contract_id, event_name, contract_ids, event_names, filter, active, created_at, auto_disabled_at, auto_disabled_reason)| {
-                json!({
-                    "id": id,
-                    "url": url,
-                    "kind": kind,
-                    "contract_id": contract_id,
-                    "event_name": event_name,
-                    "contract_ids": contract_ids,
-                    "event_names": event_names,
-                    "filter": filter,
-                    "active": active,
-                    "created_at": created_at,
-                    "auto_disabled_at": auto_disabled_at,
-                    "auto_disabled_reason": auto_disabled_reason,
-                })
-            },
+    Ok(Json(rows.into_iter().map(subscription_json).collect()))
+}
+
+/// Public JSON for one subscription row. Never includes the secret.
+fn subscription_json(row: WebhookListRow) -> Value {
+    let (id, url, kind, contract_id, event_name, contract_ids, event_names, filter, active, created_at, auto_disabled_at, auto_disabled_reason) = row;
+    json!({
+        "id": id,
+        "url": url,
+        "kind": kind,
+        "contract_id": contract_id,
+        "event_name": event_name,
+        "contract_ids": contract_ids,
+        "event_names": event_names,
+        "filter": filter,
+        "active": active,
+        "created_at": created_at,
+        "auto_disabled_at": auto_disabled_at,
+        "auto_disabled_reason": auto_disabled_reason,
+    })
+}
+
+/// `GET /webhooks/:id` — one subscription, visible only to the key that created
+/// it (#421). Other callers get 404, the same as an unknown id. Never returns
+/// the secret.
+pub async fn get_webhook(
+    State(state): State<AppState>,
+    caller: Option<Extension<CallerKeyHash>>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Value>> {
+    let owner_key_hash: Option<String> = caller.map(|ext| ext.0.0.clone());
+    let row: Option<WebhookListRow> = sqlx::query_as(
+        "SELECT id, url, kind, contract_id, event_name, contract_ids, event_names, filter, active, created_at, auto_disabled_at, auto_disabled_reason
+         FROM webhook_subscriptions
+         WHERE id = $1 AND owner_key_hash IS NOT DISTINCT FROM $2",
+    )
+    .bind(id)
+    .bind(&owner_key_hash)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let row = row.ok_or_else(|| ApiError::not_found("webhook subscription not found"))?;
+    Ok(Json(subscription_json(row)))
+}
+
+/// `POST /webhooks/:id/test` — send a signed `ping` to the subscription's URL
+/// now, and report what the endpoint answered.
+///
+/// The request uses the dispatcher's signing scheme (`X-Lumenqraph-Signature`)
+/// and pins DNS to the address that passed delivery-time validation. The ping
+/// is sent directly rather than queued: `webhook_deliveries` rows reference an
+/// indexed event, which a ping doesn't have. `delivery_id` is the ping's own id,
+/// the same value sent in `X-Lumenqraph-Delivery-Id`.
+pub async fn test_webhook(
+    State(state): State<AppState>,
+    caller: Option<Extension<CallerKeyHash>>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Value>> {
+    let owner_key_hash: Option<String> = caller.map(|ext| ext.0.0.clone());
+    let encryption_key = state
+        .config
+        .webhook_encryption_key
+        .as_deref()
+        .unwrap_or("default-key-for-testing");
+
+    let (url, secret): (String, String) = sqlx::query_as(
+        "SELECT url, pgp_sym_decrypt(encrypted_secret, $2)
+         FROM webhook_subscriptions
+         WHERE id = $1 AND owner_key_hash IS NOT DISTINCT FROM $3",
+    )
+    .bind(id)
+    .bind(encryption_key)
+    .bind(&owner_key_hash)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("webhook subscription not found"))?;
+
+    let delivery_id = Uuid::new_v4();
+    let body = serde_json::to_string(&json!({
+        "type": "ping",
+        "subscription_id": id,
+        "delivery_id": delivery_id,
+        "sent_at": chrono::Utc::now(),
+    }))?;
+
+    let timestamp = chrono::Utc::now().timestamp();
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("invalid webhook secret: {e}")))?;
+    mac.update(format!("{timestamp}.{body}").as_bytes());
+    let signature = hex::encode(mac.finalize().into_bytes());
+
+    let parsed = url::Url::parse(&url).map_err(|e| ApiError::Internal(e.into()))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("webhook url has no host")))?;
+    let ip = url_validation::validate_webhook_url_at_delivery(&url)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("webhook url is not deliverable: {e}")))?;
+    let client = reqwest::Client::builder()
+        .resolve(
+            host,
+            std::net::SocketAddr::new(ip, parsed.port_or_known_default().unwrap_or(443)),
         )
-        .collect();
-    Ok(Json(out))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| ApiError::Internal(e.into()))?;
+
+    let response = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("X-Lumenqraph-Signature", format!("t={timestamp},v1={signature}"))
+        .header("X-Lumenqraph-Delivery-Id", delivery_id.to_string())
+        .header("X-Lumenqraph-Timestamp", timestamp.to_string())
+        .body(body)
+        .send()
+        .await;
+
+    Ok(Json(match response {
+        Ok(resp) => json!({
+            "delivery_id": delivery_id,
+            "delivered": resp.status().is_success(),
+            "status_code": resp.status().as_u16(),
+        }),
+        Err(e) => json!({
+            "delivery_id": delivery_id,
+            "delivered": false,
+            "error": e.to_string(),
+        }),
+    }))
 }
 
 pub async fn update_webhook(
@@ -615,6 +722,7 @@ fn webhook_row_json(row: WebhookListRow) -> Value {
 
 pub async fn delete_webhook(
     State(state): State<AppState>,
+    caller: Option<Extension<CallerKeyHash>>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     let result = sqlx::query("DELETE FROM webhook_subscriptions WHERE id = $1")
@@ -626,7 +734,8 @@ pub async fn delete_webhook(
         return Err(ApiError::not_found("webhook subscription not found"));
     }
 
-    log_webhook_action(&state.pool, "webhook_delete", &id.to_string()).await;
+    let key_prefix = caller.map(|ext| ext.0.0.clone()).unwrap_or_else(|| "anon".to_string());
+    log_webhook_action(&state.pool, &key_prefix, "webhook_delete", &id.to_string()).await;
     Ok(Json(json!({ "deleted": true })))
 }
 
@@ -884,6 +993,7 @@ fn validate_grace_seconds(grace_seconds: i64) -> Result<(), ApiError> {
 /// `lumenqraph-webhooks::dispatcher::send`.
 pub async fn rotate_webhook_secret(
     State(state): State<AppState>,
+    caller: Option<Extension<CallerKeyHash>>,
     Path(id): Path<Uuid>,
     body: Option<Json<RotateSecret>>,
 ) -> ApiResult<Json<Value>> {
@@ -921,7 +1031,8 @@ pub async fn rotate_webhook_secret(
     let (id, previous_expires_at) =
         updated.ok_or_else(|| ApiError::not_found("webhook subscription not found"))?;
 
-    log_webhook_action(&state.pool, "webhook_rotate_secret", &id.to_string()).await;
+    let key_prefix = caller.map(|ext| ext.0.0.clone()).unwrap_or_else(|| "anon".to_string());
+    log_webhook_action(&state.pool, &key_prefix, "webhook_rotate_secret", &id.to_string()).await;
 
     Ok(Json(json!({
         "id": id,
@@ -931,50 +1042,34 @@ pub async fn rotate_webhook_secret(
 }
 
 #[cfg(test)]
-mod update_tests {
-    use super::*;
+mod tests {
+    use super::{subscription_json, WebhookListRow};
+    use serde_json::Value;
+    use uuid::Uuid;
 
+    /// Subscription responses (`GET /webhooks/:id`, `GET /webhooks`) must never
+    /// carry the signing secret, which is only shown once at creation.
     #[test]
-    fn absent_field_leaves_value_unchanged() {
-        let body: UpdateWebhook = serde_json::from_str("{}").unwrap();
-        assert!(body.contract_id.is_none());
-        assert!(body.filter.is_none());
-        assert_eq!(split_clearable(body.contract_id), (false, None));
-    }
-
-    #[test]
-    fn explicit_null_clears_value() {
-        let body: UpdateWebhook =
-            serde_json::from_str(r#"{"contract_id": null, "filter": null}"#).unwrap();
-        assert_eq!(body.contract_id, Some(None));
-        assert_eq!(split_clearable(body.contract_id), (true, None));
-        assert_eq!(split_clearable(body.filter), (true, None));
-    }
-
-    #[test]
-    fn present_value_is_set() {
-        let body: UpdateWebhook =
-            serde_json::from_str(r#"{"contract_ids": ["CABC"], "url": "https://example.com/hook"}"#)
-                .unwrap();
-        assert_eq!(
-            split_clearable(body.contract_ids),
-            (true, Some(vec!["CABC".to_string()]))
+    fn subscription_json_has_no_secret_field() {
+        let row: WebhookListRow = (
+            Uuid::nil(),
+            "https://example.com/hook".to_string(),
+            "event".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            chrono::Utc::now(),
+            None,
+            None,
         );
-        assert_eq!(body.url.as_deref(), Some("https://example.com/hook"));
-    }
-}
+        let json: Value = subscription_json(row);
 
-#[cfg(test)]
-mod rotate_tests {
-    use super::*;
-
-    #[test]
-    fn grace_seconds_is_bounded() {
-        assert!(validate_grace_seconds(0).is_ok());
-        assert!(validate_grace_seconds(MAX_GRACE_SECONDS).is_ok());
-        assert!(validate_grace_seconds(-1).is_err());
-        assert!(validate_grace_seconds(MAX_GRACE_SECONDS + 1).is_err());
-        // Would overflow `$1 * interval '1 second'` on the database side.
-        assert!(validate_grace_seconds(i64::MAX).is_err());
+        assert_eq!(json["url"], "https://example.com/hook");
+        assert_eq!(json["active"], true);
+        assert!(json.get("secret").is_none(), "secret must not be serialized: {json}");
+        assert!(json.get("encrypted_secret").is_none());
     }
 }

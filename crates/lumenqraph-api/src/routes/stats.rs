@@ -301,6 +301,159 @@ async fn query_stats_by_trunc(
     state: &AppState,
     contract_id: &str,
     trunc: &str,
-   
+    from: Option<chrono::DateTime<chrono::Utc>>,
+    to: Option<chrono::DateTime<chrono::Utc>>,
+) -> ApiResult<Vec<StatsBucket>> {
+    let sql = format!(
+        "SELECT date_trunc('{trunc}', ledger_closed_at)::text as bucket, COUNT(*) as count
+         FROM events
+         WHERE contract_id = $1
+           AND ($2::timestamp IS NULL OR ledger_closed_at >= $2)
+           AND ($3::timestamp IS NULL OR ledger_closed_at <= $3)
+         GROUP BY date_trunc('{trunc}', ledger_closed_at)
+         ORDER BY date_trunc('{trunc}', ledger_closed_at) DESC"
+    );
+    let rows: Vec<(String, i64)> = sqlx::query_as(&sql)
+        .bind(contract_id)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&state.pool)
+        .await?;
 
-/* … truncated 4766 chars — edit only what you need near the top … */
+    Ok(rows
+        .into_iter()
+        .map(|(bucket, count)| StatsBucket {
+            bucket,
+            count,
+            breakdown: None,
+        })
+        .collect())
+}
+
+async fn query_stats_by_trunc_grouped(
+    state: &AppState,
+    contract_id: &str,
+    trunc: &str,
+    from: Option<chrono::DateTime<chrono::Utc>>,
+    to: Option<chrono::DateTime<chrono::Utc>>,
+) -> ApiResult<Vec<StatsBucket>> {
+    let sql = format!(
+        "SELECT date_trunc('{trunc}', ledger_closed_at)::text as bucket, event_name, COUNT(*) as count
+         FROM events
+         WHERE contract_id = $1
+           AND ($2::timestamp IS NULL OR ledger_closed_at >= $2)
+           AND ($3::timestamp IS NULL OR ledger_closed_at <= $3)
+         GROUP BY date_trunc('{trunc}', ledger_closed_at), event_name
+         ORDER BY date_trunc('{trunc}', ledger_closed_at) DESC, event_name"
+    );
+    let rows: Vec<(String, Option<String>, i64)> = sqlx::query_as(&sql)
+        .bind(contract_id)
+        .bind(from)
+        .bind(to)
+        .fetch_all(&state.pool)
+        .await?;
+
+    let mut result: std::collections::HashMap<String, (i64, std::collections::HashMap<String, i64>)> =
+        std::collections::HashMap::new();
+
+    for (bucket, event_name, count) in rows {
+        let entry = result.entry(bucket).or_insert((0, std::collections::HashMap::new()));
+        entry.0 += count;
+        if let Some(name) = event_name {
+            *entry.1.entry(name).or_insert(0) += count;
+        }
+    }
+
+    Ok(result
+        .into_iter()
+        .map(|(bucket, (total, breakdown))| StatsBucket {
+            bucket,
+            count: total,
+            breakdown: if breakdown.is_empty() {
+                None
+            } else {
+                Some(breakdown)
+            },
+        })
+        .collect())
+}
+
+async fn query_stats_by_ledger(
+    state: &AppState,
+    contract_id: &str,
+    from_ledger: Option<i64>,
+    to_ledger: Option<i64>,
+) -> ApiResult<Vec<StatsBucket>> {
+    let rows: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT ledger, COUNT(*) as count
+         FROM events
+         WHERE contract_id = $1
+           AND ($2::bigint IS NULL OR ledger >= $2)
+           AND ($3::bigint IS NULL OR ledger <= $3)
+         GROUP BY ledger
+         ORDER BY ledger DESC",
+    )
+    .bind(contract_id)
+    .bind(from_ledger)
+    .bind(to_ledger)
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(ledger, count)| StatsBucket {
+            bucket: ledger.to_string(),
+            count,
+            breakdown: None,
+        })
+        .collect())
+}
+
+async fn query_stats_by_ledger_grouped(
+    state: &AppState,
+    contract_id: &str,
+    from_ledger: Option<i64>,
+    to_ledger: Option<i64>,
+) -> ApiResult<Vec<StatsBucket>> {
+    let rows: Vec<(i64, Option<String>, i64)> = sqlx::query_as(
+        "SELECT ledger, event_name, COUNT(*) as count
+         FROM events
+         WHERE contract_id = $1
+           AND ($2::bigint IS NULL OR ledger >= $2)
+           AND ($3::bigint IS NULL OR ledger <= $3)
+         GROUP BY ledger, event_name
+         ORDER BY ledger DESC, event_name",
+    )
+    .bind(contract_id)
+    .bind(from_ledger)
+    .bind(to_ledger)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut result: std::collections::HashMap<String, (i64, std::collections::HashMap<String, i64>)> =
+        std::collections::HashMap::new();
+
+    for (ledger, event_name, count) in rows {
+        let bucket_key = ledger.to_string();
+        let entry = result
+            .entry(bucket_key)
+            .or_insert((0, std::collections::HashMap::new()));
+        entry.0 += count;
+        if let Some(name) = event_name {
+            *entry.1.entry(name).or_insert(0) += count;
+        }
+    }
+
+    Ok(result
+        .into_iter()
+        .map(|(bucket, (total, breakdown))| StatsBucket {
+            bucket,
+            count: total,
+            breakdown: if breakdown.is_empty() {
+                None
+            } else {
+                Some(breakdown)
+            },
+        })
+        .collect())
+}
