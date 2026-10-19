@@ -864,6 +864,19 @@ fn default_grace_seconds() -> i64 {
     86_400
 }
 
+/// Longest grace window accepted for a secret rotation (7 days).
+const MAX_GRACE_SECONDS: i64 = 7 * 86_400;
+
+fn validate_grace_seconds(grace_seconds: i64) -> Result<(), ApiError> {
+    if !(0..=MAX_GRACE_SECONDS).contains(&grace_seconds) {
+        return Err(ApiError::bad_request(format!(
+            "grace_seconds must be between 0 and {}",
+            MAX_GRACE_SECONDS
+        )));
+    }
+    Ok(())
+}
+
 /// Rotate the signing secret for a subscription.
 ///
 /// The previous secret is retained (encrypted) for `grace_seconds` so the
@@ -877,39 +890,43 @@ pub async fn rotate_webhook_secret(
     let grace_seconds = body
         .map(|Json(b)| b.grace_seconds)
         .unwrap_or_else(default_grace_seconds);
-    if grace_seconds < 0 {
-        return Err(ApiError::bad_request("grace_seconds must be non-negative"));
-    }
+    validate_grace_seconds(grace_seconds)?;
 
-    let encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY")
-        .unwrap_or_else(|_| "default-key-for-testing".to_string());
+    // Same key source as create_webhook (#441); no public fallback is read from the environment.
+    let encryption_key = state
+        .config
+        .webhook_encryption_key
+        .as_deref()
+        .unwrap_or("default-key-for-testing");
 
     let new_secret = random_secret();
 
-    let updated: Option<(Uuid,)> = sqlx::query_as(
+    // Expiry is computed and returned by the database so the response matches
+    // what the dispatcher will enforce.
+    let updated: Option<(Uuid, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
         "UPDATE webhook_subscriptions
             SET previous_encrypted_secret  = encrypted_secret,
                 previous_secret_expires_at = now() + ($1 * interval '1 second'),
                 encrypted_secret           = pgp_sym_encrypt($2, $3)
           WHERE id = $4
-          RETURNING id",
+          RETURNING id, previous_secret_expires_at",
     )
     .bind(grace_seconds)
     .bind(&new_secret)
-    .bind(&encryption_key)
+    .bind(encryption_key)
     .bind(id)
     .fetch_optional(&state.pool)
     .await?;
 
-    let (id,) = updated.ok_or_else(|| ApiError::not_found("webhook subscription not found"))?;
+    let (id, previous_expires_at) =
+        updated.ok_or_else(|| ApiError::not_found("webhook subscription not found"))?;
 
     log_webhook_action(&state.pool, "webhook_rotate_secret", &id.to_string()).await;
 
     Ok(Json(json!({
         "id": id,
         "secret": new_secret,
-        "previous_secret_expires_at": chrono::Utc::now()
-            + chrono::Duration::seconds(grace_seconds),
+        "previous_secret_expires_at": previous_expires_at,
     })))
 }
 
@@ -944,5 +961,20 @@ mod update_tests {
             (true, Some(vec!["CABC".to_string()]))
         );
         assert_eq!(body.url.as_deref(), Some("https://example.com/hook"));
+    }
+}
+
+#[cfg(test)]
+mod rotate_tests {
+    use super::*;
+
+    #[test]
+    fn grace_seconds_is_bounded() {
+        assert!(validate_grace_seconds(0).is_ok());
+        assert!(validate_grace_seconds(MAX_GRACE_SECONDS).is_ok());
+        assert!(validate_grace_seconds(-1).is_err());
+        assert!(validate_grace_seconds(MAX_GRACE_SECONDS + 1).is_err());
+        // Would overflow `$1 * interval '1 second'` on the database side.
+        assert!(validate_grace_seconds(i64::MAX).is_err());
     }
 }
