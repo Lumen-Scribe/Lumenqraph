@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lumenqraph"
+version = "0.1.0"
+description = "Python SDK for Lumenqraph"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "LumenQraph" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+# HTTP uses only the standard library; pydantic backs the generated models.
+dependencies = [
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "mypy>=1.11",
+    "build>=1.0",
+    "twine>=4.0",
+    "mypy>=1.10",
+    "ruff>=0.4",
+]
+# Regenerates lumenqraph/models.py from openapi.yaml (scripts/codegen.py).
+codegen = [
+    "datamodel-code-generator==0.85.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Lumen-Scribe/Lumenqraph"
+Repository = "https://github.com/Lumen-Scribe/Lumenqraph"
+
+[tool.setuptools]
+packages = ["lumenqraph"]
+
+[tool.setuptools.package-data]
+lumenqraph = ["py.typed"]
+
+[tool.mypy]
+strict = true
+python_version = "3.10"
+plugins = ["pydantic.mypy"]
+files = ["lumenqraph"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+strict = true
+python_version = "3.8"
+files = ["lumenqraph"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

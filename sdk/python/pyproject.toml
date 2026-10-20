@@ -5,10 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "lumenqraph"
 version = "0.1.0"
-description = "Python SDK for LumenQraph"
+description = "Python SDK for Lumenqraph"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
+license = "MIT"
 authors = [
     { name = "LumenQraph" },
 ]
@@ -36,7 +36,6 @@ dev = [
     "mypy>=1.11",
     "build>=1.0",
     "twine>=4.0",
-    "mypy>=1.10",
     "ruff>=0.4",
 ]
 # Regenerates lumenqraph/models.py from openapi.yaml (scripts/codegen.py).
@@ -45,8 +44,8 @@ codegen = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/lumenqraph/lumenqraph"
-Repository = "https://github.com/lumenqraph/lumenqraph"
+Homepage = "https://github.com/Lumen-Scribe/Lumenqraph"
+Repository = "https://github.com/Lumen-Scribe/Lumenqraph"
 
 [tool.setuptools]
 packages = ["lumenqraph"]
@@ -63,15 +62,6 @@ files = ["lumenqraph"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-
-[tool.mypy]
-strict = true
-python_version = "3.8"
-files = ["lumenqraph"]
-
-[tool.ruff]
-line-length = 100
-target-version = "py38"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
