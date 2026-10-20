@@ -11,6 +11,7 @@ from __future__ import annotations
 import email.utils
 import json
 import time
+import uuid
 import urllib.error
 import urllib.request
 from collections.abc import Iterator, Mapping
@@ -50,6 +51,31 @@ DEFAULT_BASE_DELAY_MS = 250
 DEFAULT_MAX_DELAY_MS = 30_000
 DEFAULT_TIMEOUT_MS = 10_000
 RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
+
+
+def _is_idempotent_method(method: str) -> bool:
+    return method.upper() in {"GET", "HEAD", "PUT", "DELETE"}
+
+
+def _is_idempotent_url(method: str, url: str) -> bool:
+    if _is_idempotent_method(method):
+        return True
+    m = method.upper()
+    if m != "POST":
+        return False
+    # Safe endpoints
+    try:
+        from urllib.parse import urlparse
+        path = urlparse(url).path
+        if path.endswith("/call") or path.endswith("/simulate") or path == "/call" or path == "/simulate":
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _should_attach_idempotency_key(method: str, url: str) -> bool:
+    return method.upper() == "POST" and not _is_idempotent_url(method, url)
 
 
 def resolve_retry(opts: RetryOptions | None) -> ResolvedRetry:
@@ -157,16 +183,23 @@ class Transport:
         headers: Mapping[str, str],
         raw: bool = False,
     ) -> Any:
-        """Send a request, retrying 429/502/503/504 and network errors.
+        """Send a request with retry/backoff.
 
-        Returns the decoded JSON body (``None`` for an empty body), or the raw
-        text when ``raw`` is true.
+        Only idempotent methods (GET, HEAD, PUT, DELETE) and safe POSTs (/call, /simulate)
+        are retried on network errors or retryable status codes (429, 502, 503, 504).
+        Non-idempotent POSTs are not retried by default; an ``Idempotency-Key`` header
+        is attached when absent to enable server-side deduplication.
         """
         timeout = self.retry["timeout_ms"] / 1000.0
         max_retries = self.retry["max_retries"]
         attempt = 0
+        should_retry = _is_idempotent_url(method, url)
+        req_headers = dict(headers)
+        if _should_attach_idempotency_key(method, url):
+            if "Idempotency-Key" not in req_headers and "idempotency-key" not in {k.lower(): v for k, v in req_headers.items()}:
+                req_headers["Idempotency-Key"] = str(uuid.uuid4())
         while True:
-            req = urllib.request.Request(url, data=body, headers=dict(headers), method=method)
+            req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     text: str = resp.read().decode("utf-8")
@@ -177,13 +210,13 @@ class Transport:
                 status = exc.code
                 text = exc.read().decode("utf-8")
                 parsed = _parse_body(text)
-                if status not in RETRYABLE_STATUSES or attempt >= max_retries:
+                if not should_retry or status not in RETRYABLE_STATUSES or attempt >= max_retries:
                     raise LumenqraphError(_error_message(status, parsed, text), status, parsed) from None
                 retry_after = _retry_after_ms(exc.headers.get("Retry-After") if exc.headers else None)
                 self._sleep(self._delay_ms(attempt, retry_after))
                 attempt += 1
             except urllib.error.URLError as exc:
-                if attempt >= max_retries:
+                if not should_retry or attempt >= max_retries:
                     raise LumenqraphError(f"Network error: {exc.reason}", 0, None) from None
                 self._sleep(self._delay_ms(attempt))
                 attempt += 1

@@ -352,6 +352,38 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 /** HTTP status codes that merit a retry. */
 const RETRYABLE_STATUSES = new Set([429, 502, 503, 504]);
 
+/** Generate a random UUID v4. */
+function generateIdempotencyKey(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  // Fallback for older environments
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+function isIdempotentMethod(method: string): boolean {
+  return method === "GET" || method === "HEAD" || method === "PUT" || method === "DELETE";
+}
+
+function isIdempotentUrl(method: string, url: string): boolean {
+  if (isIdempotentMethod(method)) return true;
+  // Allow explicit safe POSTs
+  try {
+    const u = new URL(url, "http://localhost");
+    const path = u.pathname;
+    // Safe endpoints
+    if (path === "/call" || path === "/simulate") return true;
+    if (path.endsWith("/call") || path.endsWith("/simulate")) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 // ---- Client ----
 
 export class LumenqraphClient {
@@ -1050,9 +1082,13 @@ export class LumenqraphClient {
    * Core fetch wrapper with retry + timeout (#81, #142).
    *
    * Retry policy:
-   *  - Network errors (fetch throws) are always retried.
-   *  - HTTP 429: honors `Retry-After` (seconds or HTTP-date) before retrying.
-   *  - HTTP 502 / 503 / 504: retried with exponential backoff + full jitter.
+   *  - Network errors are retried for idempotent requests (GET, HEAD, PUT, DELETE)
+   *    and explicitly safe POSTs (/call, /simulate). Non-idempotent POSTs are not
+   *    retried by default to avoid duplicate side effects.
+   *  - HTTP 429: honored with Retry-After for idempotent/safe requests.
+   *  - HTTP 502 / 503 / 504: retried with exponential backoff + full jitter for
+   *    idempotent/safe requests only.
+   *  - Idempotency-Key is attached to non-idempotent POSTs when not already set.
    *  - Any other non-2xx: thrown immediately as `LumenqraphError`.
    *
    * Each attempt gets its own `AbortController` so the timeout window resets
@@ -1063,6 +1099,17 @@ export class LumenqraphClient {
   private async request<T>(url: string, init: RequestInit, signal?: AbortSignal): Promise<T> {
     const { maxRetries, baseDelayMs, maxDelayMs, timeoutMs } = this.retry;
     let attempt = 0;
+    const method = (init.method || "GET").toUpperCase();
+    const shouldRetry = isIdempotentUrl(method, url);
+
+    // Attach Idempotency-Key to non-idempotent POSTs for server-side deduplication
+    if (!shouldRetry && method === "POST") {
+      const headers = new Headers(init.headers);
+      if (!headers.has("idempotency-key") && !headers.has("Idempotency-Key")) {
+        headers.set("Idempotency-Key", generateIdempotencyKey());
+        init = { ...init, headers };
+      }
+    }
 
     for (;;) {
       // Check if externally aborted before making the request.
@@ -1093,7 +1140,7 @@ export class LumenqraphClient {
         text = await res.text();
       } catch (err) {
         // Network error or timeout (AbortError).
-        if (attempt < maxRetries) {
+        if (shouldRetry && attempt < maxRetries) {
           await sleep(jitteredDelay(attempt, baseDelayMs, maxDelayMs));
           attempt++;
           continue;
@@ -1108,7 +1155,7 @@ export class LumenqraphClient {
 
       if (!res.ok) {
         // Retryable status?
-        if (RETRYABLE_STATUSES.has(res.status) && attempt < maxRetries) {
+        if (shouldRetry && RETRYABLE_STATUSES.has(res.status) && attempt < maxRetries) {
           const wait = retryAfterMs(res) ?? jitteredDelay(attempt, baseDelayMs, maxDelayMs);
           await sleep(wait);
           attempt++;
