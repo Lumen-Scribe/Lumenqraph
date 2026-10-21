@@ -74,7 +74,7 @@ async-graphql-axum = ">=7.0.7, <7.0.11"
 # Canonical Stellar XDR types. Used ONLY on the cold, once-per-contract spec /
 # ledger-entry path (parsing a contract's on-chain interface). The hot event
 # decode path stays dependency-free in `lumenqraph-core::xdr`.
-stellar-xdr = { version = "23", default-features = false, features = [
+stellar-xdr = { version = "26", default-features = false, features = [
     "std",
     "curr",
     "base64",
@@ -82,7 +82,7 @@ stellar-xdr = { version = "23", default-features = false, features = [
 # Canonical Soroban strkey encoding/decoding (base32 + CRC16-XModem).
 # Already a transitive dependency via stellar-xdr; pinned here explicitly so
 # lumenqraph-core can use it directly in the hot XDR decode path (#413).
-stellar-strkey = "0.0.13"
+stellar-strkey = "1.0.0"
 lru = "0.12"
 # CLI parsing for the indexer. Held to 4.5.x: newer clap releases need a
 # newer Rust than the workspace `rust-version` (1.84).
