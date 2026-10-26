@@ -22,7 +22,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 dotenvy.workspace = true
 sqlx.workspace = true
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.8", features = ["macros"] }
 tower.workspace = true
 tower-http.workspace = true
 async-graphql.workspace = true
@@ -33,15 +33,15 @@ hmac.workspace = true
 hex.workspace = true
 reqwest.workspace = true
 url.workspace = true
-rand = "0.8"
-base64 = "0.22"
-utoipa = { version = "4", features = ["axum_extras", "chrono", "uuid"] }
-utoipa-swagger-ui = { version = "7", features = ["axum"] }
-utoipa-redoc = { version = "4", features = ["axum"] }
+rand = "0.10"
+base64 = "0.23"
+utoipa = { version = "6", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-swagger-ui = { version = "10", features = ["axum"] }
+utoipa-redoc = { version = "7", features = ["axum"] }
 futures = "0.3"
 parking_lot = "0.12"
-lru = "0.12"
-redis = "0.24"
+lru = "0.19"
+redis = "1.7"
 stellar-xdr.workspace = true
 
 [dev-dependencies]
