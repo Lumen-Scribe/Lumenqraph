@@ -40,7 +40,7 @@ dev = [
 ]
 # Regenerates lumenqraph/models.py from openapi.yaml (scripts/codegen.py).
 codegen = [
-    "datamodel-code-generator==0.85.0",
+    "datamodel-code-generator==0.86.0",
 ]
 
 [project.urls]
