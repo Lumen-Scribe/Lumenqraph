@@ -31,7 +31,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
-thiserror = "1"
+thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
@@ -46,9 +46,9 @@ sqlx = { version = "0.8", default-features = false, features = [
     "uuid",
 ] }
 uuid = { version = "1", features = ["v4", "serde"] }
-rand = "0.8"
-sha2 = "0.10"
-hmac = "0.12"
+rand = "0.10"
+sha2 = "0.11"
+hmac = "0.13"
 hex = "0.4"
 subtle = "2"
 futures = "0.3"
@@ -57,9 +57,9 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
 ] }
 url = "2"
-axum = "0.7"
+axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.5", features = ["trace", "cors", "fs", "set-header", "compression-gzip", "compression-br", "timeout"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "fs", "set-header", "compression-gzip", "compression-br", "timeout"] }
 # Constrained to the async-graphql 7.0.x releases that still target axum 0.7:
 # 7.0.11 switched to axum 0.8, which would clash with the rest of the stack
 # (`axum = "0.7"`, `tower-http = "0.5"`, and the utoipa axum integrations).
@@ -69,8 +69,8 @@ tower-http = { version = "0.5", features = ["trace", "cors", "fs", "set-header",
 # the axum-0.8 bump stays gated. Lifting the `<7.0.11` ceiling is the
 # async-graphql side of migrating the whole workspace to axum 0.8 and should be
 # done together with it (tracked separately).
-async-graphql = { version = ">=7.0.7, <7.0.11", features = ["chrono"] }
-async-graphql-axum = ">=7.0.7, <7.0.11"
+async-graphql = { version = ">=7.0.7, <7.2.2", features = ["chrono"] }
+async-graphql-axum = ">=7.0.7, <7.2.2"
 # Canonical Stellar XDR types. Used ONLY on the cold, once-per-contract spec /
 # ledger-entry path (parsing a contract's on-chain interface). The hot event
 # decode path stays dependency-free in `lumenqraph-core::xdr`.
@@ -83,11 +83,11 @@ stellar-xdr = { version = "23", default-features = false, features = [
 # Already a transitive dependency via stellar-xdr; pinned here explicitly so
 # lumenqraph-core can use it directly in the hot XDR decode path (#413).
 stellar-strkey = "0.0.13"
-lru = "0.12"
+lru = "0.19"
 # CLI parsing for the indexer. Held to 4.5.x: newer clap releases need a
 # newer Rust than the workspace `rust-version` (1.84).
 clap = { version = "~4.5", features = ["derive"] }
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 
 [profile.release]
 opt-level = 3
