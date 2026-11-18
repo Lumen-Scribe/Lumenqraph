@@ -130,18 +130,55 @@ silently sending RPC calls to the wrong network.
 
 ## Tools
 
-The MCP server exposes eight tools for agents to discover and query Soroban contracts:
+The MCP server exposes 17 tools for agents to discover and query Soroban contracts. The definitions live in `crates/lumenqraph-mcp/src/tools.rs` (`definitions()`); a client can list them with `tools/list`.
 
 | Tool | Purpose |
 | --- | --- |
 | `list_contracts` | List all indexed contracts with event counts and ledger ranges |
 | `get_contract_interface` | Get a contract's decoded on-chain interface (functions, events, types) |
+| `list_contract_functions` | List a contract's callable functions with typed inputs and outputs, without the full interface payload |
 | `get_contract_upgrades` | View a contract's interface history with semantic diffs and breaking-change detection |
+| `diff_contract_interface` | Compute what changed between any two versions of a contract's interface |
 | `get_contract_state` | Read a contract's current (and historical) instance storage |
 | `get_contract_data` | Read a contract's per-key state — individual entries like token balances |
+| `get_contract_stats` | Summarize a contract's event activity by event name |
 | `query_events` | Query recent indexed events for a contract, newest first |
+| `get_event` | Fetch a single indexed event by its event id |
+| `get_transaction_events` | List every indexed event of a transaction in emission order |
+| `query_transfers` | Query materialized token transfers for a contract, newest first |
+| `query_swaps` | Query materialized AMM swap events for a contract, newest first |
+| `query_nft_events` | Query materialized NFT mint/transfer/burn events for a contract, newest first |
+| `query_liquidity_events` | Query materialized liquidity add/remove events for a contract, newest first |
 | `call_contract` | Invoke a contract's view function read-only via RPC simulation, with type-checking |
 | `simulate_call` | Dry-run ANY contract call (including state-changing ones) without submitting it |
+
+### Tool parameters
+
+Every tool that takes a `contract_id` expects a contract id (`C...`). `limit` values outside the stated range are clamped to it. Parameters marked optional can be omitted.
+
+| Tool | Parameters | Returns |
+| --- | --- | --- |
+| `list_contracts` | none | Indexed contracts with event counts and ledger ranges |
+| `get_contract_interface` | `contract_id` | The decoded interface |
+| `list_contract_functions` | `contract_id` | `contract_id`, `count`, `functions` |
+| `get_contract_upgrades` | `contract_id`; `limit` (optional, 1-200, default 20) | Interface versions, newest first, with diffs |
+| `diff_contract_interface` | `contract_id`; `from` and `to` (both required, interface version numbers >= 1, must differ) | `contract_id`, `from`, `to`, `diff` |
+| `get_contract_state` | `contract_id`; `limit` (optional, 1-200, default 1 = current state) | Instance storage; requires state indexing |
+| `get_contract_data` | `contract_id`; `label` (optional, e.g. `balance`); `limit` (optional, 1-1000, default 100) | Latest value per key; requires key indexing |
+| `get_contract_stats` | `contract_id`; `limit` (optional, 1-50, default 10) | `contract_id`, `total_events`, `counts` (`event_name`, `count`, most frequent first) |
+| `query_events` | `contract_id`; `event_name` (optional); `limit` (optional, 1-200, default 20); `include_raw` (optional, default `false`) | Events, newest first |
+| `get_event` | `event_id`; `include_raw` (optional, default `false`) | `event`; errors if no event has that id |
+| `get_transaction_events` | `tx_hash`; `limit` (optional, 1-1000, default 100); `successful_only` (optional, only events from successful calls); `include_raw` (optional, default `false`) | `tx_hash`, `count`, `events` in emission order |
+| `query_transfers` | `contract_id`; `from` (optional sender); `to` (optional recipient); `limit` (optional, 1-200, default 20) | `contract_id`, `count`, `transfers` (`from_addr`, `to_addr`, `amount`, `kind`, `ledger`, ...) |
+| `query_swaps` | `contract_id`; `sender`, `sell_token`, `buy_token` (all optional); `limit` (optional, 1-200, default 20) | `contract_id`, `count`, `swaps` (sender, sell/buy token and amount, ...) |
+| `query_nft_events` | `contract_id`; `kind` (optional: `mint`, `transfer` or `burn`); `from`, `to`, `token_id` (optional); `limit` (optional, 1-200, default 20) | `contract_id`, `count`, `nft_events` |
+| `query_liquidity_events` | `contract_id`; `kind` (optional: `add` or `remove`); `provider` (optional); `limit` (optional, 1-200, default 20) | `contract_id`, `count`, `liquidity_events` |
+| `call_contract` | `contract_id`; `function`; `args` (object keyed by parameter name, or a positional array) | Typed result of the read-only call |
+| `simulate_call` | `contract_id`; `function`; `args` (as above); `source_account` (optional `G...`) | Typed result, the events the call would emit, and its resource cost |
+
+`query_events`, `get_event` and `get_transaction_events` return a compact event shape (`event_id`, `contract_id`, `ledger`, `closed_at`, `event_type`, `name`, `tx_hash`, `params`, `in_successful_call`). `params` is the enriched record when available, otherwise the decoded value. With `include_raw=true` they return the complete event rows, including raw XDR.
+
+`query_nft_events` and `query_liquidity_events` reject any other `kind` value with an error.
 
 ## Connect to Claude Desktop
 
@@ -450,3 +487,31 @@ cargo test -p lumenqraph-mcp --test '*' -- --ignored
 - [Model Context Protocol](https://modelcontextprotocol.io) — the specification
 - [Lumenqraph README](../README.md#ai-agent-access--the-mcp-server) — quick reference
 - [Architecture](ARCHITECTURE.md) — how the indexer, API, and MCP layers fit together
+
+### Agent: "What changed between two versions?"
+
+**Agent prompt:**
+```
+Contract <contract_id> was upgraded. What changed between version 1 and version 3, and is it breaking?
+```
+
+**Agent uses:** `get_contract_upgrades` with `contract_id` to see which versions exist, then `diff_contract_interface` with:
+- `contract_id: "<contract_id>"`
+- `from: 1`
+- `to: 3`
+
+**Result:** an object with `contract_id`, `from`, `to` and a `diff` describing the functions, events and types that were added, removed or changed between the two versions. `diff_contract_interface` compares any two versions directly, so the agent does not have to chain the per-upgrade diffs from `get_contract_upgrades`.
+
+### Agent: "Show a wallet's transfer history"
+
+**Agent prompt:**
+```
+Show the 10 most recent transfers of token <contract_id> sent by <address>.
+```
+
+**Agent uses:** `query_transfers` with:
+- `contract_id: "<contract_id>"`
+- `from: "<address>"`
+- `limit: 10`
+
+**Result:** an object with `contract_id`, `count` and a `transfers` array, newest first. Each transfer carries `event_id`, `from_addr`, `to_addr`, `amount`, `kind`, `ledger` and `ledger_closed_at`. Pass `to` instead of (or together with) `from` to filter by recipient.
