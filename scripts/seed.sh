@@ -27,6 +27,7 @@ if [[ -z "${SEED_LEDGER:-}" ]]; then
   SEED_LEDGER=$(( 2 + (NOW_UNIX - GENESIS_UNIX) / 5 ))
 fi
 
+# Reject anything that is not a plain integer before it reaches SQL.
 if ! [[ "${SEED_LEDGER}" =~ ^[0-9]+$ ]]; then
   echo "error: SEED_LEDGER must be a non-negative integer, got: ${SEED_LEDGER}" >&2
   exit 1
@@ -39,8 +40,7 @@ echo "Applying seed data to ${DATABASE_URL}..."
 # seed.sql can read it via current_setting('seed.ledger', true).
 psql "$DATABASE_URL" \
   -v ON_ERROR_STOP=1 \
-  -v ledger="${SEED_LEDGER}" \
-  -c "SET seed.ledger = :'ledger';" \
+  -c "SET seed.ledger = ${SEED_LEDGER};" \
   -f "$(dirname "$0")/seed.sql"
 
 # ---------------------------------------------------------------------------
