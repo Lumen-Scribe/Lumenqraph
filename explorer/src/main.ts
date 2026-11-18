@@ -4,7 +4,7 @@ import * as ui from './ui';
 
 let selected: string | null = null;
 let tab = 'events';
-let healthTimer: NodeJS.Timeout | null = null;
+let healthTimer: ReturnType<typeof setInterval> | null = null;
 let mounts: Record<string, string> = {};
 let ifaceVersion: number | null = null;
 
