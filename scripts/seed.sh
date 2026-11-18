@@ -27,6 +27,11 @@ if [[ -z "${SEED_LEDGER:-}" ]]; then
   SEED_LEDGER=$(( 2 + (NOW_UNIX - GENESIS_UNIX) / 5 ))
 fi
 
+if ! [[ "${SEED_LEDGER}" =~ ^[0-9]+$ ]]; then
+  echo "error: SEED_LEDGER must be a non-negative integer, got: ${SEED_LEDGER}" >&2
+  exit 1
+fi
+
 echo "Using SEED_LEDGER=${SEED_LEDGER}"
 echo "Applying seed data to ${DATABASE_URL}..."
 
@@ -34,7 +39,8 @@ echo "Applying seed data to ${DATABASE_URL}..."
 # seed.sql can read it via current_setting('seed.ledger', true).
 psql "$DATABASE_URL" \
   -v ON_ERROR_STOP=1 \
-  -c "SET seed.ledger = ${SEED_LEDGER};" \
+  -v ledger="${SEED_LEDGER}" \
+  -c "SET seed.ledger = :'ledger';" \
   -f "$(dirname "$0")/seed.sql"
 
 # ---------------------------------------------------------------------------
@@ -42,11 +48,11 @@ psql "$DATABASE_URL" \
 # reports near-zero lag immediately after seeding.
 # ---------------------------------------------------------------------------
 echo "Setting indexer_cursor to ledger ${SEED_LEDGER}..."
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<SQL
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -v ledger="${SEED_LEDGER}" <<SQL
 INSERT INTO indexer_cursor (id, last_processed_ledger, updated_at)
-VALUES (1, ${SEED_LEDGER}, NOW())
+VALUES (1, :ledger, NOW())
 ON CONFLICT (id) DO UPDATE
-    SET last_processed_ledger = ${SEED_LEDGER},
+    SET last_processed_ledger = :ledger,
         updated_at             = NOW();
 SQL
 
