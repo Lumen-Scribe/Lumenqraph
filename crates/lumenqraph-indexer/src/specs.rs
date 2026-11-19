@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lru::LruCache;
-use lumenqraph_core::{ContractSpec, SpecDiff};
+use lumenqraph_core::{ContractKind, ContractSpec, SpecDiff};
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
@@ -45,6 +45,8 @@ struct Cached {
     spec: CachedSpec,
     /// The executable hash the cached spec was parsed from (`None` for SAC).
     wasm_hash: Option<String>,
+    /// The contract kind derived from the spec, computed once per spec load.
+    kind: Option<ContractKind>,
 }
 
 impl Default for Cached {
@@ -52,6 +54,7 @@ impl Default for Cached {
         Self {
             spec: CachedSpec::NoSpec,
             wasm_hash: None,
+            kind: None,
         }
     }
 }
@@ -96,6 +99,19 @@ impl SpecCache {
             })
     }
 
+    /// The contract kind for a contract, derived from its cached spec.
+    ///
+    /// Returns `None` when the spec isn't cached (or has no usable spec). The
+    /// kind is computed once per spec load and stored alongside it, so this is a
+    /// cheap in-memory lookup suitable for the per-event resolver.
+    pub fn kind(&self, contract_id: &str) -> Option<ContractKind> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(contract_id)
+            .and_then(|c| c.kind)
+    }
+
     /// The spec for a contract, fetching+parsing+persisting on first use.
     /// Distinguishes transient failures (retryable) from permanent failures (SAC).
     /// Concurrent fetches are bounded by the semaphore; already-cached lookups bypass it.
@@ -138,6 +154,11 @@ impl SpecCache {
                 }
             }
         };
+        // Classify once per spec load; the resolver reads this on every event.
+        let kind = match &cached_spec {
+            CachedSpec::Spec(s) => classify_kind(s),
+            _ => None,
+        };
         {
             let mut map = self.inner.lock().unwrap();
             map.put(
@@ -145,6 +166,7 @@ impl SpecCache {
                 Cached {
                     spec: cached_spec.clone(),
                     wasm_hash,
+                    kind,
                 },
             );
             // LruCache::len() is O(1) and accounts for any eviction this insert
@@ -196,6 +218,36 @@ impl SpecCache {
             let _ = self.get(pool, rpc, contract_id, ledger).await;
         }
     }
+}
+
+/// Classify a contract from its parsed spec using well-known interface shapes.
+///
+/// Heuristics, checked in order (most specific first):
+/// - AMM: declares a `swap` event and `get_reserves`/`swap` functions.
+/// - NFT: declares `owner_of`/`token_uri` functions.
+/// - Liquidity pool: declares `deposit`/`withdraw` events and a `shares` field.
+/// - Fungible token: declares the SEP-41 `transfer`/`approve`/`balance` functions.
+///
+/// Returns `None` when the spec matches none of these shapes. SAC detection is
+/// left to `default_contract_kind`, which handles specs we never parse.
+fn classify_kind(spec: &ContractSpec) -> Option<ContractKind> {
+    let has_event = |name: &str| spec.events.iter().any(|e| e.name == name);
+    let has_function = |name: &str| spec.functions.iter().any(|f| f.name == name);
+    let has_field = |name: &str| spec.fields.iter().any(|f| f.name == name);
+
+    if has_event("swap") && (has_function("get_reserves") || has_function("swap")) {
+        return Some(ContractKind::Amm);
+    }
+    if has_function("owner_of") || has_function("token_uri") {
+        return Some(ContractKind::NonFungibleToken);
+    }
+    if (has_event("deposit") || has_event("withdraw")) && has_field("shares") {
+        return Some(ContractKind::LiquidityPool);
+    }
+    if has_function("transfer") && has_function("approve") && has_function("balance") {
+        return Some(ContractKind::FungibleToken);
+    }
+    None
 }
 
 /// Check whether `contract_id` has been upgraded, and if so re-read its

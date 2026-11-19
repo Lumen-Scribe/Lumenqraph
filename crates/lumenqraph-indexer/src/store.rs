@@ -15,6 +15,22 @@ use tracing::debug;
 /// (issue #600).
 static TRANSFER_PROJECTION_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Counts vertical projection failures (swaps, NFT events, liquidity events)
+/// that were rolled back to a savepoint so the raw events could still commit
+/// (issue #730).
+static VERTICAL_PROJECTION_FAILED: AtomicU64 = AtomicU64::new(0);
+
+/// Total number of vertical projection failures since process start. Exposed
+/// for the `lumenqraph_vertical_projection_failed_total` metric.
+#[allow(dead_code)] // read by the metrics endpoint
+pub fn vertical_projection_failed_total() -> u64 {
+    VERTICAL_PROJECTION_FAILED.load(Ordering::Relaxed)
+}
+
+fn record_vertical_projection_failed() {
+    VERTICAL_PROJECTION_FAILED.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Total number of transfer-like events skipped by the projection since process
 /// start. Exposed for the `lumenqraph_transfer_projection_skipped_total` metric.
 #[allow(dead_code)] // read by the metrics endpoint
@@ -225,107 +241,155 @@ pub async fn insert_events_with_resolver(
         }
 
         // Vertical projections (#599): swaps, NFT events and liquidity events.
-        // Written in the same transaction as the events insert.
-        project_verticals(&mut tx, &new_events, resolve).await?;
+        // Run inside a nested transaction (SAVEPOINT) so a projection failure
+        // is logged and counted instead of rolling back the events insert
+        // (issue #730).
+        let mut proj = tx.begin().await?;
+        match project_verticals(&mut proj, &new_events, resolve).await {
+            Ok(()) => proj.commit().await?,
+            Err(err) => {
+                record_vertical_projection_failed();
+                tracing::warn!(error = %err, "vertical projection failed; events still committed");
+                proj.rollback().await?;
+            }
+        }
     }
 
     // Wake the API's SSE fan-out. Postgres delivers NOTIFY only on commit, so
     // it is sent in the same transaction as the rows it announces (#569).
-    sqlx::query("SELECT pg_notify('lumenqraph_events', '')")
-        .execute(&mut *tx)
-        .await?;
+    // Only notify when rows were actually inserted, and carry the new max seq
+    // so listeners can skip the catch-up query when already past it (#732).
+    if inserted_count > 0 {
+        let max_seq: Option<i64> = sqlx::query_scalar("SELECT MAX(seq) FROM events")
+            .fetch_one(&mut *tx)
+            .await?;
+        sqlx::query("SELECT pg_notify('lumenqraph_events', $1)")
+            .bind(max_seq.unwrap_or(0).to_string())
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
     Ok(inserted_count)
 }
 
 /// Write `amm_swaps`, `nft_events` and `liquidity_events` rows for the given
-/// newly-inserted events, gated on the resolved contract kind.
+/// newly-inserted events, gated on the resolved contract kind. Column names and
+/// value vocabularies match migrations 0012/0013/0014 (issue #730).
 async fn project_verticals(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     events: &[&NewEvent],
     resolve: &ContractKindResolver<'_>,
 ) -> anyhow::Result<()> {
+    // amm_swaps: sell_* / buy_* columns, sell_amount and buy_amount NOT NULL.
     let swaps: Vec<Swap> = events
         .iter()
         .filter_map(|e| extract_swap(e, resolve))
+        .filter(|s| {
+            let ok = s.sell_amount.is_some() && s.buy_amount.is_some();
+            if !ok {
+                record_vertical_projection_failed();
+            }
+            ok
+        })
         .collect();
     if !swaps.is_empty() {
         let s_event_ids: Vec<String> = swaps.iter().map(|s| s.event_id.clone()).collect();
         let s_contract_ids: Vec<String> = swaps.iter().map(|s| s.contract_id.clone()).collect();
         let s_senders: Vec<Option<String>> = swaps.iter().map(|s| s.sender.clone()).collect();
-        let s_recipients: Vec<Option<String>> = swaps.iter().map(|s| s.recipient.clone()).collect();
-        let s_token_ins: Vec<Option<String>> = swaps.iter().map(|s| s.token_in.clone()).collect();
-        let s_token_outs: Vec<Option<String>> = swaps.iter().map(|s| s.token_out.clone()).collect();
-        let s_amount_ins: Vec<Option<String>> = swaps.iter().map(|s| s.amount_in.clone()).collect();
-        let s_amount_outs: Vec<Option<String>> =
-            swaps.iter().map(|s| s.amount_out.clone()).collect();
+        let s_sell_tokens: Vec<Option<String>> =
+            swaps.iter().map(|s| s.sell_token.clone()).collect();
+        let s_buy_tokens: Vec<Option<String>> = swaps.iter().map(|s| s.buy_token.clone()).collect();
+        let s_sell_amounts: Vec<String> = swaps
+            .iter()
+            .map(|s| s.sell_amount.clone().unwrap_or_default())
+            .collect();
+        let s_buy_amounts: Vec<String> = swaps
+            .iter()
+            .map(|s| s.buy_amount.clone().unwrap_or_default())
+            .collect();
+        let s_raw_event_names: Vec<String> =
+            swaps.iter().map(|s| s.raw_event_name.clone()).collect();
         let s_ledgers: Vec<i64> = swaps.iter().map(|s| s.ledger).collect();
         let s_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
             swaps.iter().map(|s| s.ledger_closed_at).collect();
 
         sqlx::query(
             "INSERT INTO amm_swaps
-                (event_id, contract_id, sender, recipient, token_in, token_out,
-                 amount_in, amount_out, ledger, ledger_closed_at)
+                (event_id, contract_id, sender, sell_token, buy_token,
+                 sell_amount, buy_amount, raw_event_name, ledger, ledger_closed_at)
              SELECT * FROM UNNEST(
-                $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
-                $7::numeric[], $8::numeric[], $9::bigint[], $10::timestamptz[]
-             ) AS t(event_id, contract_id, sender, recipient, token_in, token_out,
-                    amount_in, amount_out, ledger, ledger_closed_at)
+                $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
+                $6::numeric[], $7::numeric[], $8::text[], $9::bigint[], $10::timestamptz[]
+             ) AS t(event_id, contract_id, sender, sell_token, buy_token,
+                    sell_amount, buy_amount, raw_event_name, ledger, ledger_closed_at)
              ON CONFLICT (event_id) DO NOTHING",
         )
         .bind(&s_event_ids)
         .bind(&s_contract_ids)
         .bind(&s_senders)
-        .bind(&s_recipients)
-        .bind(&s_token_ins)
-        .bind(&s_token_outs)
-        .bind(&s_amount_ins)
-        .bind(&s_amount_outs)
+        .bind(&s_sell_tokens)
+        .bind(&s_buy_tokens)
+        .bind(&s_sell_amounts)
+        .bind(&s_buy_amounts)
+        .bind(&s_raw_event_names)
         .bind(&s_ledgers)
         .bind(&s_closed_ats)
         .execute(&mut **tx)
         .await?;
     }
 
+    // nft_events: event_kind column, token_id NOT NULL. Skip (and count) rows
+    // without a token id rather than violating the constraint.
     let nfts: Vec<NftEvent> = events
         .iter()
         .filter_map(|e| extract_nft_event(e, resolve))
+        .filter(|n| {
+            let ok = n.token_id.is_some();
+            if !ok {
+                record_vertical_projection_failed();
+            }
+            ok
+        })
         .collect();
     if !nfts.is_empty() {
         let n_event_ids: Vec<String> = nfts.iter().map(|n| n.event_id.clone()).collect();
         let n_contract_ids: Vec<String> = nfts.iter().map(|n| n.contract_id.clone()).collect();
         let n_kinds: Vec<String> = nfts.iter().map(|n| n.kind.clone()).collect();
-        let n_token_ids: Vec<Option<String>> = nfts.iter().map(|n| n.token_id.clone()).collect();
         let n_froms: Vec<Option<String>> = nfts.iter().map(|n| n.from_addr.clone()).collect();
         let n_tos: Vec<Option<String>> = nfts.iter().map(|n| n.to_addr.clone()).collect();
+        let n_token_ids: Vec<String> = nfts
+            .iter()
+            .map(|n| n.token_id.clone().unwrap_or_default())
+            .collect();
         let n_ledgers: Vec<i64> = nfts.iter().map(|n| n.ledger).collect();
         let n_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
             nfts.iter().map(|n| n.ledger_closed_at).collect();
 
         sqlx::query(
             "INSERT INTO nft_events
-                (event_id, contract_id, kind, token_id, from_addr, to_addr,
+                (event_id, contract_id, event_kind, from_addr, to_addr, token_id,
                  ledger, ledger_closed_at)
              SELECT * FROM UNNEST(
                 $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
                 $7::bigint[], $8::timestamptz[]
-             ) AS t(event_id, contract_id, kind, token_id, from_addr, to_addr,
+             ) AS t(event_id, contract_id, event_kind, from_addr, to_addr, token_id,
                     ledger, ledger_closed_at)
              ON CONFLICT (event_id) DO NOTHING",
         )
         .bind(&n_event_ids)
         .bind(&n_contract_ids)
         .bind(&n_kinds)
-        .bind(&n_token_ids)
         .bind(&n_froms)
         .bind(&n_tos)
+        .bind(&n_token_ids)
         .bind(&n_ledgers)
         .bind(&n_closed_ats)
         .execute(&mut **tx)
         .await?;
     }
 
+    // liquidity_events: event_kind add/remove, shares, raw_event_name,
+    // extra_amounts JSONB; no token_a/token_b columns.
     let liqs: Vec<LiquidityEvent> = events
         .iter()
         .filter_map(|e| extract_liquidity_event(e, resolve))
@@ -335,33 +399,39 @@ async fn project_verticals(
         let l_contract_ids: Vec<String> = liqs.iter().map(|l| l.contract_id.clone()).collect();
         let l_kinds: Vec<String> = liqs.iter().map(|l| l.kind.clone()).collect();
         let l_providers: Vec<Option<String>> = liqs.iter().map(|l| l.provider.clone()).collect();
-        let l_token_as: Vec<Option<String>> = liqs.iter().map(|l| l.token_a.clone()).collect();
-        let l_token_bs: Vec<Option<String>> = liqs.iter().map(|l| l.token_b.clone()).collect();
         let l_amount_as: Vec<Option<String>> = liqs.iter().map(|l| l.amount_a.clone()).collect();
         let l_amount_bs: Vec<Option<String>> = liqs.iter().map(|l| l.amount_b.clone()).collect();
+        let l_shares: Vec<Option<String>> = liqs.iter().map(|l| l.shares.clone()).collect();
+        let l_raw_event_names: Vec<String> =
+            liqs.iter().map(|l| l.raw_event_name.clone()).collect();
+        let l_extra_amounts: Vec<Option<String>> = liqs
+            .iter()
+            .map(|l| serde_json::to_string(&l.extra_amounts).ok())
+            .collect();
         let l_ledgers: Vec<i64> = liqs.iter().map(|l| l.ledger).collect();
         let l_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
             liqs.iter().map(|l| l.ledger_closed_at).collect();
 
         sqlx::query(
             "INSERT INTO liquidity_events
-                (event_id, contract_id, kind, provider, token_a, token_b,
-                 amount_a, amount_b, ledger, ledger_closed_at)
+                (event_id, contract_id, event_kind, provider, amount_a, amount_b,
+                 shares, raw_event_name, extra_amounts, ledger, ledger_closed_at)
              SELECT * FROM UNNEST(
-                $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
-                $7::numeric[], $8::numeric[], $9::bigint[], $10::timestamptz[]
-             ) AS t(event_id, contract_id, kind, provider, token_a, token_b,
-                    amount_a, amount_b, ledger, ledger_closed_at)
+                $1::text[], $2::text[], $3::text[], $4::text[], $5::numeric[], $6::numeric[],
+                $7::numeric[], $8::text[], $9::jsonb[], $10::bigint[], $11::timestamptz[]
+             ) AS t(event_id, contract_id, event_kind, provider, amount_a, amount_b,
+                    shares, raw_event_name, extra_amounts, ledger, ledger_closed_at)
              ON CONFLICT (event_id) DO NOTHING",
         )
         .bind(&l_event_ids)
         .bind(&l_contract_ids)
         .bind(&l_kinds)
         .bind(&l_providers)
-        .bind(&l_token_as)
-        .bind(&l_token_bs)
         .bind(&l_amount_as)
         .bind(&l_amount_bs)
+        .bind(&l_shares)
+        .bind(&l_raw_event_names)
+        .bind(&l_extra_amounts)
         .bind(&l_ledgers)
         .bind(&l_closed_ats)
         .execute(&mut **tx)
@@ -525,9 +595,16 @@ pub async fn upsert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result
 
     // Wake the API's SSE fan-out. Postgres delivers NOTIFY only on commit, so
     // it is sent in the same transaction as the rows it announces (#569).
-    sqlx::query("SELECT pg_notify('lumenqraph_events', '')")
-        .execute(&mut *tx)
-        .await?;
+    // Updates don't change `seq`, so only notify when rows were inserted (#732).
+    if inserted > 0 {
+        let max_seq: Option<i64> = sqlx::query_scalar("SELECT MAX(seq) FROM events")
+            .fetch_one(&mut *tx)
+            .await?;
+        sqlx::query("SELECT pg_notify('lumenqraph_events', $1)")
+            .bind(max_seq.unwrap_or(0).to_string())
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
     Ok((inserted, updated))
 }
@@ -547,11 +624,11 @@ struct Swap {
     event_id: String,
     contract_id: String,
     sender: Option<String>,
-    recipient: Option<String>,
-    token_in: Option<String>,
-    token_out: Option<String>,
-    amount_in: Option<String>,
-    amount_out: Option<String>,
+    sell_token: Option<String>,
+    buy_token: Option<String>,
+    sell_amount: Option<String>,
+    buy_amount: Option<String>,
+    raw_event_name: String,
     ledger: i64,
     ledger_closed_at: chrono::DateTime<chrono::Utc>,
 }
@@ -572,10 +649,11 @@ struct LiquidityEvent {
     contract_id: String,
     kind: String,
     provider: Option<String>,
-    token_a: Option<String>,
-    token_b: Option<String>,
     amount_a: Option<String>,
     amount_b: Option<String>,
+    shares: Option<String>,
+    raw_event_name: String,
+    extra_amounts: Value,
     ledger: i64,
     ledger_closed_at: chrono::DateTime<chrono::Utc>,
 }
@@ -704,11 +782,11 @@ fn extract_swap(e: &NewEvent, resolve: &ContractKindResolver<'_>) -> Option<Swap
         event_id: e.event_id.clone(),
         contract_id: e.contract_id.clone(),
         sender: as_addr(e.decoded_topics.get(1)),
-        recipient: as_addr(e.decoded_topics.get(2)),
-        token_in: as_addr(e.decoded_topics.get(3)),
-        token_out: as_addr(e.decoded_topics.get(4)),
-        amount_in,
-        amount_out,
+        sell_token: as_addr(e.decoded_topics.get(3)),
+        buy_token: as_addr(e.decoded_topics.get(4)),
+        sell_amount: amount_in,
+        buy_amount: amount_out,
+        raw_event_name: e.event_name.clone().unwrap_or_default(),
         ledger: e.ledger,
         ledger_closed_at: e.ledger_closed_at,
     })
@@ -769,9 +847,10 @@ fn extract_liquidity_event(
     e: &NewEvent,
     resolve: &ContractKindResolver<'_>,
 ) -> Option<LiquidityEvent> {
+    // Migration 0014 uses `add`/`remove` as the event_kind vocabulary.
     let kind = match e.event_name.as_deref()? {
-        "deposit" => "deposit",
-        "withdraw" => "withdraw",
+        "deposit" => "add",
+        "withdraw" => "remove",
         _ => return None,
     };
     if resolve(&e.contract_id) != Some(ContractKind::LiquidityPool) {
@@ -790,15 +869,29 @@ fn extract_liquidity_event(
         _ => (None, None),
     };
 
+    let shares = match &e.decoded_value {
+        Value::Object(map) => map.get("shares").and_then(as_i128_amount),
+        _ => None,
+    };
+
+    let extra_amounts = match &e.decoded_value {
+        Value::Object(map) => map
+            .get("extra_amounts")
+            .cloned()
+            .unwrap_or(Value::Null),
+        _ => Value::Null,
+    };
+
     Some(LiquidityEvent {
         event_id: e.event_id.clone(),
         contract_id: e.contract_id.clone(),
         kind: kind.to_string(),
         provider: as_addr(e.decoded_topics.get(1)),
-        token_a: as_addr(e.decoded_topics.get(2)),
-        token_b: as_addr(e.decoded_topics.get(3)),
         amount_a,
         amount_b,
+        shares,
+        raw_event_name: e.event_name.clone().unwrap_or_default(),
+        extra_amounts,
         ledger: e.ledger,
         ledger_closed_at: e.ledger_closed_at,
     })

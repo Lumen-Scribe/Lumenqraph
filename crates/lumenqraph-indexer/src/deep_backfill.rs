@@ -452,14 +452,14 @@ pub async fn run(
         }
 
         if batch.len() >= batch_size {
-            let n = flush_batch(&pool, &mut batch).await?;
+            let n = flush_batch(&pool, &specs, &mut batch).await?;
             total_inserted += n;
             debug!(inserted = n, lines_processed, "flushed batch");
         }
     }
 
     if !batch.is_empty() {
-        let n = flush_batch(&pool, &mut batch).await?;
+        let n = flush_batch(&pool, &specs, &mut batch).await?;
         total_inserted += n;
     }
 
@@ -470,8 +470,13 @@ pub async fn run(
     Ok(())
 }
 
-async fn flush_batch(pool: &PgPool, batch: &mut Vec<NewEvent>) -> anyhow::Result<u64> {
-    let inserted = store::insert_events(pool, batch).await?;
+async fn flush_batch(
+    pool: &PgPool,
+    specs: &SpecCache,
+    batch: &mut Vec<NewEvent>,
+) -> anyhow::Result<u64> {
+    let inserted =
+        store::insert_events_with_resolver(pool, batch, &|cid| specs.kind(cid)).await?;
     batch.clear();
     Ok(inserted)
 }
