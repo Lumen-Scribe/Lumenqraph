@@ -11,9 +11,9 @@
 
 #[cfg(test)]
 mod projection_tests {
-    use chrono::Utc;
     use crate::store;
-    use lumenqraph_core::NewEvent;
+    use chrono::Utc;
+    use lumenqraph_core::{EventType, NewEvent};
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
     use sqlx::Row;
@@ -41,7 +41,7 @@ mod projection_tests {
             contract_id: contract_id.to_string(),
             ledger,
             ledger_closed_at: Utc::now(),
-            event_type: lumenqraph_core::EventType::Contract,
+            event_type: EventType::Contract,
             topics: vec![],
             decoded_topics: topics.as_array().cloned().unwrap_or_default(),
             event_name: Some(event_name.to_string()),
@@ -235,12 +235,24 @@ mod projection_tests {
         .await
         .expect("Swap should be projected into amm_swaps");
 
-        assert_eq!(row.get::<Option<String>, _>("sender").as_deref(), Some(sender.as_str()));
-        assert_eq!(row.get::<Option<String>, _>("sell_token").as_deref(), Some(sell_token.as_str()));
-        assert_eq!(row.get::<Option<String>, _>("buy_token").as_deref(), Some(buy_token.as_str()));
+        assert_eq!(
+            row.get::<Option<String>, _>("sender").as_deref(),
+            Some(sender.as_str())
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("sell_token").as_deref(),
+            Some(sell_token.as_str())
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("buy_token").as_deref(),
+            Some(buy_token.as_str())
+        );
         assert_eq!(row.get::<String, _>("sell_amount"), "1000000000");
         assert_eq!(row.get::<String, _>("buy_amount"), "2000000000");
-        assert_eq!(row.get::<Option<String>, _>("raw_event_name").as_deref(), Some("swap"));
+        assert_eq!(
+            row.get::<Option<String>, _>("raw_event_name").as_deref(),
+            Some("swap")
+        );
 
         cleanup_test_data(&pool, &contract_id).await;
     }
@@ -280,7 +292,10 @@ mod projection_tests {
 
         assert_eq!(row.get::<String, _>("event_kind"), "mint");
         assert_eq!(row.get::<Option<String>, _>("from_addr"), None);
-        assert_eq!(row.get::<Option<String>, _>("to_addr").as_deref(), Some(recipient.as_str()));
+        assert_eq!(
+            row.get::<Option<String>, _>("to_addr").as_deref(),
+            Some(recipient.as_str())
+        );
         assert_eq!(row.get::<String, _>("token_id"), "token_123");
 
         cleanup_test_data(&pool, &contract_id).await;
@@ -321,8 +336,14 @@ mod projection_tests {
         .expect("Transfer should be projected into nft_events");
 
         assert_eq!(row.get::<String, _>("event_kind"), "transfer");
-        assert_eq!(row.get::<Option<String>, _>("from_addr").as_deref(), Some(from.as_str()));
-        assert_eq!(row.get::<Option<String>, _>("to_addr").as_deref(), Some(to.as_str()));
+        assert_eq!(
+            row.get::<Option<String>, _>("from_addr").as_deref(),
+            Some(from.as_str())
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("to_addr").as_deref(),
+            Some(to.as_str())
+        );
         assert_eq!(row.get::<String, _>("token_id"), "nft_id_456");
 
         cleanup_test_data(&pool, &contract_id).await;
@@ -403,8 +424,14 @@ mod projection_tests {
         .await
         .expect("SEP-41 transfer should be projected into token_transfers");
 
-        assert_eq!(row.get::<Option<String>, _>("from_addr").as_deref(), Some(from.as_str()));
-        assert_eq!(row.get::<Option<String>, _>("to_addr").as_deref(), Some(to.as_str()));
+        assert_eq!(
+            row.get::<Option<String>, _>("from_addr").as_deref(),
+            Some(from.as_str())
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("to_addr").as_deref(),
+            Some(to.as_str())
+        );
         assert_eq!(row.get::<String, _>("amount"), "12345");
         assert_eq!(
             row.get::<Option<String>, _>("amount_numeric").as_deref(),
@@ -452,11 +479,26 @@ mod projection_tests {
         .expect("Deposit should be projected into liquidity_events");
 
         assert_eq!(row.get::<String, _>("event_kind"), "add");
-        assert_eq!(row.get::<Option<String>, _>("provider").as_deref(), Some(provider.as_str()));
-        assert_eq!(row.get::<Option<String>, _>("amount_a").as_deref(), Some("1000000"));
-        assert_eq!(row.get::<Option<String>, _>("amount_b").as_deref(), Some("2000000"));
-        assert_eq!(row.get::<Option<String>, _>("shares").as_deref(), Some("1500000"));
-        assert_eq!(row.get::<Option<String>, _>("raw_event_name").as_deref(), Some("deposit"));
+        assert_eq!(
+            row.get::<Option<String>, _>("provider").as_deref(),
+            Some(provider.as_str())
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("amount_a").as_deref(),
+            Some("1000000")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("amount_b").as_deref(),
+            Some("2000000")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("shares").as_deref(),
+            Some("1500000")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("raw_event_name").as_deref(),
+            Some("deposit")
+        );
 
         cleanup_test_data(&pool, &contract_id).await;
     }
@@ -473,7 +515,10 @@ mod projection_tests {
         let now = Utc::now();
         let event_id = "withdraw_event_1";
 
-        let decoded_topics = json!(["withdraw", "GPROVIDER_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"]);
+        let decoded_topics = json!([
+            "withdraw",
+            "GPROVIDER_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+        ]);
 
         let decoded_value = json!({
             "amounts": ["500000", "750000"],
@@ -500,13 +545,12 @@ mod projection_tests {
         .expect("Failed to insert withdraw event");
 
         // Fetch and project
-        let event = sqlx::query(
-            "SELECT decoded_topics, decoded_value FROM events WHERE event_id = $1",
-        )
-        .bind(event_id)
-        .fetch_one(&pool)
-        .await
-        .expect("Failed to fetch event");
+        let event =
+            sqlx::query("SELECT decoded_topics, decoded_value FROM events WHERE event_id = $1")
+                .bind(event_id)
+                .fetch_one(&pool)
+                .await
+                .expect("Failed to fetch event");
 
         let topics_str: String = event.try_get("decoded_topics").unwrap();
         let value_str: String = event.try_get("decoded_value").unwrap();

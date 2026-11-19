@@ -44,12 +44,11 @@ pub async fn health(State(state): State<AppState>) -> ApiResult<Json<Value>> {
         })));
     };
 
-    let unrecovered_missed_ranges: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM missed_ranges WHERE recovered_at IS NULL",
-    )
-    .fetch_one(&state.pool)
-    .await
-    .unwrap_or(0);
+    let unrecovered_missed_ranges: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM missed_ranges WHERE recovered_at IS NULL")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap_or(0);
 
     let lag_ledgers = (tip - last).max(0);
     let secs_since_update = (chrono::Utc::now() - updated_at).num_seconds();
@@ -87,7 +86,12 @@ pub async fn livez() -> StatusCode {
 
 /// Whether the indexer cursor is recent and close enough to the chain tip.
 /// Shared by `/health` (reports `degraded`) and, when opted in, `/readyz`.
-pub fn indexer_fresh(lag_ledgers: i64, secs_since_update: i64, max_lag: i64, max_age_secs: i64) -> bool {
+pub fn indexer_fresh(
+    lag_ledgers: i64,
+    secs_since_update: i64,
+    max_lag: i64,
+    max_age_secs: i64,
+) -> bool {
     secs_since_update <= max_age_secs && lag_ledgers < max_lag
 }
 

@@ -489,6 +489,108 @@ WEBHOOK_ENCRYPTION_KEY="$(openssl rand -hex 32)"
 
 ---
 
+## Complete Reference by Service
+
+The tables below cover the remaining runtime settings, grouped by the service that reads them. A **Sensitive** setting affects authentication, network exposure, rate limiting or resource limits. Review these before deploying. Settings already described above are not repeated.
+
+### Database connection pools
+
+Every service reads the shared `DATABASE_*` settings. Each service also reads its own override (`INDEXER_DATABASE_*`, `MCP_DATABASE_*`). When both are set, the override wins.
+
+| Variable | Default | Used by | Purpose |
+|----------|---------|---------|---------|
+| `DATABASE_MAX_CONNECTIONS` | 10 (API), 5 (webhooks) | API, webhooks, and the fallback for indexer and MCP | Maximum pooled connections. |
+| `DATABASE_MIN_CONNECTIONS` | 1 (API, webhooks), 0 (indexer, MCP) | All | Minimum pooled connections. The indexer clamps this to the maximum. |
+| `DATABASE_ACQUIRE_TIMEOUT_SECS` | 30 | All | Seconds to wait for a pooled connection before failing. |
+| `DATABASE_IDLE_TIMEOUT_SECS` | 600 | All | Seconds before an idle connection is closed. |
+| `DATABASE_CONNECT_RETRIES` | 30 | All | Connection attempts at startup, for when the database starts late. |
+| `INDEXER_DATABASE_MAX_CONNECTIONS` | shared value (10 if unset) | Indexer | Indexer override of `DATABASE_MAX_CONNECTIONS`. |
+| `INDEXER_DATABASE_MIN_CONNECTIONS` | shared value (0 if unset) | Indexer | Indexer override of `DATABASE_MIN_CONNECTIONS`. |
+| `INDEXER_DATABASE_ACQUIRE_TIMEOUT_SECS` | shared value (30 if unset) | Indexer | Indexer override of `DATABASE_ACQUIRE_TIMEOUT_SECS`. |
+| `INDEXER_DATABASE_IDLE_TIMEOUT_SECS` | shared value (600 if unset) | Indexer | Indexer override of `DATABASE_IDLE_TIMEOUT_SECS`. |
+| `INDEXER_DATABASE_CONNECT_RETRIES` | shared value (30 if unset) | Indexer | Indexer override of `DATABASE_CONNECT_RETRIES`. |
+| `MCP_DATABASE_MAX_CONNECTIONS` | shared value (5 if unset) | MCP | MCP override of `DATABASE_MAX_CONNECTIONS`. |
+| `MCP_DATABASE_MIN_CONNECTIONS` | shared value (0 if unset) | MCP | MCP override of `DATABASE_MIN_CONNECTIONS`. |
+| `MCP_DATABASE_ACQUIRE_TIMEOUT_SECS` | shared value (30 if unset) | MCP | MCP override of `DATABASE_ACQUIRE_TIMEOUT_SECS`. |
+| `MCP_DATABASE_IDLE_TIMEOUT_SECS` | shared value (600 if unset) | MCP | MCP override of `DATABASE_IDLE_TIMEOUT_SECS`. |
+| `MCP_DATABASE_CONNECT_RETRIES` | shared value (30 if unset) | MCP | MCP override of `DATABASE_CONNECT_RETRIES`. |
+
+### Indexer
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `INDEXER_HTTP_BIND_ADDR` | `127.0.0.1:9090` | Address for the indexer's `/health` and `/metrics`. Loopback by default, so they are not public (#605). **Sensitive:** binding to `0.0.0.0` exposes both. |
+| `METRICS_BEARER_TOKEN` | unset | When set, `/metrics` requires `Authorization: Bearer <token>`. An empty value means no authentication. **Sensitive.** |
+| `METRICS_API_KEY` | unset | Used for `/metrics` only when `METRICS_BEARER_TOKEN` is unset. Provided for parity with the API's `METRICS_REQUIRE_API_KEY`. **Sensitive.** |
+| `RPC_URLS` | unset | Comma-separated Soroban RPC endpoints, tried in order. Takes precedence over `RPC_URL`. |
+| `SKIP_MIGRATIONS` | unset | Set to `1`, `true`, `yes` or `on` to skip running migrations at startup. |
+| `DEGRADED_POLL_INTERVAL_SECS` | 300 | Poll interval used while the circuit breaker is open. |
+| `MAX_CONSECUTIVE_ERRORS` | 20 | Consecutive poll errors that open the circuit breaker, which switches polling to `DEGRADED_POLL_INTERVAL_SECS`. `0` disables the breaker. |
+| `ENRICHMENT_WARN_THRESHOLD` | 0.5 | Logs a warning when the fraction of events that could not be enriched exceeds this value (0.0 to 1.0). Out-of-range values fall back to 0.5. |
+| `SPEC_VERSION_RETENTION` | 0 | Number of contract spec versions to keep. `0` disables pruning. |
+| `SPEC_CACHE_MAX_ENTRIES` | 2000 | Maximum contract specs cached in memory. Clamped to at least 1. |
+| `SPEC_FETCH_CONCURRENCY` | 4 | Maximum concurrent contract spec fetches. Clamped to at least 1. |
+| `HEALTH_MAX_LAG_LEDGERS` | 100 | `/health` reports unhealthy when the indexer is at least this many ledgers behind the chain tip. Also read by the API. |
+| `HEALTH_MAX_STALE_SECS` | 120 | `/health` reports unhealthy when the last update is older than this. Also read by the API. |
+
+### API
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MAX_REQUEST_BODY_BYTES` | 65536 | Maximum request body size. **Sensitive:** a resource limit. |
+| `API_MAX_BODY_BYTES` | 65536 | Legacy alias for `MAX_REQUEST_BODY_BYTES`. Read only when that variable is unset. |
+| `API_REQUEST_TIMEOUT_SECS` | 60 | Per-request timeout. |
+| `API_SHUTDOWN_TIMEOUT_SECS` | 30 | How long in-flight requests may run during graceful shutdown. |
+| `EXPLORER_DIR` | `explorer` | Directory of the static explorer UI served at `/`. The Docker image uses `/app/explorer`. |
+| `CLIENT_IP_HEADER` | unset | Single-value header holding the real client IP, set by the platform (for example `Fly-Client-IP` or `CF-Connecting-IP`). It is preferred over `X-Forwarded-For`. **Sensitive:** set this only when the platform overwrites the header. A client-supplied value lets callers evade per-IP limits. |
+| `MAX_CONCURRENT_PER_IP` | 100 | Maximum in-flight requests per client IP. **Sensitive:** a DoS limit. |
+| `RATE_LIMIT_BACKEND` | `memory` | `memory` keeps counters per process. `redis` shares them across replicas and requires `REDIS_URL`. **Sensitive.** |
+| `REDIS_URL` | unset | Redis connection URL. Required when `RATE_LIMIT_BACKEND=redis`. |
+| `RATE_LIMIT_FAIL_MODE` | `open` | Behavior when the Redis backend errors. `open` allows the request. `closed` rejects it. **Sensitive.** |
+| `READ_MAX_REQUEST_SIZE` | 262144 | Maximum size of a read-call request (256 KiB). |
+| `READ_MAX_ARGS_SIZE` | 131072 | Maximum size of a read-call's arguments (128 KiB). |
+| `CALL_CACHE_MAX_ENTRIES` | 1000 | Entries in the read-call result cache. |
+| `CALL_CACHE_TTL_SECS` | 5 | Seconds a cached read-call result stays valid. |
+| `API_KEY_CACHE_CAPACITY` | 2000 | Entries in the API-key lookup cache. Must be at least 1. |
+| `API_KEY_CACHE_TTL_SECS` | 30 | Seconds a successful key lookup stays cached. A revoked key can keep working for up to this long. **Sensitive.** |
+| `API_KEY_CACHE_NEG_TTL_SECS` | 5 | Seconds a failed key lookup stays cached. |
+| `METRICS_REQUIRE_API_KEY` | `false` | When `true`, `/metrics` requires an API key. It is public by default. **Sensitive.** |
+| `READYZ_LAG_THRESHOLD` | 100 | `/readyz` fails when the indexer is at least this many ledgers behind. |
+| `READYZ_MAX_AGE_SECS` | 120 | `/readyz` fails when the indexer's last update is older than this. |
+| `READYZ_REQUIRE_FRESH_INDEX` | `false` | When `true`, `/readyz` also requires a fresh index. It is off by default so that an indexer stall does not take every API replica out of rotation. |
+
+### MCP server
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MCP_RPC_RATE_LIMIT_PER_MIN` | 60 | Requests per minute allowed for each MCP client (session or token), using a sliding window. A shared global bucket also caps total throughput. |
+| `MCP_HTTP_BIND` | unset | Address for the streamable-HTTP transport. When unset, the server uses stdio only. |
+| `MCP_AUTH_TOKEN` | unset | Bearer token required on the HTTP transport. The server refuses to start with `MCP_HTTP_BIND` set and no token, unless `MCP_HTTP_ALLOW_ANONYMOUS=true`. **Sensitive.** |
+| `MCP_HTTP_ALLOW_ANONYMOUS` | `false` | Allows the HTTP transport without `MCP_AUTH_TOKEN`. Anyone who can reach the port can call tools and read the index, so bind to localhost. **Sensitive.** |
+| `MCP_ALLOWED_ORIGINS` | unset | Comma-separated `Origin` allowlist for HTTP requests (DNS-rebinding protection). Browser requests from other origins get 403. **Sensitive.** |
+| `MCP_ALLOW_ANY_ORIGIN` | `false` | Disables `Origin` checks. Only safe behind an authenticating reverse proxy. **Sensitive.** |
+
+### Webhooks
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `WEBHOOKS_METRICS_BIND_ADDR` | `127.0.0.1:9091` | Address for the webhook service's metrics endpoint. Loopback by default. **Sensitive:** binding to a public interface exposes it. |
+| `WEBHOOK_DELIVERY_RETENTION_DAYS` | 14 | Days to keep delivery records before pruning them. |
+
+### Telemetry (all services)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `LOG_FORMAT` | text | Set to `json` for structured JSON logs. `RUST_LOG` still controls the filter. |
+
+### Test-only
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `TEST_DATABASE_URL` | unset | Postgres URL for tests that need a real database. Those tests are skipped when it is unset. The service binaries never read it. |
+
+---
+
 ## Security Hardening Configuration
 
 Recommended settings for different deployment scenarios.

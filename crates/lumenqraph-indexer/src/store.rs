@@ -38,8 +38,6 @@ pub enum ContractKind {
     Amm,
     /// A liquidity pool emitting `deposit`/`withdraw` events.
     LiquidityPool,
-    /// Anything else, or unknown.
-    Other,
 }
 
 /// Supplies the [`ContractKind`] for a contract id. In production this is backed
@@ -119,12 +117,7 @@ pub async fn insert_events_with_resolver(
         event_names.push(e.event_name.clone());
         values.push(e.value.clone());
         decoded_values_json.push(serde_json::to_string(&e.decoded_value)?);
-        enriched_json.push(
-            e.enriched
-                .as_ref()
-                .map(|v| serde_json::to_string(v))
-                .transpose()?,
-        );
+        enriched_json.push(e.enriched.as_ref().map(serde_json::to_string).transpose()?);
         tx_hashes.push(e.tx_hash.clone());
         in_successful_calls.push(e.in_successful_call);
         paging_tokens.push(e.paging_token.clone());
@@ -194,8 +187,7 @@ pub async fn insert_events_with_resolver(
             .collect();
 
         if !transfers.is_empty() {
-            let t_event_ids: Vec<String> =
-                transfers.iter().map(|t| t.event_id.clone()).collect();
+            let t_event_ids: Vec<String> = transfers.iter().map(|t| t.event_id.clone()).collect();
             let t_contract_ids: Vec<String> =
                 transfers.iter().map(|t| t.contract_id.clone()).collect();
             let t_from_addrs: Vec<Option<String>> =
@@ -204,9 +196,8 @@ pub async fn insert_events_with_resolver(
                 transfers.iter().map(|t| t.to_addr.clone()).collect();
             let t_amounts: Vec<String> = transfers.iter().map(|t| t.amount.clone()).collect();
             let t_kinds: Vec<String> = transfers.iter().map(|t| t.kind.clone()).collect();
-            let t_amounts_numeric: Vec<Option<String>> = transfers.iter().map(|t| {
-                Some(t.amount.clone())
-            }).collect();
+            let t_amounts_numeric: Vec<Option<String>> =
+                transfers.iter().map(|t| Some(t.amount.clone())).collect();
             let t_ledgers: Vec<i64> = transfers.iter().map(|t| t.ledger).collect();
             let t_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
                 transfers.iter().map(|t| t.ledger_closed_at).collect();
@@ -261,13 +252,10 @@ async fn project_verticals(
         let s_event_ids: Vec<String> = swaps.iter().map(|s| s.event_id.clone()).collect();
         let s_contract_ids: Vec<String> = swaps.iter().map(|s| s.contract_id.clone()).collect();
         let s_senders: Vec<Option<String>> = swaps.iter().map(|s| s.sender.clone()).collect();
-        let s_recipients: Vec<Option<String>> =
-            swaps.iter().map(|s| s.recipient.clone()).collect();
+        let s_recipients: Vec<Option<String>> = swaps.iter().map(|s| s.recipient.clone()).collect();
         let s_token_ins: Vec<Option<String>> = swaps.iter().map(|s| s.token_in.clone()).collect();
-        let s_token_outs: Vec<Option<String>> =
-            swaps.iter().map(|s| s.token_out.clone()).collect();
-        let s_amount_ins: Vec<Option<String>> =
-            swaps.iter().map(|s| s.amount_in.clone()).collect();
+        let s_token_outs: Vec<Option<String>> = swaps.iter().map(|s| s.token_out.clone()).collect();
+        let s_amount_ins: Vec<Option<String>> = swaps.iter().map(|s| s.amount_in.clone()).collect();
         let s_amount_outs: Vec<Option<String>> =
             swaps.iter().map(|s| s.amount_out.clone()).collect();
         let s_ledgers: Vec<i64> = swaps.iter().map(|s| s.ledger).collect();
@@ -345,8 +333,7 @@ async fn project_verticals(
         let l_event_ids: Vec<String> = liqs.iter().map(|l| l.event_id.clone()).collect();
         let l_contract_ids: Vec<String> = liqs.iter().map(|l| l.contract_id.clone()).collect();
         let l_kinds: Vec<String> = liqs.iter().map(|l| l.kind.clone()).collect();
-        let l_providers: Vec<Option<String>> =
-            liqs.iter().map(|l| l.provider.clone()).collect();
+        let l_providers: Vec<Option<String>> = liqs.iter().map(|l| l.provider.clone()).collect();
         let l_token_as: Vec<Option<String>> = liqs.iter().map(|l| l.token_a.clone()).collect();
         let l_token_bs: Vec<Option<String>> = liqs.iter().map(|l| l.token_b.clone()).collect();
         let l_amount_as: Vec<Option<String>> = liqs.iter().map(|l| l.amount_a.clone()).collect();
@@ -387,10 +374,7 @@ async fn project_verticals(
 /// If an event already exists (same event_id), update mutable fields (decoded values, enrichment)
 /// in case the RPC returned different content for a recently-passed ledger (shallow reorg).
 /// Returns (inserted, updated) counts.
-pub async fn upsert_events(
-    pool: &PgPool,
-    events: &[NewEvent],
-) -> anyhow::Result<(u64, u64)> {
+pub async fn upsert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result<(u64, u64)> {
     if events.is_empty() {
         return Ok((0, 0));
     }
@@ -422,12 +406,7 @@ pub async fn upsert_events(
         event_names.push(e.event_name.clone());
         values.push(e.value.clone());
         decoded_values_json.push(serde_json::to_string(&e.decoded_value)?);
-        enriched_json.push(
-            e.enriched
-                .as_ref()
-                .map(|v| serde_json::to_string(v))
-                .transpose()?,
-        );
+        enriched_json.push(e.enriched.as_ref().map(serde_json::to_string).transpose()?);
         tx_hashes.push(e.tx_hash.clone());
         in_successful_calls.push(e.in_successful_call);
         paging_tokens.push(e.paging_token.clone());
@@ -506,8 +485,7 @@ pub async fn upsert_events(
             .collect();
 
         if !transfers.is_empty() {
-            let t_event_ids: Vec<String> =
-                transfers.iter().map(|t| t.event_id.clone()).collect();
+            let t_event_ids: Vec<String> = transfers.iter().map(|t| t.event_id.clone()).collect();
             let t_contract_ids: Vec<String> =
                 transfers.iter().map(|t| t.contract_id.clone()).collect();
             let t_from_addrs: Vec<Option<String>> =
@@ -516,9 +494,8 @@ pub async fn upsert_events(
                 transfers.iter().map(|t| t.to_addr.clone()).collect();
             let t_amounts: Vec<String> = transfers.iter().map(|t| t.amount.clone()).collect();
             let t_kinds: Vec<String> = transfers.iter().map(|t| t.kind.clone()).collect();
-            let t_amounts_numeric: Vec<Option<String>> = transfers.iter().map(|t| {
-                Some(t.amount.clone())
-            }).collect();
+            let t_amounts_numeric: Vec<Option<String>> =
+                transfers.iter().map(|t| Some(t.amount.clone())).collect();
             let t_ledgers: Vec<i64> = transfers.iter().map(|t| t.ledger).collect();
             let t_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
                 transfers.iter().map(|t| t.ledger_closed_at).collect();
@@ -621,15 +598,10 @@ fn as_i128_amount(v: &Value) -> Option<String> {
                 None
             }
         }
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Some(i.to_string())
-            } else if let Some(u) = n.as_u64() {
-                Some(u.to_string())
-            } else {
-                None
-            }
-        }
+        Value::Number(n) => n
+            .as_i64()
+            .map(|i| i.to_string())
+            .or_else(|| n.as_u64().map(|u| u.to_string())),
         _ => None,
     }
 }
@@ -682,7 +654,10 @@ fn extract_transfer(e: &NewEvent, resolve: &ContractKindResolver<'_>) -> Option<
     };
 
     let (from_addr, to_addr) = match kind {
-        "transfer" => (as_addr(e.decoded_topics.get(1)), as_addr(e.decoded_topics.get(2))),
+        "transfer" => (
+            as_addr(e.decoded_topics.get(1)),
+            as_addr(e.decoded_topics.get(2)),
+        ),
         "mint" => (None, as_addr(e.decoded_topics.get(1))),
         "burn" | "clawback" => (as_addr(e.decoded_topics.get(1)), None),
         _ => return None,
@@ -764,7 +739,10 @@ fn extract_nft_event(e: &NewEvent, resolve: &ContractKindResolver<'_>) -> Option
     };
 
     let (from_addr, to_addr) = match kind {
-        "transfer" => (as_addr(e.decoded_topics.get(1)), as_addr(e.decoded_topics.get(2))),
+        "transfer" => (
+            as_addr(e.decoded_topics.get(1)),
+            as_addr(e.decoded_topics.get(2)),
+        ),
         "mint" => (None, as_addr(e.decoded_topics.get(1))),
         "burn" => (as_addr(e.decoded_topics.get(1)), None),
         _ => return None,
@@ -833,6 +811,12 @@ mod tests {
         Some(ContractKind::FungibleToken)
     }
     use serde_json::json;
+
+    /// Test resolver: treats every contract as a confirmed fungible token so the
+    /// transfer projection itself is what the assertions exercise.
+    fn fungible(_contract_id: &str) -> Option<ContractKind> {
+        Some(ContractKind::FungibleToken)
+    }
 
     fn event(name: Option<&str>, topics: Vec<Value>, value: Value) -> NewEvent {
         NewEvent {
@@ -986,11 +970,7 @@ mod tests {
         let muxed_addr = "MAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
         let e = event(
             Some("transfer"),
-            vec![
-                json!("transfer"),
-                json!("GFROM"),
-                json!(muxed_addr),
-            ],
+            vec![json!("transfer"), json!("GFROM"), json!(muxed_addr)],
             json!("1000"),
         );
         let t = extract_transfer(&e, &fungible);
@@ -1057,8 +1037,9 @@ mod tests {
             struct_value,
         );
         let t = extract_transfer(&e, &fungible);
-        let t = t.expect("should handle complex struct value");
-        assert!(t.amount.contains("field") || t.amount.contains("nested"));
+        assert!(t.is_some(), "should handle complex struct value");
+        let amount = t.unwrap().amount;
+        assert!(amount.contains("field") || amount.contains("nested"));
     }
 
     #[test]

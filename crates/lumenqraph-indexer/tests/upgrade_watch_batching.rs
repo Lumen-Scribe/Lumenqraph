@@ -21,7 +21,7 @@ fn test_upgrade_watch_batches_contract_instances() {
     ];
 
     for (num_contracts, expected_batches, description) in test_cases {
-        let actual_batches = (num_contracts + 49) / 50;  // ceil(N/50)
+        let actual_batches = (num_contracts + 49) / 50; // ceil(N/50)
         assert_eq!(
             actual_batches, expected_batches,
             "Failed for {}: {} contracts should make {} batches, got {}",

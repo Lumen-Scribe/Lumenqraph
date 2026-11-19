@@ -2,17 +2,12 @@
 //! Postgres the API reads and the same read-layer encoder the API calls, so an
 //! agent gets typed, self-describing access to every indexed Soroban contract.
 
-use lumenqraph_core::{read, AmmSwap, Contract, ContractSpec, EventRow, LiquidityEvent, NftEvent, SpecDiff, TokenTransfer};
+use lumenqraph_core::{read, Contract, ContractSpec, EventRow, SpecDiff, TokenTransfer};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::rpc::SimOutcome;
 use crate::State;
-
-/// Cached spec for reuse across diff calculations.
-struct CachedSpec {
-    parsed: Option<Arc<ContractSpec>>,
-}
 
 /// JSON-Schema tool definitions returned by `tools/list`.
 pub fn definitions() -> Value {
@@ -244,7 +239,7 @@ pub fn definitions() -> Value {
             },
             "outputSchema": base_output.clone()
         },
-        { 
+        {
             "name": "query_transfers",
             "description": "Query materialized token transfers for a contract, newest first. Each transfer includes from/to addresses and amount. Optionally filter by sender or recipient address.",
             "inputSchema": {
@@ -326,7 +321,20 @@ pub fn definitions() -> Value {
 
 /// Execute a tool call. Returns the JSON payload to hand back as text content.
 /// `Err` is a tool-level error (surfaced to the agent as `isError: true`).
+/// Test helper: dispatch as the stdio client.
+#[cfg(test)]
 pub async fn call(state: &State, name: &str, args: &Value) -> anyhow::Result<Value> {
+    call_for_client(state, name, args, "stdio").await
+}
+
+/// Dispatch one `tools/call`. `client_key` names the caller for the per-client
+/// RPC rate limit: the HTTP session id, or a fixed key over stdio (#625).
+pub async fn call_for_client(
+    state: &State,
+    name: &str,
+    args: &Value,
+    client_key: &str,
+) -> anyhow::Result<Value> {
     match name {
         "list_contracts" => list_contracts(state).await,
         "get_contract_interface" => get_interface(state, str_arg(args, "contract_id")?).await,
@@ -361,7 +369,9 @@ pub async fn call(state: &State, name: &str, args: &Value) -> anyhow::Result<Val
                 str_arg(args, "contract_id")?,
                 args.get("event_name").and_then(Value::as_str),
                 args.get("limit").and_then(Value::as_i64),
-                args.get("include_raw").and_then(Value::as_bool).unwrap_or(false),
+                args.get("include_raw")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             )
             .await
         }
@@ -369,7 +379,9 @@ pub async fn call(state: &State, name: &str, args: &Value) -> anyhow::Result<Val
             get_event(
                 state,
                 str_arg(args, "event_id")?,
-                args.get("include_raw").and_then(Value::as_bool).unwrap_or(false),
+                args.get("include_raw")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             )
             .await
         }
@@ -379,7 +391,9 @@ pub async fn call(state: &State, name: &str, args: &Value) -> anyhow::Result<Val
                 str_arg(args, "tx_hash")?,
                 args.get("limit").and_then(Value::as_i64),
                 args.get("successful_only").and_then(Value::as_bool),
-                args.get("include_raw").and_then(Value::as_bool).unwrap_or(false),
+                args.get("include_raw")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             )
             .await
         }
@@ -391,10 +405,13 @@ pub async fn call(state: &State, name: &str, args: &Value) -> anyhow::Result<Val
             )
             .await
         }
-        "list_contract_functions" => list_contract_functions(state, str_arg(args, "contract_id")?).await,
+        "list_contract_functions" => {
+            list_contract_functions(state, str_arg(args, "contract_id")?).await
+        }
         "call_contract" => {
             call_contract(
                 state,
+                client_key,
                 str_arg(args, "contract_id")?,
                 str_arg(args, "function")?,
                 args.get("args").cloned().unwrap_or(Value::Null),
@@ -406,6 +423,7 @@ pub async fn call(state: &State, name: &str, args: &Value) -> anyhow::Result<Val
         "simulate_call" => {
             call_contract(
                 state,
+                client_key,
                 str_arg(args, "contract_id")?,
                 str_arg(args, "function")?,
                 args.get("args").cloned().unwrap_or(Value::Null),
@@ -750,107 +768,11 @@ fn event_output(event: EventRow, include_raw: bool) -> anyhow::Result<Value> {
     }))
 }
 
-#[cfg(test)]
-mod event_output_tests {
-    use super::event_output;
-    use lumenqraph_core::{EventRow, EventType};
-    use serde_json::{json, Value};
-    use sqlx::types::Json;
-
-    #[test]
-    fn compact_event_omits_raw_xdr_and_uses_enriched_params() {
-        let timestamp = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let event = EventRow {
-            event_id: "event-1".to_owned(),
-            contract_id: "contract-1".to_owned(),
-            ledger: 42,
-            ledger_closed_at: timestamp.clone(),
-            event_type: EventType::Contract,
-            topics: Json(vec!["raw-topic-xdr".to_owned()]),
-            decoded_topics: Json(json!(["transfer"])),
-            event_name: Some("transfer".to_owned()),
-            value: "raw-value-xdr".to_owned(),
-            decoded_value: Json(json!({"amount": "100"})),
-            enriched: Some(Json(json!({"amount": {"type": "i128", "value": "100"}}))),
-            tx_hash: "tx-1".to_owned(),
-            in_successful_call: true,
-            paging_token: "paging-1".to_owned(),
-            created_at: timestamp,
-        };
-
-        let compact = event_output(event, false).unwrap();
-
-        assert!(compact.get("topics").is_none());
-        assert!(compact.get("value").is_none());
-        assert!(compact.get("decoded_topics").is_none());
-        assert!(compact.get("decoded_value").is_none());
-        assert_eq!(compact["params"], json!({"amount": {"type": "i128", "value": "100"}}));
-        assert_eq!(compact["event_id"], Value::String("event-1".to_owned()));
-        assert_eq!(compact["tx_hash"], Value::String("tx-1".to_owned()));
-    }
-
-    #[test]
-    fn compact_event_falls_back_to_decoded_value() {
-        let timestamp = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let event = EventRow {
-            event_id: "event-1".to_owned(),
-            contract_id: "contract-1".to_owned(),
-            ledger: 42,
-            ledger_closed_at: timestamp.clone(),
-            event_type: EventType::Contract,
-            topics: Json(vec!["raw-topic-xdr".to_owned()]),
-            decoded_topics: Json(json!(["transfer"])),
-            event_name: Some("transfer".to_owned()),
-            value: "raw-value-xdr".to_owned(),
-            decoded_value: Json(json!({"amount": "100"})),
-            enriched: None,
-            tx_hash: "tx-1".to_owned(),
-            in_successful_call: true,
-            paging_token: "paging-1".to_owned(),
-            created_at: timestamp,
-        };
-
-        let compact = event_output(event, false).unwrap();
-        assert_eq!(compact["params"], json!({"amount": "100"}));
-    }
-
-    #[test]
-    fn include_raw_returns_the_complete_event_row() {
-        let timestamp = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let event = EventRow {
-            event_id: "event-1".to_owned(),
-            contract_id: "contract-1".to_owned(),
-            ledger: 42,
-            ledger_closed_at: timestamp.clone(),
-            event_type: EventType::Contract,
-            topics: Json(vec!["raw-topic-xdr".to_owned()]),
-            decoded_topics: Json(json!(["transfer"])),
-            event_name: Some("transfer".to_owned()),
-            value: "raw-value-xdr".to_owned(),
-            decoded_value: Json(json!({"amount": "100"})),
-            enriched: None,
-            tx_hash: "tx-1".to_owned(),
-            in_successful_call: true,
-            paging_token: "paging-1".to_owned(),
-            created_at: timestamp,
-        };
-
-        let full = event_output(event, true).unwrap();
-        assert_eq!(full["topics"], json!(["raw-topic-xdr"]));
-        assert_eq!(full["value"], "raw-value-xdr");
-        assert_eq!(full["decoded_value"], json!({"amount": "100"}));
-        assert_eq!(full["paging_token"], "paging-1");
-        assert_eq!(full["created_at"], "2025-01-01T00:00:00Z");
-    }
-}
-
-async fn get_contract_stats(state: &State, contract_id: &str, limit: Option<i64>) -> anyhow::Result<Value> {
+async fn get_contract_stats(
+    state: &State,
+    contract_id: &str,
+    limit: Option<i64>,
+) -> anyhow::Result<Value> {
     validate_contract_id(contract_id)?;
     let limit = limit.unwrap_or(10).clamp(1, 50);
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE contract_id = $1")
@@ -1091,8 +1013,13 @@ async fn load_spec_at_version(
     }
 
     let section = hex::decode(&hex_section)?;
-    let spec = ContractSpec::from_spec_xdr(&section).map(|p| p.spec)
-        .ok_or_else(|| anyhow::anyhow!("spec section for version {version} contains invalid XDR or has no entries"))?;
+    let spec = ContractSpec::from_spec_xdr(&section)
+        .map(|p| p.spec)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "spec section for version {version} contains invalid XDR or has no entries"
+            )
+        })?;
     Ok(Arc::new(spec))
 }
 
@@ -1100,6 +1027,7 @@ async fn load_spec_at_version(
 /// When `preview` is set, the emitted events and resource cost are included.
 async fn call_contract(
     state: &State,
+    client_key: &str,
     contract_id: &str,
     function: &str,
     args: Value,
@@ -1110,12 +1038,20 @@ async fn call_contract(
     let args_json = serde_json::to_string(&args).unwrap_or_default();
     let estimated_body_size = function.len() + args_json.len();
     if estimated_body_size > 256 * 1024 {
-        anyhow::bail!("MCP RPC request too large: {} bytes (limit: {} bytes)", estimated_body_size, 256 * 1024);
+        anyhow::bail!(
+            "MCP RPC request too large: {} bytes (limit: {} bytes)",
+            estimated_body_size,
+            256 * 1024
+        );
     }
     if args_json.len() > 128 * 1024 {
-        anyhow::bail!("MCP RPC args too large: {} bytes (limit: {} bytes)", args_json.len(), 128 * 1024);
+        anyhow::bail!(
+            "MCP RPC args too large: {} bytes (limit: {} bytes)",
+            args_json.len(),
+            128 * 1024
+        );
     }
-    if !state.rpc_limiter.try_consume() {
+    if state.rpc_limiter.try_consume(client_key).is_err() {
         anyhow::bail!("MCP RPC rate limit exceeded: too many simulation calls in the last minute");
     }
 
@@ -1162,5 +1098,108 @@ async fn call_contract(
                 lumenqraph_core::sanitize::sanitize_simulation_error(&msg)
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod event_output_tests {
+    use super::event_output;
+    use lumenqraph_core::{EventRow, EventType};
+    use serde_json::{json, Value};
+    use sqlx::types::Json;
+
+    #[test]
+    fn compact_event_omits_raw_xdr_and_uses_enriched_params() {
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let event = EventRow {
+            event_id: "event-1".to_owned(),
+            contract_id: "contract-1".to_owned(),
+            ledger: 42,
+            ledger_closed_at: timestamp,
+            event_type: EventType::Contract,
+            topics: Json(vec!["raw-topic-xdr".to_owned()]),
+            decoded_topics: Json(json!(["transfer"])),
+            event_name: Some("transfer".to_owned()),
+            value: "raw-value-xdr".to_owned(),
+            decoded_value: Json(json!({"amount": "100"})),
+            enriched: Some(Json(json!({"amount": {"type": "i128", "value": "100"}}))),
+            tx_hash: "tx-1".to_owned(),
+            in_successful_call: true,
+            paging_token: "paging-1".to_owned(),
+            created_at: timestamp,
+        };
+
+        let compact = event_output(event, false).unwrap();
+
+        assert!(compact.get("topics").is_none());
+        assert!(compact.get("value").is_none());
+        assert!(compact.get("decoded_topics").is_none());
+        assert!(compact.get("decoded_value").is_none());
+        assert_eq!(
+            compact["params"],
+            json!({"amount": {"type": "i128", "value": "100"}})
+        );
+        assert_eq!(compact["event_id"], Value::String("event-1".to_owned()));
+        assert_eq!(compact["tx_hash"], Value::String("tx-1".to_owned()));
+    }
+
+    #[test]
+    fn compact_event_falls_back_to_decoded_value() {
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let event = EventRow {
+            event_id: "event-1".to_owned(),
+            contract_id: "contract-1".to_owned(),
+            ledger: 42,
+            ledger_closed_at: timestamp,
+            event_type: EventType::Contract,
+            topics: Json(vec!["raw-topic-xdr".to_owned()]),
+            decoded_topics: Json(json!(["transfer"])),
+            event_name: Some("transfer".to_owned()),
+            value: "raw-value-xdr".to_owned(),
+            decoded_value: Json(json!({"amount": "100"})),
+            enriched: None,
+            tx_hash: "tx-1".to_owned(),
+            in_successful_call: true,
+            paging_token: "paging-1".to_owned(),
+            created_at: timestamp,
+        };
+
+        let compact = event_output(event, false).unwrap();
+        assert_eq!(compact["params"], json!({"amount": "100"}));
+    }
+
+    #[test]
+    fn include_raw_returns_the_complete_event_row() {
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let event = EventRow {
+            event_id: "event-1".to_owned(),
+            contract_id: "contract-1".to_owned(),
+            ledger: 42,
+            ledger_closed_at: timestamp,
+            event_type: EventType::Contract,
+            topics: Json(vec!["raw-topic-xdr".to_owned()]),
+            decoded_topics: Json(json!(["transfer"])),
+            event_name: Some("transfer".to_owned()),
+            value: "raw-value-xdr".to_owned(),
+            decoded_value: Json(json!({"amount": "100"})),
+            enriched: None,
+            tx_hash: "tx-1".to_owned(),
+            in_successful_call: true,
+            paging_token: "paging-1".to_owned(),
+            created_at: timestamp,
+        };
+
+        let full = event_output(event, true).unwrap();
+        assert_eq!(full["topics"], json!(["raw-topic-xdr"]));
+        assert_eq!(full["value"], "raw-value-xdr");
+        assert_eq!(full["decoded_value"], json!({"amount": "100"}));
+        assert_eq!(full["paging_token"], "paging-1");
+        assert_eq!(full["created_at"], "2025-01-01T00:00:00Z");
     }
 }

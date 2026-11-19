@@ -107,7 +107,8 @@ impl CallCache {
             return;
         }
         let key = self.make_key(contract_id, function, args, scope);
-        let evicted = self.inner
+        let evicted = self
+            .inner
             .lock()
             .unwrap()
             .put(key, (result, Instant::now()));
@@ -211,7 +212,9 @@ mod tests {
     fn miss_on_different_args() {
         let cache = CallCache::new(10, 60);
         cache.insert("C1", "balance", &json!({"addr": "G1"}), SCOPE, json!(100));
-        assert!(cache.get("C1", "balance", &json!({"addr": "G2"}), SCOPE).is_none());
+        assert!(cache
+            .get("C1", "balance", &json!({"addr": "G2"}), SCOPE)
+            .is_none());
     }
 
     #[test]
@@ -236,10 +239,20 @@ mod tests {
     fn identical_args_with_different_key_ordering_produce_cache_hit() {
         let cache = CallCache::new(10, 60);
         // Insert with one key order
-        cache.insert("C1", "transfer", &json!({"from": "G1", "to": "G2"}), SCOPE, json!(true));
+        cache.insert(
+            "C1",
+            "transfer",
+            &json!({"from": "G1", "to": "G2"}),
+            SCOPE,
+            json!(true),
+        );
         // Retrieve with different key order - should hit cache
         let result = cache.get("C1", "transfer", &json!({"to": "G2", "from": "G1"}), SCOPE);
-        assert_eq!(result, Some(json!(true)), "cache should hit for args with different key order");
+        assert_eq!(
+            result,
+            Some(json!(true)),
+            "cache should hit for args with different key order"
+        );
     }
 
     #[test]
@@ -254,18 +267,33 @@ mod tests {
     #[test]
     fn different_source_accounts_do_not_share_entries() {
         let cache = CallCache::new(10, 60);
-        let alice = CallScope { source_account: Some("GALICE"), wasm_hash: "hash-v1" };
-        let bob = CallScope { source_account: Some("GBOB"), wasm_hash: "hash-v1" };
+        let alice = CallScope {
+            source_account: Some("GALICE"),
+            wasm_hash: "hash-v1",
+        };
+        let bob = CallScope {
+            source_account: Some("GBOB"),
+            wasm_hash: "hash-v1",
+        };
         cache.insert("C1", "whoami", &json!({}), alice, json!("alice"));
         assert!(cache.get("C1", "whoami", &json!({}), bob).is_none());
-        assert_eq!(cache.get("C1", "whoami", &json!({}), alice), Some(json!("alice")));
+        assert_eq!(
+            cache.get("C1", "whoami", &json!({}), alice),
+            Some(json!("alice"))
+        );
     }
 
     #[test]
     fn default_source_is_distinct_from_an_explicit_account() {
         let cache = CallCache::new(10, 60);
-        let default = CallScope { source_account: None, wasm_hash: "hash-v1" };
-        let explicit = CallScope { source_account: Some("GALICE"), wasm_hash: "hash-v1" };
+        let default = CallScope {
+            source_account: None,
+            wasm_hash: "hash-v1",
+        };
+        let explicit = CallScope {
+            source_account: Some("GALICE"),
+            wasm_hash: "hash-v1",
+        };
         cache.insert("C1", "whoami", &json!({}), default, json!("zero"));
         assert!(cache.get("C1", "whoami", &json!({}), explicit).is_none());
     }
@@ -273,10 +301,18 @@ mod tests {
     #[test]
     fn upgrade_to_new_wasm_hash_invalidates_entries() {
         let cache = CallCache::new(10, 60);
-        let v1 = CallScope { source_account: None, wasm_hash: "hash-v1" };
-        let v2 = CallScope { source_account: None, wasm_hash: "hash-v2" };
+        let v1 = CallScope {
+            source_account: None,
+            wasm_hash: "hash-v1",
+        };
+        let v2 = CallScope {
+            source_account: None,
+            wasm_hash: "hash-v2",
+        };
         cache.insert("C1", "balance", &json!({"addr": "G1"}), v1, json!(100));
-        assert!(cache.get("C1", "balance", &json!({"addr": "G1"}), v2).is_none());
+        assert!(cache
+            .get("C1", "balance", &json!({"addr": "G1"}), v2)
+            .is_none());
     }
 }
 
@@ -285,19 +321,24 @@ mod invalidate_contract_tests {
     use super::CallCache;
     use serde_json::json;
 
+    const SCOPE: super::CallScope<'static> = super::CallScope {
+        source_account: None,
+        wasm_hash: "wasm",
+    };
+
     #[test]
     fn invalidate_contract_drops_only_that_contracts_entries() {
         let cache = CallCache::new(100, 60);
         let args = json!({});
-        cache.insert("CA_ONE", "balance", &args, json!(1));
-        cache.insert("CA_ONE", "name", &args, json!("one"));
-        cache.insert("CA_TWO", "balance", &args, json!(2));
+        cache.insert("CA_ONE", "balance", &args, SCOPE, json!(1));
+        cache.insert("CA_ONE", "name", &args, SCOPE, json!("one"));
+        cache.insert("CA_TWO", "balance", &args, SCOPE, json!(2));
 
         cache.invalidate_contract("CA_ONE");
 
-        assert_eq!(cache.get("CA_ONE", "balance", &args), None);
-        assert_eq!(cache.get("CA_ONE", "name", &args), None);
-        assert_eq!(cache.get("CA_TWO", "balance", &args), Some(json!(2)));
+        assert_eq!(cache.get("CA_ONE", "balance", &args, SCOPE), None);
+        assert_eq!(cache.get("CA_ONE", "name", &args, SCOPE), None);
+        assert_eq!(cache.get("CA_TWO", "balance", &args, SCOPE), Some(json!(2)));
         assert_eq!(cache.size(), 1);
     }
 }

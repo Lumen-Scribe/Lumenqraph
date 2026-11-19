@@ -39,6 +39,95 @@ components:
   # Shared schemas
   # ---------------------------------------------------------------------------
   schemas:
+    # ---- admin (API-key management, #431) ----
+    KeyMeta:
+      type: object
+      description: API key metadata. Never includes the plaintext key or its full hash.
+      required: [key_prefix, name, tier, rate_limit_per_min, scopes, revoked, created_at]
+      properties:
+        key_prefix:
+          type: string
+          description: First 8 hex characters of the key's SHA-256 hash. Use this to address the key.
+        name:
+          type: string
+        tier:
+          type: string
+        rate_limit_per_min:
+          type: integer
+        scopes:
+          type: array
+          items:
+            type: string
+        revoked:
+          type: boolean
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        last_used_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+    CreateKeyRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        tier:
+          type: string
+          default: free
+        rate_limit_per_min:
+          type: integer
+          minimum: 1
+          maximum: 100000
+          default: 60
+        scopes:
+          type: array
+          default: [read]
+          items:
+            type: string
+            enum: [read, rpc, webhooks:write, admin]
+        expires_at:
+          type: string
+          format: date-time
+    CreatedKey:
+      type: object
+      description: A newly issued key. `key` is shown only in this response.
+      required: [key]
+      allOf:
+        - $ref: "#/components/schemas/KeyMeta"
+      properties:
+        key:
+          type: string
+          description: Plaintext API key (lqk_ prefix). Cannot be retrieved again.
+    RotateKeyRequest:
+      type: object
+      properties:
+        grace_seconds:
+          type: integer
+          minimum: 0
+          maximum: 604800
+          default: 0
+          description: Seconds the old key keeps working. 0 revokes it immediately.
+    RotatedKey:
+      type: object
+      description: Replacement key plus the rotated key's state.
+      required: [key, previous]
+      allOf:
+        - $ref: "#/components/schemas/KeyMeta"
+      properties:
+        key:
+          type: string
+          description: Plaintext replacement key. Shown only in this response.
+        previous:
+          $ref: "#/components/schemas/KeyMeta"
+
     # ---- contracts ----
     Contract:
       type: object
@@ -1356,6 +1445,110 @@ paths:
                 type: object
         "404":
           $ref: "#/components/responses/NotFound"
+
+  /admin/keys:
+    get:
+      operationId: listAdminKeys
+      summary: List all API keys (metadata only; never plaintext keys).
+      tags: [admin]
+      responses:
+        "200":
+          description: All API keys, newest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/KeyMeta"
+        "401":
+          description: Missing or invalid admin credentials.
+        "404":
+          description: Admin API disabled (ADMIN_TOKEN is unset).
+    post:
+      operationId: createAdminKey
+      summary: Create an API key. The plaintext key is returned only once.
+      tags: [admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateKeyRequest"
+      responses:
+        "201":
+          description: Key created. Store the returned `key` now; it cannot be retrieved again.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreatedKey"
+        "400":
+          description: Invalid name, tier, rate limit, scopes or expiry.
+        "401":
+          description: Missing or invalid admin credentials.
+        "404":
+          description: Admin API disabled (ADMIN_TOKEN is unset).
+
+  /admin/keys/{prefix}/revoke:
+    post:
+      operationId: revokeAdminKey
+      summary: Revoke an API key immediately. Idempotent.
+      tags: [admin]
+      parameters:
+        - name: prefix
+          in: path
+          required: true
+          description: At least 8 lowercase hex characters of the key's SHA-256 hash.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Key revoked (or already revoked).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KeyMeta"
+        "400":
+          description: Malformed prefix.
+        "401":
+          description: Missing or invalid admin credentials.
+        "404":
+          description: No key matches the prefix.
+        "409":
+          description: The prefix matches more than one key; use a longer prefix.
+
+  /admin/keys/{prefix}/rotate:
+    post:
+      operationId: rotateAdminKey
+      summary: Issue a replacement key with the same settings. The old key is revoked now, or after grace_seconds.
+      tags: [admin]
+      parameters:
+        - name: prefix
+          in: path
+          required: true
+          description: At least 8 lowercase hex characters of the key's SHA-256 hash.
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RotateKeyRequest"
+      responses:
+        "200":
+          description: Replacement key issued. The plaintext `key` is shown only in this response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RotatedKey"
+        "400":
+          description: Malformed prefix or grace_seconds out of range.
+        "401":
+          description: Missing or invalid admin credentials.
+        "404":
+          description: No key matches the prefix.
+        "409":
+          description: The prefix is ambiguous, or the key is already revoked.
 
   /graphql:
     post:

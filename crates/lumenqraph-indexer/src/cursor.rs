@@ -68,11 +68,10 @@ pub async fn pin_network_passphrase(
 
 /// Read the current version for optimistic locking.
 async fn read_version(pool: &PgPool) -> anyhow::Result<i64> {
-    let row: (i64,) = sqlx::query_as(
-        "SELECT COALESCE(version, 0) FROM indexer_cursor WHERE id = 1"
-    )
-    .fetch_one(pool)
-    .await?;
+    let row: (i64,) =
+        sqlx::query_as("SELECT COALESCE(version, 0) FROM indexer_cursor WHERE id = 1")
+            .fetch_one(pool)
+            .await?;
     Ok(row.0)
 }
 
@@ -154,21 +153,6 @@ pub async fn track_enrichment(
     Ok(())
 }
 
-/// Track spec fetch failures.
-pub async fn track_spec_fetch_failure(pool: &PgPool, count: u64) -> anyhow::Result<()> {
-    sqlx::query(
-        "INSERT INTO indexer_cursor (id, last_processed_ledger, spec_fetch_failures_total, updated_at)
-         VALUES (1, 0, $1, now())
-         ON CONFLICT (id) DO UPDATE SET
-            spec_fetch_failures_total = indexer_cursor.spec_fetch_failures_total + $1,
-            updated_at                = now()",
-    )
-    .bind(count as i64)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 /// Track RPC call metrics: total calls, errors, and endpoint failovers.
 pub async fn track_rpc_call(
     pool: &PgPool,
@@ -212,7 +196,6 @@ pub async fn set_consecutive_errors(pool: &PgPool, count: u32) -> anyhow::Result
     .await?;
     Ok(())
 }
-
 
 /// Increment the timestamp parse error counter (#399). Called once per event
 /// whose `ledgerClosedAt` field cannot be parsed as RFC 3339 or Unix seconds.

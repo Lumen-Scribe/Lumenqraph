@@ -33,7 +33,10 @@ impl LatencyHistogram {
     pub fn observe(&mut self, elapsed_ms: u64) {
         self.count += 1;
         self.sum_ms = self.sum_ms.saturating_add(elapsed_ms);
-        if let Some(i) = LATENCY_BUCKETS_MS.iter().position(|&bound| elapsed_ms <= bound) {
+        if let Some(i) = LATENCY_BUCKETS_MS
+            .iter()
+            .position(|&bound| elapsed_ms <= bound)
+        {
             self.buckets[i] += 1;
         }
     }
@@ -65,9 +68,6 @@ pub struct MetricsCollector {
     pub histogram_buckets: Arc<RwLock<HashMap<HistogramKey, LatencyHistogram>>>,
     pub status_counters: Arc<RwLock<HashMap<String, u64>>>,
 }
-
-#[derive(Clone)]
-pub struct RouteLabel(pub String);
 
 impl MetricsCollector {
     pub fn new() -> Self {
@@ -171,7 +171,12 @@ mod tests {
     async fn hit(router: &Router, path: &str) {
         router
             .clone()
-            .oneshot(HttpRequest::builder().uri(path).body(Body::empty()).unwrap())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
     }
@@ -196,7 +201,10 @@ mod tests {
         hit(&router, "/contracts/C1234/events").await;
         hit(&router, "/contracts/C9999/events").await;
 
-        assert_eq!(routes_seen(&collector), vec!["/contracts/:contract_id/events"]);
+        assert_eq!(
+            routes_seen(&collector),
+            vec!["/contracts/:contract_id/events"]
+        );
     }
 
     #[tokio::test]
@@ -237,7 +245,12 @@ mod tests {
         let collector = MetricsCollector::new();
         let routes = ["/contracts", "/events", "/transfers"];
         for i in 0..1_000_000u64 {
-            collector.record(routes[(i % 3) as usize], &Method::GET, StatusCode::OK, i % 1_500);
+            collector.record(
+                routes[(i % 3) as usize],
+                &Method::GET,
+                StatusCode::OK,
+                i % 1_500,
+            );
         }
 
         let histograms = collector.histogram_buckets.read();

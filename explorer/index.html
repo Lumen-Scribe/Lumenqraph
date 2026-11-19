@@ -15,11 +15,15 @@
     </div>
     <div class="conn">
       <input id="base" size="26" value="" placeholder="API base (blank = same origin)" title="API base URL — leave blank when the page is served by/behind the API" />
-      <input id="key" size="16" placeholder="x-api-key (optional)" />
+      <input id="key" type="password" autocomplete="off" size="16" placeholder="x-api-key (optional)" title="API key. Use a read-only-scoped key where possible. Kept for this browser tab only unless 'Remember on this device' is ticked." />
       <select id="senet" title="Network — auto-detected from the connected API; pick one to switch to its remembered API base">
         <option value="public">mainnet</option>
         <option value="testnet">testnet</option>
       </select>
+      <label class="remember" title="Keep the API key in this browser across restarts. Off: the key is cleared when the tab is closed.">
+        <input type="checkbox" id="rememberKey" /> Remember on this device
+      </label>
+      <button id="forgetKey" type="button" title="Remove the API key from this page and from this browser">Forget key</button>
     </div>
   </header>
 

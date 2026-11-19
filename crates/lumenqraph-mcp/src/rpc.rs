@@ -47,10 +47,8 @@ impl RpcRateLimiter {
 
         // Outer bound: total throughput across all clients.
         {
-            let mut global: MutexGuard<'_, VecDeque<Instant>> = self
-                .global
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut global: MutexGuard<'_, VecDeque<Instant>> =
+                self.global.lock().unwrap_or_else(|e| e.into_inner());
             global.retain(|ts| now.duration_since(*ts) < window);
             if global.len() >= self.global_limit_per_min {
                 return Err(retry_after(&global, now, window));
@@ -59,10 +57,8 @@ impl RpcRateLimiter {
         }
 
         // Per-client budget.
-        let mut per_client: MutexGuard<'_, HashMap<String, VecDeque<Instant>>> = self
-            .per_client
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut per_client: MutexGuard<'_, HashMap<String, VecDeque<Instant>>> =
+            self.per_client.lock().unwrap_or_else(|e| e.into_inner());
         let recent = per_client.entry(client_key.to_string()).or_default();
         recent.retain(|ts| now.duration_since(*ts) < window);
         if recent.len() >= self.limit_per_min {
@@ -213,6 +209,6 @@ mod tests {
         let limiter = RpcRateLimiter::new(1);
         assert!(limiter.try_consume("client-a").is_ok());
         let retry_after = limiter.try_consume("client-a").unwrap_err();
-        assert!(retry_after >= 1 && retry_after <= 60);
+        assert!((1..=60).contains(&retry_after));
     }
 }

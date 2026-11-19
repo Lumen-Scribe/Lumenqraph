@@ -465,12 +465,7 @@ INT = Union[int, str]  # large integers as decimal strings
         } else {
             for (i, f) in s.fields.iter().enumerate() {
                 let ty = py_type(&f.ty);
-                let _ = writeln!(
-                    out,
-                    "    {}: {}",
-                    py_ident(&f.name, "field", i),
-                    ty
-                );
+                let _ = writeln!(out, "    {}: {}", py_ident(&f.name, "field", i), ty);
             }
         }
     }
@@ -529,7 +524,11 @@ class ContractClient:
                 .enumerate()
                 .map(|(i, inp)| format!("{}: {}", py_ident(&inp.name, "arg", i), py_type(&inp.ty)))
                 .collect();
-            let _ = writeln!(out, "    def {method}(self, {}) -> {ret}:", params.join(", "));
+            let _ = writeln!(
+                out,
+                "    def {method}(self, {}) -> {ret}:",
+                params.join(", ")
+            );
         }
         if !f.doc.trim().is_empty() {
             let _ = writeln!(out, "        {}", py_doc(f.doc.trim()));
@@ -674,11 +673,7 @@ pub const CONTRACT_ID: &str = {contract_id:?};
         let _ = writeln!(out, "pub struct {} {{", rust_type_name(&s.name));
         for (i, f) in s.fields.iter().enumerate() {
             let ty = rust_type(&f.ty);
-            let _ = writeln!(
-                out,
-                "    pub {}: {ty},",
-                rust_ident(&f.name, "field", i)
-            );
+            let _ = writeln!(out, "    pub {}: {ty},", rust_ident(&f.name, "field", i));
         }
         out.push_str("}\n\n");
     }
@@ -837,7 +832,7 @@ fn rust_type(ty: &ScSpecTypeDef) -> String {
         T::U128 | T::U256 => "String".into(), // decimal strings for big ints
         T::I128 | T::I256 => "String".into(),
         T::String | T::Symbol => "String".into(),
-        T::Address => "String".into(), // strkey
+        T::Address => "String".into(),              // strkey
         T::Bytes | T::BytesN(_) => "String".into(), // hex
         T::Option(o) => format!("Option<{}>", rust_type(&o.value_type)),
         T::Vec(v) => format!("Vec<{}>", rust_type(&v.element_type)),
@@ -1565,7 +1560,10 @@ mod tests {
 
     #[test]
     fn python_client_is_deterministic() {
-        assert_eq!(python_client(C, &full_spec()), python_client(C, &full_spec()));
+        assert_eq!(
+            python_client(C, &full_spec()),
+            python_client(C, &full_spec())
+        );
     }
 
     // ── Rust codegen tests ────────────────────────────────────────────────────

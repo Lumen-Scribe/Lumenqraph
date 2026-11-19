@@ -82,5 +82,7 @@ pub async fn list_nft_events(
     .fetch_all(&state.pool)
     .await?;
 
-    Ok(page.finish(rows, |r| LedgerCursor::new(r.ledger, &r.event_id)))
+    Ok(Json(page.finish(rows, |r| {
+        LedgerCursor::new(r.ledger, &r.event_id)
+    })))
 }

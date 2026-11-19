@@ -20,7 +20,7 @@ pub enum EventType {
 }
 
 impl EventType {
-    /// The `events.event_type` text value, as stored in the database.
+    /// The lowercase value stored in `events.event_type`.
     pub fn as_str(self) -> &'static str {
         match self {
             EventType::Contract => "contract",
@@ -28,15 +28,17 @@ impl EventType {
             EventType::Diagnostic => "diagnostic",
         }
     }
+}
 
-    /// Parse the `type` field of an RPC event. Returns `None` for values the
-    /// database CHECK constraint would reject.
-    pub fn from_rpc_str(s: &str) -> Option<Self> {
+impl std::str::FromStr for EventType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "contract" => Some(EventType::Contract),
-            "system" => Some(EventType::System),
-            "diagnostic" => Some(EventType::Diagnostic),
-            _ => None,
+            "contract" => Ok(EventType::Contract),
+            "system" => Ok(EventType::System),
+            "diagnostic" => Ok(EventType::Diagnostic),
+            other => Err(format!("unknown event type {other:?}")),
         }
     }
 }

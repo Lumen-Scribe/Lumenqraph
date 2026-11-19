@@ -37,6 +37,20 @@ jobs:
   docker-build:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Postgres for the explorer smoke test below: the API will not start
+    # without a database at the current schema (#473).
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: lumenqraph
+          POSTGRES_PASSWORD: lumenqraph
+          POSTGRES_DB: lumenqraph
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U lumenqraph"
+          --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       
@@ -109,3 +123,37 @@ jobs:
             exit 1
           fi
           echo "✓ Container runs as non-root user 'lumenqraph'"
+
+      # Issue #635: the image must serve a working explorer. Loads `/` and
+      # `/app.js`, which the page's <script src="app.js"> needs under the CSP.
+      - name: Smoke test - explorer UI and app.js are served
+        env:
+          DATABASE_URL: postgres://lumenqraph:lumenqraph@127.0.0.1:5432/lumenqraph
+          WEBHOOK_ENCRYPTION_KEY: ci-smoke-test-key-not-for-production
+        run: |
+          set -euo pipefail
+          docker run --rm --network host -e DATABASE_URL="$DATABASE_URL" \
+            "${IMAGE_NAME}:test" lumenqraph-indexer migrate
+          docker run -d --name explorer-smoke --network host \
+            -e DATABASE_URL="$DATABASE_URL" \
+            -e WEBHOOK_ENCRYPTION_KEY="$WEBHOOK_ENCRYPTION_KEY" \
+            -e API_BIND_ADDR=127.0.0.1:8080 \
+            "${IMAGE_NAME}:test" lumenqraph-api
+          ready=false
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8080/livez >/dev/null; then ready=true; break; fi
+            sleep 1
+          done
+          if [ "$ready" != true ]; then
+            echo "::error::API did not become live"
+            docker logs explorer-smoke || true
+            exit 1
+          fi
+          page=$(mktemp)
+          curl -sf http://127.0.0.1:8080/ -o "$page"
+          grep -q "<title>Lumenqraph Explorer</title>" "$page"
+          script=$(mktemp)
+          headers=$(curl -sf -D - -o "$script" http://127.0.0.1:8080/app.js)
+          printf '%s\n' "$headers" | grep -qi '^content-type: *text/javascript\|^content-type: *application/javascript'
+          test -s "$script"
+          echo "✓ explorer page and app.js are served"

@@ -1,6 +1,7 @@
 //! Route table. `/health` and `/metrics` are public; everything else sits
 //! behind the auth + rate-limit middleware.
 
+pub mod admin;
 pub mod contracts;
 pub mod events;
 pub mod health;
@@ -22,8 +23,8 @@ use axum::extract::{Request, State};
 use axum::http::{header, HeaderValue};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse};
+use axum::routing::{get, post};
 use axum::Json;
-use axum::routing::{delete, get, patch, post};
 use axum::{middleware, Extension, Router};
 use serde_json::json;
 use tower::Layer;
@@ -31,7 +32,7 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::auth::{
-    auth_and_rate_limit, concurrency_limit, proxy_rate_limit, rpc_auth_and_rate_limit,
+    admin_auth, auth_and_rate_limit, concurrency_limit, proxy_rate_limit, rpc_auth_and_rate_limit,
     webhook_auth_and_rate_limit, webhook_manage_auth_and_rate_limit,
 };
 use crate::graphql::{self, AppSchema};
@@ -170,15 +171,23 @@ pub fn router(state: AppState) -> Router {
     // of REQUIRE_API_KEY (#420 — anonymous callers must not be able to list,
     // modify, or delete webhook subscriptions).
     let webhook_manage_routes = Router::new()
+        .route("/webhooks", get(webhooks::list_webhooks))
         .route(
-            "/webhooks",
-            get(webhooks::list_webhooks),
+            "/webhooks/:id",
+            get(webhooks::get_webhook)
+                .delete(webhooks::delete_webhook)
+                .patch(webhooks::update_webhook),
         )
-        .route("/webhooks/:id", get(webhooks::get_webhook).delete(webhooks::delete_webhook).patch(webhooks::update_webhook))
-        .route("/webhooks/:id/deliveries", get(webhooks::list_webhook_deliveries))
+        .route(
+            "/webhooks/:id/deliveries",
+            get(webhooks::list_webhook_deliveries),
+        )
         .route("/webhooks/:id/redrive", post(webhooks::redrive_webhook))
         .route("/webhooks/:id/reenable", post(webhooks::reenable_webhook))
-        .route("/webhooks/:id/rotate-secret", post(webhooks::rotate_webhook_secret))
+        .route(
+            "/webhooks/:id/rotate-secret",
+            post(webhooks::rotate_webhook_secret),
+        )
         .route("/webhooks/:id/test", post(webhooks::test_webhook))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -193,6 +202,14 @@ pub fn router(state: AppState) -> Router {
             webhook_auth_and_rate_limit,
         ));
 
+    // API-key management (#431). Guarded by the separate ADMIN_TOKEN credential,
+    // not by API keys, and disabled (404) unless that token is configured.
+    let admin_routes = Router::new()
+        .route("/admin/keys", get(admin::list_keys).post(admin::create_key))
+        .route("/admin/keys/:prefix/revoke", post(admin::revoke_key))
+        .route("/admin/keys/:prefix/rotate", post(admin::rotate_key))
+        .layer(middleware::from_fn_with_state(state.clone(), admin_auth));
+
     let metrics_collector = state.metrics.clone();
     let mut app = public
         .merge(metrics_router)
@@ -200,6 +217,7 @@ pub fn router(state: AppState) -> Router {
         .merge(rpc_routes)
         .merge(webhook_create_routes)
         .merge(webhook_manage_routes)
+        .merge(admin_routes)
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -260,7 +278,7 @@ pub fn router(state: AppState) -> Router {
             HeaderValue::from_static("DENY"),
         );
         app.fallback_service(
-            no_frame.layer(nosniff.layer(csp.layer(revalidate.layer(ServeDir::new(explorer_dir)))))
+            no_frame.layer(nosniff.layer(csp.layer(revalidate.layer(ServeDir::new(explorer_dir))))),
         )
     } else {
         app

@@ -6,10 +6,10 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::Utc;
+use serde_json::json;
 use sqlx::PgPool;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use serde_json::json;
 use tracing::{error, info};
 
 use crate::specs::SpecCache;
@@ -83,11 +83,7 @@ pub async fn start_http_server(
 async fn health(State(state): State<HttpState>) -> impl IntoResponse {
     match get_indexer_status(&state.pool).await {
         Ok(status) => {
-            let health_status = if status.is_healthy {
-                "ok"
-            } else {
-                "degraded"
-            };
+            let health_status = if status.is_healthy { "ok" } else { "degraded" };
             (
                 axum::http::StatusCode::OK,
                 Json(json!({
@@ -132,31 +128,58 @@ async fn metrics(
         Ok(metrics) => {
             body.push_str("# HELP lumenqraph_indexer_last_processed_ledger The last ledger processed by the indexer\n");
             body.push_str("# TYPE lumenqraph_indexer_last_processed_ledger gauge\n");
-            body.push_str(&format!("lumenqraph_indexer_last_processed_ledger {}\n", metrics.last_processed_ledger));
+            body.push_str(&format!(
+                "lumenqraph_indexer_last_processed_ledger {}\n",
+                metrics.last_processed_ledger
+            ));
 
-            body.push_str("# HELP lumenqraph_indexer_chain_tip_ledger The current chain tip ledger\n");
+            body.push_str(
+                "# HELP lumenqraph_indexer_chain_tip_ledger The current chain tip ledger\n",
+            );
             body.push_str("# TYPE lumenqraph_indexer_chain_tip_ledger gauge\n");
-            body.push_str(&format!("lumenqraph_indexer_chain_tip_ledger {}\n", metrics.chain_tip_ledger));
+            body.push_str(&format!(
+                "lumenqraph_indexer_chain_tip_ledger {}\n",
+                metrics.chain_tip_ledger
+            ));
 
             body.push_str("# HELP lumenqraph_indexer_lag_ledgers Lag between indexer and chain tip in ledgers\n");
             body.push_str("# TYPE lumenqraph_indexer_lag_ledgers gauge\n");
-            body.push_str(&format!("lumenqraph_indexer_lag_ledgers {}\n", metrics.lag_ledgers));
+            body.push_str(&format!(
+                "lumenqraph_indexer_lag_ledgers {}\n",
+                metrics.lag_ledgers
+            ));
 
-            body.push_str("# HELP lumenqraph_indexer_seconds_since_update Seconds since last cursor update\n");
+            body.push_str(
+                "# HELP lumenqraph_indexer_seconds_since_update Seconds since last cursor update\n",
+            );
             body.push_str("# TYPE lumenqraph_indexer_seconds_since_update gauge\n");
-            body.push_str(&format!("lumenqraph_indexer_seconds_since_update {}\n", metrics.secs_since_update));
+            body.push_str(&format!(
+                "lumenqraph_indexer_seconds_since_update {}\n",
+                metrics.secs_since_update
+            ));
 
-            body.push_str("# HELP lumenqraph_indexer_events_ingested_total Total events ingested\n");
+            body.push_str(
+                "# HELP lumenqraph_indexer_events_ingested_total Total events ingested\n",
+            );
             body.push_str("# TYPE lumenqraph_indexer_events_ingested_total counter\n");
-            body.push_str(&format!("lumenqraph_indexer_events_ingested_total {}\n", metrics.events_ingested_total));
+            body.push_str(&format!(
+                "lumenqraph_indexer_events_ingested_total {}\n",
+                metrics.events_ingested_total
+            ));
 
             body.push_str("# HELP lumenqraph_indexer_errors_total Total indexer errors\n");
             body.push_str("# TYPE lumenqraph_indexer_errors_total counter\n");
-            body.push_str(&format!("lumenqraph_indexer_errors_total {}\n", metrics.errors_total));
+            body.push_str(&format!(
+                "lumenqraph_indexer_errors_total {}\n",
+                metrics.errors_total
+            ));
 
             body.push_str("# HELP lumenqraph_enrichment_rate Fraction of events successfully enriched (0.0 to 1.0)\n");
             body.push_str("# TYPE lumenqraph_enrichment_rate gauge\n");
-            body.push_str(&format!("lumenqraph_enrichment_rate {}\n", metrics.enrichment_rate));
+            body.push_str(&format!(
+                "lumenqraph_enrichment_rate {}\n",
+                metrics.enrichment_rate
+            ));
 
             // Spec cache size gauge (issue #268).
             let cache_size = state.spec_cache.cache_size();
@@ -167,25 +190,57 @@ async fn metrics(
             // RPC failover counter (#398).
             body.push_str("# HELP lumenqraph_indexer_rpc_failovers_total Total number of RPC endpoint failovers\n");
             body.push_str("# TYPE lumenqraph_indexer_rpc_failovers_total counter\n");
-            body.push_str(&format!("lumenqraph_indexer_rpc_failovers_total {}\n", metrics.rpc_failovers_total));
+            body.push_str(&format!(
+                "lumenqraph_indexer_rpc_failovers_total {}\n",
+                metrics.rpc_failovers_total
+            ));
 
             // Timestamp parse error counter (#399).
             body.push_str("# HELP lumenqraph_indexer_timestamp_parse_errors_total Total ledgerClosedAt parse failures (never stored as Utc::now())\n");
             body.push_str("# TYPE lumenqraph_indexer_timestamp_parse_errors_total counter\n");
-            body.push_str(&format!("lumenqraph_indexer_timestamp_parse_errors_total {}\n", metrics.timestamp_parse_errors_total));
+            body.push_str(&format!(
+                "lumenqraph_indexer_timestamp_parse_errors_total {}\n",
+                metrics.timestamp_parse_errors_total
+            ));
 
             body.push_str("# HELP lumenqraph_rpc_oldest_ledger Oldest ledger currently available from the RPC provider\n");
             body.push_str("# TYPE lumenqraph_rpc_oldest_ledger gauge\n");
-            body.push_str(&format!("lumenqraph_rpc_oldest_ledger {}\n", crate::poller::rpc_oldest_ledger()));
+            body.push_str(&format!(
+                "lumenqraph_rpc_oldest_ledger {}\n",
+                crate::poller::rpc_oldest_ledger()
+            ));
             body.push_str("# HELP lumenqraph_indexer_unrecovered_missed_ranges Number of ledger ranges not yet recovered\n");
             body.push_str("# TYPE lumenqraph_indexer_unrecovered_missed_ranges gauge\n");
-            body.push_str(&format!("lumenqraph_indexer_unrecovered_missed_ranges {}\n", metrics.unrecovered_missed_ranges));
+            body.push_str(&format!(
+                "lumenqraph_indexer_unrecovered_missed_ranges {}\n",
+                metrics.unrecovered_missed_ranges
+            ));
             body.push_str("# HELP lumenqraph_indexer_recoverable_missed_ranges Unrecovered ranges still within RPC retention\n");
             body.push_str("# TYPE lumenqraph_indexer_recoverable_missed_ranges gauge\n");
-            body.push_str(&format!("lumenqraph_indexer_recoverable_missed_ranges {}\n", metrics.recoverable_missed_ranges));
+            body.push_str(&format!(
+                "lumenqraph_indexer_recoverable_missed_ranges {}\n",
+                metrics.recoverable_missed_ranges
+            ));
             body.push_str("# HELP lumenqraph_indexer_unrecoverable_missed_ranges Unrecovered ranges outside RPC retention\n");
             body.push_str("# TYPE lumenqraph_indexer_unrecoverable_missed_ranges gauge\n");
-            body.push_str(&format!("lumenqraph_indexer_unrecoverable_missed_ranges {}\n", metrics.unrecoverable_missed_ranges));
+            body.push_str(&format!(
+                "lumenqraph_indexer_unrecoverable_missed_ranges {}\n",
+                metrics.unrecoverable_missed_ranges
+            ));
+            body.push_str("# HELP lumenqraph_transfer_projection_skipped_total Transfer-like events skipped by the SEP-41 projection since start\n");
+            body.push_str("# TYPE lumenqraph_transfer_projection_skipped_total counter\n");
+            body.push_str(&format!(
+                "lumenqraph_transfer_projection_skipped_total {}\n",
+                crate::store::transfer_projection_skipped_total()
+            ));
+            body.push_str("# HELP lumenqraph_webhook_deliveries_dropped_by_retention_total webhook_deliveries rows dropped by retention since start\n");
+            body.push_str(
+                "# TYPE lumenqraph_webhook_deliveries_dropped_by_retention_total counter\n",
+            );
+            body.push_str(&format!(
+                "lumenqraph_webhook_deliveries_dropped_by_retention_total {}\n",
+                crate::retention::webhook_deliveries_dropped_by_retention_total()
+            ));
         }
         Err(e) => {
             error!(error = %e, "failed to gather indexer metrics");
@@ -207,7 +262,10 @@ fn bearer_token_matches(headers: &axum::http::HeaderMap, expected: &str) -> bool
     let Ok(value) = value.to_str() else {
         return false;
     };
-    let Some(token) = value.strip_prefix("Bearer ").or_else(|| value.strip_prefix("bearer ")) else {
+    let Some(token) = value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+    else {
         return false;
     };
     let token = token.trim();
@@ -290,7 +348,19 @@ struct IndexerMetrics {
 }
 
 async fn gather_metrics(pool: &PgPool) -> anyhow::Result<IndexerMetrics> {
-    let status: Option<(i64, i64, i64, i64, i64, i64, i64, i64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+    // Column order matches the SELECT below.
+    type CursorRow = (
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        chrono::DateTime<chrono::Utc>,
+    );
+    let status: Option<CursorRow> = sqlx::query_as(
         "SELECT last_processed_ledger, chain_tip_ledger, events_ingested_total, errors_total, events_enriched_total, events_not_enriched_total,
                 COALESCE(rpc_failovers_total, 0),
                 COALESCE(timestamp_parse_errors_total, 0),
@@ -300,7 +370,18 @@ async fn gather_metrics(pool: &PgPool) -> anyhow::Result<IndexerMetrics> {
     .fetch_optional(pool)
     .await?;
 
-    let Some((last, tip, events, errors, enriched, not_enriched, rpc_failovers, ts_errors, updated_at)) = status else {
+    let Some((
+        last,
+        tip,
+        events,
+        errors,
+        enriched,
+        not_enriched,
+        rpc_failovers,
+        ts_errors,
+        updated_at,
+    )) = status
+    else {
         anyhow::bail!("indexer cursor not initialized");
     };
 
@@ -375,7 +456,12 @@ mod tests {
     async fn metrics_rejects_missing_token_when_configured() {
         let app = app_with(test_state(Some("s3cret")));
         let resp = app
-            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);

@@ -48,6 +48,16 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo build --release --workspace
 
+# Explorer UI bundle (#635). Built in its own Node stage: scripts/build.mjs
+# generates app.js (not committed) and index.html, which must exist in the
+# image for the page's <script src="app.js"> to load under the CSP.
+FROM node:20-slim AS explorer-build
+WORKDIR /app/explorer
+COPY explorer/package.json explorer/package-lock.json ./
+RUN npm ci
+COPY explorer/ ./
+RUN npm run build
+
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
@@ -61,7 +71,9 @@ COPY --from=builder /app/target/release/lumenqraph-mcp /usr/local/bin/
 # This is the source of truth for the toolchain check in docker.yml.
 COPY --from=builder /rustc-version.txt /rustc-version.txt
 # Static explorer UI, served same-origin by the API (EXPLORER_DIR=/app/explorer).
-COPY explorer /app/explorer
+# Only the built artifacts are shipped: the sources, tests and node_modules stay
+# out of the runtime image.
+COPY --from=explorer-build /app/explorer/index.html /app/explorer/app.js /app/explorer/
 # Entrypoint for single-slot hosts that run the indexer + API as one process
 # (Render's free tier has no worker type). Unused by compose/Fly.
 # Migrations are applied by the indexer binary's own `migrate` subcommand

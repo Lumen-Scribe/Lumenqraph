@@ -1,4 +1,4 @@
-import type { Health, Contract, EventRecord, Transfer, ContractState, ContractData, InterfaceInfo, InterfaceHistory } from './types';
+import type { Health, Contract, EventRecord, Transfer, ContractState, ContractData, InterfaceInfo, InterfaceHistory, Page } from './types';
 
 export function getBase(): string {
   return (document.getElementById('base') as HTMLInputElement).value.replace(/\/+$/, '');
@@ -28,16 +28,27 @@ export async function health(): Promise<Health> {
   return get('/health');
 }
 
-export async function listContracts(): Promise<Contract[]> {
-  return get('/contracts');
+/** Append query parameters, skipping any that are undefined or empty. */
+function withQuery(path: string, params: Record<string, string | number | undefined>): string {
+  const parts = Object.entries(params)
+    .filter(([, v]) => v !== undefined && v !== '')
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`);
+  return parts.length ? `${path}?${parts.join('&')}` : path;
 }
 
-export async function listEvents(contractId: string, limit = 50): Promise<EventRecord[]> {
-  return get(`/contracts/${encodeURIComponent(contractId)}/events?limit=${limit}`);
+// The list endpoints return the Page<T> envelope, not a bare array (#127, #445).
+// Callers render `page.data` and follow `page.next_cursor` for more rows.
+
+export async function listContracts(after?: string): Promise<Page<Contract>> {
+  return get(withQuery('/contracts', { after }));
 }
 
-export async function listTransfers(contractId: string, limit = 50): Promise<Transfer[]> {
-  return get(`/contracts/${encodeURIComponent(contractId)}/transfers?limit=${limit}`);
+export async function listEvents(contractId: string, limit = 50, after?: string): Promise<Page<EventRecord>> {
+  return get(withQuery(`/contracts/${encodeURIComponent(contractId)}/events`, { limit, after }));
+}
+
+export async function listTransfers(contractId: string, limit = 50, after?: string): Promise<Page<Transfer>> {
+  return get(withQuery(`/contracts/${encodeURIComponent(contractId)}/transfers`, { limit, after }));
 }
 
 export async function getState(contractId: string, limit = 1): Promise<ContractState> {

@@ -31,7 +31,7 @@ use std::time::Duration;
 use anyhow::Context;
 use axum::extract::DefaultBodyLimit;
 use axum::http;
-use axum::middleware;
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tower_http::compression::CompressionLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
@@ -45,14 +45,48 @@ use rate_limit::RateLimiter;
 use read_cost_limit::ReadCostLimitConfig;
 use state::{AppState, BuildInfo};
 
+/// Version, commit and build time shown by `--version`. clap prints the binary
+/// name in front of this, so it contains only the version lines.
+fn version_string() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        format!(
+            "{}\ncommit: {}\nbuilt: {}",
+            env!("CARGO_PKG_VERSION"),
+            option_env!("LUMENQRAPH_GIT_SHA").unwrap_or("unknown"),
+            option_env!("LUMENQRAPH_BUILD_TIME").unwrap_or("unknown"),
+        )
+    })
+}
 
-fn version_string() -> String {
-    format!(
-        "lumenqraph-api {}\ncommit: {}\nbuilt: {}",
-        env!("CARGO_PKG_VERSION"),
-        option_env!("LUMENQRAPH_GIT_SHA").unwrap_or("unknown"),
-        option_env!("LUMENQRAPH_BUILD_TIME").unwrap_or("unknown"),
-    )
+/// Command-line interface. It is parsed before any environment config is read,
+/// so `--help` and `--version` succeed with no env set (#651).
+#[derive(Parser)]
+#[command(
+    name = "lumenqraph-api",
+    about = "Lumenqraph read API: REST, GraphQL and webhook management over indexed Soroban events"
+)]
+struct Cli {
+    /// Dump the generated OpenAPI 3.1 spec as JSON to stdout and exit. Used by
+    /// the CI drift check (scripts/check_openapi_drift.py) without starting the
+    /// server or connecting to Postgres.
+    #[arg(long)]
+    print_openapi: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Probe the local /health endpoint and exit 0 (healthy) or 1. Used by the
+    /// Dockerfile HEALTHCHECK and compose; needs no curl (#469).
+    Healthcheck,
+}
+
+fn parse_cli() -> Cli {
+    let matches = Cli::command().version(version_string()).get_matches();
+    Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
 }
 
 /// CORS for the configured allowlist. `CORS_ALLOWED_ORIGINS` was validated by
@@ -64,7 +98,8 @@ fn build_cors_layer(origins_str: &str) -> tower_http::cors::CorsLayer {
         info!("CORS: allowing all origins (permissive mode)");
         return CorsLayer::permissive();
     }
-    let origins = config::parse_cors_origins(origins_str).expect("validated by ApiConfig::from_env");
+    let origins =
+        config::parse_cors_origins(origins_str).expect("validated by ApiConfig::from_env");
     if origins.is_empty() {
         info!("CORS: no allowed origins configured; browsers will enforce same-origin policy");
         return CorsLayer::new();
@@ -105,27 +140,20 @@ fn build_cors_layer(origins_str: &str) -> tower_http::cors::CorsLayer {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(|s| s.as_str()) == Some("--version") {
-        println!("{}", version_string());
-        return Ok(());
-    }
+    let cli = parse_cli();
 
-    // healthcheck: probe our own /health on localhost and exit 0/1 (#469).
-    // Used by the Dockerfile HEALTHCHECK and compose; needs no curl.
-    if args.get(1).map(|s| s.as_str()) == Some("healthcheck") {
+    if let Some(Command::Healthcheck) = cli.command {
         let _ = dotenvy::dotenv();
         let bind = std::env::var("API_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
         lumenqraph_core::healthcheck::run_and_exit(&bind, "/health");
     }
 
-    // --print-openapi: dump the generated OpenAPI 3.1 spec as JSON to stdout
-    // and exit.  Used by the CI drift check to compare against the committed
-    // openapi.yaml without starting the full server or connecting to Postgres.
+    // Used by the CI drift check to compare against the committed openapi.yaml
+    // without starting the full server or connecting to Postgres.
     //
     //   cargo run -p lumenqraph-api -- --print-openapi | \
     //     python3 scripts/check_openapi_drift.py openapi.yaml -
-    if args.get(1).map(|s| s.as_str()) == Some("--print-openapi") {
+    if cli.print_openapi {
         use utoipa::OpenApi as _;
         let spec = openapi::ApiDoc::openapi();
         let json = serde_json::to_string_pretty(&spec)?;
@@ -139,14 +167,15 @@ async fn main() -> anyhow::Result<()> {
     // Parse every setting once, up front: an invalid value exits here with a
     // message naming the variable instead of silently becoming the default.
     let config = Arc::new(ApiConfig::from_env()?);
-    info!(config = ?config, "effective configuration");
+    info!(
+        config = ?config, // sensitive-log-ok: Config's Debug impl redacts DB, RPC and webhook secrets
+        "effective configuration"
+    );
 
     // Validate CONTRACT_IDS at startup so a misconfigured address is caught
     // immediately rather than silently ignored or causing runtime errors.
-    lumenqraph_core::parse_contract_ids(
-        &std::env::var("CONTRACT_IDS").unwrap_or_default(),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    lumenqraph_core::parse_contract_ids(&std::env::var("CONTRACT_IDS").unwrap_or_default())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let pool = lumenqraph_core::db::connect_with_retry(&config.database_url, &config.db).await?;
 
@@ -176,9 +205,21 @@ async fn main() -> anyhow::Result<()> {
             .to_string(),
     });
 
+    // One rate limiter per route class. Each has its own key namespace so a
+    // shared Redis backend keeps their counters apart (#677).
+    let limiter = Arc::new(RateLimiter::build(&config.rate_limit, "anon").await?);
+    let rpc_limiter = Arc::new(RateLimiter::build(&config.rate_limit, "rpc").await?);
+    let proxy_limiter = Arc::new(RateLimiter::build(&config.rate_limit, "proxy").await?);
+    let webhook_limiter = Arc::new(RateLimiter::build(&config.rate_limit, "webhook").await?);
+
+    // Audit rows are written off the request path by a background batch writer (#367).
+    let audit_tx = auth::spawn_audit_writer(pool.clone());
+
     // Cancelled by `shutdown_signal`; long-lived SSE streams watch it so they end
     // promptly instead of holding graceful shutdown until the hard timeout (#571).
     let shutdown = tokio_util::sync::CancellationToken::new();
+
+    let event_fanout = Arc::new(routes::stream::EventFanout::new());
 
     let state = AppState {
         pool,
@@ -218,7 +259,11 @@ async fn main() -> anyhow::Result<()> {
         audit_tx: Some(audit_tx),
         audit_dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         shutdown: shutdown.clone(),
+        event_fanout: Arc::clone(&event_fanout),
     };
+
+    // One shared Postgres LISTEN task feeds every SSE stream (#570-#573).
+    routes::stream::spawn_listener(state.clone(), event_fanout);
 
     // Resolve the RPC network passphrase in the background so /health never
     // waits on the RPC (#578).
@@ -250,7 +295,7 @@ async fn main() -> anyhow::Result<()> {
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
-        shutdown_signal(shutdown_timeout_secs).await;
+        shutdown_signal(shutdown_timeout_secs, shutdown.clone()).await;
         let _ = drain_started_tx.send(());
     })
     .into_future();
@@ -284,7 +329,10 @@ async fn force_exit_after_drain(
     }
 }
 
-async fn shutdown_signal(shutdown_timeout_secs: u64) {
+async fn shutdown_signal(
+    shutdown_timeout_secs: u64,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -352,8 +400,11 @@ mod tests {
             // by using the same test id repeated — the count check fires before
             // strkey validation so any 26 non-empty tokens trigger it.
             // Use a real C-strkey so each individual ID passes strkey validation.
-            let single = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
-            let raw = std::iter::repeat(single).take(26).collect::<Vec<_>>().join(",");
+            // Distinct ids: duplicates are dropped before the count (#219).
+            let raw = (0..26u8)
+                .map(|i| stellar_strkey::Contract([i; 32]).to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             let err = lumenqraph_core::parse_contract_ids(&raw).unwrap_err();
             assert!(
                 err.contains("26"),
@@ -399,7 +450,8 @@ mod shutdown_deadline {
     #[tokio::test]
     async fn deadline_does_not_fire_without_a_shutdown_signal() {
         let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let fired = tokio::time::timeout(Duration::from_millis(50), force_exit_after_drain(rx, 0)).await;
+        let fired =
+            tokio::time::timeout(Duration::from_millis(50), force_exit_after_drain(rx, 0)).await;
         assert!(fired.is_err(), "deadline fired before any shutdown signal");
     }
 

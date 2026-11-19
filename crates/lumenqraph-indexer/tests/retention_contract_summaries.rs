@@ -7,15 +7,12 @@
 #[cfg(test)]
 mod retention_contract_summaries_tests {
     use sqlx::postgres::PgPoolOptions;
-    use sqlx::{PgPool, Row};
-    use std::path::Path;
+    use sqlx::PgPool;
 
     /// Create an isolated test database schema with all migrations.
     async fn setup_test_db() -> PgPool {
-        let database_url =
-            std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
-                "postgres://localhost/lumenqraph_test".to_string()
-            });
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://localhost/lumenqraph_test".to_string());
 
         let admin_pool = PgPoolOptions::new()
             .max_connections(1)
@@ -34,11 +31,7 @@ mod retention_contract_summaries_tests {
 
         // Connect to new schema and run migrations
         let options = format!("-c search_path={schema_name},public");
-        let sep = if database_url.contains('?') {
-            "&"
-        } else {
-            "?"
-        };
+        let sep = if database_url.contains('?') { "&" } else { "?" };
         let schema_url = format!(
             "{url}{sep}options={opts}",
             url = database_url,
@@ -86,13 +79,12 @@ mod retention_contract_summaries_tests {
 
     /// Get the event_count for a contract from contract_summaries.
     async fn get_summary_event_count(pool: &PgPool, contract_id: &str) -> Option<i64> {
-        let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT event_count FROM contract_summaries WHERE contract_id = $1",
-        )
-        .bind(contract_id)
-        .fetch_optional(pool)
-        .await
-        .expect("Failed to query contract_summaries");
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT event_count FROM contract_summaries WHERE contract_id = $1")
+                .bind(contract_id)
+                .fetch_optional(pool)
+                .await
+                .expect("Failed to query contract_summaries");
         row.map(|(count,)| count)
     }
 
@@ -169,7 +161,10 @@ mod retention_contract_summaries_tests {
         let before = get_summary_event_count(&pool, contract_id)
             .await
             .expect("Summary row should exist after inserts");
-        assert_eq!(before, 3, "Insert trigger should have counted all three events");
+        assert_eq!(
+            before, 3,
+            "Insert trigger should have counted all three events"
+        );
 
         // Prune events older than ledger 250 (tip=1000, retention=750 → cutoff=250)
         // Events e1 (ledger=100) and e2 (ledger=200) are below cutoff; e3 survives
@@ -211,8 +206,16 @@ mod retention_contract_summaries_tests {
         // Verify initial state
         let initial_first = get_summary_first_ledger(&pool, contract_id).await;
         let initial_last = get_summary_last_ledger(&pool, contract_id).await;
-        assert_eq!(initial_first, Some(50), "First ledger should be the oldest event");
-        assert_eq!(initial_last, Some(900), "Last ledger should be the newest event");
+        assert_eq!(
+            initial_first,
+            Some(50),
+            "First ledger should be the oldest event"
+        );
+        assert_eq!(
+            initial_last,
+            Some(900),
+            "Last ledger should be the newest event"
+        );
 
         // Prune events before ledger 200 (cutoff=200 → only b1 deleted)
         prune_events(&pool, 1000, 800).await;
@@ -221,11 +224,13 @@ mod retention_contract_summaries_tests {
         let new_first = get_summary_first_ledger(&pool, contract_id).await;
         let new_last = get_summary_last_ledger(&pool, contract_id).await;
         assert_eq!(
-            new_first, Some(500),
+            new_first,
+            Some(500),
             "first_seen_ledger should advance to the next surviving event"
         );
         assert_eq!(
-            new_last, Some(900),
+            new_last,
+            Some(900),
             "last_seen_ledger should remain at the newest event"
         );
 
@@ -292,11 +297,13 @@ mod retention_contract_summaries_tests {
         let c1_after = get_summary_event_count(&pool, c1).await;
         let c2_after = get_summary_event_count(&pool, c2).await;
         assert_eq!(
-            c1_after, Some(1),
+            c1_after,
+            Some(1),
             "C1 should have 1 event after pruning c1e1"
         );
         assert_eq!(
-            c2_after, Some(1),
+            c2_after,
+            Some(1),
             "C2 should still have 1 event (unaffected by C1's prune)"
         );
     }

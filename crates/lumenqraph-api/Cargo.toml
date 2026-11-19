@@ -9,6 +9,7 @@ name = "lumenqraph-api"
 path = "src/main.rs"
 
 [dependencies]
+clap.workspace = true
 lumenqraph-core.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -41,8 +42,14 @@ utoipa-redoc = { version = "4", features = ["axum"] }
 futures = "0.3"
 parking_lot = "0.12"
 lru = "0.12"
-redis = "0.24"
+redis = { version = "0.24", features = ["aio", "tokio-comp", "connection-manager", "script"] }
 stellar-xdr.workspace = true
 
 [dev-dependencies]
+stellar-strkey.workspace = true
 tower.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "rate_limit"
+harness = false

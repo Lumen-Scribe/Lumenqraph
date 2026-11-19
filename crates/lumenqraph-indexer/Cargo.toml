@@ -36,10 +36,12 @@ sha2.workspace = true
 uuid.workspace = true
 lru.workspace = true
 axum.workspace = true
+clap.workspace = true
 
 [dev-dependencies]
 hmac.workspace = true
 stellar-strkey.workspace = true
+tower = { workspace = true, features = ["util"] }
 sha2.workspace = true
 reqwest.workspace = true
 criterion.workspace = true

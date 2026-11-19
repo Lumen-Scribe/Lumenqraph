@@ -16,12 +16,9 @@ use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::Sha256;
-use std::time::Duration as StdDuration;
-use sqlx::types::Json;
 use sqlx::PgPool;
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -60,6 +57,71 @@ fn worker_id() -> String {
 /// number an operator can alert on.
 pub static PENDING_DELIVERIES: AtomicI64 = AtomicI64::new(0);
 
+/// Delivery attempts made by the worker pool since start
+/// (`lumenqraph_webhook_delivery_attempts_total`).
+pub static DELIVERY_ATTEMPTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative time spent in delivery attempts, in seconds.
+pub static DELIVERY_LATENCY_SECONDS_TOTAL: AtomicF64 = AtomicF64::new(0.0);
+
+/// Duration of the most recent delivery attempt, in seconds.
+pub static DELIVERY_LATENCY_LAST_SECONDS: AtomicF64 = AtomicF64::new(0.0);
+
+/// Age of the oldest pending delivery in seconds, kept in step with the
+/// `/metrics` scrape (`lumenqraph_webhook_queue_age_oldest_seconds`).
+pub static QUEUE_AGE_OLDEST_SECONDS: AtomicF64 = AtomicF64::new(0.0);
+
+/// An `f64` stored as its bit pattern in an [`AtomicU64`], for the second-valued
+/// gauges and counters above.
+pub struct AtomicF64(AtomicU64);
+
+impl AtomicF64 {
+    pub const fn new(value: f64) -> Self {
+        Self(AtomicU64::new(value.to_bits()))
+    }
+
+    pub fn load(&self, order: Ordering) -> f64 {
+        f64::from_bits(self.0.load(order))
+    }
+
+    pub fn store(&self, value: f64, order: Ordering) {
+        self.0.store(value.to_bits(), order);
+    }
+
+    pub fn add(&self, value: f64, order: Ordering) {
+        let mut current = self.0.load(Ordering::Relaxed);
+        loop {
+            let next = (f64::from_bits(current) + value).to_bits();
+            match self
+                .0
+                .compare_exchange_weak(current, next, order, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+/// A delivery's source row (its event or contract spec version) no longer
+/// exists, almost always because retention pruned it. Such a delivery can never
+/// succeed, so it is failed permanently rather than retried, and is not counted
+/// against the subscriber (#602).
+#[derive(Debug)]
+pub struct SourcePruned;
+
+impl std::fmt::Display for SourcePruned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("delivery source was pruned by retention")
+    }
+}
+
+impl std::error::Error for SourcePruned {}
+
+/// Response-body bytes kept in a delivery's recorded outcome. Enough for a
+/// subscriber's error message, never the whole body (#616).
+const RESPONSE_BODY_CAP_BYTES: usize = 512;
+
 /// Refresh [`PENDING_DELIVERIES`] from the database. Called once per tick by the
 /// service loop; returns the value it stored so the caller can log it.
 pub async fn refresh_pending_gauge(pool: &PgPool) -> anyhow::Result<i64> {
@@ -79,7 +141,10 @@ const WEBHOOK_SECRET_BACKFILL_LOCK: i64 = 566_001;
 /// Runs in a transaction holding a transaction-scoped advisory lock, so
 /// replicas starting together do not race. The statement is idempotent: rows
 /// already encrypted no longer match. Returns the number of rows migrated.
-pub async fn backfill_encrypted_secrets(pool: &PgPool, encryption_key: &str) -> anyhow::Result<u64> {
+pub async fn backfill_encrypted_secrets(
+    pool: &PgPool,
+    encryption_key: &str,
+) -> anyhow::Result<u64> {
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(WEBHOOK_SECRET_BACKFILL_LOCK)
@@ -135,12 +200,10 @@ async fn enqueue_backfill(pool: &PgPool, batch: i64) -> anyhow::Result<u64> {
         // The backfill window is (backfill_seq, starting_seq].  Once the cursor
         // reaches starting_seq the backfill is complete.
         if backfill_seq >= starting_seq {
-            sqlx::query(
-                "UPDATE webhook_subscriptions SET backfill_seq = NULL WHERE id = $1::uuid",
-            )
-            .bind(&sub_id)
-            .execute(pool)
-            .await?;
+            sqlx::query("UPDATE webhook_subscriptions SET backfill_seq = NULL WHERE id = $1::uuid")
+                .bind(&sub_id)
+                .execute(pool)
+                .await?;
             continue;
         }
 
@@ -181,20 +244,16 @@ async fn enqueue_backfill(pool: &PgPool, batch: i64) -> anyhow::Result<u64> {
 
         // Advance or clear the cursor.
         if upper >= starting_seq {
-            sqlx::query(
-                "UPDATE webhook_subscriptions SET backfill_seq = NULL WHERE id = $1::uuid",
-            )
-            .bind(&sub_id)
-            .execute(&mut *tx)
-            .await?;
+            sqlx::query("UPDATE webhook_subscriptions SET backfill_seq = NULL WHERE id = $1::uuid")
+                .bind(&sub_id)
+                .execute(&mut *tx)
+                .await?;
         } else {
-            sqlx::query(
-                "UPDATE webhook_subscriptions SET backfill_seq = $2 WHERE id = $1::uuid",
-            )
-            .bind(&sub_id)
-            .bind(upper)
-            .execute(&mut *tx)
-            .await?;
+            sqlx::query("UPDATE webhook_subscriptions SET backfill_seq = $2 WHERE id = $1::uuid")
+                .bind(&sub_id)
+                .bind(upper)
+                .execute(&mut *tx)
+                .await?;
         }
 
         tx.commit().await?;
@@ -350,12 +409,17 @@ struct DueDelivery {
     secret: Option<String>,
     /// Previous signing secret, present only while its rotation grace period is open.
     previous_secret: Option<String>,
+    // Source identifiers and timestamp. The envelope already carries them, so
+    // only the tests read these fields directly.
+    #[allow(dead_code)]
     event_id: Option<String>,
+    #[allow(dead_code)]
     upgrade_id: Option<i64>,
+    #[allow(dead_code)]
     created_at: DateTime<Utc>,
     /// Pre-built envelope, joined in `fetch_due` so `send` never re-reads the
-    /// event/upgrade row (#620).
-    envelope: WebhookEnvelope,
+    /// event/upgrade row (#620). `None` when the source row was pruned (#602).
+    envelope: Option<WebhookEnvelope>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -365,85 +429,104 @@ pub struct DeliveryOutcome {
     pub body_snippet: String,
 }
 
+/// One claimed delivery joined with its subscription, event and upgrade rows
+/// by [`fetch_due`]. Columns are aliased so the names match the struct fields.
+#[derive(sqlx::FromRow)]
+struct ClaimedDelivery {
+    id: i64,
+    subscription_id: Uuid,
+    attempts: i32,
+    url: String,
+    secret: Option<String>,
+    previous_secret: Option<String>,
+    event_id: Option<String>,
+    upgrade_id: Option<i64>,
+    created_at: DateTime<Utc>,
+    ev_event_id: Option<String>,
+    ev_contract_id: Option<String>,
+    ev_ledger: Option<i64>,
+    ev_ledger_closed_at: Option<DateTime<Utc>>,
+    ev_event_name: Option<String>,
+    ev_topics: Option<sqlx::types::Json<Vec<String>>>,
+    ev_value: Option<String>,
+    ev_decoded_topics: Option<sqlx::types::Json<serde_json::Value>>,
+    ev_decoded_value: Option<sqlx::types::Json<serde_json::Value>>,
+    ev_enriched: Option<sqlx::types::Json<serde_json::Value>>,
+    ev_tx_hash: Option<String>,
+    ev_in_successful_call: Option<bool>,
+    up_version: Option<i32>,
+    up_contract_id: Option<String>,
+    up_wasm_hash: Option<String>,
+    up_previous_wasm_hash: Option<String>,
+    up_breaking: Option<bool>,
+    up_diff: Option<sqlx::types::Json<serde_json::Value>>,
+    up_observed_at: Option<DateTime<Utc>>,
+}
+
 /// Atomically claim and fetch due deliveries, handling decryption failures gracefully.
 ///
 /// The event/upgrade payloads are joined in the same statement so a batch of N
 /// deliveries costs O(1) queries rather than N+1 (#620).
-async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::Result<Vec<DueDelivery>> {
+async fn fetch_due(
+    pool: &PgPool,
+    batch: i64,
+    encryption_key: &str,
+) -> anyhow::Result<Vec<DueDelivery>> {
     let worker = worker_id();
     let lock_duration = Duration::seconds(60);
 
-    #[allow(clippy::type_complexity)]
-    let claimed: Vec<(
-        i64,
-        Uuid,
-        i32,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        DateTime<Utc>,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<DateTime<Utc>>,
-        Option<String>,
-        Option<Json<Vec<String>>>,
-        Option<String>,
-        Option<Json<serde_json::Value>>,
-        Option<Json<serde_json::Value>>,
-        Option<Json<serde_json::Value>>,
-        Option<String>,
-        Option<bool>,
-        Option<i32>,
-        Option<String>,
-        Option<String>,
-        Option<bool>,
-        Option<Json<serde_json::Value>>,
-        Option<DateTime<Utc>>,
-    )> = sqlx::query_as(
-        "UPDATE webhook_deliveries d
-         SET locked_until = now() + $1, locked_by = $2
-         WHERE d.id IN (
-             SELECT id FROM webhook_deliveries
-             WHERE status = 'pending'
-               AND next_attempt_at <= now()
-               AND (locked_until IS NULL OR locked_until < now())
-             ORDER BY next_attempt_at
-             LIMIT $3
-             FOR UPDATE SKIP LOCKED
+    // Claim the due rows in a data-modifying CTE, then join the subscription,
+    // event and upgrade payloads in the same statement (#620). One round trip
+    // per batch, not one per delivery.
+    let claimed: Vec<ClaimedDelivery> = sqlx::query_as(
+        "WITH claimed AS (
+             UPDATE webhook_deliveries d
+             SET locked_until = now() + $1, locked_by = $2
+             WHERE d.id IN (
+                 SELECT id FROM webhook_deliveries
+                 WHERE status = 'pending'
+                   AND next_attempt_at <= now()
+                   AND (locked_until IS NULL OR locked_until < now())
+                 ORDER BY next_attempt_at
+                 LIMIT $3
+                 FOR UPDATE SKIP LOCKED
+             )
+             RETURNING d.id, d.subscription_id, d.attempts, d.event_id, d.upgrade_id, d.created_at
          )
-         RETURNING d.id,
-                   d.subscription_id,
-                   d.attempts,
-                   (SELECT url FROM webhook_subscriptions WHERE id = d.subscription_id),
-                   (SELECT safe_decrypt_webhook_secret(encrypted_secret, $4) FROM webhook_subscriptions WHERE id = d.subscription_id),
-                   (SELECT CASE WHEN previous_secret_expires_at > now()
-                                THEN safe_decrypt_webhook_secret(previous_encrypted_secret, $4)
-                           END
-                    FROM webhook_subscriptions WHERE id = d.subscription_id),
-                   d.event_id,
-                   d.upgrade_id,
-                   d.created_at,
-                   e.event_id,
-                   e.contract_id,
-                   e.ledger,
-                   e.ledger_closed_at,
-                   e.event_name,
-                   e.topics,
-                   e.value,
-                   e.decoded_topics,
-                   e.decoded_value,
-                   e.enriched,
-                   e.tx_hash,
-                   e.in_successful_call,
-                   v.contract_id,
-                   v.wasm_hash,
-                   v.previous_wasm_hash,
-                   v.breaking,
-                   v.diff,
-                   v.observed_at",
+         SELECT c.id,
+                c.subscription_id,
+                c.attempts,
+                s.url AS url,
+                safe_decrypt_webhook_secret(s.encrypted_secret, $4) AS secret,
+                CASE WHEN s.previous_secret_expires_at > now()
+                     THEN safe_decrypt_webhook_secret(s.previous_encrypted_secret, $4)
+                END AS previous_secret,
+                c.event_id,
+                c.upgrade_id,
+                c.created_at,
+                e.event_id AS ev_event_id,
+                e.contract_id AS ev_contract_id,
+                e.ledger AS ev_ledger,
+                e.ledger_closed_at AS ev_ledger_closed_at,
+                e.event_name AS ev_event_name,
+                e.topics AS ev_topics,
+                e.value AS ev_value,
+                e.decoded_topics AS ev_decoded_topics,
+                e.decoded_value AS ev_decoded_value,
+                e.enriched AS ev_enriched,
+                e.tx_hash AS ev_tx_hash,
+                e.in_successful_call AS ev_in_successful_call,
+                v.version AS up_version,
+                v.contract_id AS up_contract_id,
+                v.wasm_hash AS up_wasm_hash,
+                v.previous_wasm_hash AS up_previous_wasm_hash,
+                v.breaking AS up_breaking,
+                v.diff AS up_diff,
+                v.observed_at AS up_observed_at
+         FROM claimed c
+         JOIN webhook_subscriptions s ON s.id = c.subscription_id
+         LEFT JOIN events e ON e.event_id = c.event_id
+         LEFT JOIN contract_spec_versions v ON v.id = c.upgrade_id",
     )
     .bind(lock_duration)
     .bind(&worker)
@@ -456,13 +539,13 @@ async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::R
     let mut failed_subscriptions = Vec::new();
 
     for row in claimed {
-        let (
+        let ClaimedDelivery {
             id,
-            sub_id,
+            subscription_id: sub_id,
             attempts,
             url,
-            decrypted_secret,
-            decrypted_previous,
+            secret: decrypted_secret,
+            previous_secret: decrypted_previous,
             event_id,
             upgrade_id,
             created_at,
@@ -485,13 +568,15 @@ async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::R
             up_breaking,
             up_diff,
             up_observed_at,
-        ) = row;
+        } = row;
 
         let secret = match decrypted_secret {
             None => {
                 warn!(delivery = id, subscription = %sub_id, "failed to decrypt secret (NULL or wrong key)");
                 failed_subscriptions.push((sub_id, "secret unavailable: decryption failed"));
-                let _ = mark_failed_undecryptable(pool, id, "secret unavailable: decryption failed").await;
+                let _ =
+                    mark_failed_undecryptable(pool, id, "secret unavailable: decryption failed")
+                        .await;
                 continue;
             }
             Some(s) if s.is_empty() => {
@@ -504,7 +589,17 @@ async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::R
         };
 
         // Build the envelope from the joined row; no extra SELECT in `send`.
-        let envelope = if let (Some(event_id), Some(contract_id), Some(ledger), Some(ledger_closed_at), Some(value), Some(decoded_topics), Some(decoded_value), Some(tx_hash), Some(in_successful_call)) = (
+        let envelope = if let (
+            Some(event_id),
+            Some(contract_id),
+            Some(ledger),
+            Some(ledger_closed_at),
+            Some(value),
+            Some(decoded_topics),
+            Some(decoded_value),
+            Some(tx_hash),
+            Some(in_successful_call),
+        ) = (
             ev_event_id,
             ev_contract_id,
             ev_ledger,
@@ -529,8 +624,15 @@ async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::R
                 tx_hash,
                 in_successful_call,
             };
-            WebhookEnvelope::for_event(id, created_at, event_data)
-        } else if let (Some(version), Some(contract_id), Some(wasm_hash), Some(breaking), Some(diff), Some(observed_at)) = (
+            Some(WebhookEnvelope::for_event(id, created_at, event_data))
+        } else if let (
+            Some(version),
+            Some(contract_id),
+            Some(wasm_hash),
+            Some(breaking),
+            Some(diff),
+            Some(observed_at),
+        ) = (
             up_version,
             up_contract_id,
             up_wasm_hash,
@@ -547,11 +649,15 @@ async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::R
                 diff: diff.0,
                 observed_at,
             };
-            WebhookEnvelope::for_upgrade(id, created_at, upgrade_data)
+            Some(WebhookEnvelope::for_upgrade(id, created_at, upgrade_data))
         } else {
-            warn!(delivery = id, "delivery has neither event nor upgrade payload");
-            let _ = mark_failed_undecryptable(pool, id, "delivery has neither event_id nor upgrade_id").await;
-            continue;
+            // The referenced row was pruned. `send` fails the delivery as
+            // SourcePruned; it is not dropped here so the outcome is recorded.
+            warn!(
+                delivery = id,
+                "delivery source row is missing; it will be failed as pruned"
+            );
+            None
         };
 
         deliveries.push(DueDelivery {
@@ -575,7 +681,21 @@ async fn fetch_due(pool: &PgPool, batch: i64, encryption_key: &str) -> anyhow::R
     Ok(deliveries)
 }
 
-async fn mark_failed_undecryptable(pool: &PgPool, delivery_id: i64, error_msg: &str) -> anyhow::Result<()> {
+async fn mark_failed_undecryptable(
+    pool: &PgPool,
+    delivery_id: i64,
+    error_msg: &str,
+) -> anyhow::Result<()> {
+    mark_failed_permanent(pool, delivery_id, error_msg).await
+}
+
+/// Terminally fail a delivery that can never succeed. Leaves `attempts` and the
+/// subscriber's failure counters alone (#602).
+async fn mark_failed_permanent(
+    pool: &PgPool,
+    delivery_id: i64,
+    error_msg: &str,
+) -> anyhow::Result<()> {
     sqlx::query(
         "UPDATE webhook_deliveries
          SET status = 'failed', last_error = $2, locked_until = NULL, locked_by = NULL
@@ -588,7 +708,11 @@ async fn mark_failed_undecryptable(pool: &PgPool, delivery_id: i64, error_msg: &
     Ok(())
 }
 
-async fn auto_disable_subscription(pool: &PgPool, subscription_id: Uuid, reason: &str) -> anyhow::Result<()> {
+async fn auto_disable_subscription(
+    pool: &PgPool,
+    subscription_id: Uuid,
+    reason: &str,
+) -> anyhow::Result<()> {
     sqlx::query(
         "UPDATE webhook_subscriptions
          SET active = false, auto_disabled_at = now(), auto_disabled_reason = $2
@@ -603,17 +727,8 @@ async fn auto_disable_subscription(pool: &PgPool, subscription_id: Uuid, reason:
     Ok(())
 }
 
-pub async fn deliver(
-    pool: &PgPool,
-    http: &reqwest::Client,
-    config: &Config,
-) -> anyhow::Result<(u64, u64)> {
-    deliver_with_shutdown(pool, http, config, &CancellationToken::new()).await
-}
-
 pub async fn deliver_with_shutdown(
     pool: &PgPool,
-    http: &reqwest::Client,
     config: &Config,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<(u64, u64)> {
@@ -641,13 +756,11 @@ pub async fn deliver_with_shutdown(
         // Only claim when there is spare capacity; otherwise drain one result.
         let available = semaphore.available_permits();
         if available == 0 {
-            if let Some(result) = inflight.next().await {
-                if let Some((ok, _sub)) = result {
-                    if ok {
-                        delivered += 1;
-                    } else {
-                        failed += 1;
-                    }
+            if let Some(Some((ok, _sub))) = inflight.next().await {
+                if ok {
+                    delivered += 1;
+                } else {
+                    failed += 1;
                 }
             }
             continue;
@@ -661,7 +774,6 @@ pub async fn deliver_with_shutdown(
 
         for d in deliveries {
             let pool = pool.clone();
-            let http = http.clone();
             let config = config.clone();
             let semaphore = semaphore.clone();
             let per_host_limits = per_host_limits.clone();
@@ -679,7 +791,14 @@ pub async fn deliver_with_shutdown(
                 let _permit = semaphore.acquire().await.ok()?;
                 let _host_permit = host_semaphore.acquire().await.ok()?;
 
-                match send(&pool, &http, &d, &config).await {
+                let started = std::time::Instant::now();
+                let result = send(&d, &config).await;
+                let elapsed = started.elapsed().as_secs_f64();
+                DELIVERY_ATTEMPTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                DELIVERY_LATENCY_LAST_SECONDS.store(elapsed, Ordering::Relaxed);
+                DELIVERY_LATENCY_SECONDS_TOTAL.add(elapsed, Ordering::Relaxed);
+
+                match result {
                     Ok(outcome) => {
                         let status = outcome.status.unwrap_or(200);
                         if (200..=299).contains(&status) {
@@ -764,100 +883,51 @@ fn extract_host(url: &str) -> String {
 
 /// Computes the hex-encoded HMAC-SHA256 of `signed_payload` under `secret`.
 fn sign_payload(secret: &str, signed_payload: &str) -> anyhow::Result<String> {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).context("invalid webhook secret")?;
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).context("invalid webhook secret")?;
     mac.update(signed_payload.as_bytes());
     Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
-async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &Config) -> anyhow::Result<DeliveryOutcome> {
+async fn send(d: &DueDelivery, config: &Config) -> anyhow::Result<DeliveryOutcome> {
     validate_webhook_url_at_delivery(&d.url)
         .await
         .map_err(|e| anyhow::anyhow!("URL validation failed at delivery: {}", e))?;
 
-    let secret = d.secret.as_ref().ok_or_else(|| anyhow::anyhow!("delivery has no decrypted secret"))?;
+    let secret = d
+        .secret
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("delivery has no decrypted secret"))?;
 
-    // A delivery whose source row was pruned (retention deletes old
-    // `contract_spec_versions`) can never succeed. Surface it as a distinct,
-    // permanent error so the caller can fail it without retrying or counting
-    // it against the subscriber (#602).
-    let envelope = if let Some(event_id) = &d.event_id {
-        let event: (
-            String,
-            String,
-            i64,
-            DateTime<Utc>,
-            Option<String>,
-            Json<Vec<String>>,
-            String,
-            Json<serde_json::Value>,
-            Json<serde_json::Value>,
-            Option<Json<serde_json::Value>>,
-            String,
-            bool,
-        ) = sqlx::query_as(
-            "SELECT event_id, contract_id, ledger, ledger_closed_at, event_name, topics, value, decoded_topics, decoded_value, enriched, tx_hash, in_successful_call FROM events WHERE event_id = $1",
-        )
-        .bind(event_id)
-        .fetch_one(pool)
-        .await?;
-
-        let event_data = ContractEventData {
-            event_id: event.0,
-            contract_id: event.1,
-            ledger: event.2,
-            ledger_closed_at: event.3,
-            event_name: event.4,
-            topics: event.5.0,
-            value: event.6,
-            decoded_topics: event.7.0,
-            decoded_value: event.8.0,
-            enriched: event.9.map(|j| j.0),
-            tx_hash: event.10,
-            in_successful_call: event.11,
-        };
-
-        WebhookEnvelope::for_event(d.id, d.created_at, event_data)
-    } else if let Some(upgrade_id) = d.upgrade_id {
-        let upgrade: (String, i32, String, Option<String>, bool, Json<serde_json::Value>, DateTime<Utc>) = sqlx::query_as(
-            "SELECT contract_id, version, wasm_hash, previous_wasm_hash, breaking, diff, observed_at FROM contract_spec_versions WHERE id = $1",
-        )
-        .bind(upgrade_id)
-        .fetch_optional(pool)
-        .await?
+    // The envelope was joined in `fetch_due` (#620). Without one, the source
+    // row was pruned by retention and can never be delivered: surface a
+    // distinct, permanent error so the caller fails it without retrying or
+    // counting it against the subscriber (#602).
+    let envelope = d
+        .envelope
+        .as_ref()
         .ok_or_else(|| anyhow::Error::new(SourcePruned))?;
 
-        let upgrade_data = ContractUpgradeData {
-            contract_id: upgrade.0,
-            version: upgrade.1,
-            wasm_hash: upgrade.2,
-            previous_wasm_hash: upgrade.3,
-            breaking: upgrade.4,
-            diff: upgrade.5.0,
-            observed_at: upgrade.6,
-        };
-
-        WebhookEnvelope::for_upgrade(d.id, d.created_at, upgrade_data)
-    } else {
-        // An upgrade delivery with no `upgrade_id` means the referenced spec
-        // version was pruned (FK is `ON DELETE SET NULL`), so there is nothing
-        // left to deliver.
-        return Err(anyhow::Error::new(SourcePruned));
-    };
-
-    let body = serde_json::to_vec(&envelope)?;
+    let body = serde_json::to_vec(envelope)?;
     let timestamp = Utc::now().timestamp();
     let signed_payload = format!("{}.{}", timestamp, std::str::from_utf8(&body)?);
 
     // During a rotation grace period the previous secret signs too, so receivers
     // that have not yet picked up the new secret keep verifying (#564).
-    let mut signature_header = format!("t={},v1={}", timestamp, sign_payload(secret, &signed_payload)?);
+    let mut signature_header = format!(
+        "t={},v1={}",
+        timestamp,
+        sign_payload(secret, &signed_payload)?
+    );
     if let Some(previous) = &d.previous_secret {
         signature_header.push_str(&format!(",v1={}", sign_payload(previous, &signed_payload)?));
     }
 
     let parsed_url = Url::parse(&d.url).context("failed to parse URL")?;
     let host = parsed_url.host_str().context("URL must have a host")?;
-    let validated_ip = validate_webhook_url_at_delivery(&d.url).await.map_err(|e| anyhow::anyhow!(e))?;
+    let validated_ip = validate_webhook_url_at_delivery(&d.url)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
     // Pin the validated IP, but keep the same hardening as `build_delivery_client`:
     // never follow redirects (SSRF guard, #447/#615) and bound connect/total time.
     let client = reqwest::Client::builder()
@@ -865,7 +935,13 @@ async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &C
             host,
             std::net::SocketAddr::new(
                 validated_ip,
-                parsed_url.port().unwrap_or(if parsed_url.scheme() == "https" { 443 } else { 80 }),
+                parsed_url
+                    .port()
+                    .unwrap_or(if parsed_url.scheme() == "https" {
+                        443
+                    } else {
+                        80
+                    }),
             ),
         )
         .redirect(reqwest::redirect::Policy::none())
@@ -907,7 +983,7 @@ async fn send(pool: &PgPool, http: &reqwest::Client, d: &DueDelivery, config: &C
     // Read at most `response_body_cap` bytes, streaming chunk-by-chunk so a
     // subscriber cannot force us to buffer an unbounded body (#616). Dropping
     // the response afterwards aborts the connection.
-    let snippet = read_body_snippet(resp, config.response_body_cap()).await?;
+    let snippet = read_body_snippet(resp, RESPONSE_BODY_CAP_BYTES).await?;
 
     Ok(DeliveryOutcome {
         status: Some(status.as_u16() as i32),
@@ -953,6 +1029,7 @@ fn delivery_outcome(status: reqwest::StatusCode, location: Option<&str>) -> anyh
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn build_delivery_client(
     connect_timeout: std::time::Duration,
     total_timeout: std::time::Duration,
@@ -998,8 +1075,7 @@ const BACKOFF_FLOOR_SECS: i64 = 1;
 fn jittered_backoff<R: Rng + ?Sized>(attempts: i32, rng: &mut R) -> Duration {
     let window = (2i64)
         .saturating_pow(attempts.max(1) as u32)
-        .min(BACKOFF_CAP_SECS)
-        .max(BACKOFF_FLOOR_SECS);
+        .clamp(BACKOFF_FLOOR_SECS, BACKOFF_CAP_SECS);
     let jittered = rng.gen_range(0..=window);
     Duration::seconds(jittered.max(BACKOFF_FLOOR_SECS))
 }
@@ -1011,28 +1087,39 @@ async fn mark_retry(
     max_attempts: i32,
     outcome: &DeliveryOutcome,
 ) -> anyhow::Result<()> {
-    mark_retry_with_rng(pool, d, err, max_attempts, outcome, &mut rand::thread_rng()).await
+    // The RNG is used synchronously and dropped before the first await. A
+    // `ThreadRng` is not `Send`, so it must not live in this future.
+    let next_attempt_at = next_attempt_at_for(d.attempts + 1, outcome, &mut rand::thread_rng());
+    mark_retry_at(pool, d, err, max_attempts, outcome, next_attempt_at).await
 }
 
-/// [`mark_retry`] with an injectable RNG so backoff jitter is deterministic in
-/// tests (#617).
-async fn mark_retry_with_rng<R: Rng + ?Sized>(
+/// When a failed delivery should be retried: the subscriber's `Retry-After`
+/// (capped at 24h) when given, otherwise jittered exponential backoff (#617).
+fn next_attempt_at_for<R: Rng + ?Sized>(
+    attempts: i32,
+    outcome: &DeliveryOutcome,
+    rng: &mut R,
+) -> DateTime<Utc> {
+    if let Some(retry_after) = outcome.retry_after {
+        Utc::now() + retry_after.min(Duration::hours(24))
+    } else {
+        Utc::now() + jittered_backoff(attempts, rng)
+    }
+}
+
+/// Record a failed attempt, scheduling a retry at `next_attempt_at` or marking
+/// the delivery terminally failed once `max_attempts` is reached.
+async fn mark_retry_at(
     pool: &PgPool,
     d: &DueDelivery,
     err: &str,
     max_attempts: i32,
     outcome: &DeliveryOutcome,
-    rng: &mut R,
+    next_attempt_at: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
     let attempts = d.attempts + 1;
     let final_retry = attempts >= max_attempts;
-    let next_attempt_at = if let Some(retry_after) = outcome.retry_after {
-        let capped = retry_after.min(Duration::hours(24));
-        Utc::now() + capped
-    } else {
-        Utc::now() + jittered_backoff(attempts, rng)
-    };
 
     if final_retry {
         sqlx::query(
@@ -1069,12 +1156,15 @@ async fn mark_retry_with_rng<R: Rng + ?Sized>(
     Ok(())
 }
 
+/// `(consecutive_failures, last_success_at, first_failure_at)` after a failure.
+type ConsecutiveFailures = (i32, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+
 async fn check_and_auto_disable(
     pool: &PgPool,
     subscription_id: Uuid,
     failure_threshold: i32,
 ) -> anyhow::Result<()> {
-    let result: Option<(i32, Option<DateTime<Utc>>, Option<DateTime<Utc>>)> = sqlx::query_as(
+    let result: Option<ConsecutiveFailures> = sqlx::query_as(
         "UPDATE webhook_subscriptions
          SET consecutive_failures = consecutive_failures + 1,
              first_failure_at = COALESCE(first_failure_at, now())
@@ -1246,7 +1336,10 @@ pub(crate) mod tests {
         add_version(&pool, 1, false).await;
         add_version(&pool, 2, true).await;
 
-        assert_eq!(backfill_encrypted_secrets(&pool, "test-key").await.unwrap(), 1);
+        assert_eq!(
+            backfill_encrypted_secrets(&pool, "test-key").await.unwrap(),
+            1
+        );
         assert_eq!(
             backfill_encrypted_secrets(&pool, "test-key").await.unwrap(),
             0,
@@ -1356,16 +1449,14 @@ pub(crate) mod tests {
 
         let due = fetch_due(&pool, 100, "test-key").await.unwrap();
         assert_eq!(due.len(), 1);
-        assert!(due[0].upgrade_id.is_none(), "upgrade_id should be NULL after prune");
+        assert!(
+            due[0].upgrade_id.is_none(),
+            "upgrade_id should be NULL after prune"
+        );
 
         // send() must classify this as a permanent SourcePruned error.
-        let http = build_delivery_client(
-            std::time::Duration::from_secs(2),
-            std::time::Duration::from_secs(5),
-        )
-        .expect("client");
         let config = Config::for_test();
-        let err = send(&pool, &http, &due[0], &config).await.unwrap_err();
+        let err = send(&due[0], &config).await.unwrap_err();
         assert!(
             err.downcast_ref::<SourcePruned>().is_some(),
             "expected SourcePruned, got: {err}"
@@ -1385,7 +1476,10 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(status, "failed");
         assert_eq!(attempts, 0, "attempts must not be incremented");
-        assert_eq!(last_error.as_deref(), Some("source spec version was pruned"));
+        assert_eq!(
+            last_error.as_deref(),
+            Some("source spec version was pruned")
+        );
 
         // No retry scheduled: nothing is due again.
         assert!(fetch_due(&pool, 100, "test-key").await.unwrap().is_empty());
@@ -1418,11 +1512,20 @@ pub(crate) mod tests {
         assert_eq!(due.len(), 5);
 
         // Deterministic RNG so the variance assertion is stable (#617).
+        use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(0x5EED);
         for d in due {
-            mark_retry_with_rng(&pool, &d, "test error", 5, &DeliveryOutcome::default(), &mut rng)
-                .await
-                .expect("mark retry");
+            let next = next_attempt_at_for(d.attempts + 1, &DeliveryOutcome::default(), &mut rng);
+            mark_retry_at(
+                &pool,
+                &d,
+                "test error",
+                5,
+                &DeliveryOutcome::default(),
+                next,
+            )
+            .await
+            .expect("mark retry");
         }
 
         // Fetch all scheduled retries and check their times are different.
@@ -1492,8 +1595,8 @@ pub(crate) mod tests {
         let body = r#"{"event":"transfer","amount":"100","currency":"€"}"#;
         let expected_hex = "7f57c5ce713d6e0af04058523af69c77096025b41bac63a883ecf8be1b2ca55e";
 
-        let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-            .expect("HMAC accepts any key size");
+        let mut mac =
+            HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key size");
         mac.update(body.as_bytes());
         let computed_hex = hex::encode(mac.finalize().into_bytes());
 
@@ -1534,6 +1637,7 @@ mod redirect_tests {
             event_id: None,
             upgrade_id: None,
             created_at: Utc::now(),
+            envelope: None,
         }
     }
 
@@ -1568,22 +1672,25 @@ mod redirect_tests {
             }
         });
 
-        // Drive the real delivery path. `send()` needs a pool only to build the
-        // envelope, which fails before any query for a delivery with neither
-        // event nor upgrade id — so we exercise the HTTP path via a lazy pool.
-        let pool = sqlx::PgPool::connect_lazy("postgres://unused/unused").unwrap();
-        let http = build_delivery_client(StdDuration::from_secs(2), StdDuration::from_secs(5))
+        // The SSRF guard in `send()` refuses loopback URLs, so the redirect policy
+        // is exercised on the same client builder `send()` uses. Redirects must
+        // come back as a 3xx and never be followed.
+        let client = build_delivery_client(StdDuration::from_secs(2), StdDuration::from_secs(5))
             .expect("client");
-        let config = Config::default();
-        let d = due_for(&format!("http://{hook_addr}/hook"));
-        let err = send(&pool, &http, &d, &config).await.unwrap_err();
-        assert!(
-            err.to_string().contains("redirects are not followed"),
-            "unexpected error: {err}"
-        );
+        let resp = client
+            .post(format!("http://{hook_addr}/hook"))
+            .body("{}")
+            .send()
+            .await
+            .expect("hook responds");
+        assert!(resp.status().is_redirection(), "expected 3xx, got {}", resp.status());
 
         tokio::time::sleep(StdDuration::from_millis(100)).await;
-        assert_eq!(hits.load(Ordering::SeqCst), 0, "redirect target was contacted");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "redirect target was contacted"
+        );
     }
 
     #[tokio::test]
@@ -1619,7 +1726,11 @@ mod redirect_tests {
 
         let started = std::time::Instant::now();
         let snippet = read_body_snippet(resp, 512).await.expect("read body");
-        assert!(snippet.len() <= 512, "snippet not bounded: {}", snippet.len());
+        assert!(
+            snippet.len() <= 512,
+            "snippet not bounded: {}",
+            snippet.len()
+        );
         assert!(
             started.elapsed() < StdDuration::from_secs(2),
             "reading bounded body took too long: {:?}",
