@@ -191,7 +191,10 @@ async fn poll_once(
     let cycle_span_for_record = cycle_span.clone();
     async move {
 
-    let mut start = match cursor::read_last_processed(pool).await? {
+    // A cursor of 0 means nothing has been processed yet (the row can exist
+    // only because the network passphrase was pinned, #714), so it is not a
+    // position to resume after.
+    let mut start = match cursor::read_last_processed(pool).await?.filter(|c| *c > 0) {
         Some(c) => c + 1,
         None if config.start_ledger > 0 => config.start_ledger,
         None => latest,

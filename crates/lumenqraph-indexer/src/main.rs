@@ -152,6 +152,19 @@ fn skip_migrations() -> bool {
     )
 }
 
+/// Returns true when `ALLOW_NETWORK_CHANGE` is set to a truthy value. It lets
+/// the database be re-pinned to a different Soroban network (#714).
+fn allow_network_change() -> bool {
+    matches!(
+        std::env::var("ALLOW_NETWORK_CHANGE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 async fn run_migrations(pool: &sqlx::PgPool) -> anyhow::Result<()> {
     let mut conn = pool
         .acquire()
@@ -270,10 +283,13 @@ async fn main() -> anyhow::Result<()> {
     let rpc = RpcClient::with_urls(config.rpc_urls.clone(), config.rpc_timeout_secs);
     // Only commands that use the RPC need a reachable endpoint, and then only
     // one of them (#713). `migrate` and `deep-backfill` make no RPC calls.
-    if !matches!(command, Command::Migrate | Command::DeepBackfill { .. }) {
+    let live_passphrase = if matches!(command, Command::Migrate | Command::DeepBackfill { .. }) {
+        None
+    } else {
         let network_passphrase = rpc.validate_network_passphrases().await?;
         info!(%network_passphrase, endpoints = config.rpc_urls.len(), "validated RPC network identity");
-    }
+        Some(network_passphrase)
+    };
 
     match &command {
         Command::Migrate => return run_migrations(&pool).await,
@@ -287,6 +303,12 @@ async fn main() -> anyhow::Result<()> {
         run_migrations(&pool).await?;
     } else {
         info!("SKIP_MIGRATIONS is set; skipping database migrations");
+    }
+
+    // Store the network the database is for, or refuse a different one (#714).
+    // DeepBackfill has no live RPC to compare against, so it skips this.
+    if let Some(passphrase) = &live_passphrase {
+        cursor::pin_network_passphrase(&pool, passphrase, allow_network_change()).await?;
     }
 
     match command {

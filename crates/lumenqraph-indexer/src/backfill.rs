@@ -398,6 +398,7 @@ pub async fn run(
     let resume_from = if from_ledger == 0 {
         cursor::read_last_processed(&pool)
             .await?
+            .filter(|l| *l > 0)
             .map(|l| l + 1)
             .unwrap_or(0)
     } else {

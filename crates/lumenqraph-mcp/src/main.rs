@@ -1127,6 +1127,34 @@ mod tests {
         }
     }
 
+    /// #714: the indexer pins `indexer_cursor.network_passphrase`; with no
+    /// RPC_URL, MCP must derive the default endpoint from that stored value.
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn resolves_default_rpc_url_from_stored_passphrase() {
+        let state = fixture_state().await;
+        sqlx::query(
+            "INSERT INTO indexer_cursor (id, last_processed_ledger, network_passphrase, updated_at)
+             VALUES (1, 0, $1, now())
+             ON CONFLICT (id) DO UPDATE SET network_passphrase = EXCLUDED.network_passphrase",
+        )
+        .bind("Test SDF Network ; September 2015")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let url = resolve_rpc_url(&state.pool, None).await.unwrap();
+        assert_eq!(url, "https://soroban-testnet.stellar.org");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn no_rpc_url_and_no_stored_passphrase_is_an_error() {
+        let state = fixture_state().await;
+        let err = resolve_rpc_url(&state.pool, None).await.unwrap_err();
+        assert!(err.to_string().contains("network_passphrase is unavailable"), "{err}");
+    }
+
     fn percent_encode(s: &str) -> String {
         s.chars()
             .flat_map(|c| match c {
