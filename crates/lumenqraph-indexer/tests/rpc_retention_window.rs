@@ -215,7 +215,7 @@ mod rpc_retention_window_tests {
     }
 
     /// Test: Hardcoded constant is removed or only used as last-resort fallback.
-    #[tokio::test]
+    #[test]
     fn test_hardcoded_120000_is_not_primary_source() {
         // This is a code inspection test: verify that MAX_LOOKBACK_LEDGERS = 120_000
         // is not used directly in fresh-start clamping logic.

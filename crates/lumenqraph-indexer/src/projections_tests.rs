@@ -12,11 +12,11 @@
 #[cfg(test)]
 mod projection_tests {
     use chrono::Utc;
-    use lumenqraph_indexer::store::{self, NewEvent};
+    use crate::store;
+    use lumenqraph_core::NewEvent;
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
     use sqlx::Row;
-    use stellar_strkey::Strkey;
 
     /// Deterministic, valid contract strkey.
     fn contract_strkey(seed: u8) -> String {
@@ -25,7 +25,7 @@ mod projection_tests {
 
     /// Deterministic, valid account (ed25519 public key) strkey.
     fn account_strkey(seed: u8) -> String {
-        stellar_strkey::Ed25519PublicKey([seed; 32]).to_string()
+        stellar_strkey::ed25519::PublicKey([seed; 32]).to_string()
     }
 
     fn new_event(
@@ -41,9 +41,9 @@ mod projection_tests {
             contract_id: contract_id.to_string(),
             ledger,
             ledger_closed_at: Utc::now(),
-            event_type: "contract".to_string(),
-            topics: json!([]),
-            decoded_topics: topics,
+            event_type: lumenqraph_core::EventType::Contract,
+            topics: vec![],
+            decoded_topics: topics.as_array().cloned().unwrap_or_default(),
             event_name: Some(event_name.to_string()),
             value: String::new(),
             decoded_value: value,
@@ -395,7 +395,7 @@ mod projection_tests {
             .expect("insert_events should succeed");
 
         let row = sqlx::query(
-            "SELECT from_addr, to_addr, amount, amount_numeric
+            "SELECT from_addr, to_addr, amount, amount_numeric::text AS amount_numeric
              FROM token_transfers WHERE event_id = $1",
         )
         .bind(event_id)
@@ -407,8 +407,8 @@ mod projection_tests {
         assert_eq!(row.get::<Option<String>, _>("to_addr").as_deref(), Some(to.as_str()));
         assert_eq!(row.get::<String, _>("amount"), "12345");
         assert_eq!(
-            row.get::<Option<sqlx::types::BigDecimal>, _>("amount_numeric"),
-            Some(sqlx::types::BigDecimal::from(12345))
+            row.get::<Option<String>, _>("amount_numeric").as_deref(),
+            Some("12345")
         );
 
         cleanup_test_data(&pool, &contract_id).await;

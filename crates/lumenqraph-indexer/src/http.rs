@@ -359,7 +359,7 @@ mod tests {
             .expect("lazy pool");
         HttpState {
             pool: Arc::new(pool),
-            spec_cache: Arc::new(SpecCache::new()),
+            spec_cache: Arc::new(SpecCache::new(16, 2)),
             metrics_bearer_token: token.map(|t| Arc::new(t.to_string())),
         }
     }
