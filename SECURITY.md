@@ -49,13 +49,9 @@ We commit to the following response timeline:
 
 ## Supported Versions
 
-Security updates are provided for:
+No release has been published yet, so **only the `main` branch is supported**. Security fixes land on `main`.
 
-- **Current release**: Full support for all issues
-- **Previous major version**: Critical and high severity issues only
-- **Earlier versions**: No guaranteed support (updates may be provided at maintainers' discretion)
-
-Check the [releases page](https://github.com/Lumen-Scribe/Lumenqraph/releases) for version information.
+Once releases are published, this section will list the supported versions. Check the [releases page](https://github.com/Lumen-Scribe/Lumenqraph/releases) for version information.
 
 ## Security Best Practices
 
@@ -273,7 +269,7 @@ If a vulnerability is confirmed:
 
 ## Acknowledgments
 
-We appreciate the security research community and thank all reporters who have responsibly disclosed vulnerabilities. Contributors to security improvements will be acknowledged in our [Security Credits](SECURITY_CREDITS.md) file (if applicable).
+We appreciate the security research community and thank all reporters who have responsibly disclosed vulnerabilities. Contributors to security improvements will be acknowledged (if applicable).
 
 ## Questions or Concerns?
 

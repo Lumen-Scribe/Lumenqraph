@@ -22,6 +22,25 @@ Breaking changes will be documented in the changelog with migration guidance whe
 
 ## [Unreleased]
 
+### Added
+
+- Admin API for API-key management (#431): `GET /admin/keys`, `POST /admin/keys`,
+  `POST /admin/keys/{prefix}/revoke` and `POST /admin/keys/{prefix}/rotate`.
+  Guarded by the new `ADMIN_TOKEN` credential; the routes return 404 unless it is
+  set. Every action is written to the audit log.
+
+### Fixed
+
+- Python SDK: `Retry-After` is honoured on every retry, backoff uses full jitter,
+  and cancelling an async call stops further retries (#634).
+- Docker image: the explorer bundle (`app.js`) is built in the image, so the
+  bundled explorer loads. A CI smoke test now checks the page and script (#635).
+- Explorer: list endpoints are read as `Page<T>`. The contract list, events and
+  transfers tabs render `data` and offer "Load more" (#636).
+- Build: the core crate declares its `hmac` and `sha2` dependencies, and the API
+  config and webhook handlers no longer carry merge leftovers or an insecure
+  fallback key.
+
 ### Migration notes
 
 > Full step-by-step instructions: [docs/UPGRADING.md — Unreleased](docs/UPGRADING.md#unreleased--next-release)

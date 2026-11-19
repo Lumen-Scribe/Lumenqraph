@@ -42,33 +42,17 @@ volumes:
 
 ### Prometheus Configuration
 
-Create a `monitoring/prometheus.yml`:
+`monitoring/prometheus.yml` already scrapes all three services (API, indexer and webhooks) plus Prometheus itself, using docker-compose service names. Use it as-is with the compose snippet above, or adapt the targets for bare metal:
 
-```yaml
-global:
-  scrape_interval: 30s
-  evaluation_interval: 30s
-  external_labels:
-    cluster: 'production'
+| Job | Default target | Service setting |
+|-----|----------------|-----------------|
+| `lumenqraph-api` | `api:8080` | `API_BIND_ADDR` |
+| `lumenqraph-indexer` | `indexer:9090` | `INDEXER_HTTP_BIND_ADDR` (must be `0.0.0.0:9090` inside compose) |
+| `lumenqraph-webhooks` | `webhooks:9091` | `WEBHOOKS_METRICS_BIND_ADDR` (must be `0.0.0.0:9091` inside compose) |
 
-alerting:
-  alertmanagers:
-    - static_configs:
-        - targets: []
+The indexer and webhooks default to `127.0.0.1`, which is unreachable from another container. `docker-compose.full.yml` sets both to `0.0.0.0` on the private compose network without publishing the ports. If the indexer sets `METRICS_BEARER_TOKEN`, uncomment the `authorization` block in the indexer job.
 
-rule_files:
-  - 'prometheus_alerts.yml'
-
-scrape_configs:
-  - job_name: 'lumenqraph-api'
-    static_configs:
-      - targets: ['localhost:8080']
-    metrics_path: '/metrics'
-
-  - job_name: 'prometheus'
-    static_configs:
-      - targets: ['localhost:9090']
-```
+To send alerts to Alertmanager, set the `alerting.alertmanagers` targets in `prometheus.yml` (the file has a commented example).
 
 ### Importing the Grafana Dashboard
 
@@ -92,7 +76,7 @@ scrape_configs:
 - **`lumenqraph_indexer_lag_ledgers`** - Ledgers behind chain tip (lower is better)
 - **`lumenqraph_indexer_last_processed_ledger`** - Most recent ledger processed
 - **`lumenqraph_indexer_chain_tip_ledger`** - Latest ledger on chain
-- **`lumenqraph_indexer_ingested_total`** - Total events ingested (cumulative)
+- **`lumenqraph_indexer_events_ingested_total`** - Events ingested by the indexer process (cumulative). The API also exposes `lumenqraph_indexer_ingested_total`, derived from the database.
 - **`lumenqraph_indexer_errors_total`** - Total indexer poll-cycle errors (cumulative)
 
 ### API Metrics
@@ -106,7 +90,7 @@ scrape_configs:
 ### Webhook Metrics
 
 Exposed by the `lumenqraph-webhooks` service on its own `/metrics` endpoint
-(default `127.0.0.1:9091`, `WEBHOOKS_METRICS_BIND_ADDR`):
+(default `127.0.0.1:9091`, `WEBHOOKS_METRICS_BIND_ADDR`; use `0.0.0.0:9091` when Prometheus scrapes from another container):
 
 - **`lumenqraph_webhooks_pending_deliveries`** - Deliveries in the `pending`
   state (queue depth), refreshed once per dispatcher tick. A sustained rise
@@ -132,6 +116,24 @@ Exposed by the `lumenqraph-webhooks` service on its own `/metrics` endpoint
 - **IngestRateLow** - Processing < 1 event/sec for 10+ minutes
 - **APINoRequests** - No API requests for 5+ minutes
 - **LumenqraphWebhookBacklogHigh** - Pending webhook deliveries > 500 for 5+ minutes
+
+## Validating the Configuration
+
+CI (`monitoring-config` job) runs these checks; run them locally before changing the files:
+
+```bash
+# Alert and scrape consistency: every metric in an alert expression must be
+# emitted by a service that has a scrape job.
+python3 scripts/check_alert_metrics.py
+
+# Prometheus syntax checks, pinned to the same image as CI
+docker run --rm -v "$PWD/monitoring:/etc/prometheus:ro" \
+  --entrypoint promtool prom/prometheus:v2.54.1 \
+  check config /etc/prometheus/prometheus.yml
+docker run --rm -v "$PWD/monitoring:/etc/prometheus:ro" \
+  --entrypoint promtool prom/prometheus:v2.54.1 \
+  check rules /etc/prometheus/prometheus_alerts.yml
+```
 
 ## Customization
 

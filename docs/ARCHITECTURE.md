@@ -82,20 +82,27 @@ diff endpoints; the indexer needs it to enrich events without re-parsing on
 every one. They are separate processes with separate caches, so an upgrade
 detected by the indexer is not automatically visible to the API.
 
-Rather than rely on a TTL — which would leave a window where the API serves a
-stale interface after the indexer has already recorded the new one — the API's
-cache revalidates against Postgres on every lookup, keyed on both
+The API's cache validates against Postgres, keyed on both
 `contract_specs.wasm_hash` and `contract_specs.fetched_at`. `wasm_hash`
 changing is what actually signals an upgrade; `fetched_at` is compared
 alongside it so any write to that row is caught even in cases hash equality
 alone wouldn't cover (e.g. a hash collision, or the row being rewritten by a
-future code path this cache doesn't know about). Together they mean any write
-the indexer makes is visible to the API's cache on its very next lookup, with
-no staleness window to tune.
+future code path this cache doesn't know about).
 
-This costs one small, indexed query per lookup (`wasm_hash`, `fetched_at`) —
-the section itself (large, and requiring an XDR re-parse) is only re-fetched
-when that comparison actually detects a change.
+A validated entry is served without a database query for up to 5 seconds
+(`REVALIDATE_AFTER` in `crates/lumenqraph-api/src/specs.rs`, #647). Once that
+window passes, the next lookup re-runs the `wasm_hash`/`fetched_at` check
+before the entry is used again. Two consequences follow:
+
+- An upgrade written by the indexer can be served from the API's cache for at
+  most about 5 seconds after it is recorded. Earlier versions had no window at
+  all, at the cost of one query on every request.
+- Eviction is least-recently-used. A full cache drops one entry rather than
+  clearing everything, so a busy replica does not re-parse all its contracts
+  at once.
+
+The section itself (large, and requiring an XDR re-parse) is only re-fetched
+when the comparison detects a change.
 
 ## Database Invariants
 

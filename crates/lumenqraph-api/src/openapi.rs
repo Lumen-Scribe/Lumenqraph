@@ -195,6 +195,11 @@ impl OpenApiBuilder {
     ),
     components(
         schemas(
+            crate::routes::admin::KeyMeta,
+            crate::routes::admin::CreateKeyRequest,
+            crate::routes::admin::CreatedKey,
+            crate::routes::admin::RotateKeyRequest,
+            crate::routes::admin::RotatedKey,
             EventResponse,
             ErrorResponse,
             TransferResponse,
@@ -213,6 +218,11 @@ impl OpenApiBuilder {
         )
     ),
     paths(
+        // API-key management (#431)
+        crate::routes::admin::list_keys,
+        crate::routes::admin::create_key,
+        crate::routes::admin::revoke_key,
+        crate::routes::admin::rotate_key,
         // Core endpoints documented in routes
         get_health,
         get_metrics,
@@ -239,7 +249,8 @@ impl OpenApiBuilder {
         (name = "Transfers", description = "Token transfer tracking"),
         (name = "Data", description = "Per-key contract state snapshots"),
         (name = "Webhooks", description = "Event subscription and delivery management"),
-        (name = "System", description = "Health and observability endpoints")
+        (name = "System", description = "Health and observability endpoints"),
+        (name = "Admin", description = "API-key management. Requires the ADMIN_TOKEN bearer credential; disabled unless it is set")
     )
 )]
 pub struct ApiDoc;

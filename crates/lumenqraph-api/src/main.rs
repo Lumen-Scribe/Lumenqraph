@@ -167,7 +167,10 @@ async fn main() -> anyhow::Result<()> {
     // Parse every setting once, up front: an invalid value exits here with a
     // message naming the variable instead of silently becoming the default.
     let config = Arc::new(ApiConfig::from_env()?);
-    info!(config = ?config, "effective configuration");
+    info!(
+        config = ?config, // sensitive-log-ok: Config's Debug impl redacts DB, RPC and webhook secrets
+        "effective configuration"
+    );
 
     // Validate CONTRACT_IDS at startup so a misconfigured address is caught
     // immediately rather than silently ignored or causing runtime errors.

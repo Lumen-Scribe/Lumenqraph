@@ -164,8 +164,8 @@ pub async fn list_events(
            AND ($2::text IS NULL OR event_name = $2)
            AND ($3::bigint IS NULL OR ledger >= $3)
            AND ($4::bigint IS NULL OR ledger <= $4)
-           AND ($5::timestamp IS NULL OR ledger_closed_at >= $5)
-           AND ($6::timestamp IS NULL OR ledger_closed_at <= $6)
+           AND ($5::timestamptz IS NULL OR ledger_closed_at >= $5)
+           AND ($6::timestamptz IS NULL OR ledger_closed_at <= $6)
            -- Topic filtering matches the value at an exact position: `-> n` reads
            -- decoded_topics[n] as jsonb, so `topic1` only matches index 1.
            AND ($7::text IS NULL OR (decoded_topics -> 0) = $7::jsonb)

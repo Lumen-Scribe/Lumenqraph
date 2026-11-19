@@ -13,10 +13,11 @@
 //! project whose whole point is detecting exactly that change. It would also
 //! mean this cache could silently outlive an upgrade the *indexer's own*
 //! `SpecCache` already detected and recorded, since the two run in separate
-//! processes with no direct notification between them. So this doesn't cache
-//! on a timer and hope. Instead it keeps the contract's `wasm_hash` and
-//! `contract_specs.fetched_at` alongside the parse and revalidates both on
-//! every lookup:
+//! processes with no direct notification between them. The cache keeps the
+//! contract's `wasm_hash` and `contract_specs.fetched_at` alongside the parse
+//! and revalidates both once [`REVALIDATE_AFTER`] has passed since the last
+//! check (#647). Within that window a hit is served without a query, so an
+//! upgrade is visible within that many seconds rather than immediately:
 //!
 //! - the validating query is a primary-key lookup returning one short hash and
 //!   one timestamp, and
@@ -29,26 +30,36 @@
 //! hash equality as the sole word on freshness. See `docs/ARCHITECTURE.md` for the
 //! full invalidation strategy.
 //!
-//! So a hit still costs one cheap round trip and is always correct, which is the
-//! right trade for a cache guarding a correctness-critical value.
+//! A hit used to cost one cheap round trip on every request. Since #647, a
+//! validated entry is served without touching Postgres for
+//! [`REVALIDATE_AFTER`]. That bounds how long an upgrade can go unseen to a few
+//! seconds, in exchange for taking the validating query off the request path.
+//! After the window, the next lookup re-runs the `wasm_hash`/`fetched_at` check
+//! before the entry is used again.
 //!
 //! Historical versions (`contract_spec_versions`) need no such check: a version
 //! that has been observed is immutable, so those are cached outright.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use lru::LruCache;
 use lumenqraph_core::ContractSpec;
+use parking_lot::Mutex;
 use sqlx::PgPool;
 
 use crate::error::{ApiError, ApiResult};
 
 /// Max contracts held per map. In index-all mode the contract set is unbounded,
-/// so this caps memory. Eviction is a crude wholesale clear rather than an LRU:
-/// refilling an entry costs one query, and a cache that never grows is easier to
-/// reason about than one that pretends to be smart.
+/// so this caps memory. When full, the least-recently-used entry is evicted
+/// (#647). Clearing everything at once would cause a burst of re-parses.
 const MAX_ENTRIES: usize = 256;
+
+/// How long a validated `current` entry is served without querying Postgres
+/// (#647). A genuine upgrade is visible to this API within this window.
+const REVALIDATE_AFTER: Duration = Duration::from_secs(5);
 
 /// A contract's interface in both the forms callers need: the parsed, indexed
 /// view (the read layer's encoder resolves functions and UDTs against it, so a
@@ -76,7 +87,21 @@ pub struct SpecCache {
     /// cover.
     current: RwLock<HashMap<String, CurrentEntry>>,
     /// (contract_id, version) -> entry. Immutable once observed.
-    versions: RwLock<HashMap<(String, i32), Arc<CachedSpec>>>,
+    versions: Mutex<LruCache<(String, i32), Arc<CachedSpec>>>,
+}
+
+fn lru<K: std::hash::Hash + Eq, V>() -> Mutex<LruCache<K, V>> {
+    let cap = NonZeroUsize::new(MAX_ENTRIES).expect("MAX_ENTRIES > 0");
+    Mutex::new(LruCache::new(cap))
+}
+
+impl Default for SpecCache {
+    fn default() -> Self {
+        Self {
+            current: lru(),
+            versions: lru(),
+        }
+    }
 }
 
 impl SpecCache {
@@ -84,17 +109,21 @@ impl SpecCache {
         Self::default()
     }
 
-    /// The contract's *current* interface, revalidated against its stored
-    /// `wasm_hash`. `404` with a precise message for SACs (which have no spec)
-    /// or contracts that haven't been indexed yet.
+    /// The contract's *current* interface. A validated entry younger than
+    /// [`REVALIDATE_AFTER`] is returned without a database round trip. Older
+    /// entries are revalidated against the stored `wasm_hash` and `fetched_at`.
+    /// `404` with a precise message for SACs (which have no spec) or contracts
+    /// that haven't been indexed yet.
     pub async fn current(&self, pool: &PgPool, contract_id: &str) -> ApiResult<Arc<CachedSpec>> {
+        if let Some(spec) = self.fresh_current(contract_id) {
+            return Ok(spec);
+        }
+
         // In tests the cache may be pre-populated via `seed()` to avoid a DB
         // round-trip. A seeded entry uses the sentinel hash "test-hash".
         #[cfg(test)]
-        if let Some((hash, _, spec)) = self.current.read().unwrap().get(contract_id) {
-            if hash == "test-hash" {
-                return Ok(Arc::clone(spec));
-            }
+        if let Some(spec) = self.seeded(contract_id) {
+            return Ok(spec);
         }
 
         let row: Option<(String, DateTime<Utc>)> = sqlx::query_as(
@@ -153,9 +182,21 @@ impl SpecCache {
             })?;
         let entry = Arc::new(parse(&hex_section, &wasm_hash)?);
 
-        let mut map = self.current.write().unwrap();
-        if map.len() >= MAX_ENTRIES {
-            map.clear();
+    /// Re-validate a cached entry against the row's current `wasm_hash` and
+    /// `fetched_at`. On success the entry is marked as checked now and returned.
+    /// `None` means the row changed, or nothing is cached, so the caller must
+    /// re-fetch.
+    fn revalidate(
+        &self,
+        contract_id: &str,
+        wasm_hash: &str,
+        fetched_at: DateTime<Utc>,
+    ) -> Option<Arc<CachedSpec>> {
+        let mut map = self.current.lock();
+        let entry = map.get_mut(contract_id)?;
+        if entry.wasm_hash == wasm_hash && entry.fetched_at >= fetched_at {
+            entry.checked_at = Instant::now();
+            return Some(Arc::clone(&entry.spec));
         }
         map.insert(
             contract_id.to_string(),
@@ -173,7 +214,7 @@ impl SpecCache {
         version: i32,
     ) -> ApiResult<Arc<CachedSpec>> {
         let key = (contract_id.to_string(), version);
-        if let Some(spec) = self.versions.read().unwrap().get(&key) {
+        if let Some(spec) = self.versions.lock().get(&key) {
             return Ok(Arc::clone(spec));
         }
 
@@ -190,30 +231,37 @@ impl SpecCache {
         })?;
         let entry = Arc::new(parse(&hex_section, &wasm_hash)?);
 
-        let mut map = self.versions.write().unwrap();
-        if map.len() >= MAX_ENTRIES {
-            map.clear();
-        }
-        map.insert(key, Arc::clone(&entry));
+        self.versions.lock().put(key, Arc::clone(&entry));
         Ok(entry)
     }
 
     /// Evict a contract's current interface from the in-memory cache, forcing
     /// subsequent lookups to re-read and re-parse.
     pub fn invalidate(&self, contract_id: &str) {
-        let mut map = self.current.write().unwrap();
-        map.remove(contract_id);
+        self.current.lock().pop(contract_id);
     }
 
     /// Seed a pre-built spec directly into the cache, bypassing the database.
     /// Used only in handler tests where a real Postgres connection is not needed.
     #[cfg(test)]
     pub fn seed(&self, contract_id: &str, spec: CachedSpec) {
-        let arc = Arc::new(spec);
-        self.current.write().unwrap().insert(
+        self.current.lock().put(
             contract_id.to_string(),
-            ("test-hash".to_string(), Utc::now(), arc),
+            CurrentEntry {
+                wasm_hash: "test-hash".to_string(),
+                fetched_at: Utc::now(),
+                checked_at: Instant::now(),
+                spec: Arc::new(spec),
+            },
         );
+    }
+
+    /// A seeded entry, if present. Seeded entries never expire in tests.
+    #[cfg(test)]
+    fn seeded(&self, contract_id: &str) -> Option<Arc<CachedSpec>> {
+        let mut map = self.current.lock();
+        let entry = map.get(contract_id)?;
+        (entry.wasm_hash == "test-hash").then(|| Arc::clone(&entry.spec))
     }
 }
 
@@ -416,5 +464,121 @@ mod tests {
         assert!(
             matches!(missing, ApiError::Status(s, _, _) if s == axum::http::StatusCode::NOT_FOUND)
         );
+    }
+}
+
+/// Cache behaviour that needs no database (#647). A lazy pool that cannot
+/// connect stands in for Postgres, so a query made on it fails the test.
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    fn unreachable_pool() -> PgPool {
+        PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://nobody:nothing@127.0.0.1:1/none")
+            .expect("lazy pool")
+    }
+
+    fn spec(hash: &str) -> CachedSpec {
+        CachedSpec {
+            section: vec![],
+            parsed: None,
+            wasm_hash: hash.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_hit_makes_no_database_query() {
+        let cache = SpecCache::new();
+        cache.store_current("C_FRESH", "h1".into(), Utc::now(), spec("h1"));
+        // Every query fails on this pool, so getting Ok proves none ran.
+        let got = cache
+            .current(&unreachable_pool(), "C_FRESH")
+            .await
+            .expect("fresh entry served from cache");
+        assert_eq!(got.wasm_hash, "h1");
+    }
+
+    #[tokio::test]
+    async fn stale_entry_is_revalidated_against_the_database() {
+        let cache = SpecCache::new();
+        cache.store_current("C_STALE", "h1".into(), Utc::now(), spec("h1"));
+        cache.current.lock().get_mut("C_STALE").unwrap().checked_at =
+            Instant::now() - REVALIDATE_AFTER - Duration::from_secs(1);
+        // Past the window the lookup must query, and that fails on this pool.
+        assert!(cache.current(&unreachable_pool(), "C_STALE").await.is_err());
+    }
+
+    #[test]
+    fn revalidation_detects_upgrade_and_row_writes() {
+        let cache = SpecCache::new();
+        let t0 = Utc::now();
+        cache.store_current("C", "h1".into(), t0, spec("h1"));
+
+        assert!(
+            cache.revalidate("C", "h1", t0).is_some(),
+            "unchanged row keeps entry"
+        );
+        assert!(
+            cache.revalidate("C", "h2", t0).is_none(),
+            "new wasm_hash is an upgrade"
+        );
+        let later = t0 + chrono::Duration::seconds(1);
+        assert!(
+            cache.revalidate("C", "h1", later).is_none(),
+            "rewritten row is a miss"
+        );
+    }
+
+    #[test]
+    fn revalidation_marks_entry_as_checked_now() {
+        let cache = SpecCache::new();
+        let t0 = Utc::now();
+        cache.store_current("C", "h1".into(), t0, spec("h1"));
+        cache.current.lock().get_mut("C").unwrap().checked_at =
+            Instant::now() - REVALIDATE_AFTER - Duration::from_secs(1);
+        assert!(cache.fresh_current("C").is_none());
+        assert!(cache.revalidate("C", "h1", t0).is_some());
+        assert!(
+            cache.fresh_current("C").is_some(),
+            "revalidation restarts the window"
+        );
+    }
+
+    #[test]
+    fn full_cache_evicts_least_recently_used_not_everything() {
+        let cache = SpecCache::new();
+        let now = Utc::now();
+        for i in 0..MAX_ENTRIES {
+            cache.store_current(&format!("C{i}"), "h".into(), now, spec("h"));
+        }
+        // Use C0 so that C1 becomes the least recently used entry.
+        assert!(cache.fresh_current("C0").is_some());
+
+        cache.store_current("C_NEW", "h".into(), now, spec("h"));
+
+        assert!(
+            cache.fresh_current("C0").is_some(),
+            "recently used entry must survive"
+        );
+        assert!(
+            cache.fresh_current("C1").is_none(),
+            "LRU entry must be evicted"
+        );
+        assert!(
+            cache.fresh_current("C2").is_some(),
+            "other entries must survive, not be cleared"
+        );
+        assert_eq!(cache.current.lock().len(), MAX_ENTRIES);
+    }
+
+    #[test]
+    fn invalidate_drops_current_entry() {
+        let cache = SpecCache::new();
+        cache.store_current("C", "h".into(), Utc::now(), spec("h"));
+        cache.invalidate("C");
+        assert!(cache.fresh_current("C").is_none());
     }
 }

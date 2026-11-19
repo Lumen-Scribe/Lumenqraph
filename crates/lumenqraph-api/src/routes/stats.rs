@@ -319,8 +319,8 @@ async fn query_stats_by_trunc(
         "SELECT date_trunc('{trunc}', ledger_closed_at)::text as bucket, COUNT(*) as count
          FROM events
          WHERE contract_id = $1
-           AND ($2::timestamp IS NULL OR ledger_closed_at >= $2)
-           AND ($3::timestamp IS NULL OR ledger_closed_at <= $3)
+           AND ($2::timestamptz IS NULL OR ledger_closed_at >= $2)
+           AND ($3::timestamptz IS NULL OR ledger_closed_at <= $3)
          GROUP BY date_trunc('{trunc}', ledger_closed_at)
          ORDER BY date_trunc('{trunc}', ledger_closed_at) DESC"
     );
@@ -352,8 +352,8 @@ async fn query_stats_by_trunc_grouped(
         "SELECT date_trunc('{trunc}', ledger_closed_at)::text as bucket, event_name, COUNT(*) as count
          FROM events
          WHERE contract_id = $1
-           AND ($2::timestamp IS NULL OR ledger_closed_at >= $2)
-           AND ($3::timestamp IS NULL OR ledger_closed_at <= $3)
+           AND ($2::timestamptz IS NULL OR ledger_closed_at >= $2)
+           AND ($3::timestamptz IS NULL OR ledger_closed_at <= $3)
          GROUP BY date_trunc('{trunc}', ledger_closed_at), event_name
          ORDER BY date_trunc('{trunc}', ledger_closed_at) DESC, event_name"
     );

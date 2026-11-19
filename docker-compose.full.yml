@@ -128,7 +128,9 @@ services:
     environment:
       DATABASE_URL: postgres://lumenqraph:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/lumenqraph
       WEBHOOK_ENCRYPTION_KEY: ${WEBHOOK_ENCRYPTION_KEY}
-      WEBHOOKS_METRICS_BIND_ADDR: 127.0.0.1:9091
+      # Reachable by the Prometheus scrape job on the compose network only; the
+      # webhooks service publishes no host ports (see monitoring/prometheus.yml).
+      WEBHOOKS_METRICS_BIND_ADDR: 0.0.0.0:9091
       RUST_LOG: ${RUST_LOG:-info}
     healthcheck:
       test: ["CMD", "lumenqraph-webhooks", "healthcheck"]

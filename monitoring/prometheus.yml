@@ -5,16 +5,31 @@ global:
     cluster: 'production'
     environment: 'production'
 
+# Alertmanager. Leave targets empty to disable routing; otherwise list the
+# Alertmanager endpoint(s), e.g.:
+#
+#   alerting:
+#     alertmanagers:
+#       - static_configs:
+#           - targets: ['alertmanager:9093']
+#
 alerting:
   alertmanagers:
     - static_configs:
         - targets: []
-          # Uncomment and configure AlertManager targets:
-          # - 'alertmanager:9093'
 
 rule_files:
   - 'prometheus_alerts.yml'
 
+# Scrape targets use docker-compose service names (see docker-compose.full.yml).
+# For a bare-metal deployment, replace each target with the host:port the service
+# listens on (API :8080, indexer INDEXER_HTTP_BIND_ADDR, webhooks
+# WEBHOOKS_METRICS_BIND_ADDR).
+#
+# Every service must listen on an address Prometheus can reach. The indexer and
+# webhooks default to 127.0.0.1, which is unreachable from another container, so
+# set INDEXER_HTTP_BIND_ADDR=0.0.0.0:9090 and WEBHOOKS_METRICS_BIND_ADDR=0.0.0.0:9091
+# on the private network. Do not publish these ports to the internet.
 scrape_configs:
   # Lumenqraph API metrics endpoint
   - job_name: 'lumenqraph-api'
@@ -22,9 +37,34 @@ scrape_configs:
     scrape_timeout: 10s
     metrics_path: '/metrics'
     static_configs:
-      - targets: ['localhost:8080']
+      - targets: ['api:8080']
         labels:
           instance: 'lumenqraph-api'
+          service: 'lumenqraph'
+
+  # Indexer: chain lag, ingestion, RPC and missed-range metrics (INDEXER_HTTP_BIND_ADDR, default :9090).
+  - job_name: 'lumenqraph-indexer'
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    metrics_path: '/metrics'
+    # If METRICS_BEARER_TOKEN is set on the indexer, uncomment and set the token:
+    # authorization:
+    #   credentials_file: /etc/prometheus/indexer_metrics_token
+    static_configs:
+      - targets: ['indexer:9090']
+        labels:
+          instance: 'lumenqraph-indexer'
+          service: 'lumenqraph'
+
+  # Webhook dispatcher: queue depth, delivery latency, failures (WEBHOOKS_METRICS_BIND_ADDR, default :9091).
+  - job_name: 'lumenqraph-webhooks'
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['webhooks:9091']
+        labels:
+          instance: 'lumenqraph-webhooks'
           service: 'lumenqraph'
 
   # Prometheus self-monitoring
@@ -34,8 +74,3 @@ scrape_configs:
         labels:
           instance: 'prometheus'
           service: 'prometheus'
-
-  # Optional: Add Alertmanager scraping if deployed
-  # - job_name: 'alertmanager'
-  #   static_configs:
-  #     - targets: ['alertmanager:9093']
