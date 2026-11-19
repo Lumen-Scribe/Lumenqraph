@@ -46,21 +46,11 @@ pub fn parse_ledger_closed_at(raw: &str) -> Option<DateTime<Utc>> {
 /// Returns `None` when the `ledgerClosedAt` timestamp cannot be parsed — the
 /// event is skipped entirely rather than stored with a fabricated timestamp.
 /// All other missing/malformed fields are handled gracefully with defaults.
-/// Map the RPC/data-lake event type string onto the typed model. Only the three
-/// values the `events.event_type` CHECK constraint accepts are valid; anything
-/// else is rejected so the event is skipped rather than failing the whole batch.
-pub fn parse_event_type(raw: &str) -> Option<EventType> {
-    match raw {
-        "contract" => Some(EventType::Contract),
-        "system" => Some(EventType::System),
-        "diagnostic" => Some(EventType::Diagnostic),
-        _ => None,
-    }
-}
-
 pub fn to_new_event(e: &EventInfo, spec: Option<&ContractSpec>) -> Option<NewEvent> {
     // Parse the timestamp. On failure, return None — never fall back to Utc::now().
     let parsed_ts = parse_ledger_closed_at(&e.ledger_closed_at)?;
+    // Unknown event types cannot satisfy the events.event_type CHECK; skip them.
+    let event_type = EventType::from_rpc_str(&e.event_type)?;
     // The ledger timestamp is authoritative. Backfill and catch-up routinely
     // ingest ledgers older than wall-clock tolerance, so never clamp it.
     let ledger_closed_at = parsed_ts;
@@ -80,7 +70,10 @@ pub fn to_new_event(e: &EventInfo, spec: Option<&ContractSpec>) -> Option<NewEve
         contract_id: e.contract_id.clone(),
         ledger: e.ledger,
         ledger_closed_at,
-        event_type: parse_event_type(&e.event_type)?,
+        // The RPC only emits contract|system|diagnostic, the values the
+        // `events.event_type` CHECK constraint accepts. Anything else cannot be
+        // stored, so the event is skipped.
+        event_type: e.event_type.parse::<EventType>().ok()?,
         topics: e.topic.clone(),
         decoded_topics,
         event_name,
@@ -134,5 +127,4 @@ mod tests {
         // A date without time component is not valid RFC 3339.
         assert!(parse_ledger_closed_at("2024-01-01").is_none());
     }
-
 }

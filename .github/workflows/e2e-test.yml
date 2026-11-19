@@ -31,7 +31,7 @@ jobs:
       # job failed at "Set up job" on every run. Use the same verified v4 pin
       # as docker.yml and docker-publish.yml.
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a0c4c1e0e0e0e0e0e0e0e0e0e0e0e0e0 # v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Generate webhook encryption key and Postgres password
         run: |

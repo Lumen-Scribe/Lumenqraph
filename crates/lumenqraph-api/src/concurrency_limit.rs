@@ -5,7 +5,6 @@
 //! capped per key/IP and globally (`SSE_MAX_STREAMS`).
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,7 +15,9 @@ const MAX_TRACKED_IPS: usize = 100_000;
 #[derive(Debug, Clone)]
 pub struct ConcurrencyLimitStatus {
     pub allowed: bool,
+    #[allow(dead_code)] // surfaced by the per-IP limit follow-up; not read yet
     pub current_in_flight: usize,
+    #[allow(dead_code)] // reported by the SSE limiter follow-up; not read yet
     pub limit: usize,
 }
 
@@ -99,7 +100,11 @@ impl ConcurrencyLimiter {
     /// The slot is released when the returned guard is dropped. Dropping it is
     /// how a cancelled or timed-out request gives its slot back, so hold the
     /// guard for the whole lifetime of the request.
-    pub fn try_acquire(self: &Arc<Self>, ip: &str, max_concurrent: usize) -> Option<ConcurrencySlot> {
+    pub fn try_acquire(
+        self: &Arc<Self>,
+        ip: &str,
+        max_concurrent: usize,
+    ) -> Option<ConcurrencySlot> {
         if !self.acquire(ip, max_concurrent).allowed {
             return None;
         }
@@ -130,6 +135,7 @@ impl Drop for ConcurrencySlot {
 
 /// Status returned when acquiring an SSE stream slot.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // SSE stream caps are not enforced yet; see follow-up
 pub struct SseStreamStatus {
     pub allowed: bool,
     pub current_streams: usize,
@@ -142,11 +148,13 @@ pub struct SseStreamStatus {
 /// tracked separately from short-lived request concurrency. `max_per_key`
 /// and `max_global` of 0 mean unlimited for that dimension.
 #[derive(Default)]
+#[allow(dead_code)] // SSE stream caps are not enforced yet; see follow-up
 pub struct SseStreamLimiter {
     per_key: Mutex<HashMap<String, usize>>,
     global: AtomicUsize,
 }
 
+#[allow(dead_code)] // SSE stream caps are not enforced yet; see follow-up
 impl SseStreamLimiter {
     pub fn new() -> Self {
         Self::default()
@@ -196,7 +204,7 @@ impl SseStreamLimiter {
         // Saturating decrement of the global counter.
         let _ = self
             .global
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
                 if v > 0 {
                     Some(v - 1)
                 } else {

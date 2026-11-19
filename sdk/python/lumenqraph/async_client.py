@@ -35,6 +35,7 @@ from ._http import (
     LumenqraphError,
     RetryOptions,
     Transport,
+    _TransientError,
     build_headers,
     build_url,
     drop_none,
@@ -101,17 +102,30 @@ class AsyncLumenqraphClient:
         body: Any = None,
         raw: bool = False,
     ) -> Any:
+        transport = self._transport
         url = build_url(self.base_url, path, query)
         accept = "text/plain, */*" if raw else "application/json"
-        send = functools.partial(
-            self._transport.send,
-            method,
-            url,
-            encode_json(body),
-            build_headers(self.api_key, accept),
-            raw,
-        )
-        return await asyncio.get_running_loop().run_in_executor(None, send)
+        # Headers (and the Idempotency-Key, if any) are fixed once, so every
+        # retry of this logical request reuses the same key.
+        headers = transport.prepare_headers(method, url, build_headers(self.api_key, accept))
+        payload = encode_json(body)
+        should_retry = transport.should_retry(method, url)
+        loop = asyncio.get_running_loop()
+
+        # The retry loop lives in this coroutine, not in the executor thread.
+        # Only a single blocking attempt runs in the thread. The backoff is a
+        # cancellable asyncio.sleep, so cancelling the task (timeout, abort)
+        # stops any further attempts at once.
+        attempt = 0
+        while True:
+            send_once = functools.partial(transport.send_once, method, url, payload, headers, raw)
+            try:
+                return await loop.run_in_executor(None, send_once)
+            except _TransientError as exc:
+                if not should_retry or attempt >= transport.retry["max_retries"]:
+                    raise exc.error from None
+                await asyncio.sleep(transport.retry_delay_ms(attempt, exc.retry_after_ms) / 1000.0)
+                attempt += 1
 
     async def _get(self, path: str, query: Mapping[str, Any] | None = None) -> Any:
         return await self._request("GET", path, query)

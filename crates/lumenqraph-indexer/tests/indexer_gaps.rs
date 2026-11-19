@@ -5,7 +5,7 @@
 #[cfg(test)]
 mod indexer_gaps_tests {
     use sqlx::postgres::PgPoolOptions;
-    use sqlx::{PgPool, Row};
+    use sqlx::PgPool;
 
     async fn setup_test_db() -> PgPool {
         let database_url = std::env::var("DATABASE_URL")
@@ -82,7 +82,8 @@ mod indexer_gaps_tests {
         let last_processed = 1_000_000i64;
         let latest = 2_000_000i64;
         let max_catchup_ledgers = 100_000i64;
-        let gap_reason = "gap unrecoverable via public RPC; use a retaining/paid RPC or deep-backfill";
+        let gap_reason =
+            "gap unrecoverable via public RPC; use a retaining/paid RPC or deep-backfill";
 
         // Check if cursor is too far behind
         if latest - last_processed > max_catchup_ledgers {
@@ -92,7 +93,7 @@ mod indexer_gaps_tests {
             // Record the gap
             sqlx::query(
                 "INSERT INTO indexer_gaps (from_ledger, to_ledger, reason, detected_at)
-                 VALUES ($1, $2, $3, NOW())"
+                 VALUES ($1, $2, $3, NOW())",
             )
             .bind(gap_start)
             .bind(gap_end)
@@ -103,12 +104,11 @@ mod indexer_gaps_tests {
         }
 
         // Verify gap was recorded
-        let gap_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM indexer_gaps WHERE filled_at IS NULL"
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("query should succeed");
+        let gap_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM indexer_gaps WHERE filled_at IS NULL")
+                .fetch_one(&pool)
+                .await
+                .expect("query should succeed");
 
         assert_eq!(gap_count, 1, "skip-ahead should create one open gap");
 
@@ -126,10 +126,7 @@ mod indexer_gaps_tests {
             stored_from, expected_from,
             "gap should start after last processed ledger"
         );
-        assert_eq!(
-            stored_to, expected_to,
-            "gap should end at skip-ahead point"
-        );
+        assert_eq!(stored_to, expected_to, "gap should end at skip-ahead point");
 
         cleanup_test_data(&pool).await;
     }
@@ -143,8 +140,9 @@ mod indexer_gaps_tests {
 
         let configured_start = 50_000i64;
         let oldest_available = 150_000i64;
-        let latest = 200_000i64;
-        let clamp_reason = "fresh-start ledger clamped to earliest servable ledger (RPC retention limit)";
+        let _latest = 200_000i64;
+        let clamp_reason =
+            "fresh-start ledger clamped to earliest servable ledger (RPC retention limit)";
 
         // Clamping scenario
         if configured_start < oldest_available {
@@ -154,7 +152,7 @@ mod indexer_gaps_tests {
             // Record the gap from clamping
             sqlx::query(
                 "INSERT INTO indexer_gaps (from_ledger, to_ledger, reason, detected_at)
-                 VALUES ($1, $2, $3, NOW())"
+                 VALUES ($1, $2, $3, NOW())",
             )
             .bind(gap_start)
             .bind(gap_end)
@@ -166,7 +164,7 @@ mod indexer_gaps_tests {
 
         // Verify clamping gap was recorded
         let clamping_gaps: Vec<(i64, i64)> = sqlx::query_as(
-            "SELECT from_ledger, to_ledger FROM indexer_gaps WHERE reason LIKE '%fresh-start%'"
+            "SELECT from_ledger, to_ledger FROM indexer_gaps WHERE reason LIKE '%fresh-start%'",
         )
         .fetch_all(&pool)
         .await
@@ -179,8 +177,14 @@ mod indexer_gaps_tests {
         );
 
         let (gap_from, gap_to) = clamping_gaps[0];
-        assert_eq!(gap_from, configured_start, "gap should start at configured START_LEDGER");
-        assert_eq!(gap_to, oldest_available, "gap should end at oldest available");
+        assert_eq!(
+            gap_from, configured_start,
+            "gap should start at configured START_LEDGER"
+        );
+        assert_eq!(
+            gap_to, oldest_available,
+            "gap should end at oldest available"
+        );
 
         cleanup_test_data(&pool).await;
     }
@@ -196,7 +200,7 @@ mod indexer_gaps_tests {
         for i in 0..3 {
             sqlx::query(
                 "INSERT INTO indexer_gaps (from_ledger, to_ledger, reason, detected_at)
-                 VALUES ($1, $2, $3, NOW())"
+                 VALUES ($1, $2, $3, NOW())",
             )
             .bind(1_000_000 + (i * 100_000))
             .bind(1_050_000 + (i * 100_000))
@@ -209,7 +213,7 @@ mod indexer_gaps_tests {
         // Simulate /health query: count open gaps and total ledgers
         let (open_gap_count, total_gap_ledgers): (i64, Option<i64>) = sqlx::query_as(
             "SELECT COUNT(*), COALESCE(SUM(to_ledger - from_ledger), 0)
-             FROM indexer_gaps WHERE filled_at IS NULL"
+             FROM indexer_gaps WHERE filled_at IS NULL",
         )
         .fetch_one(&pool)
         .await
@@ -217,7 +221,8 @@ mod indexer_gaps_tests {
 
         assert_eq!(open_gap_count, 3, "should have 3 open gaps");
         assert_eq!(
-            total_gap_ledgers, Some(150_000),
+            total_gap_ledgers,
+            Some(150_000),
             "total gap should be 150_000 ledgers (3 gaps × 50_000)"
         );
 
@@ -239,7 +244,7 @@ mod indexer_gaps_tests {
         // Create an open gap
         sqlx::query(
             "INSERT INTO indexer_gaps (from_ledger, to_ledger, reason, detected_at)
-             VALUES (1_000_000, 1_100_000, 'skip-ahead', NOW())"
+             VALUES (1_000_000, 1_100_000, 'skip-ahead', NOW())",
         )
         .execute(&pool)
         .await
@@ -255,7 +260,7 @@ mod indexer_gaps_tests {
              SET filled_at = NOW()
              WHERE filled_at IS NULL
                AND from_ledger >= $1
-               AND to_ledger <= $2"
+               AND to_ledger <= $2",
         )
         .bind(backfill_start)
         .bind(backfill_end)
@@ -264,29 +269,24 @@ mod indexer_gaps_tests {
         .expect("gap update should succeed");
 
         // Verify gap is now marked as filled
-        let open_gap_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM indexer_gaps WHERE filled_at IS NULL"
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("query should succeed");
+        let open_gap_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM indexer_gaps WHERE filled_at IS NULL")
+                .fetch_one(&pool)
+                .await
+                .expect("query should succeed");
 
         assert_eq!(
             open_gap_count, 0,
             "gap should be marked as filled after deep-backfill"
         );
 
-        let filled_gap_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM indexer_gaps WHERE filled_at IS NOT NULL"
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("query should succeed");
+        let filled_gap_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM indexer_gaps WHERE filled_at IS NOT NULL")
+                .fetch_one(&pool)
+                .await
+                .expect("query should succeed");
 
-        assert_eq!(
-            filled_gap_count, 1,
-            "one gap should be marked as filled"
-        );
+        assert_eq!(filled_gap_count, 1, "one gap should be marked as filled");
 
         cleanup_test_data(&pool).await;
     }
@@ -301,7 +301,7 @@ mod indexer_gaps_tests {
         // Create an open gap
         sqlx::query(
             "INSERT INTO indexer_gaps (from_ledger, to_ledger, reason, detected_at)
-             VALUES (1_000_000, 1_100_000, 'skip-ahead', NOW())"
+             VALUES (1_000_000, 1_100_000, 'skip-ahead', NOW())",
         )
         .execute(&pool)
         .await
@@ -317,7 +317,7 @@ mod indexer_gaps_tests {
              SET filled_at = NOW()
              WHERE filled_at IS NULL
                AND from_ledger >= $1
-               AND to_ledger <= $2"
+               AND to_ledger <= $2",
         )
         .bind(backfill_start)
         .bind(backfill_end)
@@ -326,12 +326,11 @@ mod indexer_gaps_tests {
         .expect("gap update should succeed");
 
         // Verify gap is still open
-        let open_gap_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM indexer_gaps WHERE filled_at IS NULL"
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("query should succeed");
+        let open_gap_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM indexer_gaps WHERE filled_at IS NULL")
+                .fetch_one(&pool)
+                .await
+                .expect("query should succeed");
 
         assert_eq!(
             open_gap_count, 1,

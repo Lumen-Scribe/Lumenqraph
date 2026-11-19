@@ -1,4 +1,5 @@
-//! Test for issue #389: reenrich command needs additional CLI flags
+//! Issue #712: `reenrich --contract` and `--force` must reach the re-enrichment
+//! pass, and a malformed `--contract` must fail before any query runs.
 //!
 //! This test verifies the implementation of:
 //! - `--contract` to restrict re-enrichment to specific contracts
@@ -82,8 +83,7 @@ mod reenrich_cli_flags_tests {
         let decoded_value = json!("1000");
 
         // Insert events for both contracts
-        for (i, contract) in [&contract_1, &contract_2].iter().enumerate()
-        {
+        for (i, contract) in [&contract_1, &contract_2].iter().enumerate() {
             for j in 0..3 {
                 let event_id = format!("event_{}_{}", i, j);
                 sqlx::query(
@@ -205,7 +205,10 @@ mod reenrich_cli_flags_tests {
         .await
         .expect("Failed to count");
 
-        assert_eq!(count_without_force.0, 2, "Without --force, only 2 un-enriched events");
+        assert_eq!(
+            count_without_force.0, 2,
+            "Without --force, only 2 un-enriched events"
+        );
 
         // With --force: count all events (simulating the flag behavior)
         let count_with_force: (i64,) = sqlx::query_as(
@@ -273,7 +276,10 @@ mod reenrich_cli_flags_tests {
         .await
         .expect("Failed to count");
 
-        assert_eq!(count_full_range.0, 101, "Should have 101 events (1000-1100)");
+        assert_eq!(
+            count_full_range.0, 101,
+            "Should have 101 events (1000-1100)"
+        );
 
         let count_partial_range: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM events
@@ -391,8 +397,7 @@ mod reenrich_cli_flags_tests {
         let enrichment = json!({"old": "value"});
 
         // Insert events for both contracts (some enriched, some not)
-        for (i, contract) in [&contract_1, &contract_2].iter().enumerate()
-        {
+        for (i, contract) in [&contract_1, &contract_2].iter().enumerate() {
             for j in 0..4 {
                 let event_id = format!("event_{}_{}", i, j);
                 let enriched = if j % 2 == 0 {
@@ -434,7 +439,10 @@ mod reenrich_cli_flags_tests {
         .fetch_one(&pool)
         .await
         .expect("Failed to count");
-        assert_eq!(default_count.0, 4, "Default: 4 un-enriched events (2 per contract)");
+        assert_eq!(
+            default_count.0, 4,
+            "Default: 4 un-enriched events (2 per contract)"
+        );
 
         // With --contract only: filter to contract 1, un-enriched only
         let contract_filtered: (i64,) = sqlx::query_as(
@@ -447,20 +455,29 @@ mod reenrich_cli_flags_tests {
         .expect("Failed to count");
         assert_eq!(contract_filtered.0, 2, "With --contract C1: 2 un-enriched");
 
-        // With --contract and --force: reprocess all events for that contract
-        let contract_force: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM events WHERE contract_id = $1 AND event_name IS NOT NULL",
-        )
-        .bind(&contract_1)
-        .fetch_one(&pool)
-        .await
-        .expect("Failed to count");
-        assert_eq!(
-            contract_force.0, 4,
-            "With --contract C1 --force: all 4 events"
-        );
+#[test]
+fn invalid_contract_fails_before_touching_database_or_rpc() {
+    let out = indexer()
+        .args(["reenrich", "--contract", "CNOT-A-STRKEY"])
+        .output()
+        .expect("run indexer");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "malformed --contract must exit non-zero");
+    assert!(stderr.contains("invalid --contract"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("connect") && !stderr.contains("getNetwork"),
+        "validation must run before any connection attempt: {stderr}"
+    );
+}
 
-        cleanup_test_data(&pool, &contract_1).await;
-        cleanup_test_data(&pool, &contract_2).await;
-    }
+#[test]
+fn reenrich_help_documents_contract_and_force() {
+    let out = indexer()
+        .args(["reenrich", "--help"])
+        .output()
+        .expect("run indexer");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--contract"), "help: {stdout}");
+    assert!(stdout.contains("--force"), "help: {stdout}");
 }

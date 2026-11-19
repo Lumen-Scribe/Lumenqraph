@@ -3,7 +3,9 @@
 use anyhow::Context;
 use std::time::Duration;
 
-pub fn redact_database_url(url: &str) -> String { lumenqraph_core::redact_url(url) }
+pub fn redact_database_url(url: &str) -> String {
+    lumenqraph_core::redact_url(url)
+}
 
 #[derive(Clone)]
 pub struct Config {
@@ -57,13 +59,14 @@ impl std::fmt::Debug for Config {
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        let encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY")
-            .map_err(|_| anyhow::anyhow!(
+        let encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY").map_err(|_| {
+            anyhow::anyhow!(
                 "WEBHOOK_ENCRYPTION_KEY must be set \
                  (generate with: openssl rand -hex 32). \
                  The default test key provides no security and must not be \
                  used in production."
-            ))?;
+            )
+        })?;
         if encryption_key.trim().is_empty() {
             anyhow::bail!(
                 "WEBHOOK_ENCRYPTION_KEY is set but empty; \
@@ -84,7 +87,7 @@ impl Config {
             metrics_bind_addr: std::env::var("WEBHOOKS_METRICS_BIND_ADDR")
                 .ok()
                 .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| "127.0.0.1:9091".to_string()),
+                .unwrap_or_else(|| crate::metrics::DEFAULT_METRICS_BIND_ADDR.to_string()),
             db_max_connections: parse("DATABASE_MAX_CONNECTIONS", 5)?,
             db_min_connections: parse("DATABASE_MIN_CONNECTIONS", 1)?,
             db_acquire_timeout_secs: parse("DATABASE_ACQUIRE_TIMEOUT_SECS", 30)?,
@@ -98,6 +101,30 @@ impl Config {
         })
     }
 
+    /// Config for unit and integration tests: short timeouts, a fixed test key.
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        Self {
+            database_url: String::new(),
+            tick_secs: 1,
+            batch_size: 100,
+            max_attempts: 5,
+            connect_timeout_secs: 2,
+            total_timeout_secs: 5,
+            max_concurrent_per_host: 4,
+            max_concurrent_deliveries: 8,
+            failure_threshold: 10,
+            metrics_bind_addr: "127.0.0.1:0".to_string(),
+            db_max_connections: 5,
+            db_min_connections: 0,
+            db_acquire_timeout_secs: 5,
+            db_idle_timeout_secs: 60,
+            db_connect_retries: 1,
+            encryption_key: "test-key".to_string(),
+            delivery_retention_days: 0,
+        }
+    }
+
     pub fn connect_timeout(&self) -> Duration {
         Duration::from_secs(self.connect_timeout_secs)
     }
@@ -105,6 +132,28 @@ impl Config {
     pub fn total_timeout(&self) -> Duration {
         Duration::from_secs(self.total_timeout_secs)
     }
+}
+
+/// Read and validate `WEBHOOK_ENCRYPTION_KEY` (#644).
+///
+/// A missing, empty, placeholder or weak key is a startup error that names the
+/// variable. The validation rules live in `lumenqraph_core::crypto` so the API
+/// and this service accept exactly the same keys.
+fn encryption_key_from_env_value(value: Option<String>) -> anyhow::Result<String> {
+    let key = value.ok_or_else(|| {
+        anyhow::anyhow!(
+            "WEBHOOK_ENCRYPTION_KEY must be set (generate with: openssl rand -hex 32). \
+             The default test key provides no security and must not be used in production."
+        )
+    })?;
+    if key.trim().is_empty() {
+        anyhow::bail!(
+            "WEBHOOK_ENCRYPTION_KEY is set but empty; generate a key with: openssl rand -hex 32"
+        );
+    }
+    lumenqraph_core::crypto::validate_webhook_encryption_key(&key)
+        .map_err(|e| anyhow::anyhow!("WEBHOOK_ENCRYPTION_KEY is invalid: {e}"))?;
+    Ok(key)
 }
 
 /// Parse `key`, or return `default` when unset/empty. A present but
@@ -136,11 +185,15 @@ mod tests {
         let result = {
             // Temporarily remove the key from this process's env if it's set.
             let original = std::env::var("WEBHOOK_ENCRYPTION_KEY").ok();
-            unsafe { std::env::remove_var("WEBHOOK_ENCRYPTION_KEY"); }
+            unsafe {
+                std::env::remove_var("WEBHOOK_ENCRYPTION_KEY");
+            }
             let r = Config::from_env();
             // Restore.
             if let Some(val) = original {
-                unsafe { std::env::set_var("WEBHOOK_ENCRYPTION_KEY", val); }
+                unsafe {
+                    std::env::set_var("WEBHOOK_ENCRYPTION_KEY", val);
+                }
             }
             r
         };
@@ -149,6 +202,34 @@ mod tests {
         assert!(
             err.to_string().contains("WEBHOOK_ENCRYPTION_KEY"),
             "error should mention the missing var: {err}"
+        );
+    }
+
+    #[test]
+    fn encryption_key_rejects_missing_empty_placeholder_and_weak_values() {
+        for value in [
+            None,
+            Some(String::new()),
+            Some(" \t".to_string()),
+            Some("GENERATE_ME_WITH_openssl_rand_hex_32".to_string()),
+            Some("changeme".to_string()),
+        ] {
+            let err = encryption_key_from_env_value(value.clone())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("WEBHOOK_ENCRYPTION_KEY"),
+                "{value:?} should be rejected naming the variable: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn encryption_key_accepts_a_generated_key_unchanged() {
+        let key = "9f3a6c1e0b7d4a2f8e5c91b3d6a04f7e2c8b5d1a9e6f3c0b7a4d2e8f1c5b9a36";
+        assert_eq!(
+            encryption_key_from_env_value(Some(key.to_string())).unwrap(),
+            key
         );
     }
 

@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
-use tokio::time::{interval, sleep};
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -33,8 +33,10 @@ use crate::request_id::RequestId;
 use crate::state::AppState;
 
 /// Maximum number of concurrent SSE streams allowed globally.
+#[allow(dead_code)] // not enforced yet; see the SSE stream-cap follow-up
 const SSE_MAX_STREAMS: usize = 1000;
 /// Maximum number of concurrent SSE streams allowed per contract key.
+#[allow(dead_code)] // not enforced yet; see the SSE stream-cap follow-up
 const SSE_MAX_STREAMS_PER_KEY: usize = 100;
 /// Capacity of the shared broadcast channel.
 const SSE_BROADCAST_CAPACITY: usize = 1024;
@@ -389,6 +391,7 @@ pub async fn stream_events(
     // Subscribe to the shared fan-out before constructing the stream so no
     // events published after this point are missed.
     let rx = state.event_fanout.subscribe();
+    let fanout = Arc::clone(&state.event_fanout);
     let shutdown = state.shutdown.clone();
     let last_ledger = initial_cursor.ledger;
 
@@ -447,13 +450,8 @@ pub async fn stream_events(
                 Ok(Err(broadcast::error::RecvError::Lagged(dropped))) => {
                     // Fell behind; fall through to polling to catch up.
                     st.fanout.record_lag(dropped);
-                    match fetch_new_events(
-                        &st.state,
-                        &st.contract_id,
-                        &st.event_name,
-                        &st.cursor,
-                    )
-                    .await
+                    match fetch_new_events(&st.state, &st.contract_id, &st.event_name, &st.cursor)
+                        .await
                     {
                         Ok(events) => {
                             if events.is_empty() {
@@ -463,8 +461,7 @@ pub async fn stream_events(
                             }
                         }
                         Err(e) => {
-                            let frame =
-                                fetch_error_event(&e, &st.request_id, st.poll_secs).await;
+                            let frame = fetch_error_event(&e, &st.request_id, st.poll_secs).await;
                             return Some((Ok(frame), st));
                         }
                     }
@@ -480,13 +477,8 @@ pub async fn stream_events(
                         continue;
                     }
                     // Fallback: poll for new events.
-                    match fetch_new_events(
-                        &st.state,
-                        &st.contract_id,
-                        &st.event_name,
-                        &st.cursor,
-                    )
-                    .await
+                    match fetch_new_events(&st.state, &st.contract_id, &st.event_name, &st.cursor)
+                        .await
                     {
                         Ok(events) => {
                             if events.is_empty() {
@@ -496,8 +488,7 @@ pub async fn stream_events(
                             }
                         }
                         Err(e) => {
-                            let frame =
-                                fetch_error_event(&e, &st.request_id, st.poll_secs).await;
+                            let frame = fetch_error_event(&e, &st.request_id, st.poll_secs).await;
                             return Some((Ok(frame), st));
                         }
                     }
@@ -532,7 +523,6 @@ where
                 .data(json!({ "reason": "server_shutdown" }).to_string()))
         }))
 }
-
 
 /// Resolve the current head of the event log for a contract, used as the
 /// starting cursor for a fresh stream with no resume position.
@@ -617,8 +607,7 @@ mod tests {
     /// #570 — SSE error frames must not leak driver or infrastructure error text.
     #[test]
     fn error_frame_carries_only_code_and_request_id() {
-        let data: serde_json::Value =
-            serde_json::from_str(&error_frame_data("req-123")).unwrap();
+        let data: serde_json::Value = serde_json::from_str(&error_frame_data("req-123")).unwrap();
         assert_eq!(data["code"], "internal_error");
         assert_eq!(data["request_id"], "req-123");
         assert_eq!(data.as_object().unwrap().len(), 2);
@@ -630,7 +619,7 @@ mod tests {
     async fn stream_ends_with_one_shutdown_frame_when_cancelled() {
         let shutdown = CancellationToken::new();
         let open_stream = stream::pending::<Result<Event, Infallible>>();
-        let mut ended = Box::pin(end_on_shutdown(open_stream, shutdown.clone()));
+        let ended = Box::pin(end_on_shutdown(open_stream, shutdown.clone()));
 
         shutdown.cancel();
 
@@ -642,7 +631,8 @@ mod tests {
 
     #[test]
     fn error_frame_never_contains_driver_error_text() {
-        let driver_error = "connection to server at 10.0.3.4 failed: relation \"events\" does not exist";
+        let driver_error =
+            "connection to server at 10.0.3.4 failed: relation \"events\" does not exist";
         let data = error_frame_data("req-456");
         assert!(!data.contains("10.0.3.4"));
         assert!(!data.contains("relation"));

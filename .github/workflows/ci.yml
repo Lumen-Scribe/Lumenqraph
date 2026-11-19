@@ -121,7 +121,6 @@ jobs:
             echo "::error::No migrations were recorded on the fresh database."
             exit 1
           fi
-=======
 
   # Issue #475: lint new or changed migrations with squawk so table-locking
   # DDL (non-concurrent index builds, constraints without NOT VALID, column
@@ -228,6 +227,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Check sensitive logging
         run: python3 scripts/check_sensitive_logging.py
+      - name: Test sensitive logging lint fixtures
+        run: python3 scripts/test_check_sensitive_logging.py
       - name: Check .env.example covers every env var
         run: python3 scripts/check_env_example.py
       - name: Install sqlx-cli
@@ -365,10 +366,40 @@ jobs:
         run: |
           python3 scripts/check_openapi_drift.py openapi.yaml /tmp/generated-openapi.json
 
+  # Issue #639: every environment variable read by runtime Rust code must be
+  # documented in docs/CONFIGURATION.md, so operators can find security-relevant
+  # settings and defaults.
+  config-docs:
+    name: Config Reference Drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Check every runtime env var is documented
+        run: python3 scripts/check_config_docs.py
+
   # Issue #357: build and validate the Python SDK so it stays installable.
   # `python -m build` produces an sdist and a wheel from sdk/python, and
   # `twine check` verifies the package metadata (including the LICENSE file
   # referenced by pyproject.toml) is valid for upload.
+  # Issue #641: the webhook verification examples in docs/WEBHOOKS.md must
+  # verify the committed cross-language test vector (Node, Python, Go), and the
+  # snippets in the doc must match the tested source files.
+  webhook-examples:
+    name: Webhook Verification Examples (Node, Python, Go)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Run webhook example suites and doc snippet checks
+        run: python3 scripts/check_webhook_examples.py
+
   python-sdk-build:
     name: Python SDK Build (3.12)
     runs-on: ubuntu-latest
@@ -479,6 +510,35 @@ jobs:
           done <<< "$refs"
           exit $status
 
+  # Issue #640: dead links in SECURITY.md and fly.toml went unnoticed. Check
+  # every Markdown link, and every docs/ path that config comments refer to.
+  # External URLs are not fetched (--offline), so the check is deterministic
+  # and does not fail on third-party outages.
+  link-check:
+    name: Link Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check Markdown links (offline)
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: --offline --no-progress --verbose --exclude-path node_modules --exclude-path target './**/*.md'
+          fail: true
+      - name: Check doc paths referenced from config comments
+        run: |
+          status=0
+          for f in fly.toml render.yaml docker-compose.yml docker-compose.full.yml; do
+            [ -f "$f" ] || continue
+            for p in $(grep -ohE 'docs/[A-Za-z0-9_./-]+\.md' "$f" | sort -u); do
+              if [ ! -f "$p" ]; then
+                echo "::error file=$f::refers to missing file $p"
+                status=1
+              fi
+            done
+          done
+          exit $status
+
   # Issue #538: the explorer has lint, build and Playwright smoke tests that
   # were never run in CI. Run them here so regressions (including XSS-relevant
   # rendering changes) fail before merge.
@@ -501,12 +561,46 @@ jobs:
         run: npm run lint
       - name: Build
         run: npm run build
+      # Issue #637: index.html is a source file. The build must never rewrite
+      # it, so fail if the build left any change to the committed copy.
+      - name: Verify build leaves index.html unchanged
+        run: git diff --exit-code -- index.html
       - name: Install Playwright browsers
-        run: npx playwright install --with-deps chromium
+        # playwright.config.ts runs every browser project, so install them all.
+        run: npx playwright install --with-deps chromium firefox webkit
       - name: Test (Playwright smoke)
         run: npm test
 
   # Validate Grafana dashboard metrics against metrics defined in Rust code
+  # Issue #642: the sample Prometheus config must scrape every service that
+  # exposes metrics, and every alert expression must reference a metric that a
+  # scraped service emits. promtool checks run in a pinned Prometheus image.
+  monitoring-config:
+    name: Monitoring Config (promtool, alert metrics)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install PyYAML
+        run: pip install pyyaml
+      - name: Check every alert metric is emitted by a scraped service
+        run: python3 scripts/check_alert_metrics.py
+      - name: promtool check config
+        run: |
+          docker run --rm -v "$PWD/monitoring:/etc/prometheus:ro" \
+            --entrypoint promtool prom/prometheus:v2.54.1 \
+            check config /etc/prometheus/prometheus.yml
+      - name: promtool check rules
+        run: |
+          docker run --rm -v "$PWD/monitoring:/etc/prometheus:ro" \
+            --entrypoint promtool prom/prometheus:v2.54.1 \
+            check rules /etc/prometheus/prometheus_alerts.yml
+
   dashboard-metrics:
     name: Dashboard Metrics Validation
     runs-on: ubuntu-latest

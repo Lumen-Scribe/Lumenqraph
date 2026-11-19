@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::IntoResponse;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use lumenqraph_core::{Contract, ContractSpec, SpecDiff};
@@ -89,16 +89,16 @@ pub async fn list_contracts(
     let contracts: Vec<Contract> = if let Some(ref cursor) = q.after {
         // Look up the event_count of the cursor contract so we can use a
         // keyset predicate instead of OFFSET, keeping the query O(log N).
-        let cursor_count: Option<i64> = sqlx::query_scalar(
-            "SELECT event_count FROM contract_summaries WHERE contract_id = $1",
-        )
-        .bind(cursor)
-        .fetch_optional(&state.pool)
-        .await?;
+        let cursor_count: Option<i64> =
+            sqlx::query_scalar("SELECT event_count FROM contract_summaries WHERE contract_id = $1")
+                .bind(cursor)
+                .fetch_optional(&state.pool)
+                .await?;
 
         match cursor_count {
-            Some(cc) => sqlx::query_as(
-                "SELECT contract_id,
+            Some(cc) => {
+                sqlx::query_as(
+                    "SELECT contract_id,
                         event_count,
                         first_seen_ledger,
                         last_seen_ledger
@@ -108,12 +108,13 @@ pub async fn list_contracts(
                         OR (event_count = $1 AND contract_id > $2))
                  ORDER BY event_count DESC, contract_id ASC
                  LIMIT $3",
-            )
-            .bind(cc)
-            .bind(cursor)
-            .bind(limit + 1)
-            .fetch_all(&state.pool)
-            .await?,
+                )
+                .bind(cc)
+                .bind(cursor)
+                .bind(limit + 1)
+                .fetch_all(&state.pool)
+                .await?
+            }
             // Unknown cursor — return empty rather than silently restarting.
             None => vec![],
         }
@@ -188,10 +189,13 @@ pub async fn contract_interface(
                 "has_events": has_events,
                 "fetched_at": fetched_at,
                 "interface": interface.0,
-            })).into_response();
-            response.headers_mut().insert(header::ETAG, etag.parse().unwrap());
+            }))
+            .into_response();
+            response
+                .headers_mut()
+                .insert(header::ETAG, etag.parse().unwrap());
             Ok(response)
-        },
+        }
         None => Err(ApiError::not_found(
             "no on-chain interface indexed for this contract yet",
         )),
@@ -228,10 +232,13 @@ async fn contract_interface_at_version(
                 "wasm_hash": wasm_hash,
                 "observed_at": observed_at,
                 "interface": interface.0,
-            })).into_response();
-            response.headers_mut().insert(header::ETAG, etag.parse().unwrap());
+            }))
+            .into_response();
+            response
+                .headers_mut()
+                .insert(header::ETAG, etag.parse().unwrap());
             Ok(response)
-        },
+        }
         None => Err(ApiError::not_found(format!(
             "no version {version} recorded for this contract"
         ))),
@@ -283,11 +290,7 @@ pub async fn contract_interface_history(
 ) -> Result<axum::response::Response, ApiError> {
     // Parse the cursor before hitting the DB so a malformed value returns 400
     // immediately rather than after an unnecessary round-trip.
-    let after_version: Option<i32> = q
-        .after
-        .as_deref()
-        .map(parse_history_cursor)
-        .transpose()?;
+    let after_version: Option<i32> = q.after.as_deref().map(parse_history_cursor).transpose()?;
 
     let limit = q.limit.clamp(1, 1000);
 
@@ -535,19 +538,16 @@ pub async fn contract_state(
 
     if rows.is_empty() {
         // Check if state indexing is disabled by seeing if any state exists at all.
-        let any_state_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM contract_state LIMIT 1)")
-            .fetch_one(&state.pool)
-            .await?;
+        let any_state_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM contract_state LIMIT 1)")
+                .fetch_one(&state.pool)
+                .await?;
 
         if !any_state_exists {
-            return Err(ApiError::feature_disabled(
-                "state indexing is disabled",
-            ));
+            return Err(ApiError::feature_disabled("state indexing is disabled"));
         }
 
-        return Err(ApiError::not_found(
-            "no state snapshots for this contract",
-        ));
+        return Err(ApiError::not_found("no state snapshots for this contract"));
     }
 
     let latest_ledger = rows[0].0;
@@ -566,8 +566,11 @@ pub async fn contract_state(
         "contract_id": contract_id,
         "count": versions.len(),
         "versions": versions,
-    })).into_response();
-    response.headers_mut().insert(header::ETAG, etag.parse().unwrap());
+    }))
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::ETAG, etag.parse().unwrap());
     Ok(response)
 }
 
@@ -626,14 +629,13 @@ pub async fn contract_data(
 
     if rows.is_empty() {
         // Check if key indexing is disabled by seeing if any data exists at all.
-        let any_data_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM contract_data LIMIT 1)")
-            .fetch_one(&state.pool)
-            .await?;
+        let any_data_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM contract_data LIMIT 1)")
+                .fetch_one(&state.pool)
+                .await?;
 
         if !any_data_exists {
-            return Err(ApiError::feature_disabled(
-                "key indexing is disabled",
-            ));
+            return Err(ApiError::feature_disabled("key indexing is disabled"));
         }
 
         return Err(ApiError::not_found(
@@ -744,7 +746,9 @@ pub async fn refresh_contract(
         .get_contract_wasm(&contract_id)
         .await
         .map_err(|e| {
-            ApiError::Internal(anyhow::anyhow!("failed to fetch contract WASM from RPC: {e}"))
+            ApiError::Internal(anyhow::anyhow!(
+                "failed to fetch contract WASM from RPC: {e}"
+            ))
         })?
         .ok_or_else(|| {
             ApiError::not_found(
@@ -1030,8 +1034,15 @@ mod tests {
                 proxy_limiter: Arc::new(RateLimiter::memory()),
                 webhook_limiter: Arc::new(RateLimiter::memory()),
                 config: Arc::new(crate::config::ApiConfig::test_default()),
-                key_cache: Arc::new(crate::key_cache::KeyCache::new(256, std::time::Duration::from_secs(30), std::time::Duration::from_secs(5))),
-                ip_config: crate::auth::IpConfig { trusted_proxy_hops: 0, platform_header: None },
+                key_cache: Arc::new(crate::key_cache::KeyCache::new(
+                    256,
+                    std::time::Duration::from_secs(30),
+                    std::time::Duration::from_secs(5),
+                )),
+                ip_config: crate::auth::IpConfig {
+                    trusted_proxy_hops: 0,
+                    platform_header: None,
+                },
                 audit_tx: None,
                 audit_dropped: Arc::new(AtomicU64::new(0)),
                 shutdown: tokio_util::sync::CancellationToken::new(),
@@ -1061,7 +1072,10 @@ mod tests {
             let body: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(body["code"], "bad_request");
             assert!(
-                body["error"].as_str().unwrap_or_default().contains("must be less than"),
+                body["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("must be less than"),
                 "unexpected body: {body}"
             );
         }

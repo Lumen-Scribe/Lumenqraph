@@ -95,10 +95,7 @@ pub async fn contract_sdk(
     };
     Ok((
         [
-            (
-                header::CONTENT_TYPE,
-                lang.content_type().to_string(),
-            ),
+            (header::CONTENT_TYPE, lang.content_type().to_string()),
             (
                 header::CONTENT_DISPOSITION,
                 format!("inline; filename=\"{filename}\""),

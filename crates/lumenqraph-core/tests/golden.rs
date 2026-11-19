@@ -27,7 +27,7 @@ use serde_json::json;
 use stellar_xdr::curr::{
     Limits, ScSpecEntry, ScSpecEventDataFormat, ScSpecEventParamLocationV0, ScSpecEventV0,
     ScSpecFunctionInputV0, ScSpecFunctionV0, ScSpecTypeDef, ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0,
-    ScSpecUdtStructFieldV0, ScSpecUdtStructV0, ScSpecUdtUnionCaseV0, ScSpecUdtUnionCaseTupleV0,
+    ScSpecUdtStructFieldV0, ScSpecUdtStructV0, ScSpecUdtUnionCaseTupleV0, ScSpecUdtUnionCaseV0,
     ScSpecUdtUnionCaseVoidV0, ScSpecUdtUnionV0, ScSymbol, WriteXdr,
 };
 
@@ -54,10 +54,7 @@ fn sym(s: &str) -> ScSymbol {
 /// Symbol "fee" captured from a real Soroban event topic.
 #[test]
 fn xdr_symbol_fee() {
-    assert_eq!(
-        decode_scval_base64("AAAADwAAAANmZWUA"),
-        json!("fee")
-    );
+    assert_eq!(decode_scval_base64("AAAADwAAAANmZWUA"), json!("fee"));
 }
 
 /// Symbol "transfer" — the canonical SEP-41 event name.
@@ -94,50 +91,39 @@ fn xdr_i128_zero() {
 #[test]
 fn xdr_u32() {
     // ScVal::U32(7) — tag=3, value=7
-    assert_eq!(
-        decode_scval_base64("AAAAAwAAAAc="),
-        json!(7)
-    );
+    assert_eq!(decode_scval_base64("AAAAAwAAAAc="), json!(7));
 }
 
 /// bool true.
 #[test]
 fn xdr_bool_true() {
     // ScVal::Bool(true) — tag=0, value=1
-    assert_eq!(
-        decode_scval_base64("AAAAAAAAAAE="),
-        json!(true)
-    );
+    assert_eq!(decode_scval_base64("AAAAAAAAAAE="), json!(true));
 }
 
 /// bool false.
 #[test]
 fn xdr_bool_false() {
     // ScVal::Bool(false) — tag=0, value=0
-    assert_eq!(
-        decode_scval_base64("AAAAAAAAAAA="),
-        json!(false)
-    );
+    assert_eq!(decode_scval_base64("AAAAAAAAAAA="), json!(false));
 }
 
 /// void / null.
 #[test]
 fn xdr_void_is_null() {
     // ScVal::Void — tag=1
-    assert_eq!(
-        decode_scval_base64("AAAAAQ=="),
-        json!(null)
-    );
+    assert_eq!(decode_scval_base64("AAAAAQ=="), json!(null));
 }
 
 /// Account address decodes to a G… strkey.
 #[test]
 fn xdr_account_address_is_g_strkey() {
-    let v = decode_scval_base64(
-        "AAAAEgAAAAAAAAAAZnYwtpgeUB4mlva1EnnCVBm0hGxbz5B5Zl89BaJLufM=",
-    );
+    let v = decode_scval_base64("AAAAEgAAAAAAAAAAZnYwtpgeUB4mlva1EnnCVBm0hGxbz5B5Zl89BaJLufM=");
     let s = v.as_str().expect("should be a string");
-    assert!(s.starts_with('G'), "account address must start with G, got {s}");
+    assert!(
+        s.starts_with('G'),
+        "account address must start with G, got {s}"
+    );
     assert_eq!(s.len(), 56, "ed25519 strkey must be 56 chars, got {s}");
 }
 
@@ -159,7 +145,10 @@ fn xdr_vec_of_i128s() {
     assert_eq!(arr.len(), 3);
     // Each element should be a decimal-string i128.
     for el in arr {
-        assert!(el.is_string(), "each vec element should be a decimal string, got {el:?}");
+        assert!(
+            el.is_string(),
+            "each vec element should be a decimal string, got {el:?}"
+        );
     }
 }
 
@@ -342,11 +331,14 @@ fn spec_udt_enum_cases_parsed() {
     assert_eq!(spec.enums.len(), 1);
     let e = &spec.enums[0];
     assert_eq!(e.name, "Status");
-    assert_eq!(e.cases, vec![
-        ("Open".to_string(), 0u32),
-        ("Filled".to_string(), 1),
-        ("Cancelled".to_string(), 2),
-    ]);
+    assert_eq!(
+        e.cases,
+        vec![
+            ("Open".to_string(), 0u32),
+            ("Filled".to_string(), 1),
+            ("Cancelled".to_string(), 2),
+        ]
+    );
 }
 
 /// A spec with a union parses void and tuple cases.
@@ -506,7 +498,10 @@ fn enrich_sep41_transfer_golden() {
 fn enrich_unknown_event_returns_none() {
     let spec = sep41_spec();
     let result = spec.enrich_event("unknown_event", &[json!("unknown_event")], &json!(null));
-    assert!(result.is_none(), "unknown event must return None, not panic");
+    assert!(
+        result.is_none(),
+        "unknown event must return None, not panic"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -589,8 +584,13 @@ fn udt_spec() -> ContractSpec {
         outputs: vec![ScSpecTypeDef::Void].try_into().unwrap(),
     });
 
-    ContractSpec::from_spec_xdr_simple(&spec_bytes(&[dummy_fn, status_enum, action_union, order_struct]))
-        .expect("udt spec must parse")
+    ContractSpec::from_spec_xdr_simple(&spec_bytes(&[
+        dummy_fn,
+        status_enum,
+        action_union,
+        order_struct,
+    ]))
+    .expect("udt spec must parse")
 }
 
 /// A unit enum discriminant is relabeled to the case name string.
@@ -634,12 +634,22 @@ fn udt_union_tuple_case_relabeled_to_named_map() {
     });
 
     // ["Bid", "GABC...", "250"] from the generic decoder.
-    let raw = json!(["Bid", "GABC1111111111111111111111111111111111111111111111111111", "250"]);
+    let raw = json!([
+        "Bid",
+        "GABC1111111111111111111111111111111111111111111111111111",
+        "250"
+    ]);
     let relabeled = spec.relabel_value(&raw, &ty);
-    assert!(relabeled.get("Bid").is_some(), "expected {{Bid: [..]}}, got {relabeled}");
+    assert!(
+        relabeled.get("Bid").is_some(),
+        "expected {{Bid: [..]}}, got {relabeled}"
+    );
     let vals = relabeled["Bid"].as_array().unwrap();
     assert_eq!(vals.len(), 2);
-    assert_eq!(vals[0], "GABC1111111111111111111111111111111111111111111111111111");
+    assert_eq!(
+        vals[0],
+        "GABC1111111111111111111111111111111111111111111111111111"
+    );
     assert_eq!(vals[1], "250");
 }
 
@@ -658,7 +668,10 @@ fn udt_struct_object_fields_are_stable() {
     let relabeled = spec.relabel_value(&raw, &ty);
     // Primitive fields pass through unchanged.
     assert_eq!(relabeled["amount"], "500");
-    assert_eq!(relabeled["buyer"], "GABC1111111111111111111111111111111111111111111111111111");
+    assert_eq!(
+        relabeled["buyer"],
+        "GABC1111111111111111111111111111111111111111111111111111"
+    );
 }
 
 /// Unknown UDT name: the value is returned unchanged (best-effort, no panic).
@@ -775,7 +788,7 @@ fn assert_block_comments_inert(src: &str, lang: &str) {
 #[test]
 fn codegen_ts_hostile_docs_are_inert() {
     let spec = hostile_spec();
-    let ts = spec.to_typescript();
+    let ts = lumenqraph_core::codegen::typescript_client("CTEST", &spec);
     assert_block_comments_inert(&ts, "ts");
     // The raw injection payload must never appear verbatim at top level.
     assert!(
@@ -788,7 +801,7 @@ fn codegen_ts_hostile_docs_are_inert() {
 #[test]
 fn codegen_py_hostile_docs_are_inert() {
     let spec = hostile_spec();
-    let py = spec.to_python();
+    let py = lumenqraph_core::codegen::python_client("CTEST", &spec);
     // Count triple quotes: they must all pair up.
     let triples = py.matches("\"\"\"").count();
     assert_eq!(triples % 2, 0, "py: unbalanced triple quotes in output");
@@ -802,7 +815,7 @@ fn codegen_py_hostile_docs_are_inert() {
 #[test]
 fn codegen_rust_hostile_docs_are_inert() {
     let spec = hostile_spec();
-    let rs = spec.to_rust();
+    let rs = lumenqraph_core::codegen::rust_client("CTEST", &spec);
     assert_block_comments_inert(&rs, "rs");
 }
 
@@ -811,9 +824,15 @@ fn codegen_rust_hostile_docs_are_inert() {
 fn codegen_hostile_names_are_sanitised() {
     let spec = hostile_spec();
     for (lang, src) in [
-        ("ts", spec.to_typescript()),
-        ("py", spec.to_python()),
-        ("rs", spec.to_rust()),
+        (
+            "ts",
+            lumenqraph_core::codegen::typescript_client("CTEST", &spec),
+        ),
+        (
+            "py",
+            lumenqraph_core::codegen::python_client("CTEST", &spec),
+        ),
+        ("rs", lumenqraph_core::codegen::rust_client("CTEST", &spec)),
     ] {
         assert!(
             !src.contains("os.system"),
@@ -872,9 +891,8 @@ fn event_name_bytes_topic_is_none() {
 #[test]
 fn decoder_paths_agree_on_representative_scvals() {
     use stellar_xdr::curr::{
-        AccountId, ContractId, Hash, LedgerKeyNonce, PublicKey, ScAddress, ScBytes, ScContractInstance,
-        ScError, ScErrorCode, ScErrorType, ScNonceKey, ScString, ScSymbol as XSymbol, ScVal,
-        UInt256,
+        AccountId, Hash, PublicKey, ScAddress, ScBytes, ScContractInstance, ScError, ScErrorCode,
+        ScNonceKey, ScString, ScSymbol as XSymbol, ScVal, UInt256Parts,
     };
 
     let mut cases: Vec<ScVal> = Vec::new();
@@ -888,7 +906,6 @@ fn decoder_paths_agree_on_representative_scvals() {
     cases.push(ScVal::Error(ScError::Value(ScErrorCode::InvalidInput)));
     cases.push(ScVal::Error(ScError::Auth(ScErrorCode::InvalidAction)));
     cases.push(ScVal::Error(ScError::Budget(ScErrorCode::ExceededLimit)));
-    cases.push(ScVal::Error(ScError::Type(ScErrorType::Contract)));
 
     // Invalid UTF-8 string.
     cases.push(ScVal::String(ScString(
@@ -911,7 +928,7 @@ fn decoder_paths_agree_on_representative_scvals() {
         lo_hi: 0,
         lo_lo: 1234,
     }));
-    cases.push(ScVal::U256(UInt256 {
+    cases.push(ScVal::U256(UInt256Parts {
         hi_hi: 0,
         hi_lo: 0,
         lo_hi: 0,
@@ -922,7 +939,10 @@ fn decoder_paths_agree_on_representative_scvals() {
     cases.push(ScVal::Bool(true));
     cases.push(ScVal::Void);
     cases.push(ScVal::U32(7));
-    cases.push(ScVal::I128(stellar_xdr::curr::Int128Parts { hi: 0, lo: 300 }));
+    cases.push(ScVal::I128(stellar_xdr::curr::Int128Parts {
+        hi: 0,
+        lo: 300,
+    }));
     cases.push(ScVal::Symbol(XSymbol("fee".try_into().unwrap())));
     cases.push(ScVal::Bytes(ScBytes(vec![0xde, 0xad].try_into().unwrap())));
     cases.push(ScVal::Address(ScAddress::Account(AccountId(
@@ -930,24 +950,19 @@ fn decoder_paths_agree_on_representative_scvals() {
     ))));
 
     // Silence unused import warnings for types only used in comments.
-    let _ = LedgerKeyNonce { nonce: 0 };
 
     for v in cases {
         let bytes = v.to_xdr(Limits::none()).unwrap();
         let b64 = base64_encode(&bytes);
         let typed = decode_scval(&v);
         let byte = decode_scval_base64(&b64);
-        assert_eq!(
-            typed, byte,
-            "decoder paths disagree for {v:?} (b64={b64})"
-        );
+        assert_eq!(typed, byte, "decoder paths disagree for {v:?} (b64={b64})");
     }
 }
 
 /// Minimal base64 encoder so the test does not depend on a crate feature.
 fn base64_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;
