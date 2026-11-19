@@ -661,6 +661,45 @@ pub async fn webhook_manage_auth_and_rate_limit(
 #[derive(Clone)]
 pub struct CallerKeyHash(pub String);
 
+/// Identity of an authenticated admin caller, inserted by [`admin_auth`]. The
+/// value is a short fingerprint of the admin token (never the token itself),
+/// recorded as the actor in the audit log (#431).
+#[derive(Clone)]
+pub struct AdminCaller(pub String);
+
+/// Byte comparison that does not return early on the first mismatch. Only the
+/// length is observable, which is fixed for the configured token.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Guard for the `/admin` routes (#431).
+///
+/// When `ADMIN_TOKEN` is unset the routes behave as if they do not exist (404),
+/// so an instance that does not opt in exposes no admin surface. Otherwise the
+/// presented credential (`Authorization: Bearer` or `x-api-key`) must equal the
+/// configured token. API keys are deliberately not accepted here.
+pub async fn admin_auth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut req: Request,
+    next: Next,
+) -> ApiResult<Response> {
+    let Some(expected) = state.config.admin_token.as_deref() else {
+        return Err(ApiError::not_found("not found"));
+    };
+    let presented = extract_key(&headers).unwrap_or_default();
+    if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        return Err(ApiError::unauthorized("invalid admin credentials"));
+    }
+    let fingerprint = hash_key(expected)[..8].to_string();
+    req.extensions_mut().insert(AdminCaller(fingerprint));
+    Ok(next.run(req).await)
+}
+
 /// Per-IP concurrency limiter middleware. Rejects requests when a single IP
 /// has too many in-flight requests, preventing slowloris-style attacks.
 pub async fn concurrency_limit(

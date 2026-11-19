@@ -1,6 +1,7 @@
 //! Route table. `/health` and `/metrics` are public; everything else sits
 //! behind the auth + rate-limit middleware.
 
+pub mod admin;
 pub mod contracts;
 pub mod events;
 pub mod health;
@@ -31,7 +32,7 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::auth::{
-    auth_and_rate_limit, concurrency_limit, proxy_rate_limit, rpc_auth_and_rate_limit,
+    admin_auth, auth_and_rate_limit, concurrency_limit, proxy_rate_limit, rpc_auth_and_rate_limit,
     webhook_auth_and_rate_limit, webhook_manage_auth_and_rate_limit,
 };
 use crate::graphql::{self, AppSchema};
@@ -193,6 +194,14 @@ pub fn router(state: AppState) -> Router {
             webhook_auth_and_rate_limit,
         ));
 
+    // API-key management (#431). Guarded by the separate ADMIN_TOKEN credential,
+    // not by API keys, and disabled (404) unless that token is configured.
+    let admin_routes = Router::new()
+        .route("/admin/keys", get(admin::list_keys).post(admin::create_key))
+        .route("/admin/keys/:prefix/revoke", post(admin::revoke_key))
+        .route("/admin/keys/:prefix/rotate", post(admin::rotate_key))
+        .layer(middleware::from_fn_with_state(state.clone(), admin_auth));
+
     let metrics_collector = state.metrics.clone();
     let mut app = public
         .merge(metrics_router)
@@ -200,6 +209,7 @@ pub fn router(state: AppState) -> Router {
         .merge(rpc_routes)
         .merge(webhook_create_routes)
         .merge(webhook_manage_routes)
+        .merge(admin_routes)
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),

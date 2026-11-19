@@ -107,6 +107,11 @@ pub struct ApiConfig {
 
     pub graphql: GraphqlConfig,
 
+    /// Bearer credential for the `/admin` key-management API (#431). `None`
+    /// disables the admin routes entirely (they return 404). Never a fallback
+    /// to API keys: admin access is a separate, operator-held secret.
+    pub admin_token: Option<String>,
+
 
     /// Required `pgp_sym_encrypt` key for webhook secrets. Read and validated
     /// once at startup; handlers never consult the environment directly.
@@ -131,6 +136,19 @@ impl ApiConfig {
 
 
         let webhook_encryption_key = required_env("WEBHOOK_ENCRYPTION_KEY")?;
+
+        // Optional. When set it must be long enough to resist guessing, since
+        // it is the only credential for the key-management API (#431).
+        let admin_token = std::env::var("ADMIN_TOKEN")
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        if let Some(token) = &admin_token {
+            anyhow::ensure!(
+                token.len() >= 32,
+                "ADMIN_TOKEN must be at least 32 characters; generate one with `openssl rand -hex 32`"
+            );
+        }
 
         // Reject bad origins at startup, naming the entry, rather than letting
         // CORS silently never match a browser's Origin header (#581).
@@ -192,6 +210,7 @@ impl ApiConfig {
             },
 
             webhook_encryption_key,
+            admin_token,
 
             mounts: crate::routes::proxy::parse_mounts(&env_string("INSTANCE_MOUNTS", "")),
             proxy: ProxyConfig {
@@ -285,6 +304,7 @@ impl ApiConfig {
 
             // Test-only value; production config always reads a required key
             // from the environment.
+            admin_token: None,
             webhook_encryption_key: "test-only-webhook-key".into(),
             webhook_delivery_retention_days: 14,
 
@@ -332,6 +352,7 @@ impl fmt::Debug for ApiConfig {
             .field("api_key_cache_ttl_secs", &self.api_key_cache_ttl_secs)
             .field("api_key_cache_neg_ttl_secs", &self.api_key_cache_neg_ttl_secs)
             .field("graphql", &self.graphql)
+            .field("admin_token", &self.admin_token.as_ref().map(|_| "[REDACTED]"))
 
             .field("webhook_encryption_key", &"[REDACTED]")
             .field(
