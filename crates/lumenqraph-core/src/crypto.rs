@@ -155,6 +155,58 @@ pub fn verify_webhook(
     }
 }
 
+/// The placeholder shipped in older `.env.example` files. It is a public string,
+/// so a key taken from it protects nothing.
+pub const WEBHOOK_KEY_PLACEHOLDER_PREFIX: &str = "GENERATE_ME";
+
+/// Minimum number of distinct characters a webhook encryption key must contain.
+/// A random 32-byte key almost always has far more; this rejects repeated or
+/// patterned values that still have the right length, such as `aaaa…`.
+const MIN_DISTINCT_KEY_CHARS: usize = 8;
+
+/// Check that `WEBHOOK_ENCRYPTION_KEY` is a strong key, not a placeholder.
+///
+/// Accepted forms are 64 hex characters (`openssl rand -hex 32`) or at least 43
+/// base64 characters (32 bytes, `openssl rand -base64 32`). The value is used
+/// exactly as given, so surrounding whitespace is rejected rather than trimmed.
+/// Placeholders such as `GENERATE_ME_WITH_openssl_rand_hex_32` and short or
+/// low-variety values are rejected with a message that says how to generate one.
+pub fn validate_webhook_encryption_key(key: &str) -> anyhow::Result<()> {
+    const HINT: &str = "generate a strong key with `openssl rand -hex 32`";
+
+    if key.to_ascii_uppercase().starts_with(WEBHOOK_KEY_PLACEHOLDER_PREFIX) {
+        anyhow::bail!(
+            "the value is the placeholder from .env.example, which is public and \
+             gives no protection; {HINT}"
+        );
+    }
+
+    let is_hex = key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit());
+    let is_base64 = key.len() >= 43
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'-' | b'_' | b'='));
+    if !is_hex && !is_base64 {
+        anyhow::bail!(
+            "must be 64 hex characters or at least 43 base64 characters (32 bytes of \
+             entropy); {HINT}"
+        );
+    }
+
+    let mut distinct = [false; 256];
+    for b in key.bytes() {
+        distinct[b as usize] = true;
+    }
+    let distinct_count = distinct.iter().filter(|&&seen| seen).count();
+    if distinct_count < MIN_DISTINCT_KEY_CHARS {
+        anyhow::bail!(
+            "has only {distinct_count} distinct characters, which is too little entropy; {HINT}"
+        );
+    }
+
+    Ok(())
+}
+
 /// Verify that two byte slices are equal using constant-time comparison.
 ///
 /// This function is useful for comparing API keys, tokens, or other secrets
@@ -241,6 +293,36 @@ mod tests {
         );
     }
 
+    /// The committed cross-language vector, shared with the Node, Python and Go
+    /// examples in `docs/examples/webhooks` (all checked in CI).
+    #[test]
+    fn verifies_committed_cross_language_vector() {
+        let vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/examples/webhooks/test_vector.json"
+        ))
+        .unwrap();
+        let secret = vector["secret"].as_str().unwrap();
+        let header = vector["header"].as_str().unwrap();
+        let body = vector["body"].as_str().unwrap().as_bytes();
+
+        // The vector's timestamp is fixed in the past, so widen the tolerance
+        // to keep this test independent of the wall clock.
+        let wide = Duration::from_secs(i64::MAX as u64);
+        assert_eq!(verify_webhook(secret, header, body, wide), Ok(()));
+
+        let mut tampered = body.to_vec();
+        tampered.push(b' ');
+        assert_eq!(
+            verify_webhook(secret, header, &tampered, wide),
+            Err(VerifyError::Mismatch)
+        );
+        // With the default 300s tolerance the 2023 vector is stale.
+        assert_eq!(
+            verify_webhook(secret, header, body, Duration::from_secs(300)),
+            Err(VerifyError::StaleTimestamp)
+        );
+    }
+
     #[test]
     fn test_verify_secret_equal_matches() {
         assert!(verify_secret_equal("s3cret-token", "s3cret-token"));
@@ -251,5 +333,57 @@ mod tests {
         assert!(!verify_secret_equal("s3cret-token", "s3cret-tokeN"));
         assert!(!verify_secret_equal("s3cret-token", "s3cret-token-longer"));
         assert!(!verify_secret_equal("s3cret-token", ""));
+    }
+
+    // A real key for accept cases; both forms are 32 bytes of entropy.
+    const HEX_KEY: &str = "9f3a6c1e0b7d4a2f8e5c91b3d6a04f7e2c8b5d1a9e6f3c0b7a4d2e8f1c5b9a36";
+    const B64_KEY: &str = "q7Zf3kP0mWc9Lx2RbT8yNn5VhJ1sDg4uEa6OiXrK0Mo";
+
+    #[test]
+    fn webhook_key_accepts_hex_and_base64_forms() {
+        assert_eq!(HEX_KEY.len(), 64);
+        assert!(validate_webhook_encryption_key(HEX_KEY).is_ok());
+        // 43 characters is the minimum accepted base64 length (32 bytes).
+        assert_eq!(B64_KEY.len(), 43);
+        assert!(validate_webhook_encryption_key(B64_KEY).is_ok());
+    }
+
+    #[test]
+    fn webhook_key_rejects_the_env_example_placeholder() {
+        for placeholder in [
+            "GENERATE_ME_WITH_openssl_rand_hex_32",
+            "generate_me_with_openssl_rand_hex_32",
+        ] {
+            let err = validate_webhook_encryption_key(placeholder)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("placeholder"), "{err}");
+            assert!(err.contains("openssl rand -hex 32"), "{err}");
+        }
+    }
+
+    #[test]
+    fn webhook_key_rejects_short_and_common_values() {
+        for weak in ["changeme", "secret", "0123456789abcdef", "", " "] {
+            let err = validate_webhook_encryption_key(weak).unwrap_err().to_string();
+            assert!(err.contains("openssl rand -hex 32"), "{weak:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn webhook_key_rejects_surrounding_whitespace() {
+        let padded = format!(" {HEX_KEY}");
+        assert!(validate_webhook_encryption_key(&padded).is_err());
+        let trailing = format!("{HEX_KEY}\n");
+        assert!(validate_webhook_encryption_key(&trailing).is_err());
+    }
+
+    #[test]
+    fn webhook_key_rejects_repeated_characters() {
+        let repeated = "a".repeat(64);
+        let err = validate_webhook_encryption_key(&repeated)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("distinct characters"), "{err}");
     }
 }

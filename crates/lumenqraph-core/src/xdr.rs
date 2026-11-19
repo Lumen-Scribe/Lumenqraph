@@ -73,76 +73,8 @@
 //! information is permanently lost.
 
 use base64::Engine;
-use serde_json::{json, Map, Value};
-use stellar_strkey::ed25519::{MuxedAccount, PublicKey as Ed25519PublicKey};
-use stellar_strkey::{ClaimableBalance, Contract, LiquidityPool};
-
-// ScValType discriminants (stable wire tags). The hand-rolled raw decoder that
-// uses these is not on the current decode path (which goes through stellar-xdr);
-// it is kept, not deleted, so its items are allowed to be unused.
-#[allow(dead_code)]
-const SCV_BOOL: u32 = 0;
-#[allow(dead_code)]
-const SCV_VOID: u32 = 1;
-#[allow(dead_code)]
-const SCV_ERROR: u32 = 2;
-#[allow(dead_code)]
-const SCV_U32: u32 = 3;
-#[allow(dead_code)]
-const SCV_I32: u32 = 4;
-#[allow(dead_code)]
-const SCV_U64: u32 = 5;
-#[allow(dead_code)]
-const SCV_I64: u32 = 6;
-#[allow(dead_code)]
-const SCV_TIMEPOINT: u32 = 7;
-#[allow(dead_code)]
-const SCV_DURATION: u32 = 8;
-#[allow(dead_code)]
-const SCV_U128: u32 = 9;
-#[allow(dead_code)]
-const SCV_I128: u32 = 10;
-#[allow(dead_code)]
-const SCV_U256: u32 = 11;
-#[allow(dead_code)]
-const SCV_I256: u32 = 12;
-#[allow(dead_code)]
-const SCV_BYTES: u32 = 13;
-#[allow(dead_code)]
-const SCV_STRING: u32 = 14;
-#[allow(dead_code)]
-const SCV_SYMBOL: u32 = 15;
-#[allow(dead_code)]
-const SCV_VEC: u32 = 16;
-#[allow(dead_code)]
-const SCV_MAP: u32 = 17;
-#[allow(dead_code)]
-const SCV_ADDRESS: u32 = 18;
-// Tags 19–21: present in instance-storage snapshots; payload must be consumed.
-#[allow(dead_code)]
-const SCV_CONTRACT_INSTANCE: u32 = 19;
-#[allow(dead_code)]
-const SCV_LEDGER_KEY_CONTRACT_INSTANCE: u32 = 20;
-#[allow(dead_code)]
-const SCV_LEDGER_KEY_NONCE: u32 = 21;
-
-// ScAddressType discriminants (Protocol 23+).
-#[allow(dead_code)]
-const SC_ADDRESS_ACCOUNT: u32 = 0;
-#[allow(dead_code)]
-const SC_ADDRESS_CONTRACT: u32 = 1;
-#[allow(dead_code)]
-const SC_ADDRESS_MUXED_ACCOUNT: u32 = 2;
-#[allow(dead_code)]
-const SC_ADDRESS_CLAIMABLE_BALANCE: u32 = 3;
-#[allow(dead_code)]
-const SC_ADDRESS_LIQUIDITY_POOL: u32 = 4;
-
-/// Maximum nesting depth for `ScVal` decoding. Values nested deeper than this
-/// cause the whole decode to return the `{"_xdr": …}` fallback rather than
-/// risk a stack overflow.
-#[allow(dead_code)]
-const MAX_DEPTH: u32 = 256;
+use serde_json::{json, Value};
+use stellar_strkey::Contract;
 
 /// Decode a base64 `ScVal` into friendly JSON. Never panics.
 ///
@@ -240,17 +172,19 @@ pub fn decode_scval(sv: &stellar_xdr::curr::ScVal) -> Value {
                 }
             }
         },
-        ScVal::Address(addr) => {
-            Value::String(addr.to_string())
-        }
+        ScVal::Address(addr) => Value::String(addr.to_string()),
         ScVal::LedgerKeyContractInstance => json!({ "_type": "LedgerKeyContractInstance" }),
         ScVal::LedgerKeyNonce(n) => json!({ "_type": "LedgerKeyNonce", "nonce": n.nonce }),
         ScVal::ContractInstance(inst) => {
             // Best-effort: represent the instance type.
             use stellar_xdr::curr::ContractExecutable;
             match &inst.executable {
-                ContractExecutable::Wasm(hash) => json!({ "_type": "ContractInstance", "wasm_hash": hex(&hash.0) }),
-                ContractExecutable::StellarAsset => json!({ "_type": "ContractInstance", "stellar_asset": true }),
+                ContractExecutable::Wasm(hash) => {
+                    json!({ "_type": "ContractInstance", "wasm_hash": hex(&hash.0) })
+                }
+                ContractExecutable::StellarAsset => {
+                    json!({ "_type": "ContractInstance", "stellar_asset": true })
+                }
             }
         }
     }
@@ -290,6 +224,7 @@ fn i256_to_decimal(p: &stellar_xdr::curr::Int256Parts) -> String {
     let negative = p.hi_hi < 0;
     if !negative {
         let unsigned = stellar_xdr::curr::UInt256Parts {
+            // `hi_hi` is signed in `Int256Parts`; the bit pattern is preserved.
             hi_hi: p.hi_hi as u64,
             hi_lo: p.hi_lo,
             lo_hi: p.lo_hi,
@@ -298,7 +233,7 @@ fn i256_to_decimal(p: &stellar_xdr::curr::Int256Parts) -> String {
         return u256_to_decimal(&unsigned);
     }
     // Negate via two's complement: invert all bits then add one.
-    let mut limbs: [u64; 4] = [p.hi_hi as u64, p.hi_lo, p.lo_hi, p.lo_lo];
+    let mut limbs = [p.hi_hi as u64, p.hi_lo, p.lo_hi, p.lo_lo];
     for limb in limbs.iter_mut() {
         *limb = !*limb;
     }
@@ -330,7 +265,9 @@ pub fn decode_topics(topics: &[String]) -> Vec<Value> {
 pub fn event_name_from_topic(topic_b64: &str) -> Option<String> {
     use stellar_xdr::curr::{Limited, Limits, ReadXdr, ScVal};
 
-    let bytes = base64::engine::general_purpose::STANDARD.decode(topic_b64).ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(topic_b64)
+        .ok()?;
     let mut limited = Limited::new(bytes.as_slice(), Limits::none());
     let sv = ScVal::read_xdr(&mut limited).ok()?;
     if !limited.inner.is_empty() {
@@ -340,318 +277,6 @@ pub fn event_name_from_topic(topic_b64: &str) -> Option<String> {
         ScVal::Symbol(s) => std::str::from_utf8(&s.0).ok().map(str::to_string),
         ScVal::String(s) => std::str::from_utf8(&s.0).ok().map(str::to_string),
         _ => None,
-    }
-}
-
-/// A minimal big-endian XDR reader.
-#[allow(dead_code)]
-struct Cursor<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-#[allow(dead_code)]
-impl<'a> Cursor<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
-    }
-
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let end = self.pos.checked_add(n)?;
-        if end > self.buf.len() {
-            return None;
-        }
-        let s = &self.buf[self.pos..end];
-        self.pos = end;
-        Some(s)
-    }
-
-    fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_be_bytes(self.take(4)?.try_into().ok()?))
-    }
-
-    fn i32(&mut self) -> Option<i32> {
-        Some(i32::from_be_bytes(self.take(4)?.try_into().ok()?))
-    }
-
-    fn u64(&mut self) -> Option<u64> {
-        Some(u64::from_be_bytes(self.take(8)?.try_into().ok()?))
-    }
-
-    fn i64(&mut self) -> Option<i64> {
-        Some(i64::from_be_bytes(self.take(8)?.try_into().ok()?))
-    }
-
-    /// XDR variable opaque / string: 4-byte length, bytes, pad to 4-byte align.
-    fn var_bytes(&mut self) -> Option<Vec<u8>> {
-        let len = self.u32()? as usize;
-        let data = self.take(len)?.to_vec();
-        let pad = (4 - (len % 4)) % 4;
-        self.take(pad)?;
-        Some(data)
-    }
-
-    fn read_scval(&mut self, depth: u32) -> Option<Value> {
-        if depth > MAX_DEPTH {
-            return None;
-        }
-        let tag = self.u32()?;
-        Some(match tag {
-            // #410: strict bool — XDR bool must be exactly 0 or 1.
-            SCV_BOOL => {
-                let raw = self.u32()?;
-                match raw {
-                    0 => Value::Bool(false),
-                    1 => Value::Bool(true),
-                    _ => return None,
-                }
-            }
-            SCV_VOID => Value::Null,
-            SCV_ERROR => {
-                // SCError: type (u32) then either a code (u32 for Contract errors)
-                // or an SCErrorCode enum (u32) for host errors.
-                let error_type = self.u32()?;
-                let code = self.u32()?;
-                let type_name = match error_type {
-                    0 => "Contract",
-                    1 => "WasmVm",
-                    2 => "Context",
-                    3 => "Storage",
-                    4 => "Object",
-                    5 => "Crypto",
-                    6 => "Events",
-                    7 => "Budget",
-                    8 => "Value",
-                    9 => "Auth",
-                    _ => "Unknown",
-                };
-                // Contract errors carry a raw u32 code; host errors carry an
-                // SCErrorCode enum. Render host codes by name where known.
-                if error_type == 0 {
-                    json!({ "error": { "type": type_name, "code": code } })
-                } else {
-                    let code_name = match code {
-                        0 => "ArithDomain",
-                        1 => "IndexBounds",
-                        2 => "InvalidInput",
-                        3 => "MissingValue",
-                        4 => "ExistingValue",
-                        5 => "ExceededLimit",
-                        6 => "InvalidAction",
-                        7 => "InternalError",
-                        8 => "UnexpectedType",
-                        9 => "UnexpectedSize",
-                        _ => "Unknown",
-                    };
-                    json!({ "error": { "type": type_name, "code": code_name } })
-                }
-            }
-            SCV_U32 => json!(self.u32()?),
-            SCV_I32 => json!(self.i32()?),
-            SCV_U64 => Value::String(self.u64()?.to_string()),
-            SCV_I64 => Value::String(self.i64()?.to_string()),
-            SCV_TIMEPOINT => Value::String(self.u64()?.to_string()),
-            SCV_DURATION => Value::String(self.u64()?.to_string()),
-            SCV_U128 => {
-                // UInt128Parts { hi: u64, lo: u64 }
-                let hi = self.u64()? as u128;
-                let lo = self.u64()? as u128;
-                Value::String(((hi << 64) | lo).to_string())
-            }
-            SCV_I128 => {
-                // Int128Parts { hi: i64, lo: u64 }
-                let hi = self.i64()? as i128;
-                let lo = self.u64()? as i128;
-                Value::String(((hi << 64) | lo).to_string())
-            }
-            SCV_U256 | SCV_I256 => {
-                // 256-bit: four 64-bit limbs (hi_hi, hi_lo, lo_hi, lo_lo).
-                let raw = self.take(32)?;
-                json!({ "_u256_hex": hex(raw) })
-            }
-            SCV_BYTES => Value::String(format!("0x{}", hex(&self.var_bytes()?))),
-            SCV_STRING => match String::from_utf8(self.var_bytes()?) {
-                Ok(s) => Value::String(s),
-                Err(e) => Value::String(format!("0x{}", hex(e.as_bytes()))),
-            },
-            // #410: invalid UTF-8 in a Symbol is rendered as hex (like String)
-            // instead of failing the entire containing value.
-            SCV_SYMBOL => match String::from_utf8(self.var_bytes()?) {
-                Ok(s) => Value::String(s),
-                Err(e) => Value::String(format!("0x{}", hex(e.as_bytes()))),
-            },
-            SCV_VEC => {
-                // Option<ScVec>: presence flag, then length-prefixed ScVal array.
-                if self.u32()? == 0 {
-                    Value::Array(vec![])
-                } else {
-                    let len = self.u32()? as usize;
-                    let mut items = Vec::with_capacity(len.min(1024));
-                    for _ in 0..len {
-                        items.push(self.read_scval(depth + 1)?);
-                    }
-                    Value::Array(items)
-                }
-            }
-            SCV_MAP => {
-                if self.u32()? == 0 {
-                    Value::Object(Map::new())
-                } else {
-                    let len = self.u32()? as usize;
-                    self.read_map(len, depth + 1)?
-                }
-            }
-            SCV_ADDRESS => Value::String(self.read_address()?),
-            // #410: tag 19 — ScvContractInstance.
-            // Wire format: executable (union: 0=wasm u32+hash32, 1=token u32),
-            // then Option<ScMap> storage. Rather than try to decode this fully,
-            // we consume the bytes safely by re-entrantly reading the sub-ScVal
-            // fields so the cursor stays aligned, then fall back to an opaque
-            // marker. The `read_contract_instance_payload` helper does just that.
-            SCV_CONTRACT_INSTANCE => {
-                self.skip_contract_instance_payload(depth)?;
-                json!({ "_xdr_tag": SCV_CONTRACT_INSTANCE })
-            }
-            // #410: tag 20 — ScvLedgerKeyContractInstance. No payload.
-            SCV_LEDGER_KEY_CONTRACT_INSTANCE => {
-                json!({ "_xdr_tag": SCV_LEDGER_KEY_CONTRACT_INSTANCE })
-            }
-            // #410: tag 21 — ScvLedgerKeyNonce. Payload: ScNonceKey { nonce: i64 }.
-            SCV_LEDGER_KEY_NONCE => {
-                let _nonce = self.i64()?;
-                json!({ "_xdr_tag": SCV_LEDGER_KEY_NONCE })
-            }
-            // Any other unknown tag (e.g. a future ScVal variant added by a
-            // protocol upgrade): we cannot know the payload layout, so we
-            // cannot keep the cursor aligned. Signal failure via `None` so the
-            // whole value falls back losslessly to the raw base64 — inside a
-            // vec/map this stops decoding the container cleanly instead of
-            // reading the unknown payload as the next element.
-            _ => return None,
-        })
-    }
-
-    /// Consume the payload of a `ScvContractInstance` (tag 19) without trying
-    /// to decode it into friendly JSON. Returns `None` if the bytes are
-    /// structurally invalid (which causes the caller to fall back losslessly).
-    ///
-    /// XDR layout (simplified):
-    ///   executable: union {
-    ///     case WASM(0): wasm_hash = opaque[32]
-    ///     case TOKEN(1): (no payload)
-    ///   }
-    ///   storage: Option<ScMap>
-    fn skip_contract_instance_payload(&mut self, depth: u32) -> Option<()> {
-        // Read the executable union discriminant.
-        let exec_kind = self.u32()?;
-        match exec_kind {
-            0 => {
-                // Wasm: 32-byte hash.
-                self.take(32)?;
-            }
-            1 => {
-                // Token (Stellar Asset Contract): no additional bytes.
-            }
-            _ => return None,
-        }
-        // Read the Option<ScMap> storage presence flag.
-        let present = self.u32()?;
-        if present != 0 {
-            let len = self.u32()? as usize;
-            // Consume each key/value pair by decoding them; this keeps the
-            // cursor aligned even if the individual values are themselves complex.
-            for _ in 0..len {
-                self.read_scval(depth + 1)?;
-                self.read_scval(depth + 1)?;
-            }
-        }
-        Some(())
-    }
-
-    /// #411: read a map and fall back to the `[{key,val}]` pair form when any
-    /// key collision is detected, instead of silently dropping entries.
-    ///
-    /// `depth` is the nesting depth of the map's keys and values (the caller
-    /// passes its own depth + 1).
-    fn read_map(&mut self, len: usize, depth: u32) -> Option<Value> {
-        let mut obj: Map<String, Value> = Map::new();
-        let mut pairs: Vec<Value> = Vec::with_capacity(len);
-        let mut all_stringy = true;
-        let mut has_collision = false;
-
-        for _ in 0..len {
-            let k = self.read_scval(depth)?;
-            let v = self.read_scval(depth)?;
-            match &k {
-                Value::String(s) => {
-                    if obj.contains_key(s.as_str()) {
-                        // Duplicate key — remember this so we fall back.
-                        has_collision = true;
-                    }
-                    obj.insert(s.clone(), v.clone());
-                }
-                _ => all_stringy = false,
-            }
-            pairs.push(json!({ "key": k, "val": v }));
-        }
-
-        // Prefer a plain object only when every key is a symbol/string AND
-        // there are no collisions (which would silently lose data).
-        if all_stringy && !has_collision {
-            Some(Value::Object(obj))
-        } else {
-            Some(Value::Array(pairs))
-        }
-    }
-
-    fn read_address(&mut self) -> Option<String> {
-        match self.u32()? {
-            SC_ADDRESS_ACCOUNT => {
-                // AccountId -> PublicKey union: key type (0 = ed25519), 32 bytes.
-                let _key_type = self.u32()?;
-                let raw = self.take(32)?;
-                // #413: use stellar-strkey for canonical encoding.
-                let mut payload = [0u8; 32];
-                payload.copy_from_slice(raw);
-                Some(Ed25519PublicKey(payload).to_string())
-            }
-            SC_ADDRESS_CONTRACT => {
-                let raw = self.take(32)?;
-                // #413: use stellar-strkey for canonical encoding.
-                let mut payload = [0u8; 32];
-                payload.copy_from_slice(raw);
-                Some(Contract(payload).to_string())
-            }
-            SC_ADDRESS_MUXED_ACCOUNT => {
-                // MuxedEd25519Account: id (u64, big-endian) + ed25519 key (32 bytes).
-                // #413: encoded as an M… strkey by stellar-strkey.
-                let id = self.u64()?;
-                let mut ed25519 = [0u8; 32];
-                ed25519.copy_from_slice(self.take(32)?);
-                Some(MuxedAccount { ed25519, id }.to_string())
-            }
-            SC_ADDRESS_CLAIMABLE_BALANCE => {
-                // ClaimableBalanceID: discriminant (u32) + 32-byte hash.
-                // Only V0 (0) exists; any other type is malformed input.
-                // #413: encoded as a B… strkey by stellar-strkey.
-                if self.u32()? != 0 {
-                    return None;
-                }
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(self.take(32)?);
-                Some(ClaimableBalance::V0(hash).to_string())
-            }
-            SC_ADDRESS_LIQUIDITY_POOL => {
-                // LiquidityPoolID: 32-byte pool hash.
-                // #413: encoded as an L… strkey by stellar-strkey.
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(self.take(32)?);
-                Some(LiquidityPool(hash).to_string())
-            }
-            // Truly unknown address type: return None so the whole ScVal falls
-            // back to the _xdr representation rather than misaligning the cursor.
-            _ => None,
-        }
     }
 }
 
@@ -748,12 +373,46 @@ fn make_contract_strkey(payload: &[u8; 32]) -> String {
 }
 
 #[cfg(test)]
+use stellar_strkey::ed25519::PublicKey as Ed25519PublicKey;
+
+#[cfg(test)]
 fn make_account_strkey(payload: &[u8; 32]) -> String {
     Ed25519PublicKey(*payload).to_string()
 }
 
+/// ScValType / ScAddressType discriminants (stable wire tags) for the raw-byte
+/// test vectors below.
+#[cfg(test)]
+mod wire_tags {
+    pub const SCV_BOOL: u32 = 0;
+    pub const SCV_VOID: u32 = 1;
+    pub const SCV_ERROR: u32 = 2;
+    pub const SCV_U32: u32 = 3;
+    pub const SCV_I32: u32 = 4;
+    pub const SCV_U64: u32 = 5;
+    pub const SCV_I64: u32 = 6;
+    pub const SCV_TIMEPOINT: u32 = 7;
+    pub const SCV_DURATION: u32 = 8;
+    pub const SCV_U128: u32 = 9;
+    pub const SCV_I128: u32 = 10;
+    pub const SCV_U256: u32 = 11;
+    pub const SCV_I256: u32 = 12;
+    pub const SCV_BYTES: u32 = 13;
+    pub const SCV_STRING: u32 = 14;
+    pub const SCV_SYMBOL: u32 = 15;
+    pub const SCV_VEC: u32 = 16;
+    pub const SCV_MAP: u32 = 17;
+    pub const SCV_ADDRESS: u32 = 18;
+    pub const SCV_CONTRACT_INSTANCE: u32 = 19;
+    pub const SCV_LEDGER_KEY_CONTRACT_INSTANCE: u32 = 20;
+    pub const SCV_LEDGER_KEY_NONCE: u32 = 21;
+    pub const SC_ADDRESS_ACCOUNT: u32 = 0;
+    pub const SC_ADDRESS_CONTRACT: u32 = 1;
+}
+
 #[cfg(test)]
 mod tests {
+    use super::wire_tags::*;
     use super::*;
     use base64::Engine;
 
@@ -873,7 +532,10 @@ mod tests {
     #[test]
     fn malformed_falls_back_to_unknown() {
         let raw = base64::engine::general_purpose::STANDARD.encode([0xff, 0xff]);
-        assert_eq!(b64(&raw), serde_json::json!({ "_type": "unknown", "xdr": raw }));
+        assert_eq!(
+            b64(&raw),
+            serde_json::json!({ "_type": "unknown", "xdr": raw })
+        );
     }
 
     #[test]
@@ -899,7 +561,7 @@ mod tests {
         let mut bytes = SCV_VEC.to_be_bytes().to_vec();
         bytes.extend_from_slice(&1u32.to_be_bytes()); // present
         bytes.extend_from_slice(&3u32.to_be_bytes()); // len = 3
-        // element 0: valid u32
+                                                      // element 0: valid u32
         bytes.extend_from_slice(&SCV_U32.to_be_bytes());
         bytes.extend_from_slice(&7u32.to_be_bytes());
         // element 1: unknown tag with an opaque payload
@@ -928,7 +590,7 @@ mod tests {
             v.extend_from_slice(&(s.len() as u32).to_be_bytes());
             v.extend_from_slice(s.as_bytes());
             let pad = (4 - (s.len() % 4)) % 4;
-            v.extend(std::iter::repeat(0u8).take(pad));
+            v.extend(std::iter::repeat_n(0u8, pad));
             v
         }
         fn u32v(n: u32) -> Vec<u8> {
@@ -1043,7 +705,10 @@ mod tests {
         for (name, bytes) in samples {
             out.insert(name.to_string(), decode_scval_base64(&enc(&bytes)));
         }
-        insta::assert_json_snapshot!("dialect_snapshot", Value::Object(out));
+        // Pinned output of every dialect sample. Changing a decoder is a visible,
+        // reviewed change to this literal (previously an insta snapshot).
+        let expected: Value = serde_json::from_str(r#"{"address_account":"GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF","address_contract":"CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4","bool":true,"bytes":"0xdead","contract_instance":{"_type":"ContractInstance","wasm_hash":"0000000000000000000000000000000000000000000000000000000000000000"},"duration":"456","error_contract":{"_error":true},"i128":"-1","i256":"-22704331223003175573249212746801550559464702875615796870481879217237868556851","i32":-42,"i64":"-9223372036854775808","ledger_key_contract_instance":{"_type":"LedgerKeyContractInstance"},"ledger_key_nonce":{"_type":"LedgerKeyNonce","nonce":42},"map":{"a":1},"string":"abc","symbol":"fee","timepoint":"123","u128":"300","u256":"77648812782670860460512307594061302913369283834606025297048026922953510464427","u32":42,"u64":"18446744073709551615","unknown_tag":{"_type":"unknown","xdr":"AAAD5w=="},"vec":[1,2],"void":null}"#).expect("snapshot literal");
+        assert_eq!(Value::Object(out), expected);
     }
 
     // ── #410: edge cases ─────────────────────────────────────────────────
@@ -1121,11 +786,14 @@ mod tests {
         let mut bytes = SCV_SYMBOL.to_be_bytes().to_vec();
         bytes.extend_from_slice(&(padded_len as u32).to_be_bytes());
         bytes.extend_from_slice(bad_utf8);
-        bytes.extend(std::iter::repeat(0u8).take(pad));
+        bytes.extend(std::iter::repeat_n(0u8, pad));
         let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let result = decode_scval_base64(&raw);
-        assert_eq!(result, Value::String("0xfffe".into()),
-            "invalid UTF-8 symbol should render as hex, got {result:?}");
+        assert_eq!(
+            result,
+            Value::String("0xfffe".into()),
+            "invalid UTF-8 symbol should render as hex, got {result:?}"
+        );
     }
 
     #[test]
@@ -1135,7 +803,7 @@ mod tests {
         // Wire: [tag=19][exec_kind=0][wasm_hash: 32 zero bytes][storage_present=0]
         let mut bytes = SCV_CONTRACT_INSTANCE.to_be_bytes().to_vec();
         bytes.extend_from_slice(&0u32.to_be_bytes()); // exec_kind = Wasm
-        bytes.extend_from_slice(&[0u8; 32]);           // wasm hash (32 bytes)
+        bytes.extend_from_slice(&[0u8; 32]); // wasm hash (32 bytes)
         bytes.extend_from_slice(&0u32.to_be_bytes()); // storage absent
         let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let result = decode_scval_base64(&raw);
@@ -1149,7 +817,7 @@ mod tests {
     #[test]
     fn scv_ledger_key_contract_instance_tag_20_is_safe() {
         // #410/#608: ScvLedgerKeyContractInstance (tag 20) has no payload.
-        let mut bytes = SCV_LEDGER_KEY_CONTRACT_INSTANCE.to_be_bytes().to_vec();
+        let bytes = SCV_LEDGER_KEY_CONTRACT_INSTANCE.to_be_bytes().to_vec();
         let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let result = decode_scval_base64(&raw);
         assert_eq!(
@@ -1195,7 +863,7 @@ mod tests {
         let mut bytes = SCV_STRING.to_be_bytes().to_vec();
         bytes.extend_from_slice(&(bad_utf8.len() as u32).to_be_bytes());
         bytes.extend_from_slice(bad_utf8);
-        bytes.extend(std::iter::repeat(0u8).take(2)); // pad
+        bytes.extend(std::iter::repeat_n(0u8, 2)); // pad
         let raw = base64::engine::general_purpose::STANDARD.encode(&bytes);
         assert_eq!(decode_scval_base64(&raw), Value::String("0xfffe".into()));
     }
@@ -1230,7 +898,7 @@ mod tests {
             v.extend_from_slice(&len.to_be_bytes());
             v.extend_from_slice(s.as_bytes());
             let pad = (4 - (s.len() % 4)) % 4;
-            v.extend(std::iter::repeat(0u8).take(pad));
+            v.extend(std::iter::repeat_n(0u8, pad));
             v
         }
         fn scval_u32_xdr(n: u32) -> Vec<u8> {
@@ -1271,7 +939,7 @@ mod tests {
             v.extend_from_slice(&len.to_be_bytes());
             v.extend_from_slice(s.as_bytes());
             let pad = (4 - (s.len() % 4)) % 4;
-            v.extend(std::iter::repeat(0u8).take(pad));
+            v.extend(std::iter::repeat_n(0u8, pad));
             v
         }
         fn scval_u32_xdr(n: u32) -> Vec<u8> {
@@ -1339,23 +1007,41 @@ mod tests {
     #[test]
     fn contract_id_strkey_truncated_input() {
         let valid = make_contract_strkey(&[0u8; 32]);
-        assert!(!is_valid_contract_id(&valid[..10]), "truncated strkey rejected");
-        assert!(!is_valid_contract_id(&valid[..30]), "truncated strkey rejected");
-        assert!(!is_valid_contract_id(&valid[..55]), "truncated strkey rejected");
+        assert!(
+            !is_valid_contract_id(&valid[..10]),
+            "truncated strkey rejected"
+        );
+        assert!(
+            !is_valid_contract_id(&valid[..30]),
+            "truncated strkey rejected"
+        );
+        assert!(
+            !is_valid_contract_id(&valid[..55]),
+            "truncated strkey rejected"
+        );
         assert!(!is_valid_contract_id(""), "empty strkey rejected");
     }
 
     #[test]
     fn contract_id_strkey_overlength_input() {
         let valid = make_contract_strkey(&[0u8; 32]);
-        assert!(!is_valid_contract_id(&format!("{valid}A")), "overlength rejected");
-        assert!(!is_valid_contract_id(&format!("{valid}AAAA")), "overlength rejected");
+        assert!(
+            !is_valid_contract_id(&format!("{valid}A")),
+            "overlength rejected"
+        );
+        assert!(
+            !is_valid_contract_id(&format!("{valid}AAAA")),
+            "overlength rejected"
+        );
     }
 
     #[test]
     fn contract_id_strkey_wrong_version_byte() {
         let g_key = make_account_strkey(&[0u8; 32]);
-        assert!(!is_valid_contract_id(&g_key), "G-strkey rejected as contract ID");
+        assert!(
+            !is_valid_contract_id(&g_key),
+            "G-strkey rejected as contract ID"
+        );
         assert_eq!(g_key.chars().next().unwrap(), 'G', "G-strkey starts with G");
 
         let c_key = make_contract_strkey(&[0u8; 32]);
@@ -1432,21 +1118,25 @@ mod tests {
     #[test]
     fn parse_contract_ids_rejects_invalid_id() {
         let err = parse_contract_ids("NOT_A_VALID_ID").unwrap_err();
-        assert!(err.contains("NOT_A_VALID_ID"), "error mentions bad id: {err}");
+        assert!(
+            err.contains("NOT_A_VALID_ID"),
+            "error mentions bad id: {err}"
+        );
     }
 
     #[test]
     fn parse_contract_ids_rejects_g_strkey() {
         let g_key = make_account_strkey(&[0u8; 32]);
         let err = parse_contract_ids(&g_key).unwrap_err();
-        assert!(err.contains("C\u{2026} strkey"), "error mentions expected format: {err}");
+        assert!(
+            err.contains("C\u{2026} strkey"),
+            "error mentions expected format: {err}"
+        );
     }
 
     #[test]
     fn parse_contract_ids_rejects_too_many_ids() {
-        let ids: Vec<String> = (0u8..26)
-            .map(|i| make_contract_strkey(&[i; 32]))
-            .collect();
+        let ids: Vec<String> = (0u8..26).map(|i| make_contract_strkey(&[i; 32])).collect();
         let raw = ids.join(",");
         let err = parse_contract_ids(&raw).unwrap_err();
         assert!(err.contains("26"), "error mentions count: {err}");
@@ -1460,9 +1150,7 @@ mod tests {
     fn parse_contract_ids_deduplicates_preserving_order() {
         // #612: 26 entries with one duplicate → 25 unique IDs, in first-seen
         // order, and no "too many" error.
-        let ids: Vec<String> = (0u8..25)
-            .map(|i| make_contract_strkey(&[i; 32]))
-            .collect();
+        let ids: Vec<String> = (0u8..25).map(|i| make_contract_strkey(&[i; 32])).collect();
         // Append a duplicate of the first ID to reach 26 entries.
         let mut entries = ids.clone();
         entries.push(ids[0].clone());
@@ -1485,6 +1173,7 @@ mod tests {
 
 #[cfg(test)]
 mod prop_tests {
+    use super::wire_tags::*;
     use super::*;
     use base64::Engine;
     use proptest::prelude::*;
@@ -1544,7 +1233,7 @@ mod prop_tests {
     fn scval_account_address(raw32: &[u8; 32]) -> Vec<u8> {
         let mut v = SCV_ADDRESS.to_be_bytes().to_vec();
         v.extend_from_slice(&SC_ADDRESS_ACCOUNT.to_be_bytes()); // discriminant
-        v.extend_from_slice(&0u32.to_be_bytes());               // key_type = ed25519
+        v.extend_from_slice(&0u32.to_be_bytes()); // key_type = ed25519
         v.extend_from_slice(raw32);
         v
     }
@@ -1563,7 +1252,7 @@ mod prop_tests {
         v.extend_from_slice(&len.to_be_bytes());
         v.extend_from_slice(data);
         let pad = (4 - (data.len() % 4)) % 4;
-        v.extend(std::iter::repeat(0u8).take(pad));
+        v.extend(std::iter::repeat_n(0u8, pad));
         v
     }
 
@@ -1574,7 +1263,7 @@ mod prop_tests {
         v.extend_from_slice(&len.to_be_bytes());
         v.extend_from_slice(bytes);
         let pad = (4 - (bytes.len() % 4)) % 4;
-        v.extend(std::iter::repeat(0u8).take(pad));
+        v.extend(std::iter::repeat_n(0u8, pad));
         v
     }
 
@@ -1769,7 +1458,7 @@ mod prop_tests {
         /// For any typed ScVal, `decode_scval_base64(b64(v)) == decode_scval(v)`.
         #[test]
         fn byte_and_typed_decoders_agree(sv in arb_scval(0)) {
-            use stellar_xdr::curr::WriteXdr;
+            use stellar_xdr::curr::{Limits, WriteXdr};
             let bytes = sv.to_xdr(Limits::none()).expect("ScVal should encode");
             let b64 = encode(&bytes);
             let via_bytes = decode_scval_base64(&b64);
@@ -1781,8 +1470,8 @@ mod prop_tests {
     // ---- #608: arbitrary ScVal generator ---------------------------------
 
     use stellar_xdr::curr::{
-        Int128Parts, Int256Parts, ScAddress, ScBytes, ScMap, ScMapEntry, ScString, ScSymbol,
-        ScVal, ScVec, UInt128Parts, UInt256Parts,
+        Int128Parts, Int256Parts, ScAddress, ScBytes, ScMap, ScMapEntry, ScString, ScSymbol, ScVal,
+        ScVec, UInt128Parts, UInt256Parts,
     };
 
     fn arb_scval(depth: u32) -> BoxedStrategy<ScVal> {
@@ -1799,12 +1488,22 @@ mod prop_tests {
             (any::<i64>(), any::<u64>()).prop_map(|(hi, lo)| ScVal::I128(Int128Parts { hi, lo })),
             (any::<u64>(), any::<u64>(), any::<u64>(), any::<u64>()).prop_map(
                 |(hi_hi, hi_lo, lo_hi, lo_lo)| {
-                    ScVal::U256(UInt256Parts { hi_hi, hi_lo, lo_hi, lo_lo })
+                    ScVal::U256(UInt256Parts {
+                        hi_hi,
+                        hi_lo,
+                        lo_hi,
+                        lo_lo,
+                    })
                 }
             ),
             (any::<i64>(), any::<u64>(), any::<u64>(), any::<u64>()).prop_map(
                 |(hi_hi, hi_lo, lo_hi, lo_lo)| {
-                    ScVal::I256(Int256Parts { hi_hi, hi_lo, lo_hi, lo_lo })
+                    ScVal::I256(Int256Parts {
+                        hi_hi,
+                        hi_lo,
+                        lo_hi,
+                        lo_lo,
+                    })
                 }
             ),
             proptest::collection::vec(any::<u8>(), 0..=16)
@@ -1818,7 +1517,9 @@ mod prop_tests {
             }),
             any::<[u8; 32]>().prop_map(|raw| {
                 ScVal::Address(ScAddress::Account(stellar_xdr::curr::AccountId(
-                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(raw)),
+                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                        raw,
+                    )),
                 )))
             }),
             Just(ScVal::LedgerKeyContractInstance),
@@ -1833,17 +1534,14 @@ mod prop_tests {
             let nested = prop_oneof![
                 proptest::collection::vec(arb_scval(depth + 1), 0..=4)
                     .prop_map(|v| ScVal::Vec(Some(ScVec(v.try_into().unwrap())))),
-                proptest::collection::vec(
-                    (arb_scval(depth + 1), arb_scval(depth + 1)),
-                    0..=4,
-                )
-                .prop_map(|entries| {
-                    let entries: Vec<ScMapEntry> = entries
-                        .into_iter()
-                        .map(|(key, val)| ScMapEntry { key, val })
-                        .collect();
-                    ScVal::Map(Some(ScMap(entries.try_into().unwrap())))
-                }),
+                proptest::collection::vec((arb_scval(depth + 1), arb_scval(depth + 1)), 0..=4,)
+                    .prop_map(|entries| {
+                        let entries: Vec<ScMapEntry> = entries
+                            .into_iter()
+                            .map(|(key, val)| ScMapEntry { key, val })
+                            .collect();
+                        ScVal::Map(Some(ScMap(entries.try_into().unwrap())))
+                    }),
             ];
             prop_oneof![leaf, nested].boxed()
         }

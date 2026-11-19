@@ -59,7 +59,6 @@ pub enum Severity {
     Breaking,
 }
 
-
 /// The difference between two parsed interfaces, oldest to newest.
 #[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
 pub struct SpecDiff {
@@ -265,7 +264,8 @@ fn diff_events(old: &ContractSpec, new: &ContractSpec) -> SectionDiff {
     // potentially-breaking rather than breaking.
     let mut still_changed = Vec::new();
     for item in diff.changed.drain(..) {
-        if let (Some(before), Some(after)) = (find_event(old, &item.name), find_event(new, &item.name))
+        if let (Some(before), Some(after)) =
+            (find_event(old, &item.name), find_event(new, &item.name))
         {
             if let Some(description) = map_event_added_fields(before, after) {
                 diff.potentially_breaking.push(PotentiallyBreakingItem {
@@ -284,10 +284,7 @@ fn diff_events(old: &ContractSpec, new: &ContractSpec) -> SectionDiff {
     diff
 }
 
-fn find_event<'a>(
-    spec: &'a ContractSpec,
-    name: &str,
-) -> Option<&'a crate::spec::EventSpec> {
+fn find_event<'a>(spec: &'a ContractSpec, name: &str) -> Option<&'a crate::spec::EventSpec> {
     spec.events.iter().find(|e| e.name == name)
 }
 
@@ -394,11 +391,7 @@ fn added_cases_only(old: &ContractSpec, new: &ContractSpec, name: &str) -> Optio
         new.enums.iter().find(|e| e.name == name),
     ) {
         if n.cases.len() > o.cases.len() {
-            let same_prefix = o
-                .cases
-                .iter()
-                .zip(n.cases.iter())
-                .all(|(a, b)| a == b);
+            let same_prefix = o.cases.iter().zip(n.cases.iter()).all(|(a, b)| a == b);
             if same_prefix {
                 let added: Vec<&str> = n.cases[o.cases.len()..]
                     .iter()
@@ -1050,7 +1043,9 @@ mod tests {
             "must appear in 'potentially_breaking'"
         );
         assert!(
-            d.types.potentially_breaking[0].description.contains("Pending"),
+            d.types.potentially_breaking[0]
+                .description
+                .contains("Pending"),
             "description should name the new case: {}",
             d.types.potentially_breaking[0].description
         );
@@ -1215,7 +1210,9 @@ mod tests {
         assert!(d.types.changed.is_empty(), "must not appear in 'changed'");
         assert_eq!(d.types.potentially_breaking.len(), 1);
         assert!(
-            d.types.potentially_breaking[0].description.contains("Pause"),
+            d.types.potentially_breaking[0]
+                .description
+                .contains("Pause"),
             "description should name the new case"
         );
     }

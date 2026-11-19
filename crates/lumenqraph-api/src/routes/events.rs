@@ -89,7 +89,10 @@ fn parse_param_filter(raw: Option<&str>) -> ApiResult<Option<String>> {
             ApiError::bad_request("param must be in the form name:value, e.g. param=from:GABC...")
         })?;
     let mut object = serde_json::Map::new();
-    object.insert(name.to_string(), serde_json::Value::String(value.to_string()));
+    object.insert(
+        name.to_string(),
+        serde_json::Value::String(value.to_string()),
+    );
     Ok(Some(serde_json::Value::Object(object).to_string()))
 }
 
@@ -101,7 +104,7 @@ pub async fn list_events(
     ValidContractId(contract_id): ValidContractId,
     Query(q): Query<EventsQuery>,
 ) -> ApiResult<Json<EventsResponse>> {
-    let limit = q.limit.clamp(1, 1000);
+    let _limit = q.limit.clamp(1, 1000);
 
     let topic0 = parse_topic_filter(q.topic0.as_deref())?;
     let topic1 = parse_topic_filter(q.topic1.as_deref())?;
@@ -146,7 +149,9 @@ pub async fn list_events(
     // Validate ledger range consistency
     if let (Some(from_ledger), Some(to_ledger)) = (q.from_ledger, q.to_ledger) {
         if from_ledger > to_ledger {
-            return Err(ApiError::bad_request("'from_ledger' must be <= 'to_ledger'"));
+            return Err(ApiError::bad_request(
+                "'from_ledger' must be <= 'to_ledger'",
+            ));
         }
     }
 
@@ -159,8 +164,8 @@ pub async fn list_events(
            AND ($2::text IS NULL OR event_name = $2)
            AND ($3::bigint IS NULL OR ledger >= $3)
            AND ($4::bigint IS NULL OR ledger <= $4)
-           AND ($5::timestamp IS NULL OR ledger_closed_at >= $5)
-           AND ($6::timestamp IS NULL OR ledger_closed_at <= $6)
+           AND ($5::timestamptz IS NULL OR ledger_closed_at >= $5)
+           AND ($6::timestamptz IS NULL OR ledger_closed_at <= $6)
            -- Topic filtering matches the value at an exact position: `-> n` reads
            -- decoded_topics[n] as jsonb, so `topic1` only matches index 1.
            AND ($7::text IS NULL OR (decoded_topics -> 0) = $7::jsonb)
@@ -192,7 +197,9 @@ pub async fn list_events(
     .fetch_all(&state.pool)
     .await?;
 
-    Ok(page.finish(events, |e| LedgerCursor::new(e.ledger, &e.event_id)))
+    Ok(Json(page.finish(events, |e| {
+        LedgerCursor::new(e.ledger, &e.event_id)
+    })))
 }
 
 /// `GET /events/:event_id` — fetch a single event by its unique id.
@@ -237,12 +244,8 @@ pub async fn transaction_events(
     Query(q): Query<TxEventsQuery>,
 ) -> ApiResult<Json<TxEventsResponse>> {
     let tx_hash = normalize_tx_hash(&tx_hash)?;
-    let page = PageRequest::<LedgerCursor>::parse(
-        q.limit.unwrap_or(100),
-        1000,
-        0,
-        q.after.as_deref(),
-    )?;
+    let page =
+        PageRequest::<LedgerCursor>::parse(q.limit.unwrap_or(100), 1000, 0, q.after.as_deref())?;
     let page = page_transaction_events(&state.pool, &tx_hash, &page, q.successful_only).await?;
     Ok(Json(TxEventsResponse {
         tx_hash,
@@ -349,9 +352,15 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "query `{query}` must not fail");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "query `{query}` must not fail"
+        );
 
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         body["data"].as_array().expect("`data` array").len()
     }

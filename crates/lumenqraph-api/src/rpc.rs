@@ -148,7 +148,10 @@ impl RpcClient {
     pub async fn warm_network_passphrase(&self) {
         let mut delay = Duration::from_secs(1);
         while self.network_passphrase().await.is_none() {
-            tracing::warn!(retry_in_secs = delay.as_secs(), "rpc network passphrase unavailable, retrying");
+            tracing::warn!(
+                retry_in_secs = delay.as_secs(),
+                "rpc network passphrase unavailable, retrying"
+            );
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(Duration::from_secs(60));
         }

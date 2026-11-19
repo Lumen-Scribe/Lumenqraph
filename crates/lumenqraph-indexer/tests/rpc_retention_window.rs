@@ -84,7 +84,7 @@ mod rpc_retention_window_tests {
         // Store RPC health info with 24-hour retention
         sqlx::query(
             "INSERT INTO rpc_health (id, oldest_ledger, latest_ledger, ledger_retention_window)
-             VALUES (1, $1, $2, $3)"
+             VALUES (1, $1, $2, $3)",
         )
         .bind(oldest_available)
         .bind(latest)
@@ -97,12 +97,11 @@ mod rpc_retention_window_tests {
         let configured_start = 50_000i64; // Way older than oldest_available
 
         // Simulate the clamping logic
-        let health: (i64, i64) = sqlx::query_as(
-            "SELECT oldest_ledger, latest_ledger FROM rpc_health WHERE id = 1"
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("query should succeed");
+        let health: (i64, i64) =
+            sqlx::query_as("SELECT oldest_ledger, latest_ledger FROM rpc_health WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .expect("query should succeed");
 
         let (oldest, _latest) = health;
         let clamped_start = configured_start.max(oldest);
@@ -113,7 +112,8 @@ mod rpc_retention_window_tests {
             "fresh start should clamp to RPC-reported oldest ledger (24-hour window)"
         );
         assert_ne!(
-            clamped_start, latest - 120_000,
+            clamped_start,
+            latest - 120_000,
             "clamping should NOT use hardcoded 120_000 window"
         );
 
@@ -135,7 +135,7 @@ mod rpc_retention_window_tests {
         // Store RPC health info with 30-day retention
         sqlx::query(
             "INSERT INTO rpc_health (id, oldest_ledger, latest_ledger, ledger_retention_window)
-             VALUES (1, $1, $2, $3)"
+             VALUES (1, $1, $2, $3)",
         )
         .bind(oldest_available)
         .bind(latest)
@@ -180,12 +180,11 @@ mod rpc_retention_window_tests {
         cleanup_test_data(&pool).await;
 
         // No rpc_health data (RPC doesn't report getHealth)
-        let health_exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM rpc_health WHERE id = 1)"
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("query should succeed");
+        let health_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM rpc_health WHERE id = 1)")
+                .fetch_one(&pool)
+                .await
+                .expect("query should succeed");
         assert!(!health_exists, "rpc_health should not exist");
 
         let override_retention = 86_400i64; // 1 day override

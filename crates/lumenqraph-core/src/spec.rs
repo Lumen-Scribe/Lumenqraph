@@ -296,8 +296,7 @@ impl ContractSpec {
             if !e.prefix_topics.is_empty() {
                 // Full tuple — inserted unconditionally so the last declaration
                 // wins (consistent with the old single-key behaviour).
-                self.events_by_prefix
-                    .insert(e.prefix_topics.clone(), i);
+                self.events_by_prefix.insert(e.prefix_topics.clone(), i);
             }
         }
 
@@ -656,9 +655,7 @@ impl ContractSpec {
                 Value::Array(a) => Value::Array(
                     a.iter()
                         .map(|item| {
-                            if let (Some(k), Some(val_v)) =
-                                (item.get("key"), item.get("val"))
-                            {
+                            if let (Some(k), Some(val_v)) = (item.get("key"), item.get("val")) {
                                 json!({
                                     "key": self.relabel(k, &m.key_type),
                                     "val": self.relabel(val_v, &m.value_type),
@@ -990,7 +987,7 @@ mod tests {
     #[test]
     fn parses_event_and_struct_from_spec_xdr() {
         let body = spec_section(&[transfer_event_entry(), position_struct_entry()]);
-        let spec = ContractSpec::from_spec_xdr(&body).expect("should parse");
+        let spec = ContractSpec::from_spec_xdr_simple(&body).expect("should parse");
         assert_eq!(spec.events.len(), 1);
         assert_eq!(spec.events[0].name, "transfer");
         assert_eq!(spec.events[0].params.len(), 3);
@@ -1056,7 +1053,7 @@ mod tests {
             .unwrap(),
             data_format: ScSpecEventDataFormat::SingleValue,
         });
-        let spec = ContractSpec::from_spec_xdr(&spec_section(&[entry])).unwrap();
+        let spec = ContractSpec::from_spec_xdr_simple(&spec_section(&[entry])).unwrap();
 
         // topic[0] is the prefix symbol, not the name.
         let topics = vec![json!("mkt_pnl"), json!("ETHUSD")];
@@ -1106,7 +1103,7 @@ mod tests {
         wasm.extend(section);
 
         let spec = ContractSpec::from_wasm(&wasm).expect("should find + parse section");
-        assert_eq!(spec.events[0].name, "transfer");
+        assert_eq!(spec.spec.events[0].name, "transfer");
     }
 
     #[test]
@@ -1202,7 +1199,7 @@ mod tests {
         }
 
         fn enrich(entries: &[ScSpecEntry], value: Value) -> Value {
-            let spec = ContractSpec::from_spec_xdr(&spec_section(entries)).unwrap();
+            let spec = ContractSpec::from_spec_xdr_simple(&spec_section(entries)).unwrap();
             spec.enrich_event("changed", &[json!("changed")], &value)
                 .expect("should enrich")
         }
@@ -1299,7 +1296,6 @@ mod tests {
         use super::*;
         use stellar_xdr::curr::{
             ScSpecEventParamV0, ScSpecEventV0, ScSpecUdtStructFieldV0, ScSpecUdtStructV0, ScSymbol,
-            VecM,
         };
 
         #[test]
@@ -1617,99 +1613,100 @@ mod tests {
             assert_eq!(enriched["params"]["value"]["value"], "42");
             assert_eq!(enriched["params"]["value"]["type"], "Option<i128>");
         }
-    
-    // ── #400: bounded XDR limits ─────────────────────────────────────────────
 
-    /// Build a maximally-nested Option<Option<...<I128>...>> ScSpecTypeDef.
-    fn deeply_nested_type(depth: usize) -> ScSpecTypeDef {
-        let mut ty = ScSpecTypeDef::I128;
-        for _ in 0..depth {
-            ty = ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
-                value_type: Box::new(ty),
-            }));
+        // ── #400: bounded XDR limits ─────────────────────────────────────────────
+
+        /// Build a maximally-nested Option<Option<...<I128>...>> ScSpecTypeDef.
+        fn deeply_nested_type(depth: usize) -> ScSpecTypeDef {
+            let mut ty = ScSpecTypeDef::I128;
+            for _ in 0..depth {
+                ty = ScSpecTypeDef::Option(Box::new(stellar_xdr::curr::ScSpecTypeOption {
+                    value_type: Box::new(ty),
+                }));
+            }
+            ty
         }
-        ty
-    }
 
-    #[test]
-    fn bounded_limits_do_not_panic_on_deep_nesting() {
-        // Build a spec with a 10 000-deep nested type to verify #400 — parsing
-        // must return None (or a partial result) without panicking or overflowing.
-        use stellar_xdr::curr::{ScSpecFunctionV0, ScSpecFunctionInputV0, WriteXdr, Limits};
+        #[test]
+        fn bounded_limits_do_not_panic_on_deep_nesting() {
+            // Build a spec with a 10 000-deep nested type to verify #400 — parsing
+            // must return None (or a partial result) without panicking or overflowing.
+            use stellar_xdr::curr::{Limits, ScSpecFunctionInputV0, ScSpecFunctionV0, WriteXdr};
 
-        let fn_entry = ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
-            doc: "".try_into().unwrap(),
-            name: ScSymbol("deep".try_into().unwrap()),
-            inputs: vec![ScSpecFunctionInputV0 {
+            let fn_entry = ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
                 doc: "".try_into().unwrap(),
-                name: "x".try_into().unwrap(),
-                type_: deeply_nested_type(10_000),
-            }]
-            .try_into()
-            .unwrap(),
-            outputs: vec![].try_into().unwrap(),
-        });
+                name: ScSymbol("deep".try_into().unwrap()),
+                inputs: vec![ScSpecFunctionInputV0 {
+                    doc: "".try_into().unwrap(),
+                    name: "x".try_into().unwrap(),
+                    type_: deeply_nested_type(10_000),
+                }]
+                .try_into()
+                .unwrap(),
+                outputs: vec![].try_into().unwrap(),
+            });
 
-        // Serialise with no limits (we're constructing the attacker payload).
-        let mut body = Vec::new();
-        fn_entry.to_xdr(&mut body, Limits::none()).ok();
+            // Serialise with no limits (we're constructing the attacker payload).
+            let body = fn_entry.to_xdr(Limits::none()).unwrap_or_default();
 
-        // Parsing with bounded limits must not panic, stack-overflow, or OOM.
-        // It may return None (limits exceeded) or Some partial spec.
-        let result = std::panic::catch_unwind(|| {
-            ContractSpec::from_spec_xdr(&body)
-        });
-        assert!(result.is_ok(), "from_spec_xdr panicked on deeply-nested input");
-    }
+            // Parsing with bounded limits must not panic, stack-overflow, or OOM.
+            // It may return None (limits exceeded) or Some partial spec.
+            let result = std::panic::catch_unwind(|| ContractSpec::from_spec_xdr_simple(&body));
+            assert!(
+                result.is_ok(),
+                "from_spec_xdr panicked on deeply-nested input"
+            );
+        }
 
-    // ── #401: partial parse / incomplete spec ─────────────────────────────────
+        // ── #401: partial parse / incomplete spec ─────────────────────────────────
 
-    #[test]
-    fn partial_spec_returns_incomplete_flag() {
-        use stellar_xdr::curr::{ScSpecFunctionV0, WriteXdr, Limits};
+        #[test]
+        fn partial_spec_returns_incomplete_flag() {
+            use stellar_xdr::curr::{Limits, ScSpecFunctionV0, WriteXdr};
 
-        // A valid function entry followed by garbage bytes.
-        let good_entry = ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
-            doc: "".try_into().unwrap(),
-            name: ScSymbol("ok_fn".try_into().unwrap()),
-            inputs: vec![].try_into().unwrap(),
-            outputs: vec![].try_into().unwrap(),
-        });
+            // A valid function entry followed by garbage bytes.
+            let good_entry = ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
+                doc: "".try_into().unwrap(),
+                name: ScSymbol("ok_fn".try_into().unwrap()),
+                inputs: vec![].try_into().unwrap(),
+                outputs: vec![].try_into().unwrap(),
+            });
 
-        let mut body = Vec::new();
-        good_entry.to_xdr(&mut body, Limits::none()).unwrap();
-        // Append garbage that will fail to decode.
-        body.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x01]);
+            let mut body = good_entry.to_xdr(Limits::none()).unwrap();
+            // Append garbage that will fail to decode.
+            body.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x01]);
 
-        let result = ContractSpec::from_spec_xdr(&body);
-        assert!(result.is_some(), "expected Some partial spec");
-        let parsed = result.unwrap();
-        // The good function should be present.
-        assert_eq!(parsed.spec.functions.len(), 1);
-        assert_eq!(parsed.spec.functions[0].name, "ok_fn");
-        // The section is not complete because of the trailing garbage.
-        assert!(!parsed.complete, "expected complete=false for partial parse");
-        assert!(parsed.skipped_entries > 0);
-    }
+            let result = ContractSpec::from_spec_xdr(&body);
+            assert!(result.is_some(), "expected Some partial spec");
+            let parsed = result.unwrap();
+            // The good function should be present.
+            assert_eq!(parsed.spec.functions.len(), 1);
+            assert_eq!(parsed.spec.functions[0].name, "ok_fn");
+            // The section is not complete because of the trailing garbage.
+            assert!(
+                !parsed.complete,
+                "expected complete=false for partial parse"
+            );
+            assert!(parsed.skipped_entries > 0);
+        }
 
-    #[test]
-    fn fully_valid_spec_is_marked_complete() {
-        use stellar_xdr::curr::{ScSpecFunctionV0, WriteXdr, Limits};
+        #[test]
+        fn fully_valid_spec_is_marked_complete() {
+            use stellar_xdr::curr::{Limits, ScSpecFunctionV0, WriteXdr};
 
-        let fn_entry = ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
-            doc: "".try_into().unwrap(),
-            name: ScSymbol("my_fn".try_into().unwrap()),
-            inputs: vec![].try_into().unwrap(),
-            outputs: vec![].try_into().unwrap(),
-        });
+            let fn_entry = ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
+                doc: "".try_into().unwrap(),
+                name: ScSymbol("my_fn".try_into().unwrap()),
+                inputs: vec![].try_into().unwrap(),
+                outputs: vec![].try_into().unwrap(),
+            });
 
-        let mut body = Vec::new();
-        fn_entry.to_xdr(&mut body, Limits::none()).unwrap();
+            let body = fn_entry.to_xdr(Limits::none()).unwrap();
 
-        let parsed = ContractSpec::from_spec_xdr(&body).expect("should parse");
-        assert!(parsed.complete, "a clean spec should be marked complete");
-        assert_eq!(parsed.skipped_entries, 0);
-    }
+            let parsed = ContractSpec::from_spec_xdr(&body).expect("should parse");
+            assert!(parsed.complete, "a clean spec should be marked complete");
+            assert_eq!(parsed.skipped_entries, 0);
+        }
     }
 
     // ── #402: shared-prefix event matching ───────────────────────────────────
@@ -1751,7 +1748,8 @@ mod tests {
         fn shared_prefix_topic0_enriches_with_correct_schema() {
             let deposit = pool_event(&["pool", "deposit"], "PoolDeposit");
             let withdraw = pool_event(&["pool", "withdraw"], "PoolWithdraw");
-            let spec = ContractSpec::from_spec_xdr(&spec_section(&[deposit, withdraw])).unwrap();
+            let spec =
+                ContractSpec::from_spec_xdr_simple(&spec_section(&[deposit, withdraw])).unwrap();
 
             // A deposit event: topics[0]="pool", topics[1]="deposit"
             let dep_topics = vec![json!("pool"), json!("deposit")];
@@ -1775,7 +1773,7 @@ mod tests {
         #[test]
         fn mismatched_later_prefix_topic_is_not_enriched() {
             let deposit = pool_event(&["pool", "deposit"], "PoolDeposit");
-            let spec = ContractSpec::from_spec_xdr(&spec_section(&[deposit])).unwrap();
+            let spec = ContractSpec::from_spec_xdr_simple(&spec_section(&[deposit])).unwrap();
 
             // topic[1] = "swap" — no spec has prefix ["pool","swap"]
             let topics = vec![json!("pool"), json!("swap")];
@@ -1812,21 +1810,27 @@ mod tests {
             // Two-topic prefix (specific deposit)
             let deposit = pool_event(&["pool", "deposit"], "PoolDeposit");
             let spec =
-                ContractSpec::from_spec_xdr(&spec_section(&[generic, deposit])).unwrap();
+                ContractSpec::from_spec_xdr_simple(&spec_section(&[generic, deposit])).unwrap();
 
             // Event with topics ["pool","deposit"]: the 2-element prefix wins.
             let topics = vec![json!("pool"), json!("deposit")];
             let out = spec
                 .enrich_event("pool", &topics, &json!("999"))
                 .expect("should enrich");
-            assert_eq!(out["event"], "PoolDeposit", "2-tuple prefix must win over 1-tuple");
+            assert_eq!(
+                out["event"], "PoolDeposit",
+                "2-tuple prefix must win over 1-tuple"
+            );
 
             // Event with topics ["pool","other"]: only the 1-element prefix matches.
             let topics2 = vec![json!("pool"), json!("other")];
             let out2 = spec
                 .enrich_event("pool", &topics2, &json!("42"))
                 .expect("should enrich via 1-tuple");
-            assert_eq!(out2["event"], "PoolGeneric", "1-tuple prefix is the fallback");
+            assert_eq!(
+                out2["event"], "PoolGeneric",
+                "1-tuple prefix is the fallback"
+            );
         }
     }
 
@@ -1834,9 +1838,7 @@ mod tests {
 
     mod error_enum_tests {
         use super::*;
-        use stellar_xdr::curr::{
-            ScSpecUdtErrorEnumCaseV0, ScSpecUdtErrorEnumV0,
-        };
+        use stellar_xdr::curr::{ScSpecUdtErrorEnumCaseV0, ScSpecUdtErrorEnumV0};
 
         fn error_enum_entry() -> ScSpecEntry {
             ScSpecEntry::UdtErrorEnumV0(ScSpecUdtErrorEnumV0 {
@@ -1863,7 +1865,7 @@ mod tests {
         #[test]
         fn error_enum_is_parsed_into_errors_vec() {
             let body = spec_section(&[transfer_event_entry(), error_enum_entry()]);
-            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
             assert_eq!(spec.errors.len(), 1);
             assert_eq!(spec.errors[0].name, "ContractError");
             assert_eq!(spec.errors[0].cases.len(), 2);
@@ -1876,7 +1878,7 @@ mod tests {
         #[test]
         fn interface_json_includes_errors() {
             let body = spec_section(&[transfer_event_entry(), error_enum_entry()]);
-            let spec = ContractSpec::from_spec_xdr(&body).unwrap();
+            let spec = ContractSpec::from_spec_xdr_simple(&body).unwrap();
             let iface = spec.to_interface_json();
             let errors = iface["errors"].as_array().expect("errors must be an array");
             assert_eq!(errors.len(), 1);
@@ -1892,7 +1894,7 @@ mod tests {
             let body = spec_section(&[error_enum_entry()]);
             // Currently is_empty checks functions/events/structs/unions/enums/errors.
             // A spec with only errors is not empty.
-            let spec = ContractSpec::from_spec_xdr(&body);
+            let spec = ContractSpec::from_spec_xdr_simple(&body);
             assert!(spec.is_some(), "spec with only errors must not be None");
         }
     }
@@ -1902,8 +1904,7 @@ mod tests {
     mod relabel_map_and_result {
         use super::*;
         use stellar_xdr::curr::{
-            ScSpecTypeMap, ScSpecTypeResult, ScSpecTypeUdt, ScSpecUdtEnumCaseV0,
-            ScSpecUdtEnumV0,
+            ScSpecTypeMap, ScSpecTypeResult, ScSpecTypeUdt, ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0,
         };
 
         fn status_enum_entry() -> ScSpecEntry {
@@ -1936,7 +1937,7 @@ mod tests {
 
         /// Build a `ContractSpec` from the given entries.
         fn make_spec(entries: &[ScSpecEntry]) -> ContractSpec {
-            ContractSpec::from_spec_xdr(&spec_section(entries)).unwrap()
+            ContractSpec::from_spec_xdr_simple(&spec_section(entries)).unwrap()
         }
 
         /// Map<Status, i128> decoded as [{key:0, val:"100"},{key:7, val:"50"}]

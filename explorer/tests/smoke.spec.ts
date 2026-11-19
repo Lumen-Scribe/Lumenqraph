@@ -27,7 +27,7 @@ test.describe('Explorer Smoke Tests', () => {
 
     const labels = ['Indexer', 'Lag (ledgers)', 'Processed ledger', 'Chain tip', 'Events indexed', 'Errors'];
     for (const label of labels) {
-      await expect(page.locator('.kpi')).toContainText(label);
+      await expect(kpis).toContainText(label);
     }
   });
 
@@ -75,8 +75,8 @@ test.describe('Explorer Smoke Tests', () => {
     const options = select.locator('option');
 
     await expect(options).toHaveCount(2);
-    await expect(options.first()).toHaveValue('public');
-    await expect(options.last()).toHaveValue('testnet');
+    await expect(options.first()).toHaveAttribute('value', 'public');
+    await expect(options.last()).toHaveAttribute('value', 'testnet');
   });
 
   test('network can be switched', async ({ page }) => {
@@ -112,11 +112,13 @@ test.describe('Explorer Smoke Tests', () => {
   });
 
   test('local storage persistence', async ({ page }) => {
-    // Set values in localStorage
+    // Set values in localStorage. The API key is only restored when the user
+    // has opted in with "Remember on this device" (issue #638).
     await page.goto('/explorer/index.html');
     await page.evaluate(() => {
       localStorage.setItem('lq.base', 'http://api.example.com');
-      localStorage.setItem('lq.key', 'test-key-123');
+      localStorage.setItem('lq.key.remember', '1');
+      localStorage.setItem('lq.key.remembered', 'test-key-123');
     });
 
     // Reload and verify persistence
@@ -167,7 +169,12 @@ test.describe('Explorer Smoke Tests', () => {
 
     // Check that styles are applied
     const container = page.locator('.container');
-    const style = await container.evaluate(el => window.getComputedStyle(el));
+    // Read the properties inside the page: CSSStyleDeclaration itself does not
+    // serialize across the Playwright boundary in Firefox and WebKit.
+    const style = await container.evaluate(el => {
+      const s = window.getComputedStyle(el);
+      return { maxWidth: s.maxWidth, marginLeft: s.marginLeft };
+    });
 
     expect(style.maxWidth).toBeDefined();
     expect(style.marginLeft).toBeDefined();

@@ -95,9 +95,7 @@ pub async fn run(
         cursor::write_progress(&pool, last_page_ledger, tip, inserted).await?;
         info!(
             inserted,
-            page_max_ledger,
-            total_inserted,
-            "backfill page complete (cursor checkpointed)"
+            page_max_ledger, total_inserted, "backfill page complete (cursor checkpointed)"
         );
 
         cursor_token = page.cursor;
@@ -138,7 +136,10 @@ mod tests {
             .await
             .expect("connect");
         for stmt in ["DROP SCHEMA public CASCADE", "CREATE SCHEMA public"] {
-            sqlx::query(stmt).execute(&pool).await.expect("reset schema");
+            sqlx::query(stmt)
+                .execute(&pool)
+                .await
+                .expect("reset schema");
         }
         sqlx::migrate!("../../migrations")
             .run(&pool)
@@ -250,10 +251,14 @@ mod tests {
             upgrade_watch: false,
             reorg_overlap_ledgers: 0,
             rpc_timeout_secs: 30,
+            max_consecutive_errors: 20,
+            degraded_poll_interval_secs: 30,
             enrichment_warn_threshold: 0.5,
             key_templates: vec![],
             spec_cache_max_entries: 2000,
             spec_fetch_concurrency: 4,
+            max_consecutive_errors: 20,
+            degraded_poll_interval_secs: 300,
         }
     }
 
@@ -306,7 +311,11 @@ mod tests {
             .await
             .unwrap();
         let last = cursor::read_last_processed(&pool).await.unwrap();
-        assert_eq!(last, Some(1000), "cursor must reflect the last fetched ledger");
+        assert_eq!(
+            last,
+            Some(1000),
+            "cursor must reflect the last fetched ledger"
+        );
     }
 
     /// A second fetch of the same range inserts zero new rows (idempotency).

@@ -25,13 +25,7 @@ mod tests {
     use crate::rpc_client::RpcClient;
     use crate::specs::SpecCache;
     use crate::{cursor, poller};
-    use axum::{
-        body::Bytes,
-        extract::State,
-        http::HeaderMap,
-        routing::post,
-        Json, Router,
-    };
+    use axum::{body::Bytes, extract::State, http::HeaderMap, routing::post, Json, Router};
     use serde_json::{json, Value};
     use sqlx::{postgres::PgPoolOptions, PgPool};
     use std::sync::{Arc, Mutex};
@@ -47,7 +41,10 @@ mod tests {
             .await
             .expect("connect");
         for stmt in ["DROP SCHEMA public CASCADE", "CREATE SCHEMA public"] {
-            sqlx::query(stmt).execute(&pool).await.expect("reset schema");
+            sqlx::query(stmt)
+                .execute(&pool)
+                .await
+                .expect("reset schema");
         }
         sqlx::migrate!("../../migrations")
             .run(&pool)
@@ -259,12 +256,11 @@ mod tests {
         );
 
         // /contracts — contract_summaries denormalised row for C1.
-        let summary_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM contract_summaries WHERE contract_id = 'C1'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let summary_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM contract_summaries WHERE contract_id = 'C1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(
             summary_count, 1,
             "/contracts must list C1 after events are indexed"
@@ -272,11 +268,10 @@ mod tests {
 
         // /transfers — token_transfers; these events have no decoded transfer topic
         // so the table should be empty (no false positives).
-        let transfer_count: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM token_transfers")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let transfer_count: i64 = sqlx::query_scalar("SELECT count(*) FROM token_transfers")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(
             transfer_count, 0,
             "events with no transfer topic must not project phantom transfers"
@@ -316,11 +311,10 @@ mod tests {
         .await
         .unwrap();
 
-        let global_max: i64 =
-            sqlx::query_scalar("SELECT COALESCE(max(seq), 0) FROM events")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let global_max: i64 = sqlx::query_scalar("SELECT COALESCE(max(seq), 0) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
         let enqueued = sqlx::query(
             "INSERT INTO webhook_deliveries (subscription_id, event_id)
@@ -350,12 +344,11 @@ mod tests {
             .unwrap();
 
         // All delivery rows are pending.
-        let pending: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM webhook_deliveries WHERE status = 'pending'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let pending: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM webhook_deliveries WHERE status = 'pending'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(pending, 3);
 
         // Deliver one payload manually: fetch the first due delivery's payload,

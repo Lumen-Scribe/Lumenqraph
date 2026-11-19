@@ -8,7 +8,6 @@ mod shutdown_handling_tests {
     use sqlx::PgPool;
     use std::sync::Arc;
     use std::time::Duration;
-    
 
     async fn setup_test_db() -> PgPool {
         let database_url = std::env::var("DATABASE_URL")
@@ -72,10 +71,7 @@ mod shutdown_handling_tests {
     }
 
     async fn cleanup_test_data(pool: &PgPool) {
-        sqlx::query("DELETE FROM events")
-            .execute(pool)
-            .await
-            .ok();
+        sqlx::query("DELETE FROM events").execute(pool).await.ok();
         sqlx::query("DELETE FROM indexer_cursor WHERE id = 1")
             .execute(pool)
             .await
@@ -150,7 +146,7 @@ mod shutdown_handling_tests {
         // Simulate that a poll cycle committed progress before shutdown
         sqlx::query(
             "INSERT INTO indexer_cursor (id, last_processed_ledger, chain_tip_ledger, version)
-             VALUES (1, $1, $2, 1)"
+             VALUES (1, $1, $2, 1)",
         )
         .bind(last_committed)
         .bind(chain_tip)
@@ -160,7 +156,7 @@ mod shutdown_handling_tests {
 
         // Simulate graceful shutdown: read last progress
         let (stored_ledger, stored_tip): (i64, i64) = sqlx::query_as(
-            "SELECT last_processed_ledger, chain_tip_ledger FROM indexer_cursor WHERE id = 1"
+            "SELECT last_processed_ledger, chain_tip_ledger FROM indexer_cursor WHERE id = 1",
         )
         .fetch_one(&pool)
         .await
@@ -171,10 +167,7 @@ mod shutdown_handling_tests {
             stored_ledger, last_committed,
             "shutdown should log the last committed ledger"
         );
-        assert_eq!(
-            stored_tip, chain_tip,
-            "shutdown should log the chain tip"
-        );
+        assert_eq!(stored_tip, chain_tip, "shutdown should log the chain tip");
 
         cleanup_test_data(&pool).await;
     }
@@ -232,7 +225,6 @@ mod shutdown_handling_tests {
         let total_snapshots = 500;
 
         let cancellation_clone = cancellation.clone();
-        let _pool_clone = pool.clone();
         let task = tokio::spawn(async move {
             let mut written = 0;
 

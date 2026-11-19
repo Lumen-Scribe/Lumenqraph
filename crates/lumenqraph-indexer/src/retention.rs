@@ -90,8 +90,7 @@ pub async fn prune(pool: &PgPool, tip: i64, retention_ledgers: i64) -> anyhow::R
             .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
         warn!(
             cutoff_ledger = cutoff,
-            dropped,
-            "retention dropped webhook deliveries (non-pending) with their events"
+            dropped, "retention dropped webhook deliveries (non-pending) with their events"
         );
     }
 
@@ -478,20 +477,35 @@ mod tests {
         insert_event(&pool, "above", 501).await;
 
         let deleted = prune(&pool, 1000, 500).await.expect("prune");
-        assert_eq!(deleted, 1, "only the row strictly below the cutoff is pruned");
+        assert_eq!(
+            deleted, 1,
+            "only the row strictly below the cutoff is pruned"
+        );
 
         assert_eq!(
-            count(&pool, "SELECT count(*) FROM events WHERE event_id = 'at_floor'").await,
+            count(
+                &pool,
+                "SELECT count(*) FROM events WHERE event_id = 'at_floor'"
+            )
+            .await,
             1,
             "row at ledger == cutoff must survive (condition is `ledger < cutoff`, not `<=`)"
         );
         assert_eq!(
-            count(&pool, "SELECT count(*) FROM events WHERE event_id = 'above'").await,
+            count(
+                &pool,
+                "SELECT count(*) FROM events WHERE event_id = 'above'"
+            )
+            .await,
             1,
             "row above the cutoff must survive"
         );
         assert_eq!(
-            count(&pool, "SELECT count(*) FROM events WHERE event_id = 'below'").await,
+            count(
+                &pool,
+                "SELECT count(*) FROM events WHERE event_id = 'below'"
+            )
+            .await,
             0,
             "row strictly below the cutoff must be removed"
         );
@@ -606,7 +620,10 @@ mod tests {
         let before = summary_event_count(&pool, "C1")
             .await
             .expect("summary row should exist after inserts");
-        assert_eq!(before, 3, "insert trigger must have counted all three events");
+        assert_eq!(
+            before, 3,
+            "insert trigger must have counted all three events"
+        );
 
         // Prune events older than ledger 250 (tip=1000, retention=750 → cutoff=250).
         // Events e1 (ledger=100) and e2 (ledger=200) are below the cutoff; e3 survives.
@@ -658,7 +675,10 @@ mod tests {
             first, 500,
             "first_seen_ledger must advance to the next surviving event"
         );
-        assert_eq!(last, 900, "last_seen_ledger must remain at the newest event");
+        assert_eq!(
+            last, 900,
+            "last_seen_ledger must remain at the newest event"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -667,7 +687,12 @@ mod tests {
     // -------------------------------------------------------------------------
 
     /// Insert a spec version row and return its id.
-    async fn insert_spec_version(pool: &PgPool, contract_id: &str, version: i32, ledger: i64) -> i64 {
+    async fn insert_spec_version(
+        pool: &PgPool,
+        contract_id: &str,
+        version: i32,
+        ledger: i64,
+    ) -> i64 {
         sqlx::query_scalar(
             "INSERT INTO contract_spec_versions (contract_id, version, ledger, spec_hash, spec)
              VALUES ($1,$2,$3,'hash','{}')

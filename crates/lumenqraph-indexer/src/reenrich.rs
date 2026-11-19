@@ -37,10 +37,12 @@ pub async fn run_reenrich(
     };
 
     let total_events: i64 = if let Some(contract) = options.contract.as_deref() {
-        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM events WHERE {filter} AND contract_id = $1"))
-            .bind(contract)
-            .fetch_one(&pool)
-            .await?
+        sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM events WHERE {filter} AND contract_id = $1"
+        ))
+        .bind(contract)
+        .fetch_one(&pool)
+        .await?
     } else {
         sqlx::query_scalar(&format!("SELECT COUNT(*) FROM events WHERE {filter}"))
             .fetch_one(&pool)
@@ -58,7 +60,7 @@ pub async fn run_reenrich(
 
     loop {
         let rows = if let Some(contract) = options.contract.as_deref() {
-            let query = if let Some((_ledger, _event_id)) = cursor.as_ref() {
+            let query = if cursor.is_some() {
                 format!(
                     "SELECT ledger, event_id, contract_id, decoded_topics, event_name, decoded_value
                      FROM events WHERE {filter} AND contract_id = $1 AND (ledger, event_id) > ($2, $3)
@@ -112,13 +114,14 @@ pub async fn run_reenrich(
             let decoded_value_json: String = row.get("decoded_value");
             processed += 1;
 
-            let decoded_topics: Vec<serde_json::Value> = match serde_json::from_str(&decoded_topics_json) {
-                Ok(value) => value,
-                Err(error) => {
-                    warn!(event_id, %error, "failed to parse decoded_topics");
-                    continue;
-                }
-            };
+            let decoded_topics: Vec<serde_json::Value> =
+                match serde_json::from_str(&decoded_topics_json) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        warn!(event_id, %error, "failed to parse decoded_topics");
+                        continue;
+                    }
+                };
             let decoded_value: serde_json::Value = match serde_json::from_str(&decoded_value_json) {
                 Ok(value) => value,
                 Err(error) => {
@@ -128,16 +131,18 @@ pub async fn run_reenrich(
             };
 
             let spec = specs.get(&pool, &rpc, &contract_id, ledger).await;
-            let enriched = spec.as_deref().and_then(|spec| {
-                spec.enrich_event(&event_name, &decoded_topics, &decoded_value)
-            });
+            let enriched = spec
+                .as_deref()
+                .and_then(|spec| spec.enrich_event(&event_name, &decoded_topics, &decoded_value));
             if let Some(enriched_json) = enriched {
-                let enriched_str = serde_json::to_string(&enriched_json).unwrap_or_else(|_| "null".to_string());
-                if let Err(error) = sqlx::query("UPDATE events SET enriched = $1 WHERE event_id = $2")
-                    .bind(enriched_str)
-                    .bind(&event_id)
-                    .execute(&pool)
-                    .await
+                let enriched_str =
+                    serde_json::to_string(&enriched_json).unwrap_or_else(|_| "null".to_string());
+                if let Err(error) =
+                    sqlx::query("UPDATE events SET enriched = $1 WHERE event_id = $2")
+                        .bind(enriched_str)
+                        .bind(&event_id)
+                        .execute(&pool)
+                        .await
                 {
                     warn!(event_id, %error, "failed to update enriched field");
                 } else {
@@ -148,17 +153,35 @@ pub async fn run_reenrich(
             }
         }
 
-        if pages.is_multiple_of(PROGRESS_EVERY_PAGES) {
+        #[allow(clippy::manual_is_multiple_of)] // is_multiple_of needs Rust 1.87; MSRV is 1.85
+        let progress_due = pages % PROGRESS_EVERY_PAGES == 0;
+        if progress_due {
             let elapsed = start_time.elapsed();
             let since_last = processed - last_progress_count;
             let since_last_time = last_progress_time.elapsed().as_secs_f64();
-            let throughput = if since_last_time > 0.0 { since_last as f64 / since_last_time } else { 0.0 };
+            let throughput = if since_last_time > 0.0 {
+                since_last as f64 / since_last_time
+            } else {
+                0.0
+            };
             let remaining = (total_events as u64).saturating_sub(processed);
-            let eta_secs = if throughput > 0.0 { remaining as f64 / throughput } else { 0.0 };
+            let eta_secs = if throughput > 0.0 {
+                remaining as f64 / throughput
+            } else {
+                0.0
+            };
             if is_tty {
                 eprintln!("Re-enriching… {processed:>10}/{total_events:<10} | {updated} updated | {throughput:.0} evt/s | ETA {eta_secs:.0}s");
             }
-            info!(processed, updated, total_events, elapsed_secs = elapsed.as_secs(), throughput = throughput as u64, eta_secs, "re-enrichment progress");
+            info!(
+                processed,
+                updated,
+                total_events,
+                elapsed_secs = elapsed.as_secs(),
+                throughput = throughput as u64,
+                eta_secs,
+                "re-enrichment progress"
+            );
             last_progress_count = processed;
             last_progress_time = Instant::now();
         }

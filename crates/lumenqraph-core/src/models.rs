@@ -20,7 +20,7 @@ pub enum EventType {
 }
 
 impl EventType {
-    /// The label stored in `events.event_type`.
+    /// The lowercase value stored in `events.event_type`.
     pub fn as_str(self) -> &'static str {
         match self {
             EventType::Contract => "contract",
@@ -28,14 +28,17 @@ impl EventType {
             EventType::Diagnostic => "diagnostic",
         }
     }
+}
 
-    /// Parse the `type` field of an RPC event. Unknown labels return `None`.
-    pub fn from_rpc(label: &str) -> Option<Self> {
-        match label {
-            "contract" => Some(EventType::Contract),
-            "system" => Some(EventType::System),
-            "diagnostic" => Some(EventType::Diagnostic),
-            _ => None,
+impl std::str::FromStr for EventType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "contract" => Ok(EventType::Contract),
+            "system" => Ok(EventType::System),
+            "diagnostic" => Ok(EventType::Diagnostic),
+            other => Err(format!("unknown event type {other:?}")),
         }
     }
 }

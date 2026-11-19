@@ -149,7 +149,7 @@ mod deep_backfill_streaming_tests {
                 "INSERT INTO events
                  (event_id, contract_id, ledger, ledger_closed_at, event_type, topics,
                   decoded_topics, event_name, value, tx_hash, in_successful_call, paging_token)
-                 VALUES "
+                 VALUES ",
             );
 
             let mut values = Vec::new();
@@ -168,13 +168,11 @@ mod deep_backfill_streaming_tests {
                 .expect("Failed to insert batch");
         }
 
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM events WHERE contract_id = $1",
-        )
-        .bind(contract_id)
-        .fetch_one(&pool)
-        .await
-        .expect("Failed to count events");
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events WHERE contract_id = $1")
+            .bind(contract_id)
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to count events");
 
         assert_eq!(count.0, (batch_size * 10) as i64);
 

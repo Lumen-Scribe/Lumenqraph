@@ -9,6 +9,7 @@ name = "lumenqraph-mcp"
 path = "src/main.rs"
 
 [dependencies]
+clap.workspace = true
 lumenqraph-core.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -25,5 +26,6 @@ uuid.workspace = true
 axum.workspace = true
 
 [dev-dependencies]
+stellar-strkey.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
