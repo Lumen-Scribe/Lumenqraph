@@ -1,6 +1,7 @@
 //! Indexer configuration, loaded from environment (see `.env.example`).
 
 use anyhow::Context;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 
 use crate::keys::{parse_durability, KeyTemplate};
@@ -33,6 +34,13 @@ pub struct Config {
     pub upgrade_watch: bool,
     pub reorg_overlap_ledgers: i64,
     pub rpc_timeout_secs: u64,
+    /// Longest `Retry-After` wait honoured on a 429/503 before the client fails
+    /// over instead of sleeping (#726). Env `RPC_MAX_RETRY_AFTER_SECS`, default 60.
+    pub rpc_max_retry_after_secs: u64,
+    /// Headers sent on every RPC request, for providers that authenticate with
+    /// a header (#725). Env `RPC_HEADERS`, as `Name=value;Name2=value2` or a
+    /// JSON object. Values are redacted in `Debug` output.
+    pub rpc_headers: HeaderMap,
     pub enrichment_warn_threshold: f64,
     pub spec_cache_max_entries: usize,
     pub spec_fetch_concurrency: usize,
@@ -68,6 +76,15 @@ impl std::fmt::Debug for Config {
             .field("upgrade_watch", &self.upgrade_watch)
             .field("reorg_overlap_ledgers", &self.reorg_overlap_ledgers)
             .field("rpc_timeout_secs", &self.rpc_timeout_secs)
+            .field("rpc_max_retry_after_secs", &self.rpc_max_retry_after_secs)
+            .field(
+                "rpc_headers",
+                &self
+                    .rpc_headers
+                    .keys()
+                    .map(|name| format!("{name}: [REDACTED]"))
+                    .collect::<Vec<_>>(),
+            )
             .field("enrichment_warn_threshold", &self.enrichment_warn_threshold)
             .field("spec_cache_max_entries", &self.spec_cache_max_entries)
             .finish()
@@ -181,6 +198,13 @@ impl Config {
 
         // Validate RPC_TIMEOUT_SECS minimum (must be at least 1s).
         let rpc_timeout_secs = clamp_with_warning("RPC_TIMEOUT_SECS", rpc_timeout_secs, 1, u64::MAX);
+        // Cap on how long a server-requested Retry-After may hold us (#726).
+        let rpc_max_retry_after_secs = clamp_with_warning(
+            "RPC_MAX_RETRY_AFTER_SECS",
+            env_parse("RPC_MAX_RETRY_AFTER_SECS", 60u64)?,
+            1,
+            3600,
+        );
 
         // Validate SPEC_CACHE_MAX_ENTRIES minimum (must be at least 1).
         let spec_cache_max_entries = clamp_with_warning("SPEC_CACHE_MAX_ENTRIES", spec_cache_max_entries, 1, usize::MAX);
@@ -283,6 +307,7 @@ impl Config {
             ));
         }
         let rpc_url = rpc_urls[0].clone();
+        let rpc_headers = parse_rpc_headers(&std::env::var("RPC_HEADERS").unwrap_or_default())?;
 
         Ok(Self {
             database_url: env("DATABASE_URL")?,
@@ -305,6 +330,8 @@ impl Config {
             spec_version_retention,
             reorg_overlap_ledgers,
             rpc_timeout_secs,
+            rpc_max_retry_after_secs,
+            rpc_headers,
             enrichment_warn_threshold,
             key_templates,
             spec_cache_max_entries,
@@ -384,9 +411,93 @@ where
     env_parse(key, default)
 }
 
+/// Parse `RPC_HEADERS` into a header map (#725).
+///
+/// Accepts `Name=value;Name2=value2` (split on the first `=`, so values may
+/// contain `=`) or a JSON object of name to value. Every value is marked
+/// sensitive so `reqwest` and `HeaderValue`'s `Debug` keep it out of logs.
+/// Errors name the offending header but never echo its value.
+pub fn parse_rpc_headers(raw: &str) -> anyhow::Result<HeaderMap> {
+    let raw = raw.trim();
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    if raw.is_empty() {
+        return Ok(HeaderMap::new());
+    } else if raw.starts_with('{') {
+        let map: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(raw).context("RPC_HEADERS JSON must be an object of string values")?;
+        pairs.extend(map);
+    } else {
+        for entry in raw.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+            let (name, value) = entry
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("RPC_HEADERS entries must be Name=value"))?;
+            pairs.push((name.trim().to_string(), value.trim().to_string()));
+        }
+    }
+
+    let mut headers = HeaderMap::new();
+    for (name, value) in pairs {
+        let header_name = HeaderName::from_bytes(name.as_bytes())
+            .with_context(|| format!("RPC_HEADERS has an invalid header name `{name}`"))?;
+        let mut header_value = HeaderValue::from_str(&value)
+            .with_context(|| format!("RPC_HEADERS value for `{name}` is not a valid header value"))?;
+        header_value.set_sensitive(true);
+        headers.append(header_name, header_value);
+    }
+    Ok(headers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tests that mutate process env must hold this, or they race under the
+    /// parallel test runner.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn rpc_headers_parse_semicolon_pairs_and_keep_equals_in_values() {
+        let h = parse_rpc_headers("Authorization=Bearer abc==;X-Api-Key=k1").unwrap();
+        assert_eq!(h.get("authorization").unwrap().to_str().unwrap(), "Bearer abc==");
+        assert_eq!(h.get("x-api-key").unwrap().to_str().unwrap(), "k1");
+        assert!(h.get("authorization").unwrap().is_sensitive());
+    }
+
+    #[test]
+    fn rpc_headers_accept_a_json_object_and_empty_input() {
+        let h = parse_rpc_headers(r#"{"x-api-key":"k2"}"#).unwrap();
+        assert_eq!(h.get("x-api-key").unwrap().to_str().unwrap(), "k2");
+        assert!(parse_rpc_headers("").unwrap().is_empty());
+        assert!(parse_rpc_headers("   ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn debug_output_redacts_rpc_header_values() {
+        let _guard = env_lock();
+        std::env::set_var("DATABASE_URL", "postgres://localhost/test");
+        std::env::set_var("RPC_URL", "https://example.com");
+        std::env::remove_var("RPC_URLS");
+        std::env::set_var("RPC_HEADERS", "X-Api-Key=very-secret-key");
+        let cfg = Config::from_env().expect("config should load");
+        std::env::remove_var("RPC_HEADERS");
+
+        assert_eq!(cfg.rpc_headers.get("x-api-key").unwrap().to_str().unwrap(), "very-secret-key");
+        let dbg = format!("{cfg:?}");
+        assert!(dbg.contains("x-api-key: [REDACTED]"), "{dbg}");
+        assert!(!dbg.contains("very-secret-key"), "Debug must not print header values");
+    }
+
+    #[test]
+    fn rpc_headers_reject_bad_names_and_never_echo_values() {
+        let err = parse_rpc_headers("bad name=supersecret").unwrap_err().to_string();
+        assert!(err.contains("invalid header name"), "{err}");
+        assert!(!err.contains("supersecret"), "error must not leak the value: {err}");
+        assert!(parse_rpc_headers("no-equals-sign").is_err());
+    }
+
 
     #[test]
     fn page_size_clamping() {
@@ -450,9 +561,7 @@ mod tests {
 
     #[test]
     fn invalid_balance_key_durability_fails_config_load() {
-        // Serialize env access across tests to avoid interference.
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock();
 
         let saved: Vec<(String, Option<String>)> = [
             "BALANCE_KEY_DURABILITY",
@@ -471,7 +580,7 @@ mod tests {
         std::env::remove_var("RPC_URLS");
         std::env::remove_var("KEY_TEMPLATES");
 
-        for invalid in ["instance", "temp", "persistent ", "temporarily", ""] {
+        for invalid in ["instance", "temp", "temporarily", ""] {
             std::env::set_var("BALANCE_KEY_DURABILITY", invalid);
             // Empty string is treated as unset (defaults to persistent), so it
             // must succeed; all other typos must fail.

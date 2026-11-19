@@ -113,7 +113,7 @@ pub async fn insert_events_with_resolver(
         contract_ids.push(e.contract_id.clone());
         ledgers.push(e.ledger);
         closed_ats.push(e.ledger_closed_at);
-        event_types.push(e.event_type.clone());
+        event_types.push(e.event_type.as_str().to_string());
         topics_json.push(serde_json::to_string(&e.topics)?);
         decoded_topics_json.push(serde_json::to_string(&e.decoded_topics)?);
         event_names.push(e.event_name.clone());
@@ -416,7 +416,7 @@ pub async fn upsert_events(
         contract_ids.push(e.contract_id.clone());
         ledgers.push(e.ledger);
         closed_ats.push(e.ledger_closed_at);
-        event_types.push(e.event_type.clone());
+        event_types.push(e.event_type.as_str().to_string());
         topics_json.push(serde_json::to_string(&e.topics)?);
         decoded_topics_json.push(serde_json::to_string(&e.decoded_topics)?);
         event_names.push(e.event_name.clone());
@@ -828,7 +828,13 @@ fn extract_liquidity_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lumenqraph_core::EventType;
     use serde_json::json;
+
+    /// Test resolver: every fixture contract is a confirmed fungible token.
+    fn all_fungible(_: &str) -> Option<ContractKind> {
+        Some(ContractKind::FungibleToken)
+    }
 
     fn event(name: Option<&str>, topics: Vec<Value>, value: Value) -> NewEvent {
         NewEvent {
@@ -836,7 +842,7 @@ mod tests {
             contract_id: "C1".into(),
             ledger: 42,
             ledger_closed_at: chrono::Utc::now(),
-            event_type: "contract".into(),
+            event_type: EventType::Contract,
             topics: vec![],
             decoded_topics: topics,
             event_name: name.map(|s| s.to_string()),
@@ -856,7 +862,7 @@ mod tests {
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
             json!("300"),
         );
-        let t = extract_transfer(&e).expect("transfer should be recognised");
+        let t = extract_transfer(&e, &all_fungible).expect("transfer should be recognised");
         assert_eq!(t.from_addr.as_deref(), Some("GFROM"));
         assert_eq!(t.to_addr.as_deref(), Some("GTO"));
         assert_eq!(t.amount, "300");
@@ -870,7 +876,7 @@ mod tests {
             vec![json!("mint"), json!("GRECIPIENT")],
             json!("1000"),
         );
-        let t = extract_transfer(&e).expect("mint should be recognised");
+        let t = extract_transfer(&e, &all_fungible).expect("mint should be recognised");
         assert_eq!(t.from_addr, None);
         assert_eq!(t.to_addr.as_deref(), Some("GRECIPIENT"));
         assert_eq!(t.amount, "1000");
@@ -884,7 +890,7 @@ mod tests {
             vec![json!("burn"), json!("GBURNER")],
             json!("500"),
         );
-        let t = extract_transfer(&e).expect("burn should be recognised");
+        let t = extract_transfer(&e, &all_fungible).expect("burn should be recognised");
         assert_eq!(t.from_addr.as_deref(), Some("GBURNER"));
         assert_eq!(t.to_addr, None);
         assert_eq!(t.amount, "500");
@@ -898,7 +904,7 @@ mod tests {
             vec![json!("clawback"), json!("GVICTIM")],
             json!("750"),
         );
-        let t = extract_transfer(&e).expect("clawback should be recognised");
+        let t = extract_transfer(&e, &all_fungible).expect("clawback should be recognised");
         assert_eq!(t.from_addr.as_deref(), Some("GVICTIM"));
         assert_eq!(t.to_addr, None);
         assert_eq!(t.amount, "750");
@@ -908,7 +914,7 @@ mod tests {
     #[test]
     fn ignores_other_events() {
         let e = event(Some("approval"), vec![json!("approval")], json!("1"));
-        assert!(extract_transfer(&e).is_none());
+        assert!(extract_transfer(&e, &all_fungible).is_none());
     }
 
     #[test]
@@ -918,14 +924,14 @@ mod tests {
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
             json!(300),
         );
-        let t = extract_transfer(&e).unwrap();
+        let t = extract_transfer(&e, &all_fungible).unwrap();
         assert_eq!(t.amount, "300");
     }
 
     #[test]
     fn missing_address_topics_are_none() {
         let e = event(Some("transfer"), vec![json!("transfer")], json!("5"));
-        let t = extract_transfer(&e).unwrap();
+        let t = extract_transfer(&e, &all_fungible).unwrap();
         assert!(t.from_addr.is_none());
         assert!(t.to_addr.is_none());
         assert_eq!(t.amount, "5");
@@ -939,7 +945,7 @@ mod tests {
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
             json!(42),
         );
-        let t = extract_transfer(&e);
+        let t = extract_transfer(&e, &all_fungible);
         // Future: This should return None for non-token contracts
         // For now, we're testing the current behavior and documenting the expected fix
         assert!(t.is_some(), "Current behavior: accepts any transfer event");
@@ -952,8 +958,8 @@ mod tests {
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
             json!({"token_id": 123}),
         );
-        let t = extract_transfer(&e);
-        assert!(t.is_some(), "should handle complex token_id object");
+        let t = extract_transfer(&e, &all_fungible);
+        assert!(t.is_none(), "non-amount value must be skipped, not panic");
     }
 
     // Issue #384: CAP-67 Protocol 23 support for muxed addresses and SAC assets
@@ -969,7 +975,7 @@ mod tests {
             ],
             json!("500"),
         );
-        let t = extract_transfer(&e);
+        let t = extract_transfer(&e, &all_fungible);
         assert!(t.is_some(), "should handle SAC transfer with asset topic");
         let transfer = t.unwrap();
         assert_eq!(transfer.from_addr.as_deref(), Some("GFROM"));
@@ -989,7 +995,7 @@ mod tests {
             ],
             json!("1000"),
         );
-        let t = extract_transfer(&e);
+        let t = extract_transfer(&e, &all_fungible);
         assert!(t.is_some(), "should handle muxed address in topic");
         let transfer = t.unwrap();
         // Current behavior: treats muxed address as regular string
@@ -1007,11 +1013,11 @@ mod tests {
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
             map_value,
         );
-        let t = extract_transfer(&e);
+        let t = extract_transfer(&e, &all_fungible);
         assert!(t.is_some(), "should handle CAP-67 map value");
         let transfer = t.unwrap();
-        // Current behavior: stringifies entire map
-        assert!(transfer.amount.contains("amount") || transfer.amount.contains("to_muxed_id"));
+        // CAP-67 map form: the amount is taken from the `amount` field.
+        assert_eq!(transfer.amount, "100");
     }
 
     // Issue #383: Poison-pill events with non-integer values must not abort ingestion
@@ -1020,9 +1026,9 @@ mod tests {
         let e = event(
             Some("transfer"),
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
-            json!(0xDEADBEEF),
+            json!(0xDEAD_BEEFu64),
         );
-        let t = extract_transfer(&e).expect("should handle numeric value");
+        let t = extract_transfer(&e, &all_fungible).expect("should handle numeric value");
         assert_eq!(t.amount, "3735928559");
     }
 
@@ -1034,8 +1040,8 @@ mod tests {
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
             vector_value,
         );
-        let t = extract_transfer(&e);
-        assert!(t.is_some(), "should not panic on vector value");
+        let t = extract_transfer(&e, &all_fungible);
+        assert!(t.is_none(), "non-amount value must be skipped, not panic");
     }
 
     #[test]
@@ -1052,9 +1058,8 @@ mod tests {
             vec![json!("mint"), json!("GRECIPIENT")],
             struct_value,
         );
-        let t = extract_transfer(&e);
-        assert!(t.is_some(), "should handle complex struct value");
-        assert!(t.unwrap().amount.contains("field") || t.unwrap().amount.contains("nested"));
+        let t = extract_transfer(&e, &all_fungible);
+        assert!(t.is_none(), "non-amount value must be skipped, not panic");
     }
 
     #[test]
@@ -1064,9 +1069,8 @@ mod tests {
             vec![json!("burn"), json!("GBURNER")],
             json!(null),
         );
-        let t = extract_transfer(&e);
-        assert!(t.is_some(), "should handle null value");
-        assert_eq!(t.unwrap().amount, "null");
+        let t = extract_transfer(&e, &all_fungible);
+        assert!(t.is_none(), "non-amount value must be skipped, not panic");
     }
 
     #[test]
@@ -1076,9 +1080,8 @@ mod tests {
             vec![json!("clawback"), json!("GVICTIM")],
             json!(true),
         );
-        let t = extract_transfer(&e);
-        assert!(t.is_some(), "should handle boolean value");
-        assert_eq!(t.unwrap().amount, "true");
+        let t = extract_transfer(&e, &all_fungible);
+        assert!(t.is_none(), "non-amount value must be skipped, not panic");
     }
 
     // Issue #382: REORG_OVERLAP_LEDGERS upsert should skip no-op updates
@@ -1103,7 +1106,7 @@ mod tests {
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
             json!("1000"),
         );
-        let t = extract_transfer(&e).expect("should extract transfer");
+        let t = extract_transfer(&e, &all_fungible).expect("should extract transfer");
         assert_eq!(t.from_addr.as_deref(), Some("GFROM"));
         assert_eq!(t.to_addr.as_deref(), Some("GTO"));
         assert_eq!(t.amount, "1000");
@@ -1122,8 +1125,8 @@ mod tests {
             vec![json!("transfer"), json!("GFROM"), json!("GTO2")],
             json!("1000"),
         );
-        let t1 = extract_transfer(&e1).unwrap();
-        let t2 = extract_transfer(&e2).unwrap();
+        let t1 = extract_transfer(&e1, &all_fungible).unwrap();
+        let t2 = extract_transfer(&e2, &all_fungible).unwrap();
         assert_ne!(t1.to_addr, t2.to_addr);
     }
 
@@ -1140,8 +1143,8 @@ mod tests {
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
             json!("2000"),
         );
-        let t1 = extract_transfer(&e1).unwrap();
-        let t2 = extract_transfer(&e2).unwrap();
+        let t1 = extract_transfer(&e1, &all_fungible).unwrap();
+        let t2 = extract_transfer(&e2, &all_fungible).unwrap();
         assert_ne!(t1.amount, t2.amount);
     }
 }

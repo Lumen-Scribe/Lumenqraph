@@ -2,17 +2,23 @@
 //!
 //! These tests verify that:
 //! - #599: AMM swaps, NFTs, and liquidity events are projected through the real
-//!   ingestion path (`store::insert_events`), not by inserting rows directly.
+//!   ingestion path (`crate::store::insert_events`), not by inserting rows directly.
 //! - #600: Only SEP-41 / SAC transfers are projected into `token_transfers`;
 //!   NFT `transfer` events are not.
 //!
 //! All contract and account identifiers are valid strkeys generated with
 //! `stellar_strkey`, so the tests exercise the same validation as production.
 
+// The indexer is a binary-only crate, so the store module is compiled in
+// directly rather than imported from a library target.
+#[allow(dead_code)]
+#[path = "../src/store.rs"]
+mod store;
+
 #[cfg(test)]
 mod projection_tests {
     use chrono::Utc;
-    use lumenqraph_indexer::store::{self, NewEvent};
+    use crate::store::NewEvent;
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
     use sqlx::Row;
@@ -25,7 +31,7 @@ mod projection_tests {
 
     /// Deterministic, valid account (ed25519 public key) strkey.
     fn account_strkey(seed: u8) -> String {
-        stellar_strkey::Ed25519PublicKey([seed; 32]).to_string()
+        stellar_strkey::ed25519::PublicKey([seed; 32]).to_string()
     }
 
     fn new_event(
@@ -222,7 +228,7 @@ mod projection_tests {
             }),
         );
 
-        store::insert_events(&pool, &[event])
+        crate::store::insert_events(&pool, &[event])
             .await
             .expect("insert_events should succeed");
 
@@ -265,7 +271,7 @@ mod projection_tests {
             json!("token_123"),
         );
 
-        store::insert_events(&pool, &[event])
+        crate::store::insert_events(&pool, &[event])
             .await
             .expect("insert_events should succeed");
 
@@ -307,7 +313,7 @@ mod projection_tests {
             json!("nft_id_456"),
         );
 
-        store::insert_events(&pool, &[event])
+        crate::store::insert_events(&pool, &[event])
             .await
             .expect("insert_events should succeed");
 
@@ -350,7 +356,7 @@ mod projection_tests {
             json!("nft_id_789"),
         );
 
-        store::insert_events(&pool, &[event])
+        crate::store::insert_events(&pool, &[event])
             .await
             .expect("insert_events should succeed");
 
@@ -390,7 +396,7 @@ mod projection_tests {
             json!("12345"),
         );
 
-        store::insert_events(&pool, &[event])
+        crate::store::insert_events(&pool, &[event])
             .await
             .expect("insert_events should succeed");
 
@@ -438,7 +444,7 @@ mod projection_tests {
             }),
         );
 
-        store::insert_events(&pool, &[event])
+        crate::store::insert_events(&pool, &[event])
             .await
             .expect("insert_events should succeed");
 

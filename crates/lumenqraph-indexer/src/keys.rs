@@ -183,7 +183,7 @@ mod tests {
             contract_id: "C1".into(),
             ledger: 1,
             ledger_closed_at: chrono::Utc::now(),
-            event_type: "contract".into(),
+            event_type: lumenqraph_core::EventType::Contract,
             topics: vec![],
             decoded_topics: topics,
             event_name: name.map(String::from),

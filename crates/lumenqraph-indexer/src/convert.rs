@@ -68,7 +68,7 @@ pub fn to_new_event(e: &EventInfo, spec: Option<&ContractSpec>) -> Option<NewEve
         contract_id: e.contract_id.clone(),
         ledger: e.ledger,
         ledger_closed_at,
-        event_type: e.event_type.clone(),
+        event_type: lumenqraph_core::EventType::from_rpc_str(&e.event_type),
         topics: e.topic.clone(),
         decoded_topics,
         event_name,

@@ -33,12 +33,33 @@ use stellar_xdr::curr::{
 /// How long to wait before probing the primary again after a failover.
 const PRIMARY_PROBE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Longest `Retry-After` the client will honour before it stops waiting and
+/// fails over instead (#726). Overridable via `RPC_MAX_RETRY_AFTER_SECS`.
+pub const DEFAULT_MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// How long an endpoint that exhausted its retry budget is deprioritised when
+/// choosing where to fail over next (#723). Cooling endpoints are only used
+/// when every untried endpoint is cooling, so a call never gives up while
+/// untried endpoints remain.
+const ENDPOINT_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Per-endpoint health used to pick failover candidates (#723).
+#[derive(Clone, Copy, Default)]
+struct EndpointHealth {
+    /// When this endpoint last exhausted its retry budget. Cleared on success.
+    last_error_at: Option<Instant>,
+    /// Failed exhaustions since the last success.
+    consecutive_failures: u32,
+}
+
 /// Inner mutable state that the failover logic needs to update atomically.
 struct FailoverState {
     /// Index into `urls` of the currently active endpoint.
     active_idx: usize,
     /// Wall-clock time of the last failover event, used to gate primary probes.
     last_failover_at: Option<Instant>,
+    /// Health of each endpoint, parallel to `urls`.
+    endpoints: Vec<EndpointHealth>,
 }
 
 pub struct RpcClient {
@@ -63,6 +84,11 @@ pub struct RpcClient {
     active_url_idx: AtomicUsize,
     /// Network passphrase pinned during startup and checked before failover.
     network_passphrase: Mutex<Option<String>>,
+    /// Upper bound on a server-requested `Retry-After` wait (#726).
+    max_retry_after: Duration,
+    /// Ledger entries skipped because they could not be decoded or the ID was
+    /// invalid (#724). Reset by `take_ledger_entry_decode_errors`.
+    ledger_entry_decode_errors: AtomicU64,
 }
 
 /// Identifies the sending binary's actual release to RPC operators who key off
@@ -96,6 +122,18 @@ fn host_of(url: &str) -> String {
         .map(|i| &host_and_rest[..i])
         .unwrap_or(host_and_rest);
     host.to_string()
+}
+
+/// Parse a `Retry-After` header (RFC 9110 §10.2.3): either delta-seconds or an
+/// HTTP-date. A date already in the past means "retry now". Returns `None` for
+/// anything unparseable, so the caller falls back to its normal backoff (#726).
+fn parse_retry_after(value: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let when = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    Some((when.with_timezone(&chrono::Utc) - now).to_std().unwrap_or(Duration::ZERO))
 }
 
 #[derive(Serialize)]
@@ -239,6 +277,14 @@ struct LatestLedgerResult {
     sequence: i64,
 }
 
+/// Result of `getHealth`: the provider's retained ledger window.
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcHealth {
+    pub oldest_ledger: i64,
+    pub latest_ledger: i64,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NetworkResult {
@@ -349,12 +395,25 @@ impl RpcClient {
     /// Construct a client with an ordered list of failover endpoints. The first
     /// URL is the primary; the rest are tried in order on retryable failures.
     pub fn with_urls(urls: Vec<String>, timeout_secs: u64) -> Self {
+        Self::with_urls_and_headers(urls, timeout_secs, reqwest::header::HeaderMap::new())
+    }
+
+    /// Like [`with_urls`], but every request also carries `headers`, for
+    /// providers that authenticate with a header such as `Authorization` or
+    /// `x-api-key` (#725). Values are marked sensitive by the config parser.
+    pub fn with_urls_and_headers(
+        urls: Vec<String>,
+        timeout_secs: u64,
+        headers: reqwest::header::HeaderMap,
+    ) -> Self {
         assert!(!urls.is_empty(), "at least one RPC URL is required");
+        let len = urls.len();
         // A request timeout is essential for a 24/7 poller: without it, a hung
         // RPC connection blocks the poll loop indefinitely and the backoff path
         // (which only fires on an error) is never reached.
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
+            .default_headers(headers)
             .build()
             .expect("failed to build HTTP client");
         Self {
@@ -363,6 +422,7 @@ impl RpcClient {
             failover: Mutex::new(FailoverState {
                 active_idx: 0,
                 last_failover_at: None,
+                endpoints: vec![EndpointHealth::default(); len],
             }),
             calls_made: AtomicU64::new(0),
             calls_failed: AtomicU64::new(0),
@@ -370,7 +430,27 @@ impl RpcClient {
             failover_count: AtomicU64::new(0),
             active_url_idx: AtomicUsize::new(0),
             network_passphrase: Mutex::new(None),
+            ledger_entry_decode_errors: AtomicU64::new(0),
+            max_retry_after: DEFAULT_MAX_RETRY_AFTER,
         }
+    }
+
+    /// Cap the `Retry-After` wait the client will honour; a longer request
+    /// makes it fail over immediately instead of sleeping (#726).
+    pub fn with_max_retry_after(mut self, max: Duration) -> Self {
+        self.max_retry_after = max;
+        self
+    }
+
+    /// Count one ledger entry (or batch key) skipped by a batch helper (#724).
+    fn record_ledger_entry_decode_error(&self) {
+        self.ledger_entry_decode_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Return and reset the number of ledger entries skipped since the last
+    /// call, for the per-cycle metrics log (`lumenqraph_ledger_entry_decode_errors`).
+    pub fn take_ledger_entry_decode_errors(&self) -> u64 {
+        self.ledger_entry_decode_errors.swap(0, Ordering::Acquire)
     }
 
     /// The hostname of the currently active endpoint (no credentials, no path),
@@ -416,28 +496,73 @@ impl RpcClient {
         &self.urls[idx.min(self.urls.len() - 1)]
     }
 
-    /// Try to advance to the next endpoint in the failover list. Returns the
-    /// new active index, or the current one if there is nowhere to advance.
-    fn try_failover(&self, from_idx: usize) -> usize {
+    /// Record that the endpoint at `idx` exhausted its retry budget, starting
+    /// its error cooldown (#723).
+    fn record_endpoint_failure(&self, idx: usize) {
         let mut state = self.failover.lock().unwrap();
-        // Only advance if we haven't already been advanced by a concurrent call.
-        if state.active_idx == from_idx {
-            let next = (from_idx + 1).min(self.urls.len() - 1);
-            if next != from_idx {
-                tracing::warn!(
-                    from = %host_of(self.url_at(from_idx)),
-                    to   = %host_of(self.url_at(next)),
-                    "rpc failover: switching to next endpoint"
-                );
-                state.active_idx = next;
-                state.last_failover_at = Some(Instant::now());
-                self.active_url_idx.store(next, Ordering::Relaxed);
-                self.failover_count.fetch_add(1, Ordering::Relaxed);
+        let health = &mut state.endpoints[idx];
+        health.last_error_at = Some(Instant::now());
+        health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+    }
+
+    /// Clear the error state of the endpoint at `idx` after a successful call.
+    fn record_endpoint_success(&self, idx: usize) {
+        let mut state = self.failover.lock().unwrap();
+        state.endpoints[idx] = EndpointHealth::default();
+    }
+
+    /// Choose the next endpoint for one call after `from_idx` gave up (#723).
+    ///
+    /// Walks the list round-robin from `from_idx`, skipping endpoints already
+    /// `tried` in this call. Endpoints in error cooldown are passed over. If
+    /// every untried endpoint is cooling, the one whose failure is oldest is
+    /// chosen, since it is the most likely to have recovered. Returns `None`
+    /// only when no untried endpoint remains.
+    ///
+    /// Wrap-around matters: with `RPC_URLS=A,B,C` a client on C still reaches
+    /// B after B recovers, instead of being stuck on the last endpoint.
+    fn next_endpoint(&self, from_idx: usize, tried: &[bool]) -> Option<usize> {
+        let mut state = self.failover.lock().unwrap();
+        let n = self.urls.len();
+        let now = Instant::now();
+        let mut oldest_cooling: Option<(usize, Instant)> = None;
+
+        for step in 1..n {
+            let cand = (from_idx + step) % n;
+            if tried[cand] {
+                continue;
             }
-            next
-        } else {
-            state.active_idx
+            match state.endpoints[cand].last_error_at {
+                Some(failed_at) if now.duration_since(failed_at) < ENDPOINT_COOLDOWN => {
+                    if oldest_cooling.map_or(true, |(_, t)| failed_at < t) {
+                        oldest_cooling = Some((cand, failed_at));
+                    }
+                }
+                _ => {
+                    self.switch_active(&mut state, from_idx, cand);
+                    return Some(cand);
+                }
+            }
         }
+
+        let (cand, _) = oldest_cooling?;
+        self.switch_active(&mut state, from_idx, cand);
+        Some(cand)
+    }
+
+    /// Make `to` the active endpoint, recording the failover (#723).
+    fn switch_active(&self, state: &mut FailoverState, from_idx: usize, to: usize) {
+        if state.active_idx != to {
+            tracing::warn!(
+                from = %host_of(self.url_at(from_idx)),
+                to   = %host_of(self.url_at(to)),
+                "rpc failover: switching to next endpoint"
+            );
+            self.failover_count.fetch_add(1, Ordering::Relaxed);
+        }
+        state.active_idx = to;
+        state.last_failover_at = Some(Instant::now());
+        self.active_url_idx.store(to, Ordering::Relaxed);
     }
 
     /// Probe the primary endpoint with `getHealth`. If it responds, fail back
@@ -523,39 +648,64 @@ impl RpcClient {
         const BASE_DELAYS_MS: [u64; 2] = [1_000, 2_000];
 
         let mut last_err: Option<anyhow::Error> = None;
-        let initial_idx = self.active_url_idx.load(Ordering::Relaxed);
-        // Try each URL at most once (primary + all failover candidates).
-        let total_urls = self.urls.len();
+        // Try each endpoint at most once per call: the active one first, then
+        // every other endpoint in round-robin order (#723).
+        let mut tried = vec![false; self.urls.len()];
+        let mut url_idx = self.failover.lock().unwrap().active_idx;
 
-        for url_round in 0..total_urls {
-            let url_idx = {
-                let state = self.failover.lock().unwrap();
-                state.active_idx
-            };
+        loop {
+            tried[url_idx] = true;
             let url = self.url_at(url_idx).to_string();
 
             // Never send application traffic to a failover endpoint until its
-            // network identity has been re-checked.
+            // network identity has been re-checked. A mismatch skips the
+            // endpoint rather than aborting the call (#723).
+            let mut attempts = MAX_ATTEMPTS_PER_URL;
             if url_idx != 0 {
-                self.check_endpoint_network(url_idx).await?;
+                if let Err(e) = self.check_endpoint_network(url_idx).await {
+                    tracing::warn!(
+                        endpoint = %host_of(&url),
+                        error = %e,
+                        "rpc failover candidate failed network check; skipping"
+                    );
+                    last_err = Some(e);
+                    attempts = 0;
+                }
             }
 
-            for attempt in 0..MAX_ATTEMPTS_PER_URL {
+            // `Retry-After` from the previous 429/503 on this endpoint (#726).
+            let mut retry_after: Option<Duration> = None;
+            for attempt in 0..attempts {
                 self.calls_made.fetch_add(1, Ordering::Relaxed);
 
                 if attempt > 0 {
                     let base_ms = BASE_DELAYS_MS[(attempt - 1) as usize];
                     let jitter_ms = rand::thread_rng().gen_range(0..=(base_ms / 2)) as i64
                         - (base_ms / 4) as i64;
-                    let delay_ms = ((base_ms as i64) + jitter_ms).max(1) as u64;
+                    let mut delay = Duration::from_millis(((base_ms as i64) + jitter_ms).max(1) as u64);
+                    if let Some(server_delay) = retry_after.take() {
+                        if server_delay > self.max_retry_after {
+                            // Waiting would exceed our cap: fail over now rather than sleep (#726).
+                            tracing::warn!(
+                                method,
+                                endpoint = %host_of(&url),
+                                retry_after_secs = server_delay.as_secs(),
+                                max_retry_after_secs = self.max_retry_after.as_secs(),
+                                "rpc Retry-After exceeds maximum; failing over without waiting"
+                            );
+                            break;
+                        }
+                        // Honour the server's wait when it is longer than our backoff.
+                        delay = delay.max(server_delay);
+                    }
                     tracing::warn!(
                         method,
                         attempt,
-                        delay_ms,
+                        delay_ms = delay.as_millis() as u64,
                         endpoint = %host_of(&url),
                         "transient rpc failure; retrying after delay"
                     );
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    tokio::time::sleep(delay).await;
                 }
 
                 let result = self
@@ -576,6 +726,12 @@ impl RpcClient {
                     Ok(r) => r,
                 };
 
+                // Read `Retry-After` before `error_for_status` consumes the response (#726).
+                let retry_after_header = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
                 let response = match response.error_for_status() {
                     Err(e) => {
                         let status = e.status();
@@ -585,6 +741,11 @@ impl RpcClient {
                         let ctx_err =
                             anyhow!(e).context(format!("rpc {method} returned http error"));
                         if is_retryable {
+                            if matches!(status.map(|s| s.as_u16()), Some(429 | 503)) {
+                                retry_after = retry_after_header
+                                    .as_deref()
+                                    .and_then(|v| parse_retry_after(v, chrono::Utc::now()));
+                            }
                             last_err = Some(ctx_err);
                             continue; // retry same URL
                         }
@@ -618,18 +779,19 @@ impl RpcClient {
                     return Err(anyhow!(rpc_err));
                 }
 
+                self.record_endpoint_success(url_idx);
                 return resp
                     .result
                     .ok_or_else(|| anyhow!("rpc {method} returned no result"));
             }
 
-            // All attempts on this URL exhausted — try the next.
-            let next_idx = self.try_failover(url_idx);
-            if next_idx == url_idx {
-                // No more candidates; give up.
-                break;
+            // Every attempt on this endpoint failed: start its cooldown and
+            // move to the best remaining candidate, if any (#723).
+            self.record_endpoint_failure(url_idx);
+            match self.next_endpoint(url_idx, &tried) {
+                Some(next) => url_idx = next,
+                None => break,
             }
-            let _ = (initial_idx, url_round); // suppress unused warnings
         }
 
         self.calls_failed.fetch_add(1, Ordering::Relaxed);
@@ -760,36 +922,57 @@ impl RpcClient {
         &self,
         contract_ids: &[String],
     ) -> anyhow::Result<Vec<Option<InstanceEntry>>> {
+        let mut output = vec![None; contract_ids.len()];
         if contract_ids.is_empty() {
-            return Ok(vec![]);
+            return Ok(output);
         }
 
-        // Encode all instance keys.
-        let mut keys_with_idx: Vec<(String, usize)> = Vec::with_capacity(contract_ids.len());
+        // Encode the instance key of each valid ID. An invalid ID is logged,
+        // counted and left as `None` so it cannot fail the other lookups (#724).
+        // `key_to_idx` maps each encoded key back to its input position, which
+        // keeps response matching O(n) instead of a scan per entry.
+        let mut keys: Vec<String> = Vec::with_capacity(contract_ids.len());
+        let mut key_to_idx: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::with_capacity(contract_ids.len());
         for (idx, contract_id) in contract_ids.iter().enumerate() {
-            let addr = ScAddress::from_str(contract_id)
-                .with_context(|| format!("invalid contract id {contract_id}"))?;
+            let addr = match ScAddress::from_str(contract_id) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    self.record_ledger_entry_decode_error();
+                    tracing::warn!(
+                        contract_id = %contract_id,
+                        error = %e,
+                        "skipping invalid contract id in instance batch"
+                    );
+                    continue;
+                }
+            };
             let key = LedgerKey::ContractData(LedgerKeyContractData {
                 contract: addr,
                 key: ScVal::LedgerKeyContractInstance,
                 durability: ContractDataDurability::Persistent,
             });
             let key_b64 = key.to_xdr_base64(Limits::none()).context("encode ledger key")?;
-            keys_with_idx.push((key_b64, idx));
+            key_to_idx.entry(key_b64.clone()).or_insert(idx);
+            keys.push(key_b64);
         }
-
-        // Extract just the keys for the RPC call.
-        let keys: Vec<String> = keys_with_idx.iter().map(|(k, _)| k.clone()).collect();
+        if keys.is_empty() {
+            return Ok(output);
+        }
 
         let result: LedgerEntriesResult = self
             .call("getLedgerEntries", serde_json::json!({ "keys": keys }))
             .await?;
 
-        let mut output = vec![None; contract_ids.len()];
         for item in result.entries.unwrap_or_default() {
             let data = match LedgerEntryData::from_xdr_base64(&item.xdr, XDR_LEDGER_ENTRY_LIMITS) {
                 Ok(d) => d,
-                Err(_) => continue,
+                Err(e) => {
+                    // One undecodable entry must not discard the rest of the batch (#724).
+                    self.record_ledger_entry_decode_error();
+                    tracing::warn!(error = %e, "skipping undecodable instance ledger entry");
+                    continue;
+                }
             };
             let LedgerEntryData::ContractData(cd) = data else {
                 continue;
@@ -805,12 +988,12 @@ impl RpcClient {
                 durability: cd.durability,
             });
             if let Ok(key_b64) = entry_key.to_xdr_base64(Limits::none()) {
-                if let Some((_, idx)) = keys_with_idx.iter().find(|(k, _)| k == &key_b64) {
+                if let Some(&idx) = key_to_idx.get(&key_b64) {
                     let wasm_hash = match inst.executable {
                         ContractExecutable::Wasm(h) => Some(hex::encode(h.0)),
                         ContractExecutable::StellarAsset => None,
                     };
-                    output[*idx] = Some(InstanceEntry {
+                    output[idx] = Some(InstanceEntry {
                         wasm_hash,
                         storage: ScVal::Map(inst.storage),
                         last_modified_ledger: item.last_modified_ledger_seq,
@@ -935,8 +1118,16 @@ impl RpcClient {
 
         let mut output = vec![None; keys.len()];
         for item in result.entries.into_iter().flatten() {
-            let data = LedgerEntryData::from_xdr_base64(&item.xdr, XDR_LEDGER_ENTRY_LIMITS)
-                .context("decode ledger entry")?;
+            let data = match LedgerEntryData::from_xdr_base64(&item.xdr, XDR_LEDGER_ENTRY_LIMITS) {
+                Ok(d) => d,
+                Err(e) => {
+                    // An oversized or malformed entry only loses its own slot;
+                    // the other keys in the batch are still returned (#724).
+                    self.record_ledger_entry_decode_error();
+                    tracing::warn!(error = %e, "skipping undecodable contract data ledger entry");
+                    continue;
+                }
+            };
             // Re-derive the LedgerKey from the returned entry so we can match it
             // back to its position in the input slice.
             if let LedgerEntryData::ContractData(ref cd) = data {
@@ -991,6 +1182,12 @@ struct LedgerEntryItem {
     xdr: String,
     #[serde(default)]
     last_modified_ledger_seq: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
     // ── #398 Failover tests ────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1047,12 +1244,6 @@ struct LedgerEntryItem {
         assert_eq!(host_of("http://localhost:8080/rpc"), "localhost:8080");
         assert_eq!(host_of("https://rpc.example.com"), "rpc.example.com");
     }
-
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     fn ids(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("C{i}")).collect()
@@ -1317,28 +1508,371 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 2, "must have made 2 attempts (one failed, one succeeded)");
     }
 
+    /// Spawn a mock whose responder returns `(status, body, Retry-After)` for
+    /// each request index. Returns the URL and the request counter.
+    async fn spawn_retry_after_mock(
+        responder: Arc<dyn Fn(usize) -> (u16, String, Option<String>) + Send + Sync + 'static>,
+    ) -> (String, Arc<AtomicUsize>) {
+        #[derive(Clone)]
+        struct S {
+            count: Arc<AtomicUsize>,
+            responder: Arc<dyn Fn(usize) -> (u16, String, Option<String>) + Send + Sync + 'static>,
+        }
+        async fn handler(State(s): State<S>) -> axum::response::Response {
+            let n = s.count.fetch_add(1, Ordering::SeqCst);
+            let (status, body, retry_after) = (s.responder)(n);
+            let mut builder = axum::response::Response::builder()
+                .status(status)
+                .header("content-type", "application/json");
+            if let Some(v) = retry_after {
+                builder = builder.header("retry-after", v);
+            }
+            builder.body(axum::body::Body::from(body)).unwrap()
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let state = S { count: count.clone(), responder };
+        let app = Router::new().route("/", post(handler)).with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), count)
+    }
+
     #[tokio::test]
     async fn respects_retry_after_header() {
-        // Issue #395: Retry-After header should be respected when present.
-        // This test verifies the header parsing; actual sleep timing is tested
-        // via mock server that checks elapsed time.
-        let count = Arc::new(AtomicUsize::new(0));
-        let url = spawn_counting_mock(
-            count.clone(),
-            Arc::new(|n| if n < 1 { (429, "") } else { (200, OK_SEQ_1000) }),
-        )
+        // Issue #726 / #395: `Retry-After: 2` on a 429 must delay the retry by
+        // at least 2s. The normal jittered backoff is at most 1.25s here, so a
+        // fast retry would fail the lower bound.
+        let (url, count) = spawn_retry_after_mock(Arc::new(|n| {
+            if n < 1 {
+                (429, String::new(), Some("2".to_string()))
+            } else {
+                (200, OK_SEQ_1000.to_string(), None)
+            }
+        }))
         .await;
 
         let client = RpcClient::new(&url, 5);
         let start = std::time::Instant::now();
+        let seq: i64 = client.get_latest_ledger().await.expect("should succeed after 429");
+        let elapsed = start.elapsed();
+
+        assert_eq!(seq, 1000);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert!(
+            elapsed >= Duration::from_millis(1_900),
+            "retry came after {elapsed:?}, before the 2s Retry-After elapsed"
+        );
+        assert!(elapsed < Duration::from_secs(4), "retry waited too long: {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn respects_retry_after_http_date() {
+        // Issue #726: the HTTP-date form of Retry-After is honoured too. The
+        // date is truncated to whole seconds, so allow some slack below 3s.
+        let when = chrono::Utc::now() + chrono::Duration::seconds(3);
+        let date = when.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let (url, count) = spawn_retry_after_mock(Arc::new(move |n| {
+            if n < 1 {
+                (503, String::new(), Some(date.clone()))
+            } else {
+                (200, OK_SEQ_1000.to_string(), None)
+            }
+        }))
+        .await;
+
+        let client = RpcClient::new(&url, 5);
+        let start = std::time::Instant::now();
+        let seq: i64 = client.get_latest_ledger().await.expect("should succeed after 503");
+        let elapsed = start.elapsed();
+
+        assert_eq!(seq, 1000);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert!(elapsed >= Duration::from_millis(1_500), "retry came too early: {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "retry waited too long: {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn retry_after_above_cap_fails_over_without_waiting() {
+        // Issue #726: a `Retry-After` beyond the cap must not be slept on. The
+        // client fails over to the next endpoint immediately.
+        let (url_a, a_count) = spawn_retry_after_mock(Arc::new(|_| {
+            (429, String::new(), Some("3600".to_string()))
+        }))
+        .await;
+        let (url_b, _) = spawn_retry_after_mock(Arc::new(|_| {
+            (200, OK_SEQ_1000.to_string(), None)
+        }))
+        .await;
+
+        let client = RpcClient::with_urls(vec![url_a, url_b.clone()], 5)
+            .with_max_retry_after(Duration::from_secs(60));
+        let start = std::time::Instant::now();
+        let seq: i64 = client.get_latest_ledger().await.expect("should fail over to B");
+        let elapsed = start.elapsed();
+
+        assert_eq!(seq, 1000);
+        assert_eq!(a_count.load(Ordering::SeqCst), 1, "A is not retried after a capped wait");
+        assert!(elapsed < Duration::from_secs(2), "must not sleep the 3600s: {elapsed:?}");
+        assert_eq!(client.active_endpoint_host(), host_of(&url_b));
+    }
+
+    #[test]
+    fn parse_retry_after_handles_seconds_dates_and_garbage() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(parse_retry_after("10", now), Some(Duration::from_secs(10)));
+        assert_eq!(parse_retry_after(" 7 ", now), Some(Duration::from_secs(7)));
+        assert_eq!(
+            parse_retry_after("Thu, 01 Jan 2026 00:00:30 GMT", now),
+            Some(Duration::from_secs(30))
+        );
+        // A date in the past means "retry now".
+        assert_eq!(
+            parse_retry_after("Wed, 31 Dec 2025 23:59:00 GMT", now),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(parse_retry_after("soon", now), None);
+        assert_eq!(parse_retry_after("", now), None);
+    }
+
+    // ── #725: configured RPC headers reach every method ───────────────────
+
+    #[tokio::test]
+    async fn rpc_headers_are_sent_on_every_rpc_method() {
+        let (url, log) = spawn_recording_mock(Arc::new(|method| match method {
+            "getHealth" => r#"{"jsonrpc":"2.0","id":1,"result":{"oldestLedger":1,"latestLedger":2}}"#.to_string(),
+            "getNetwork" => r#"{"jsonrpc":"2.0","id":1,"result":{"networkPassphrase":"Test SDF Network ; September 2015"}}"#.to_string(),
+            "getEvents" => r#"{"jsonrpc":"2.0","id":1,"result":{"latestLedger":2,"events":[]}}"#.to_string(),
+            "getLedgerEntries" => r#"{"jsonrpc":"2.0","id":1,"result":{"entries":[]}}"#.to_string(),
+            _ => r#"{"jsonrpc":"2.0","id":1,"result":null}"#.to_string(),
+        }))
+        .await;
+
+        let headers = crate::config::parse_rpc_headers("Authorization=Bearer tok;X-Api-Key=key-1").unwrap();
+        let client = RpcClient::with_urls_and_headers(vec![url], 5, headers);
+
+        client.get_health().await.expect("getHealth");
+        client.validate_network_passphrases().await.expect("getNetwork");
+        client.get_events(Some(1), &[], None, 10).await.expect("getEvents");
+        client
+            .get_contract_data_batch(&[(
+                CONTRACT_A.to_string(),
+                ScVal::U32(1),
+                ContractDataDurability::Persistent,
+            )])
+            .await
+            .expect("getLedgerEntries");
+
+        let log = log.lock().unwrap();
+        for method in ["getHealth", "getNetwork", "getEvents", "getLedgerEntries"] {
+            let req = log
+                .iter()
+                .find(|r| r.method == method)
+                .unwrap_or_else(|| panic!("{method} was never sent"));
+            assert_eq!(req.headers.get("authorization").unwrap(), "Bearer tok", "{method}");
+            assert_eq!(req.headers.get("x-api-key").unwrap(), "key-1", "{method}");
+        }
+    }
+
+    // ── #723: failover wraps around all endpoints ─────────────────────────
+
+    #[test]
+    fn next_endpoint_wraps_round_robin_and_skips_tried() {
+        let client = RpcClient::with_urls(
+            vec!["http://a".into(), "http://b".into(), "http://c".into()],
+            5,
+        );
+        // From the last endpoint, the walk wraps back to the first.
+        assert_eq!(client.next_endpoint(2, &[false, false, true]), Some(0));
+        // Nothing left untried in this call.
+        assert_eq!(client.next_endpoint(2, &[true, true, true]), None);
+    }
+
+    #[test]
+    fn next_endpoint_defers_cooling_endpoints() {
+        let client = RpcClient::with_urls(
+            vec!["http://a".into(), "http://b".into(), "http://c".into()],
+            5,
+        );
+        client.record_endpoint_failure(0);
+        // A is cooling, so from C the client picks B.
+        assert_eq!(client.next_endpoint(2, &[false, false, true]), Some(1));
+        assert_eq!(client.active_url_idx.load(Ordering::Relaxed), 1);
+
+        // Once every untried endpoint is cooling, one is still chosen so the
+        // call does not give up early.
+        // Only untried endpoint C is cooling too: it is still chosen.
+        client.record_endpoint_failure(2);
+        assert_eq!(client.next_endpoint(1, &[true, true, false]), Some(2));
+    }
+
+    #[tokio::test]
+    async fn failover_wraps_back_to_recovered_secondary() {
+        // Issue #723: A, B, C. A is down throughout, B is down for its first
+        // retry budget and then recovers, C is down throughout. The client
+        // must reach B rather than staying stuck on the last endpoint.
+        let a_count = Arc::new(AtomicUsize::new(0));
+        let b_count = Arc::new(AtomicUsize::new(0));
+        let c_count = Arc::new(AtomicUsize::new(0));
+        let url_a = spawn_counting_mock(a_count.clone(), Arc::new(|_| (500, ""))).await;
+        let url_b = spawn_counting_mock(
+            b_count.clone(),
+            Arc::new(|n| if n < 3 { (500, "") } else { (200, OK_SEQ_1000) }),
+        )
+        .await;
+        let url_c = spawn_counting_mock(c_count.clone(), Arc::new(|_| (500, ""))).await;
+
+        let client = RpcClient::with_urls(vec![url_a, url_b.clone(), url_c.clone()], 5);
+
+        // Call 1: every endpoint exhausts its budget, so the call fails and
+        // the client ends up on C, the last endpoint it tried.
+        assert!(client.get_latest_ledger().await.is_err());
+        assert_eq!(client.active_endpoint_host(), host_of(&url_c));
+
+        // Call 2: starting from C, the cooling endpoints are tried and B has
+        // recovered, so the call succeeds on B.
         let seq: i64 = client
             .get_latest_ledger()
             .await
-            .expect("should retry and succeed after 429");
+            .expect("should fail over back to the recovered secondary");
         assert_eq!(seq, 1000);
-        // Should complete within a reasonable time (jittered backoff ~1-2s)
-        // If Retry-After was incorrectly ignored, this test serves as a baseline.
-        assert!(start.elapsed().as_secs() < 10, "request should complete within 10 seconds");
+        assert_eq!(client.active_endpoint_host(), host_of(&url_b));
+        assert_eq!(b_count.load(Ordering::SeqCst), 4, "B: three failures then one success");
+    }
+
+    // ── recording mock (used by #724 and #725 tests) ──────────────────────
+
+    /// One request as seen by the mock: JSON-RPC method, raw body, headers.
+    #[derive(Clone)]
+    struct RecordedRequest {
+        method: String,
+        body: String,
+        headers: axum::http::HeaderMap,
+    }
+
+    /// Spawn an RPC mock that records every request and answers with
+    /// `respond(method)` as a 200 JSON body. Returns the URL and the log.
+    async fn spawn_recording_mock(
+        respond: Arc<dyn Fn(&str) -> String + Send + Sync + 'static>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<RecordedRequest>>>) {
+        #[derive(Clone)]
+        struct S {
+            log: Arc<std::sync::Mutex<Vec<RecordedRequest>>>,
+            respond: Arc<dyn Fn(&str) -> String + Send + Sync + 'static>,
+        }
+        async fn handler(
+            State(s): State<S>,
+            headers: axum::http::HeaderMap,
+            body: String,
+        ) -> axum::response::Response {
+            let method = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v["method"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let reply = (s.respond)(&method);
+            s.log.lock().unwrap().push(RecordedRequest { method, body, headers });
+            axum::response::Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(reply))
+                .unwrap()
+        }
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = S { log: log.clone(), respond };
+        let app = Router::new().route("/", post(handler)).with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), log)
+    }
+
+    /// Base64 XDR for a contract-data ledger entry with the given key and value.
+    fn contract_data_xdr(contract_id: &str, key: ScVal, val: ScVal) -> String {
+        LedgerEntryData::ContractData(stellar_xdr::curr::ContractDataEntry {
+            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            contract: ScAddress::from_str(contract_id).unwrap(),
+            key,
+            durability: ContractDataDurability::Persistent,
+            val,
+        })
+        .to_xdr_base64(Limits::none())
+        .unwrap()
+    }
+
+    const CONTRACT_A: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+    const CONTRACT_B: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+
+    // ── #724: batch helpers isolate per-entry failures ────────────────────
+
+    #[tokio::test]
+    async fn contract_data_batch_skips_oversized_entry_and_keeps_the_rest() {
+        let keys = vec![
+            (CONTRACT_A.to_string(), ScVal::U32(1), ContractDataDurability::Persistent),
+            (CONTRACT_A.to_string(), ScVal::U32(2), ContractDataDurability::Persistent),
+            (CONTRACT_A.to_string(), ScVal::U32(3), ContractDataDurability::Persistent),
+        ];
+        // Entry 2 encodes fine but exceeds XDR_LEDGER_ENTRY_LIMITS when decoded.
+        let oversized = ScVal::Bytes(
+            vec![0u8; XDR_LEDGER_ENTRY_LIMITS.len as usize + 1].try_into().unwrap(),
+        );
+        let response = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "entries": [
+                { "key": "k1", "xdr": contract_data_xdr(CONTRACT_A, ScVal::U32(1), ScVal::U32(10)), "lastModifiedLedgerSeq": 5 },
+                { "key": "k2", "xdr": contract_data_xdr(CONTRACT_A, ScVal::U32(2), oversized), "lastModifiedLedgerSeq": 6 },
+                { "key": "k3", "xdr": contract_data_xdr(CONTRACT_A, ScVal::U32(3), ScVal::U32(30)), "lastModifiedLedgerSeq": 7 },
+            ]}
+        })
+        .to_string();
+        let (url, _log) = spawn_recording_mock(Arc::new(move |_| response.clone())).await;
+
+        let client = RpcClient::new(&url, 5);
+        let out = client.get_contract_data_batch(&keys).await.expect("batch must succeed");
+
+        assert_eq!(out.len(), 3);
+        assert!(matches!(out[0].as_ref().map(|e| &e.val), Some(ScVal::U32(10))));
+        assert!(out[1].is_none(), "the oversized entry is dropped, not the batch");
+        assert!(matches!(out[2].as_ref().map(|e| &e.val), Some(ScVal::U32(30))));
+        assert_eq!(client.take_ledger_entry_decode_errors(), 1);
+    }
+
+    #[tokio::test]
+    async fn instance_batch_isolates_invalid_id_and_returns_the_rest() {
+        let instance = ScVal::ContractInstance(stellar_xdr::curr::ScContractInstance {
+            executable: ContractExecutable::StellarAsset,
+            storage: None,
+        });
+        let ids = vec![
+            CONTRACT_A.to_string(),
+            "not-a-contract-id".to_string(),
+            CONTRACT_B.to_string(),
+        ];
+        let response = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "entries": [
+                { "key": "k2", "xdr": contract_data_xdr(CONTRACT_B, ScVal::LedgerKeyContractInstance, instance.clone()), "lastModifiedLedgerSeq": 22 },
+                { "key": "k1", "xdr": contract_data_xdr(CONTRACT_A, ScVal::LedgerKeyContractInstance, instance.clone()), "lastModifiedLedgerSeq": 11 },
+            ]}
+        })
+        .to_string();
+        let (url, log) = spawn_recording_mock(Arc::new(move |_| response.clone())).await;
+
+        let client = RpcClient::new(&url, 5);
+        let out = client.get_contract_instances_batch(&ids).await.expect("batch must succeed");
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].as_ref().map(|e| e.last_modified_ledger), Some(11));
+        assert!(out[1].is_none(), "invalid id is left as None");
+        assert_eq!(out[2].as_ref().map(|e| e.last_modified_ledger), Some(22));
+
+        // Only the two valid IDs reach the RPC.
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        let sent: serde_json::Value = serde_json::from_str(&log[0].body).unwrap();
+        assert_eq!(sent["params"]["keys"].as_array().unwrap().len(), 2);
+        assert_eq!(client.take_ledger_entry_decode_errors(), 1);
     }
 
     #[tokio::test]

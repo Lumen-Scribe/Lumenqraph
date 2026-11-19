@@ -298,6 +298,15 @@ async fn poll_once(
         cursor::track_rpc_call(pool, rpc_calls, rpc_errors, rpc_errors_32001, rpc_failovers).await?;
     }
 
+    // Ledger entries skipped by the batch helpers this cycle (#724).
+    let ledger_entry_decode_errors = rpc.take_ledger_entry_decode_errors();
+    if ledger_entry_decode_errors > 0 {
+        tracing::warn!(
+            lumenqraph_ledger_entry_decode_errors_total = ledger_entry_decode_errors,
+            "skipped undecodable or invalid ledger entries this cycle"
+        );
+    }
+
     cursor::write_progress(pool, latest, latest, inserted).await?;
     if inserted > 0 {
         info!(inserted, up_to_ledger = latest, "indexed events");
@@ -481,7 +490,7 @@ async fn fetch_and_store_with_shutdown(
     // Keys are batched into chunked getLedgerEntries calls so per-cycle RPC cost
     // scales with the number of batches, not the number of individual holders.
     if config.key_indexing && !holders_by_contract.is_empty() {
-        let durability = keys::parse_durability(&config.balance_key_durability);
+        let durability = keys::parse_durability(&config.balance_key_durability)?;
         state::snapshot_balances_batch(
             pool,
             rpc,
@@ -563,6 +572,8 @@ pub async fn recover_gaps(
     .fetch_all(pool)
     .await?;
 
+    let mut ts_parse_errors = 0u64; // #399
+
     if unrecovered.is_empty() {
         info!("no unrecovered missed ranges found");
         return Ok(());
@@ -637,6 +648,10 @@ pub async fn recover_gaps(
         );
     }
 
+    if ts_parse_errors > 0 {
+        let _ = cursor::track_timestamp_parse_error(pool, ts_parse_errors).await;
+    }
+
     info!("all missed ranges replayed successfully");
     Ok(())
 }
@@ -657,6 +672,7 @@ async fn fetch_and_upsert(
     let mut total_updated = 0u64;
     let mut enriched_count = 0u64;
     let mut not_enriched_count = 0u64;
+    let mut ts_parse_errors = 0u64; // #399
 
     loop {
         if shutdown.is_cancelled() {

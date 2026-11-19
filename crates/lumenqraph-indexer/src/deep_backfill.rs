@@ -510,7 +510,7 @@ fn historical_to_new_event(
         contract_id: ev.contract_id,
         ledger: ev.ledger,
         ledger_closed_at: ev.ledger_closed_at,
-        event_type: ev.event_type,
+        event_type: lumenqraph_core::EventType::from_rpc_str(&ev.event_type),
         topics: ev.topics,
         decoded_topics,
         event_name,

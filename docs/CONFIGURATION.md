@@ -43,6 +43,24 @@ All services read the database URL.
 | **Services** | Indexer, API |
 | **Tradeoff** | **Trust**: Using an untrusted RPC corrupts the index. **Throughput**: Paid endpoints may offer lower latency |
 
+#### `RPC_HEADERS`
+| Property | Value |
+|----------|-------|
+| **Default** | None (no extra headers) |
+| **Example** | `Authorization=Bearer <token>;X-Api-Key=<key>` or `{"x-api-key": "<key>"}` |
+| **Valid Range** | `Name=value` pairs separated by `;`, or a JSON object of string values. Names must be valid HTTP header names; a bad entry fails config load. |
+| **Services** | Indexer |
+| **Tradeoff** | **Security**: Prefer a header over putting a key in `RPC_URL`, because URLs can leak into logs. Values are sent on every RPC request to every endpoint and are redacted in `Debug` output and logs. |
+
+#### `RPC_MAX_RETRY_AFTER_SECS`
+| Property | Value |
+|----------|-------|
+| **Default** | 60 |
+| **Example** | `30` (tight), `120` (patient) |
+| **Valid Range** | 1 ≤ seconds ≤ 3600 |
+| **Services** | Indexer |
+| **Tradeoff** | **Latency** vs **Rate limits**: On a 429 or 503 with `Retry-After`, the indexer waits the server's requested time up to this cap. A longer request makes it fail over to the next endpoint immediately instead of sleeping. |
+
 #### `RPC_TIMEOUT_SECS`
 | Property | Value |
 |----------|-------|

@@ -36,12 +36,16 @@ uuid.workspace = true
 lru.workspace = true
 axum.workspace = true
 tower-http.workspace = true
+clap.workspace = true
 
 [dev-dependencies]
 hmac.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
 criterion.workspace = true
+stellar-strkey.workspace = true
+tower = { workspace = true, features = ["util"] }
+sqlx = { workspace = true, features = ["bigdecimal"] }
 tokio.workspace = true
 
 [[bench]]
