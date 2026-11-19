@@ -9,6 +9,7 @@ name = "lumenqraph-webhooks"
 path = "src/main.rs"
 
 [dependencies]
+clap.workspace = true
 lumenqraph-core.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -33,3 +34,6 @@ tower.workspace = true
 hostname = "0.4"
 futures.workspace = true
 httpdate = "1"
+
+[dev-dependencies]
+stellar-strkey.workspace = true

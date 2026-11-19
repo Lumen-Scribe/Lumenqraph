@@ -3,8 +3,8 @@
 //! retried with exponential backoff so a flaky RPC never kills the process.
 //! Responds to Ctrl-C / SIGTERM for a clean shutdown.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lumenqraph_core::NewEvent;
@@ -39,7 +39,12 @@ pub fn max_lookback() -> i64 {
     MAX_LOOKBACK_LEDGERS
 }
 
-pub async fn run(pool: PgPool, rpc: RpcClient, config: Config, specs: Arc<SpecCache>) -> anyhow::Result<()> {
+pub async fn run(
+    pool: PgPool,
+    rpc: RpcClient,
+    config: Config,
+    specs: Arc<SpecCache>,
+) -> anyhow::Result<()> {
     let base_interval = Duration::from_secs(config.poll_interval_secs.max(1));
     let degraded_interval = Duration::from_secs(config.degraded_poll_interval_secs.max(1));
     let mut backoff = base_interval;
@@ -82,14 +87,13 @@ pub async fn run(pool: PgPool, rpc: RpcClient, config: Config, specs: Arc<SpecCa
                         }
                         // Prune old spec versions (if enabled)
                         if config.spec_version_retention > 0 {
-                            if let Err(e) =
-                                retention::prune_spec_versions(
-                                    &pool,
-                                    ledger,
-                                    config.retention_ledgers,
-                                    config.spec_version_retention,
-                                )
-                                .await
+                            if let Err(e) = retention::prune_spec_versions(
+                                &pool,
+                                ledger,
+                                config.retention_ledgers,
+                                config.spec_version_retention,
+                            )
+                            .await
                             {
                                 warn!(error = %e, "spec version retention prune failed");
                             }
@@ -182,139 +186,148 @@ async fn poll_once(
     // from spawned tasks (spec fetches, state/key snapshots) — carry a shared
     // `ledger_range` field. Log aggregators can filter on it to reconstruct a
     // single cycle without interleaved noise from concurrent cycles.
-    let cycle_span = tracing::info_span!(
-        "poll_cycle",
-        from = tracing::field::Empty,
-        to = latest,
-    );
+    let cycle_span = tracing::info_span!("poll_cycle", from = tracing::field::Empty, to = latest,);
 
     let cycle_span_for_record = cycle_span.clone();
     async move {
+        let mut start = match cursor::read_last_processed(pool).await? {
+            Some(c) => c + 1,
+            None if config.start_ledger > 0 => config.start_ledger,
+            None => latest,
+        };
 
-    let mut start = match cursor::read_last_processed(pool).await? {
-        Some(c) => c + 1,
-        None if config.start_ledger > 0 => config.start_ledger,
-        None => latest,
-    };
-
-    if start > latest {
-        // Nothing new closed; still record the tip so lag reflects reality.
-        cursor::write_progress(pool, start - 1, latest, 0).await?;
-        return Ok(None);
-    }
-
-    // Clamp to RPC retention window on fresh start.
-    // If the configured START_LEDGER is older than what the RPC serves,
-    // clamp to the oldest available ledger to avoid RPC rejection errors.
-    if start < oldest_available {
-        warn!(
-            requested = start,
-            clamped_to = oldest_available,
-            reason = "start ledger is older than RPC retention window (~7 days)",
-            "fresh-start ledger clamped to earliest servable ledger"
-        );
-        if oldest_available > start {
-            record_missed_range_classified(pool, start, oldest_available - 1, "retention-window skip", false).await?;
+        if start > latest {
+            // Nothing new closed; still record the tip so lag reflects reality.
+            cursor::write_progress(pool, start - 1, latest, 0).await?;
+            return Ok(None);
         }
-        start = oldest_available;
-    }
 
-    if latest - start > config.max_catchup_ledgers {
-        let clamped = latest - config.max_catchup_ledgers;
-        warn!(
-            from = start,
-            to = clamped,
-            gap_ledgers = clamped - start,
-            "cursor too far behind tip; skipping ahead to the catch-up window \
+        // Clamp to RPC retention window on fresh start.
+        // If the configured START_LEDGER is older than what the RPC serves,
+        // clamp to the oldest available ledger to avoid RPC rejection errors.
+        if start < oldest_available {
+            warn!(
+                requested = start,
+                clamped_to = oldest_available,
+                reason = "start ledger is older than RPC retention window (~7 days)",
+                "fresh-start ledger clamped to earliest servable ledger"
+            );
+            if oldest_available > start {
+                record_missed_range_classified(
+                    pool,
+                    start,
+                    oldest_available - 1,
+                    "retention-window skip",
+                    false,
+                )
+                .await?;
+            }
+            start = oldest_available;
+        }
+
+        if latest - start > config.max_catchup_ledgers {
+            let clamped = latest - config.max_catchup_ledgers;
+            warn!(
+                from = start,
+                to = clamped,
+                gap_ledgers = clamped - start,
+                "cursor too far behind tip; skipping ahead to the catch-up window \
              (gap unrecoverable via public RPC — use a retaining/paid RPC or a \
              datalake backfill for gapless history, or raise MAX_CATCHUP_LEDGERS)"
-        );
-        if clamped > start {
-            record_missed_range_classified(pool, start, clamped - 1, "catch-up skip", true).await?;
+            );
+            if clamped > start {
+                record_missed_range_classified(pool, start, clamped - 1, "catch-up skip", true)
+                    .await?;
+            }
+            start = clamped;
         }
-        start = clamped;
-    }
 
-    // Record the ledger range we are about to process in the span, now that
-    // we know both endpoints after clamping.
-    cycle_span_for_record.record("from", start);
+        // Record the ledger range we are about to process in the span, now that
+        // we know both endpoints after clamping.
+        cycle_span_for_record.record("from", start);
 
-    let (inserted, enrichment) = fetch_and_store_with_shutdown(pool, rpc, config, specs, start, latest, shutdown).await?;
+        let (inserted, enrichment) =
+            fetch_and_store_with_shutdown(pool, rpc, config, specs, start, latest, shutdown)
+                .await?;
 
-    if shutdown.is_cancelled() {
-        return Ok(Some(latest));
-    }
+        if shutdown.is_cancelled() {
+            return Ok(Some(latest));
+        }
 
-    // Check enrichment coverage and warn if it drops significantly
-    if enrichment.enriched_count > 0 || enrichment.not_enriched_count > 0 {
-        let total = enrichment.enriched_count + enrichment.not_enriched_count;
-        if total > 0 {
-            let enrichment_rate = enrichment.enriched_count as f64 / total as f64;
-            let not_enriched_fraction = enrichment.not_enriched_count as f64 / total as f64;
+        // Check enrichment coverage and warn if it drops significantly
+        if enrichment.enriched_count > 0 || enrichment.not_enriched_count > 0 {
+            let total = enrichment.enriched_count + enrichment.not_enriched_count;
+            if total > 0 {
+                let enrichment_rate = enrichment.enriched_count as f64 / total as f64;
+                let not_enriched_fraction = enrichment.not_enriched_count as f64 / total as f64;
 
-            // Emit warning if enrichment rate is below threshold
-            if not_enriched_fraction > config.enrichment_warn_threshold {
-                warn!(
-                    enrichment_rate = enrichment_rate,
-                    not_enriched_fraction = not_enriched_fraction,
-                    threshold = config.enrichment_warn_threshold,
-                    enriched_count = enrichment.enriched_count,
-                    not_enriched_count = enrichment.not_enriched_count,
-                    total_events = total,
-                    "enrichment coverage dropped below threshold"
+                // Emit warning if enrichment rate is below threshold
+                if not_enriched_fraction > config.enrichment_warn_threshold {
+                    warn!(
+                        enrichment_rate = enrichment_rate,
+                        not_enriched_fraction = not_enriched_fraction,
+                        threshold = config.enrichment_warn_threshold,
+                        enriched_count = enrichment.enriched_count,
+                        not_enriched_count = enrichment.not_enriched_count,
+                        total_events = total,
+                        "enrichment coverage dropped below threshold"
+                    );
+                }
+            }
+        }
+
+        // Trailing re-scan for shallow reorg detection.
+        // If configured, re-fetch the last N ledgers with upsert semantics to catch
+        // content changes that might have occurred due to chain reorgs.
+        let mut reorg_updated = 0u64;
+        if config.reorg_overlap_ledgers > 0 && latest > config.reorg_overlap_ledgers {
+            let reorg_start = latest - config.reorg_overlap_ledgers;
+            reorg_updated =
+                fetch_and_upsert(pool, rpc, config, specs, reorg_start, latest, shutdown).await?;
+            if reorg_updated > 0 {
+                debug!(
+                    reorg_updated,
+                    reorg_start,
+                    reorg_end = latest,
+                    "trailing reorg re-scan complete"
                 );
             }
         }
-    }
 
-    // Trailing re-scan for shallow reorg detection.
-    // If configured, re-fetch the last N ledgers with upsert semantics to catch
-    // content changes that might have occurred due to chain reorgs.
-    let mut reorg_updated = 0u64;
-    if config.reorg_overlap_ledgers > 0 && latest > config.reorg_overlap_ledgers {
-        let reorg_start = latest - config.reorg_overlap_ledgers;
-        reorg_updated =
-            fetch_and_upsert(pool, rpc, config, specs, reorg_start, latest, shutdown).await?;
-        if reorg_updated > 0 {
-            debug!(
-                reorg_updated,
-                reorg_start,
-                reorg_end = latest,
-                "trailing reorg re-scan complete"
-            );
+        // Record RPC metrics for this cycle
+        let (rpc_calls, rpc_errors, rpc_errors_32001, rpc_failovers) = rpc.take_metrics();
+        if rpc_calls > 0 || rpc_errors > 0 || rpc_failovers > 0 {
+            if rpc_failovers > 0 {
+                tracing::warn!(
+                    rpc_failovers,
+                    active_endpoint = %rpc.active_endpoint_host(),
+                    "rpc endpoint failover(s) occurred this cycle"
+                );
+            }
+            cursor::track_rpc_call(pool, rpc_calls, rpc_errors, rpc_errors_32001, rpc_failovers)
+                .await?;
         }
-    }
 
-    // Record RPC metrics for this cycle
-    let (rpc_calls, rpc_errors, rpc_errors_32001, rpc_failovers) = rpc.take_metrics();
-    if rpc_calls > 0 || rpc_errors > 0 || rpc_failovers > 0 {
-        if rpc_failovers > 0 {
+        // Ledger entries skipped by the batch helpers this cycle (#724).
+        let ledger_entry_decode_errors = rpc.take_ledger_entry_decode_errors();
+        if ledger_entry_decode_errors > 0 {
             tracing::warn!(
-                rpc_failovers,
-                active_endpoint = %rpc.active_endpoint_host(),
-                "rpc endpoint failover(s) occurred this cycle"
+                lumenqraph_ledger_entry_decode_errors_total = ledger_entry_decode_errors,
+                "skipped undecodable or invalid ledger entries this cycle"
             );
         }
-        cursor::track_rpc_call(pool, rpc_calls, rpc_errors, rpc_errors_32001, rpc_failovers).await?;
-    }
 
-    // Ledger entries skipped by the batch helpers this cycle (#724).
-    let ledger_entry_decode_errors = rpc.take_ledger_entry_decode_errors();
-    if ledger_entry_decode_errors > 0 {
-        tracing::warn!(
-            lumenqraph_ledger_entry_decode_errors_total = ledger_entry_decode_errors,
-            "skipped undecodable or invalid ledger entries this cycle"
-        );
-    }
-
-    cursor::write_progress(pool, latest, latest, inserted).await?;
-    if inserted > 0 {
-        info!(inserted, up_to_ledger = latest, "indexed events");
-    }
-    if reorg_updated > 0 {
-        info!(reorg_updated, "events updated due to shallow reorg detection");
-    }
-    Ok(Some(latest))
+        cursor::write_progress(pool, latest, latest, inserted).await?;
+        if inserted > 0 {
+            info!(inserted, up_to_ledger = latest, "indexed events");
+        }
+        if reorg_updated > 0 {
+            info!(
+                reorg_updated,
+                "events updated due to shallow reorg detection"
+            );
+        }
+        Ok(Some(latest))
     }
     .instrument(cycle_span)
     .await
@@ -326,8 +339,40 @@ pub struct EnrichmentMetrics {
     pub not_enriched_count: u64,
 }
 
+/// Per-cycle counters shared by the three event loops, so they all flush the
+/// same way. The timestamp-parse count is kept apart from the enrichment
+/// counts on purpose: a cycle where no event parses still has to report its
+/// failures, otherwise `timestamp_parse_errors_total` never moves when the RPC
+/// changes its timestamp format (#719).
+#[derive(Default)]
+struct CycleCounters {
+    enriched: u64,
+    not_enriched: u64,
+    ts_parse_errors: u64,
+}
+
+impl CycleCounters {
+    /// Write the accumulated counts once a scan has completed. Called even when
+    /// nothing parsed, so a cycle of all-failing timestamps still reports them.
+    /// Not called on error or shutdown exits: those cycles are re-run from the
+    /// same cursor and their counts are written then, once. The timestamp write
+    /// is best-effort, and the enrichment write is attempted even if it fails.
+    async fn flush(&self, pool: &PgPool) -> anyhow::Result<()> {
+        if self.ts_parse_errors > 0 {
+            if let Err(e) = cursor::track_timestamp_parse_error(pool, self.ts_parse_errors).await {
+                warn!(error = %e, dropped = self.ts_parse_errors, "failed to record timestamp parse errors");
+            }
+        }
+        if self.enriched > 0 || self.not_enriched > 0 {
+            cursor::track_enrichment(pool, self.enriched, self.not_enriched).await?;
+        }
+        Ok(())
+    }
+}
+
 /// Page through events from `start` to the tip, storing each page. Shared by the
 /// live poller and the backfill command. Returns (total_inserted, enrichment_metrics).
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn fetch_and_store(
     pool: &PgPool,
     rpc: &RpcClient,
@@ -336,7 +381,16 @@ pub async fn fetch_and_store(
     start: i64,
     tip: i64,
 ) -> anyhow::Result<(u64, EnrichmentMetrics)> {
-    fetch_and_store_with_shutdown(pool, rpc, config, specs, start, tip, &CancellationToken::new()).await
+    fetch_and_store_with_shutdown(
+        pool,
+        rpc,
+        config,
+        specs,
+        start,
+        tip,
+        &CancellationToken::new(),
+    )
+    .await
 }
 
 async fn fetch_and_store_with_shutdown(
@@ -350,9 +404,7 @@ async fn fetch_and_store_with_shutdown(
 ) -> anyhow::Result<(u64, EnrichmentMetrics)> {
     let mut cursor_token: Option<String> = None;
     let mut total_inserted = 0u64;
-    let mut enriched_count = 0u64;
-    let mut not_enriched_count = 0u64;
-    let mut ts_parse_errors = 0u64; // #399
+    let mut counters = CycleCounters::default();
     let mut page_count = 0usize;
     let mut last_seen_ledger = start;
     // Contracts seen this cycle, used to bound per-contract instance reads when
@@ -372,7 +424,13 @@ async fn fetch_and_store_with_shutdown(
     > = std::collections::HashMap::new();
     loop {
         if shutdown.is_cancelled() {
-            return Ok((total_inserted, EnrichmentMetrics { enriched_count, not_enriched_count }));
+            return Ok((
+                total_inserted,
+                EnrichmentMetrics {
+                    enriched_count,
+                    not_enriched_count,
+                },
+            ));
         }
         let page = match rpc
             .get_events(
@@ -413,14 +471,14 @@ async fn fetch_and_store_with_shutdown(
             }
             let Some(new_event) = to_new_event(ev, spec.as_deref()) else {
                 // #399: timestamp parse failure — event skipped, counter incremented.
-                ts_parse_errors += 1;
+                counters.ts_parse_errors += 1;
                 continue;
             };
             // Track enrichment coverage: count enriched vs not-enriched events
             if new_event.enriched.is_some() {
-                enriched_count += 1;
+                counters.enriched += 1;
             } else {
-                not_enriched_count += 1;
+                counters.not_enriched += 1;
             }
             // Discover holder addresses to snapshot per-key balances for.
             if config.key_indexing {
@@ -451,13 +509,9 @@ async fn fetch_and_store_with_shutdown(
         }
     }
 
-    // Record enrichment metrics for this cycle
-    if enriched_count > 0 || not_enriched_count > 0 {
-        cursor::track_enrichment(pool, enriched_count, not_enriched_count).await?;
-        if ts_parse_errors > 0 {
-            let _ = cursor::track_timestamp_parse_error(pool, ts_parse_errors).await;
-        }
-    }
+    // Record enrichment and timestamp-parse metrics for this cycle, whatever
+    // the events in it did (#719).
+    counters.flush(pool).await?;
 
     // Read each tracked contract's instance entry. With an explicit CONTRACT_IDS
     // list we track those contracts every cycle; in index-all mode we restrict
@@ -490,6 +544,7 @@ async fn fetch_and_store_with_shutdown(
     // Keys are batched into chunked getLedgerEntries calls so per-cycle RPC cost
     // scales with the number of batches, not the number of individual holders.
     if config.key_indexing && !holders_by_contract.is_empty() {
+        // Validated at config load (`Config::from_env`), so this cannot fail here.
         let durability = keys::parse_durability(&config.balance_key_durability)?;
         state::snapshot_balances_batch(
             pool,
@@ -515,8 +570,8 @@ async fn fetch_and_store_with_shutdown(
     Ok((
         total_inserted,
         EnrichmentMetrics {
-            enriched_count,
-            not_enriched_count,
+            enriched_count: counters.enriched,
+            not_enriched_count: counters.not_enriched,
         },
     ))
 }
@@ -572,14 +627,17 @@ pub async fn recover_gaps(
     .fetch_all(pool)
     .await?;
 
-    let mut ts_parse_errors = 0u64; // #399
-
     if unrecovered.is_empty() {
         info!("no unrecovered missed ranges found");
         return Ok(());
     }
 
-    info!(count = unrecovered.len(), "replaying recorded missed ranges");
+    info!(
+        count = unrecovered.len(),
+        "replaying recorded missed ranges"
+    );
+
+    let mut ts_parse_errors = 0u64; // #399
 
     for range in unrecovered {
         info!(
@@ -591,6 +649,7 @@ pub async fn recover_gaps(
 
         let mut cursor_token: Option<String> = None;
         let mut total_inserted = 0u64;
+        let mut ts_parse_errors = 0u64; // #399
 
         loop {
             let page = rpc
@@ -615,7 +674,7 @@ pub async fn recover_gaps(
                     batch.push(new_event);
                 } else {
                     // #399: unparseable timestamp — skip event.
-                    ts_parse_errors += 1;
+                    counters.ts_parse_errors += 1;
                 }
             }
 
@@ -632,6 +691,10 @@ pub async fn recover_gaps(
             if n < config.page_size as usize || cursor_token.is_none() {
                 break;
             }
+        }
+
+        if ts_parse_errors > 0 {
+            let _ = cursor::track_timestamp_parse_error(pool, ts_parse_errors).await;
         }
 
         sqlx::query("UPDATE missed_ranges SET recovered_at = NOW() WHERE id = $1")
@@ -651,7 +714,6 @@ pub async fn recover_gaps(
     if ts_parse_errors > 0 {
         let _ = cursor::track_timestamp_parse_error(pool, ts_parse_errors).await;
     }
-
     info!("all missed ranges replayed successfully");
     Ok(())
 }
@@ -688,12 +750,15 @@ async fn fetch_and_upsert(
             .await?;
 
         let mut batch: Vec<NewEvent> = Vec::with_capacity(page.events.len());
+        let mut past_end = false;
         for ev in &page.events {
-            // Stop if we've moved past the reorg window.
+            // Stop at the first event past the reorg window. The events before it
+            // on this page are still upserted below.
             if ev.ledger > end {
                 // Record enrichment metrics for reorg scan
                 if enriched_count > 0 || not_enriched_count > 0 {
-                    let _ = cursor::track_enrichment(pool, enriched_count, not_enriched_count).await;
+                    let _ =
+                        cursor::track_enrichment(pool, enriched_count, not_enriched_count).await;
                     if ts_parse_errors > 0 {
                         let _ = cursor::track_timestamp_parse_error(pool, ts_parse_errors).await;
                     }
@@ -703,14 +768,14 @@ async fn fetch_and_upsert(
             let spec = specs.get(pool, rpc, &ev.contract_id, ev.ledger).await;
             let Some(new_event) = to_new_event(ev, spec.as_deref()) else {
                 // #399: unparseable timestamp — skip event.
-                ts_parse_errors += 1;
+                counters.ts_parse_errors += 1;
                 continue;
             };
             // Track enrichment coverage: count enriched vs not-enriched events
             if new_event.enriched.is_some() {
-                enriched_count += 1;
+                counters.enriched += 1;
             } else {
-                not_enriched_count += 1;
+                counters.not_enriched += 1;
             }
             batch.push(new_event);
         }
@@ -720,6 +785,9 @@ async fn fetch_and_upsert(
             total_updated += updated;
         }
 
+        if past_end {
+            break;
+        }
         cursor_token = page.cursor;
         let n = batch.len();
         if n < config.page_size as usize || cursor_token.is_none() {
@@ -727,10 +795,8 @@ async fn fetch_and_upsert(
         }
     }
 
-    // Record enrichment metrics for reorg scan
-    if enriched_count > 0 || not_enriched_count > 0 {
-        cursor::track_enrichment(pool, enriched_count, not_enriched_count).await?;
-    }
+    // Record enrichment and timestamp-parse metrics for the reorg scan (#719).
+    counters.flush(pool).await?;
 
     Ok(total_updated)
 }
@@ -855,9 +921,13 @@ mod tests {
         let max_consecutive_errors = 20u32;
         let consecutive_errors = 20u32;
 
-        let circuit_open = max_consecutive_errors > 0 && consecutive_errors >= max_consecutive_errors;
+        let circuit_open =
+            max_consecutive_errors > 0 && consecutive_errors >= max_consecutive_errors;
         let sleep = if circuit_open { degraded } else { base };
-        assert_eq!(sleep, degraded, "degraded interval should be used when circuit is open");
+        assert_eq!(
+            sleep, degraded,
+            "degraded interval should be used when circuit is open"
+        );
     }
 
     #[test]
@@ -865,10 +935,15 @@ mod tests {
         use crate::rpc_client::{is_non_retryable_rpc_error, SorobanRpcError};
 
         // Method not found (-32601) and Invalid params (-32602) are non-retryable
-        let err_32601 = anyhow::anyhow!(SorobanRpcError::new(-32601, "method not found", "getEvents"));
+        let err_32601 = anyhow::anyhow!(SorobanRpcError::new(
+            -32601,
+            "method not found",
+            "getEvents"
+        ));
         assert!(is_non_retryable_rpc_error(&err_32601));
 
-        let err_32602 = anyhow::anyhow!(SorobanRpcError::new(-32602, "invalid params", "getEvents"));
+        let err_32602 =
+            anyhow::anyhow!(SorobanRpcError::new(-32602, "invalid params", "getEvents"));
         assert!(is_non_retryable_rpc_error(&err_32602));
 
         // Even when wrapped in context, non-retryable errors are recognized

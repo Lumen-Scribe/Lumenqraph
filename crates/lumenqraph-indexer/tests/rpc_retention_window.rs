@@ -5,7 +5,7 @@
 #[cfg(test)]
 mod rpc_retention_window_tests {
     use sqlx::postgres::PgPoolOptions;
-    use sqlx::{PgPool, Row};
+    use sqlx::PgPool;
 
     async fn setup_test_db() -> PgPool {
         let database_url = std::env::var("DATABASE_URL")
@@ -84,7 +84,7 @@ mod rpc_retention_window_tests {
         // Store RPC health info with 24-hour retention
         sqlx::query(
             "INSERT INTO rpc_health (id, oldest_ledger, latest_ledger, ledger_retention_window)
-             VALUES (1, $1, $2, $3)"
+             VALUES (1, $1, $2, $3)",
         )
         .bind(oldest_available)
         .bind(latest)
@@ -97,12 +97,11 @@ mod rpc_retention_window_tests {
         let configured_start = 50_000i64; // Way older than oldest_available
 
         // Simulate the clamping logic
-        let health: (i64, i64) = sqlx::query_as(
-            "SELECT oldest_ledger, latest_ledger FROM rpc_health WHERE id = 1"
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("query should succeed");
+        let health: (i64, i64) =
+            sqlx::query_as("SELECT oldest_ledger, latest_ledger FROM rpc_health WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .expect("query should succeed");
 
         let (oldest, _latest) = health;
         let clamped_start = configured_start.max(oldest);
@@ -113,7 +112,8 @@ mod rpc_retention_window_tests {
             "fresh start should clamp to RPC-reported oldest ledger (24-hour window)"
         );
         assert_ne!(
-            clamped_start, latest - 120_000,
+            clamped_start,
+            latest - 120_000,
             "clamping should NOT use hardcoded 120_000 window"
         );
 
@@ -135,7 +135,7 @@ mod rpc_retention_window_tests {
         // Store RPC health info with 30-day retention
         sqlx::query(
             "INSERT INTO rpc_health (id, oldest_ledger, latest_ledger, ledger_retention_window)
-             VALUES (1, $1, $2, $3)"
+             VALUES (1, $1, $2, $3)",
         )
         .bind(oldest_available)
         .bind(latest)
@@ -145,7 +145,7 @@ mod rpc_retention_window_tests {
         .expect("insert rpc_health should succeed");
 
         // Get RPC-reported retention window (not hardcoded)
-        let (oldest, _latest, retention): (i64, i64, i64) = sqlx::query_as(
+        let (oldest, _latest, _retention): (i64, i64, i64) = sqlx::query_as(
             "SELECT oldest_ledger, latest_ledger, ledger_retention_window FROM rpc_health WHERE id = 1"
         )
         .fetch_one(&pool)
@@ -180,12 +180,11 @@ mod rpc_retention_window_tests {
         cleanup_test_data(&pool).await;
 
         // No rpc_health data (RPC doesn't report getHealth)
-        let health_exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM rpc_health WHERE id = 1)"
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("query should succeed");
+        let health_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM rpc_health WHERE id = 1)")
+                .fetch_one(&pool)
+                .await
+                .expect("query should succeed");
         assert!(!health_exists, "rpc_health should not exist");
 
         let override_retention = 86_400i64; // 1 day override
@@ -202,7 +201,7 @@ mod rpc_retention_window_tests {
             50_000i64
         };
 
-        let oldest_available = latest - retention_to_use;
+        let _oldest_available = latest - retention_to_use;
 
         // Verify fallback is more conservative than hardcoded 120_000 (when appropriate)
         // or uses the configured override
@@ -225,7 +224,7 @@ mod rpc_retention_window_tests {
         let latest = 1_000_000i64;
 
         // Hardcoded logic (current, broken):
-        let hardcoded_oldest = latest - MAX_LOOKBACK_LEDGERS;
+        let _hardcoded_oldest = latest - MAX_LOOKBACK_LEDGERS;
 
         // Should be replaced by:
         // let rpc_reported_oldest = rpc.get_health().oldest_ledger?;

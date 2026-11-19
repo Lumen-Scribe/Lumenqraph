@@ -1,0 +1,30 @@
+# Code owners for security- and release-sensitive paths (#650).
+#
+# Once "Require review from Code Owners" is enabled on `main`, a pull request
+# that touches one of these paths cannot merge without an approval from one of
+# its owners.
+#
+# TODO(maintainers): replace the placeholder team below with the real
+# maintainer team or user handles before enabling the branch rule. GitHub shows
+# an error for owners it cannot resolve, and the review requirement then cannot
+# be satisfied.
+
+# Migrations are append-only: a released migration cannot be edited or rolled back.
+/migrations/                                    @Lumen-Scribe/maintainers
+
+# CI/CD, release and container build definitions.
+/.github/                                       @Lumen-Scribe/maintainers
+/Dockerfile                                     @Lumen-Scribe/maintainers
+/deny.toml                                      @Lumen-Scribe/maintainers
+
+# Authentication and outbound-URL validation (SSRF guards).
+/crates/lumenqraph-api/src/auth.rs              @Lumen-Scribe/maintainers
+/crates/*/src/**/url_validation.rs              @Lumen-Scribe/maintainers
+
+# Webhook delivery, signing and secret handling.
+/crates/lumenqraph-webhooks/                    @Lumen-Scribe/maintainers
+
+# Core XDR decoding, codegen and cryptographic helpers.
+/crates/lumenqraph-core/src/xdr.rs              @Lumen-Scribe/maintainers
+/crates/lumenqraph-core/src/codegen.rs          @Lumen-Scribe/maintainers
+/crates/lumenqraph-core/src/crypto.rs           @Lumen-Scribe/maintainers

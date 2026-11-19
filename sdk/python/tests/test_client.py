@@ -19,6 +19,9 @@ from lumenqraph.client import CallResult, ContractState
 
 URLOPEN = "lumenqraph._http.urllib.request.urlopen"
 SLEEP = "lumenqraph._http.Transport._sleep"
+# Pin full jitter to the ceiling so backoff expectations stay exact. Jitter
+# itself is tested separately in TestRetryPolicy.
+NO_JITTER = patch("lumenqraph._http._full_jitter", side_effect=lambda ceiling: ceiling)
 
 
 class FakeResponse(io.BytesIO):
@@ -254,7 +257,7 @@ class TestAuthHeaders(unittest.TestCase):
 class TestRetries(unittest.TestCase):
     def test_retries_503_then_succeeds(self):
         rec = Recorder(http_error(503), ok({"status": "ok"}))
-        with patch(URLOPEN, rec), patch(SLEEP) as sleep:
+        with patch(URLOPEN, rec), patch(SLEEP) as sleep, NO_JITTER:
             self.assertEqual(client().health(), {"status": "ok"})
         self.assertEqual(len(rec.requests), 2)
         sleep.assert_called_once_with(250)
@@ -262,7 +265,7 @@ class TestRetries(unittest.TestCase):
     def test_exponential_backoff_is_capped(self):
         rec = Recorder(http_error(502), http_error(502), http_error(502), ok({}))
         retry = {"base_delay_ms": 100, "max_delay_ms": 300}
-        with patch(URLOPEN, rec), patch(SLEEP) as sleep:
+        with patch(URLOPEN, rec), patch(SLEEP) as sleep, NO_JITTER:
             client(retry=retry).health()
         self.assertEqual([c.args[0] for c in sleep.call_args_list], [100, 200, 300])
 
@@ -271,6 +274,25 @@ class TestRetries(unittest.TestCase):
         with patch(URLOPEN, rec), patch(SLEEP) as sleep:
             client().health()
         sleep.assert_called_once_with(2000)
+
+    def test_retry_after_is_a_floor_even_when_jitter_is_zero(self):
+        rec = Recorder(http_error(429, headers={"Retry-After": "5"}), ok({}))
+        with patch(URLOPEN, rec), patch(SLEEP) as sleep, \
+                patch("lumenqraph._http._full_jitter", return_value=0):
+            client().health()
+        sleep.assert_called_once_with(5000)
+
+    def test_retry_after_http_date_is_honored(self):
+        import email.utils
+        import time as _time
+        when = email.utils.formatdate(_time.time() + 60, usegmt=True)
+        rec = Recorder(http_error(503, headers={"Retry-After": when}), ok({}))
+        with patch(URLOPEN, rec), patch(SLEEP) as sleep, \
+                patch("lumenqraph._http._full_jitter", return_value=0):
+            client().health()
+        (delay_ms,) = sleep.call_args.args
+        self.assertGreater(delay_ms, 50_000)
+        self.assertLessEqual(delay_ms, 60_000)
 
     def test_does_not_retry_client_errors(self):
         rec = Recorder(http_error(400, {"error": "bad"}))
@@ -300,6 +322,40 @@ class TestRetries(unittest.TestCase):
                 client(retry={"max_retries": 0}).health()
         self.assertEqual(ctx.exception.status, 0)
         self.assertIsNone(ctx.exception.body)
+
+
+class TestRetryPolicy(unittest.TestCase):
+    """Delay calculation: full jitter over the capped backoff, floored by Retry-After."""
+
+    def setUp(self):
+        from lumenqraph._http import Transport, resolve_retry
+
+        self.transport = Transport(resolve_retry({"base_delay_ms": 100, "max_delay_ms": 1000}))
+
+    def test_jitter_stays_within_the_backoff_ceiling(self):
+        for attempt in range(6):
+            ceiling = min(100 * (2 ** attempt), 1000)
+            for _ in range(50):
+                delay = self.transport.retry_delay_ms(attempt)
+                self.assertGreaterEqual(delay, 0)
+                self.assertLessEqual(delay, ceiling)
+
+    def test_jitter_is_not_constant(self):
+        delays = {self.transport.retry_delay_ms(3) for _ in range(200)}
+        self.assertGreater(len(delays), 1)
+
+    def test_retry_after_overrides_a_smaller_jittered_delay(self):
+        with patch("lumenqraph._http._full_jitter", return_value=10):
+            self.assertEqual(self.transport.retry_delay_ms(0, retry_after_ms=3000), 3000)
+
+    def test_a_larger_jittered_delay_is_kept_over_retry_after(self):
+        with patch("lumenqraph._http._full_jitter", return_value=700):
+            self.assertEqual(self.transport.retry_delay_ms(0, retry_after_ms=100), 700)
+
+    def test_only_idempotent_requests_are_retried(self):
+        self.assertTrue(self.transport.should_retry("GET", "http://t/contracts"))
+        self.assertTrue(self.transport.should_retry("POST", "http://t/contracts/C1/call"))
+        self.assertFalse(self.transport.should_retry("POST", "http://t/webhooks"))
 
 
 class TestErrorMapping(unittest.TestCase):

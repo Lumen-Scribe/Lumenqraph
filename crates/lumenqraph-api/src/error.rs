@@ -106,11 +106,19 @@ pub enum ApiError {
 
 impl ApiError {
     pub fn unauthorized(msg: impl Into<String>) -> Self {
-        ApiError::Status(StatusCode::UNAUTHORIZED, ErrorCode::Unauthorized, msg.into())
+        ApiError::Status(
+            StatusCode::UNAUTHORIZED,
+            ErrorCode::Unauthorized,
+            msg.into(),
+        )
     }
     /// The key's `expires_at` has passed (#559).
     pub fn key_expired() -> Self {
-        ApiError::Status(StatusCode::UNAUTHORIZED, ErrorCode::KeyExpired, "API key expired".into())
+        ApiError::Status(
+            StatusCode::UNAUTHORIZED,
+            ErrorCode::KeyExpired,
+            "API key expired".into(),
+        )
     }
     /// The key is valid but lacks the scope this route group requires (#559).
     pub fn insufficient_scope(required: &str) -> Self {
@@ -145,13 +153,6 @@ impl ApiError {
     pub fn conflict(msg: impl Into<String>) -> Self {
         ApiError::Status(StatusCode::CONFLICT, ErrorCode::Conflict, msg.into())
     }
-    pub fn simulation_failed(msg: impl Into<String>) -> Self {
-        ApiError::Status(
-            StatusCode::BAD_REQUEST,
-            ErrorCode::SimulationFailed,
-            msg.into(),
-        )
-    }
 
     /// A simulation failure with an optional named contract error detail (#418).
     ///
@@ -183,6 +184,24 @@ impl ApiError {
         }
     }
     pub fn spec_unavailable(msg: impl Into<String>) -> Self {
+        ApiError::Status(
+            StatusCode::NOT_FOUND,
+            ErrorCode::SpecUnavailable,
+            msg.into(),
+        )
+    }
+    /// `/call` refuses a function that looks state-changing unless the caller
+    /// opts in with `allow_mutating=true` (#576).
+    pub fn not_a_view_function(msg: impl Into<String>) -> Self {
+        ApiError::Status(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::NotAViewFunction,
+            msg.into(),
+        )
+    }
+    /// A Stellar Asset Contract (or other contract with no WASM interface) has
+    /// nothing to call or simulate; token metadata endpoints serve it instead.
+    pub fn sac_not_supported(msg: impl Into<String>) -> Self {
         ApiError::Status(
             StatusCode::NOT_FOUND,
             ErrorCode::SpecUnavailable,
@@ -242,22 +261,20 @@ impl std::error::Error for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        match self {
-            ApiError::SimulationFailedWithContractError {
-                message,
-                contract_error,
-            } => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "code": ErrorCode::SimulationFailed.as_str(),
-                        "error": message,
-                        "contract_error": contract_error,
-                    })),
-                )
-                    .into_response();
-            }
-            _ => {}
+        if let ApiError::SimulationFailedWithContractError {
+            message,
+            contract_error,
+        } = self
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "code": ErrorCode::SimulationFailed.as_str(),
+                    "error": message,
+                    "contract_error": contract_error,
+                })),
+            )
+                .into_response();
         }
 
         let (status, code, message, retry_after_secs) = match self {

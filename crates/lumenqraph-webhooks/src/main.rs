@@ -7,24 +7,51 @@ mod dispatcher;
 mod metrics;
 mod prune;
 
-use anyhow::Context;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use config::Config;
 
+/// Version, commit and build time shown by `--version` (clap prints the name).
+fn version_string() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        format!(
+            "{}\ncommit: {}\nbuilt: {}",
+            env!("CARGO_PKG_VERSION"),
+            option_env!("LUMENQRAPH_GIT_SHA").unwrap_or("unknown"),
+            option_env!("LUMENQRAPH_BUILD_TIME").unwrap_or("unknown"),
+        )
+    })
+}
+
+/// The service takes all configuration from the environment. The CLI exists so
+/// `--help` and `--version` work with no env set (#651); it is parsed before
+/// any config is read.
+#[derive(Parser)]
+#[command(
+    name = "lumenqraph-webhooks",
+    about = "Lumenqraph webhooks: delivers signed indexed-event notifications to subscriber URLs"
+)]
+struct Cli {}
+
+fn parse_cli() -> Cli {
+    let matches = Cli::command().version(version_string()).get_matches();
+    Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    parse_cli();
     let _ = dotenvy::dotenv();
     lumenqraph_core::telemetry::init_tracing();
 
     // Validate CONTRACT_IDS at startup so a misconfigured address is caught
     // immediately rather than silently ignored.
-    lumenqraph_core::parse_contract_ids(
-        &std::env::var("CONTRACT_IDS").unwrap_or_default(),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    lumenqraph_core::parse_contract_ids(&std::env::var("CONTRACT_IDS").unwrap_or_default())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Config::from_env() validates and reads WEBHOOK_ENCRYPTION_KEY, failing
     // fast if it is absent or empty — no separate check needed here.
@@ -32,7 +59,13 @@ async fn main() -> anyhow::Result<()> {
     // a message naming the variable instead of silently using the default.
     let config = Config::from_env()?;
     info!(config = ?config, "effective configuration");
-    let db = lumenqraph_core::db::DbConfig { max_connections: config.db_max_connections, min_connections: config.db_min_connections, acquire_timeout_secs: config.db_acquire_timeout_secs, idle_timeout_secs: config.db_idle_timeout_secs, connect_retries: config.db_connect_retries };
+    let db = lumenqraph_core::db::DbConfig {
+        max_connections: config.db_max_connections,
+        min_connections: config.db_min_connections,
+        acquire_timeout_secs: config.db_acquire_timeout_secs,
+        idle_timeout_secs: config.db_idle_timeout_secs,
+        connect_retries: config.db_connect_retries,
+    };
     let pool = lumenqraph_core::db::connect_with_retry(&config.database_url, &db).await?;
 
     // Migrations are applied by `lumenqraph-indexer migrate`, not here. Refuse
@@ -49,15 +82,14 @@ async fn main() -> anyhow::Result<()> {
     // those subscriptions could never be signed and would silently stop.
     let backfilled = dispatcher::backfill_encrypted_secrets(&pool, &config.encryption_key).await?;
     if backfilled > 0 {
-        info!(rows = backfilled, "encrypted legacy plaintext webhook secrets");
+        info!(
+            rows = backfilled,
+            "encrypted legacy plaintext webhook secrets"
+        );
     }
 
-    // Redirects are never followed (SSRF guard, see `build_delivery_client`).
-    // The dispatcher also reuses these timeouts when it builds the per-delivery
-    // IP-pinned client, so redirects stay disabled there too (#615).
-    let connect_timeout = config.connect_timeout();
-    let total_timeout = config.total_timeout();
-    let http = dispatcher::build_delivery_client(connect_timeout, total_timeout)?;
+    // Each delivery builds its own IP-pinned client with redirects disabled and
+    // the configured timeouts (#615), so no shared HTTP client is needed here.
 
     let pool_arc = std::sync::Arc::new(pool.clone());
     metrics::start_metrics_server(pool_arc, &config.metrics_bind_addr).await?;
@@ -68,7 +100,11 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(wait_for_shutdown(shutdown.clone()));
 
     // Retention for webhook_deliveries; this service is their only writer (#567).
-    tokio::spawn(prune::run_pruner(pool.clone(), config.delivery_retention_days, shutdown.clone()));
+    tokio::spawn(prune::run_pruner(
+        pool.clone(),
+        config.delivery_retention_days,
+        shutdown.clone(),
+    ));
 
     // #621 — enqueue, delivery and the gauge refresh run as independent tasks.
     // Previously they ran serially in one loop, so a single slow subscriber
@@ -82,7 +118,6 @@ async fn main() -> anyhow::Result<()> {
     ));
     let deliver_task = tokio::spawn(run_delivery_loop(
         pool.clone(),
-        http.clone(),
         config.clone(),
         shutdown.clone(),
     ));
@@ -126,14 +161,9 @@ async fn run_enqueue_loop(
 
 /// Delivery loop: runs the continuous delivery worker pool. A slow subscriber
 /// only occupies its own slot, never blocking enqueueing or other tenants (#621).
-async fn run_delivery_loop(
-    pool: sqlx::PgPool,
-    http: reqwest::Client,
-    config: Config,
-    shutdown: CancellationToken,
-) {
+async fn run_delivery_loop(pool: sqlx::PgPool, config: Config, shutdown: CancellationToken) {
     loop {
-        if let Err(e) = dispatcher::deliver_with_shutdown(&pool, &http, &config, &shutdown).await {
+        if let Err(e) = dispatcher::deliver_with_shutdown(&pool, &config, &shutdown).await {
             tracing::warn!(error = %e, "deliver failed");
         }
         tokio::select! {
@@ -217,8 +247,11 @@ mod tests {
         #[test]
         fn rejects_too_many_contract_ids() {
             // getEvents supports at most 25 IDs; the parser enforces this.
-            let single = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
-            let raw = std::iter::repeat(single).take(26).collect::<Vec<_>>().join(",");
+            // Distinct ids: duplicates are dropped before the count (#219).
+            let raw = (0..26u8)
+                .map(|i| stellar_strkey::Contract([i; 32]).to_string())
+                .collect::<Vec<_>>()
+                .join(",");
             let err = lumenqraph_core::parse_contract_ids(&raw).unwrap_err();
             assert!(
                 err.contains("26"),

@@ -17,9 +17,10 @@
 //! The active endpoint (host only, no credentials) and total failover count are
 //! exposed via `take_metrics()`.
 
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
@@ -30,8 +31,18 @@ use stellar_xdr::curr::{
     LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal, WriteXdr,
 };
 
-/// How long to wait before probing the primary again after a failover.
+/// How long to wait before probing the primary again after a failover. Also the
+/// minimum gap between two probes, so a dead primary is probed at most once per
+/// interval (#722).
 const PRIMARY_PROBE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Timeout for a fail-back probe. Much shorter than the request timeout, so a
+/// hung primary cannot hold up application traffic for a full RPC timeout (#722).
+const PRIMARY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How far the primary's `latestLedger` may trail the active failover endpoint
+/// and still count as caught up enough to fail back to (#722).
+const FAILBACK_LEDGER_TOLERANCE: i64 = 10;
 
 /// Longest `Retry-After` the client will honour before it stops waiting and
 /// fails over instead (#726). Overridable via `RPC_MAX_RETRY_AFTER_SECS`.
@@ -56,9 +67,19 @@ struct EndpointHealth {
 struct FailoverState {
     /// Index into `urls` of the currently active endpoint.
     active_idx: usize,
-    /// Wall-clock time of the last failover event, used to gate primary probes.
+    /// Wall-clock time of the last failover event. Gates the first primary probe.
     last_failover_at: Option<Instant>,
-    /// Health of each endpoint, parallel to `urls`.
+    /// When the last primary probe started. Set before probing, so a probe that
+    /// fails still resets the timer (#722).
+    last_probe_at: Option<Instant>,
+    /// Per endpoint: whether its network passphrase has been verified since the
+    /// client last switched to it. Cleared on every switch (#721).
+    network_verified: Vec<bool>,
+    /// Per endpoint: the highest `latestLedger` seen from it since the client last
+    /// switched to it. Tips only move forward, so a value that already covers a
+    /// cursor answers the cursor check without another call (#720, #721).
+    known_tip: Vec<Option<i64>>,
+    /// Health of each endpoint, parallel to `urls` (#723).
     endpoints: Vec<EndpointHealth>,
 }
 
@@ -84,11 +105,22 @@ pub struct RpcClient {
     active_url_idx: AtomicUsize,
     /// Network passphrase pinned during startup and checked before failover.
     network_passphrase: Mutex<Option<String>>,
+    /// Indices of endpoints that were unreachable at startup and have not yet
+    /// been verified. They are verified before their first use (#713).
+    unverified: Mutex<HashSet<usize>>,
     /// Upper bound on a server-requested `Retry-After` wait (#726).
     max_retry_after: Duration,
     /// Ledger entries skipped because they could not be decoded or the ID was
     /// invalid (#724). Reset by `take_ledger_entry_decode_errors`.
     ledger_entry_decode_errors: AtomicU64,
+}
+
+/// Outcome of checking an endpoint's network identity before use.
+enum NetworkCheck {
+    /// The endpoint reports the pinned passphrase.
+    Verified,
+    /// The endpoint could not be queried right now. It is skipped, not fatal.
+    Unreachable(anyhow::Error),
 }
 
 /// Identifies the sending binary's actual release to RPC operators who key off
@@ -101,16 +133,16 @@ const USER_AGENT: &str = concat!("lumenqraph-indexer/", env!("CARGO_PKG_VERSION"
 /// types; len = 512 KiB, well above the Soroban WASM size cap of ~256 KiB).
 /// Using `Limits::none()` on untrusted input allows crafted entries to force
 /// unbounded allocations or stack overflows (#400).
-const XDR_LEDGER_ENTRY_LIMITS: Limits = Limits { depth: 500, len: 524_288 };
+const XDR_LEDGER_ENTRY_LIMITS: Limits = Limits {
+    depth: 500,
+    len: 524_288,
+};
 
 /// Extract just the hostname (and port if non-standard) from a URL, with no
 /// credentials — safe to log and use in metric labels.
 fn host_of(url: &str) -> String {
     // Best-effort: strip scheme, credentials, path, and query.
-    let after_scheme = url
-        .find("://")
-        .map(|i| &url[i + 3..])
-        .unwrap_or(url);
+    let after_scheme = url.find("://").map(|i| &url[i + 3..]).unwrap_or(url);
     // Drop userinfo (user:pass@)
     let host_and_rest = after_scheme
         .find('@')
@@ -192,19 +224,6 @@ impl SorobanRpcErrorCode {
         }
     }
 
-    pub fn code(&self) -> i64 {
-        match self {
-            Self::ParseError => -32700,
-            Self::InvalidRequest => -32600,
-            Self::MethodNotFound => -32601,
-            Self::InvalidParams => -32602,
-            Self::InternalError => -32603,
-            Self::ServerError => -32000,
-            Self::ProcessingLimitExceeded => -32001,
-            Self::Other(c) => *c,
-        }
-    }
-
     /// Whether this error represents a transient, server-side condition that is safe to retry.
     pub fn is_retryable(&self) -> bool {
         matches!(
@@ -277,7 +296,7 @@ struct LatestLedgerResult {
     sequence: i64,
 }
 
-/// Result of `getHealth`: the provider's retained ledger window.
+/// `getHealth` result: the provider's currently retained ledger window.
 #[derive(Debug, Deserialize, Clone, Copy)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcHealth {
@@ -289,6 +308,15 @@ pub struct RpcHealth {
 #[serde(rename_all = "camelCase")]
 struct NetworkResult {
     network_passphrase: String,
+}
+
+/// Response of `getHealth`: the ledger window the RPC node currently retains.
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcHealth {
+    pub oldest_ledger: i64,
+    #[allow(dead_code)] // part of the getHealth response; not read yet
+    pub latest_ledger: i64,
 }
 
 // ---- getEvents ----
@@ -388,6 +416,7 @@ pub struct EventInfo {
 }
 
 impl RpcClient {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(url: impl Into<String>, timeout_secs: u64) -> Self {
         Self::with_urls(vec![url.into()], timeout_secs)
     }
@@ -407,7 +436,7 @@ impl RpcClient {
         headers: reqwest::header::HeaderMap,
     ) -> Self {
         assert!(!urls.is_empty(), "at least one RPC URL is required");
-        let len = urls.len();
+        let n_urls = urls.len();
         // A request timeout is essential for a 24/7 poller: without it, a hung
         // RPC connection blocks the poll loop indefinitely and the backoff path
         // (which only fires on an error) is never reached.
@@ -422,7 +451,10 @@ impl RpcClient {
             failover: Mutex::new(FailoverState {
                 active_idx: 0,
                 last_failover_at: None,
-                endpoints: vec![EndpointHealth::default(); len],
+                last_probe_at: None,
+                network_verified: vec![false; n_urls],
+                known_tip: vec![None; n_urls],
+                endpoints: vec![EndpointHealth::default(); n_urls],
             }),
             calls_made: AtomicU64::new(0),
             calls_failed: AtomicU64::new(0),
@@ -430,8 +462,9 @@ impl RpcClient {
             failover_count: AtomicU64::new(0),
             active_url_idx: AtomicUsize::new(0),
             network_passphrase: Mutex::new(None),
-            ledger_entry_decode_errors: AtomicU64::new(0),
+            unverified: Mutex::new(HashSet::new()),
             max_retry_after: DEFAULT_MAX_RETRY_AFTER,
+            ledger_entry_decode_errors: AtomicU64::new(0),
         }
     }
 
@@ -460,34 +493,121 @@ impl RpcClient {
         host_of(self.urls.get(idx).unwrap_or(&self.urls[0]))
     }
 
-    /// Fetch `getNetwork` from every configured endpoint and pin the common
-    /// passphrase. A disagreement is a startup error, never a silent failover.
+    /// Ask one endpoint for its network passphrase (`getNetwork`).
+    async fn fetch_network_passphrase(&self, url: &str) -> anyhow::Result<String> {
+        let req = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getNetwork", "params": {} });
+        let response = self
+            .http
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::USER_AGENT, USER_AGENT)
+            .json(&req)
+            .send()
+            .await
+            .with_context(|| format!("getNetwork request failed for RPC host {}", host_of(url)))?
+            .error_for_status()
+            .with_context(|| format!("getNetwork failed for RPC host {}", host_of(url)))?;
+        let rpc: RpcResponse<NetworkResult> = response
+            .json()
+            .await
+            .with_context(|| format!("getNetwork response decode failed for RPC host {}", host_of(url)))?;
+        Ok(rpc
+            .result
+            .ok_or_else(|| anyhow!("getNetwork returned no result for RPC host {}", host_of(url)))?
+            .network_passphrase)
+    }
+
+    /// Pin the network passphrase at startup (#713).
+    ///
+    /// Requires at least one reachable endpoint. Endpoints that are unreachable
+    /// are logged and marked unverified, so they are checked before first use
+    /// instead of blocking startup. Two reachable endpoints that disagree on the
+    /// passphrase are still a hard error.
     pub async fn validate_network_passphrases(&self) -> anyhow::Result<String> {
         let mut expected: Option<String> = None;
         for url in &self.urls {
             let req = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getNetwork", "params": {} });
-            let response = self.http.post(url).header(reqwest::header::CONTENT_TYPE, "application/json").header(reqwest::header::USER_AGENT, USER_AGENT).json(&req).send().await
-                .with_context(|| format!("getNetwork request failed for RPC host {}", host_of(url)))?
-                .error_for_status().with_context(|| format!("getNetwork failed for RPC host {}", host_of(url)))?;
-            let rpc: RpcResponse<NetworkResult> = response.json().await.with_context(|| format!("getNetwork response decode failed for RPC host {}", host_of(url)))?;
-            let passphrase = rpc.result.ok_or_else(|| anyhow!("getNetwork returned no result for RPC host {}", host_of(url)))?.network_passphrase;
+            let response = self
+                .http
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::USER_AGENT, USER_AGENT)
+                .json(&req)
+                .send()
+                .await
+                .with_context(|| {
+                    format!("getNetwork request failed for RPC host {}", host_of(url))
+                })?
+                .error_for_status()
+                .with_context(|| format!("getNetwork failed for RPC host {}", host_of(url)))?;
+            let rpc: RpcResponse<NetworkResult> = response.json().await.with_context(|| {
+                format!(
+                    "getNetwork response decode failed for RPC host {}",
+                    host_of(url)
+                )
+            })?;
+            let passphrase = rpc
+                .result
+                .ok_or_else(|| {
+                    anyhow!(
+                        "getNetwork returned no result for RPC host {}",
+                        host_of(url)
+                    )
+                })?
+                .network_passphrase;
             if let Some(ref prior) = expected {
-                if prior != &passphrase { anyhow::bail!("RPC network mismatch: endpoint {} returned a different network passphrase", host_of(url)); }
-            } else { expected = Some(passphrase); }
+                if prior != &passphrase {
+                    anyhow::bail!(
+                        "RPC network mismatch: endpoint {} returned a different network passphrase",
+                        host_of(url)
+                    );
+                }
+            } else {
+                expected = Some(passphrase);
+            }
         }
-        let passphrase = expected.expect("at least one RPC URL is required");
+        let passphrase = pinned.ok_or_else(|| {
+            anyhow!("no RPC endpoint is reachable ({} configured)", self.urls.len())
+        })?;
         *self.network_passphrase.lock().unwrap() = Some(passphrase.clone());
         Ok(passphrase)
     }
 
-    async fn check_endpoint_network(&self, idx: usize) -> anyhow::Result<()> {
+    /// Check an endpoint's network identity before it serves traffic.
+    ///
+    /// A wrong network is a hard error. An endpoint that cannot be reached is
+    /// reported as [`NetworkCheck::Unreachable`] so the caller can skip it.
+    async fn check_endpoint_network(&self, idx: usize) -> anyhow::Result<NetworkCheck> {
         let expected = self.network_passphrase.lock().unwrap().clone();
-        let Some(expected) = expected else { return Ok(()); };
+        let Some(expected) = expected else {
+            return Ok(());
+        };
         let url = self.url_at(idx).to_string();
-        let req = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getNetwork", "params": {} });
-        let rpc: RpcResponse<NetworkResult> = self.http.post(&url).header(reqwest::header::CONTENT_TYPE, "application/json").header(reqwest::header::USER_AGENT, USER_AGENT).json(&req).send().await?.error_for_status()?.json().await?;
-        let actual = rpc.result.ok_or_else(|| anyhow!("getNetwork returned no result for RPC host {}", host_of(&url)))?.network_passphrase;
-        if actual != expected { anyhow::bail!("RPC failover network mismatch at {}", host_of(&url)); }
+        let req =
+            serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getNetwork", "params": {} });
+        let rpc: RpcResponse<NetworkResult> = self
+            .http
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::USER_AGENT, USER_AGENT)
+            .json(&req)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let actual = rpc
+            .result
+            .ok_or_else(|| {
+                anyhow!(
+                    "getNetwork returned no result for RPC host {}",
+                    host_of(&url)
+                )
+            })?
+            .network_passphrase;
+        if actual != expected {
+            anyhow::bail!("RPC failover network mismatch at {}", host_of(&url));
+        }
         Ok(())
     }
 
@@ -562,6 +682,10 @@ impl RpcClient {
         }
         state.active_idx = to;
         state.last_failover_at = Some(Instant::now());
+        // Anything cached about the new endpoint is from before this switch as
+        // far as we're concerned, so re-verify it (#721).
+        state.network_verified[to] = false;
+        state.known_tip[to] = None;
         self.active_url_idx.store(to, Ordering::Relaxed);
     }
 
@@ -595,22 +719,71 @@ impl RpcClient {
             .json(&req_body)
             .send()
             .await;
-        let ok = match result {
-            Ok(r) if r.status().is_success() => true,
-            _ => false,
-        };
+        let ok = matches!(result, Ok(r) if r.status().is_success());
         if ok {
             let mut state = self.failover.lock().unwrap();
-            if state.active_idx != 0 {
-                tracing::info!(
-                    endpoint = %host_of(primary_url),
-                    "primary rpc endpoint recovered; failing back"
+            if state.active_idx == 0 {
+                return;
+            }
+            let due_since_failover = state
+                .last_failover_at
+                .is_some_and(|t| t.elapsed() >= PRIMARY_PROBE_INTERVAL);
+            let due_since_probe = state
+                .last_probe_at
+                .is_none_or(|t| t.elapsed() >= PRIMARY_PROBE_INTERVAL);
+            if !(due_since_failover && due_since_probe) {
+                return;
+            }
+            state.last_probe_at = Some(Instant::now());
+            state.known_tip[state.active_idx]
+        };
+
+        match self.probe_primary(active_tip).await {
+            Ok(()) => {
+                let mut state = self.failover.lock().unwrap();
+                if state.active_idx != 0 {
+                    tracing::info!(
+                        endpoint = %host_of(&self.urls[0]),
+                        "primary rpc endpoint recovered; failing back"
+                    );
+                    state.active_idx = 0;
+                    state.last_failover_at = None;
+                    self.active_url_idx.store(0, Ordering::Relaxed);
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    endpoint = %host_of(&self.urls[0]),
+                    error = %e,
+                    "primary rpc endpoint still unhealthy; staying on failover endpoint"
                 );
-                state.active_idx = 0;
-                state.last_failover_at = None;
-                self.active_url_idx.store(0, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Check that the primary is fit to serve again. It must report `healthy`
+    /// from `getHealth`, pin the same network passphrase, and be no more than
+    /// `FAILBACK_LEDGER_TOLERANCE` ledgers behind the endpoint we are using.
+    /// Any HTTP 200 is not enough (#722).
+    async fn probe_primary(&self, active_tip: Option<i64>) -> anyhow::Result<()> {
+        let primary = self.urls[0].clone();
+        let health: RpcHealth = self
+            .raw_rpc(&primary, "getHealth", Some(PRIMARY_PROBE_TIMEOUT))
+            .await?;
+        anyhow::ensure!(
+            health.status == "healthy",
+            "primary reports status {:?}",
+            health.status
+        );
+        self.check_endpoint_network(0, Some(PRIMARY_PROBE_TIMEOUT)).await?;
+        if let Some(tip) = active_tip {
+            anyhow::ensure!(
+                health.latest_ledger + FAILBACK_LEDGER_TOLERANCE >= tip,
+                "primary latestLedger {} trails the active endpoint ({tip})",
+                health.latest_ledger
+            );
+        }
+        Ok(())
     }
 
     async fn call<P: Serialize, R: for<'de> Deserialize<'de>>(
@@ -628,7 +801,7 @@ impl RpcClient {
         &self,
         method: &str,
         params: P,
-        _cursor_ledger: Option<i64>,
+        cursor_ledger: Option<i64>,
     ) -> anyhow::Result<R> {
         let req = RpcRequest {
             jsonrpc: "2.0",
@@ -658,18 +831,22 @@ impl RpcClient {
             let url = self.url_at(url_idx).to_string();
 
             // Never send application traffic to a failover endpoint until its
-            // network identity has been re-checked. A mismatch skips the
-            // endpoint rather than aborting the call (#723).
+            // network identity has been re-checked, or to an endpoint that was
+            // unreachable at startup and never verified (#713). An unreachable
+            // endpoint is skipped; a wrong network is a hard error.
             let mut attempts = MAX_ATTEMPTS_PER_URL;
-            if url_idx != 0 {
-                if let Err(e) = self.check_endpoint_network(url_idx).await {
-                    tracing::warn!(
-                        endpoint = %host_of(&url),
-                        error = %e,
-                        "rpc failover candidate failed network check; skipping"
-                    );
-                    last_err = Some(e);
-                    attempts = 0;
+            if url_idx != 0 || self.is_unverified(url_idx) {
+                match self.check_endpoint_network(url_idx).await? {
+                    NetworkCheck::Verified => {}
+                    NetworkCheck::Unreachable(error) => {
+                        tracing::warn!(
+                            endpoint = %host_of(&url),
+                            %error,
+                            "RPC endpoint unreachable; skipping"
+                        );
+                        last_err = Some(error);
+                        attempts = 0;
+                    }
                 }
             }
 
@@ -682,7 +859,8 @@ impl RpcClient {
                     let base_ms = BASE_DELAYS_MS[(attempt - 1) as usize];
                     let jitter_ms = rand::thread_rng().gen_range(0..=(base_ms / 2)) as i64
                         - (base_ms / 4) as i64;
-                    let mut delay = Duration::from_millis(((base_ms as i64) + jitter_ms).max(1) as u64);
+                    let mut delay =
+                        Duration::from_millis(((base_ms as i64) + jitter_ms).max(1) as u64);
                     if let Some(server_delay) = retry_after.take() {
                         if server_delay > self.max_retry_after {
                             // Waiting would exceed our cap: fail over now rather than sleep (#726).
@@ -719,8 +897,7 @@ impl RpcClient {
 
                 let response = match result {
                     Err(e) => {
-                        last_err =
-                            Some(anyhow!(e).context(format!("rpc {method} request failed")));
+                        last_err = Some(anyhow!(e).context(format!("rpc {method} request failed")));
                         continue; // retry same URL
                     }
                     Ok(r) => r,
@@ -735,9 +912,8 @@ impl RpcClient {
                 let response = match response.error_for_status() {
                     Err(e) => {
                         let status = e.status();
-                        let is_retryable = status.map_or(false, |s| {
-                            s.is_server_error() || s.as_u16() == 429
-                        });
+                        let is_retryable =
+                            status.is_some_and(|s| s.is_server_error() || s.as_u16() == 429);
                         let ctx_err =
                             anyhow!(e).context(format!("rpc {method} returned http error"));
                         if is_retryable {
@@ -758,8 +934,7 @@ impl RpcClient {
                 let resp: RpcResponse<R> = match response.json().await {
                     Err(e) => {
                         last_err = Some(
-                            anyhow!(e)
-                                .context(format!("rpc {method} response decode failed")),
+                            anyhow!(e).context(format!("rpc {method} response decode failed")),
                         );
                         continue; // retry same URL
                     }
@@ -796,10 +971,7 @@ impl RpcClient {
 
         self.calls_failed.fetch_add(1, Ordering::Relaxed);
         Err(last_err.unwrap_or_else(|| {
-            anyhow!(
-                "rpc {method} failed on all {} endpoint(s)",
-                self.urls.len()
-            )
+            anyhow!("rpc {method} failed on all {} endpoint(s)", self.urls.len())
         }))
     }
 
@@ -826,13 +998,21 @@ impl RpcClient {
         cursor: Option<String>,
         limit: u32,
     ) -> anyhow::Result<GetEventsResult> {
+        // A failover candidate must have reached the ledger just before the first
+        // one we ask for, i.e. the cursor we are resuming from (#720). Continuation
+        // pages carry a paging token instead, so there is no ledger to check.
+        let cursor_ledger = if cursor.is_some() {
+            None
+        } else {
+            start_ledger.map(|s| s.saturating_sub(1))
+        };
         let params = GetEventsParams {
             start_ledger: if cursor.is_some() { None } else { start_ledger },
             filters: event_filters(contract_ids)?,
             pagination: Pagination { limit, cursor },
             xdr_format: "base64",
         };
-        self.call("getEvents", params).await
+        self.call_with_cursor("getEvents", params, cursor_ledger).await
     }
 
     /// Fetch a contract's deployed WASM (hex hash + bytes), so its on-chain
@@ -952,7 +1132,9 @@ impl RpcClient {
                 key: ScVal::LedgerKeyContractInstance,
                 durability: ContractDataDurability::Persistent,
             });
-            let key_b64 = key.to_xdr_base64(Limits::none()).context("encode ledger key")?;
+            let key_b64 = key
+                .to_xdr_base64(Limits::none())
+                .context("encode ledger key")?;
             key_to_idx.entry(key_b64.clone()).or_insert(idx);
             keys.push(key_b64);
         }
@@ -988,12 +1170,12 @@ impl RpcClient {
                 durability: cd.durability,
             });
             if let Ok(key_b64) = entry_key.to_xdr_base64(Limits::none()) {
-                if let Some(&idx) = key_to_idx.get(&key_b64) {
+                if let Some(idx) = key_to_idx.get(&key_b64) {
                     let wasm_hash = match inst.executable {
                         ContractExecutable::Wasm(h) => Some(hex::encode(h.0)),
                         ContractExecutable::StellarAsset => None,
                     };
-                    output[idx] = Some(InstanceEntry {
+                    output[*idx] = Some(InstanceEntry {
                         wasm_hash,
                         storage: ScVal::Map(inst.storage),
                         last_modified_ledger: item.last_modified_ledger_seq,
@@ -1103,7 +1285,10 @@ impl RpcClient {
                 key: key.clone(),
                 durability: *durability,
             });
-            key_b64s.push(lkey.to_xdr_base64(Limits::none()).context("encode ledger key")?);
+            key_b64s.push(
+                lkey.to_xdr_base64(Limits::none())
+                    .context("encode ledger key")?,
+            );
         }
 
         let key_to_idx: std::collections::HashMap<&str, usize> = key_b64s
@@ -1195,35 +1380,36 @@ mod tests {
         let primary_count = Arc::new(AtomicUsize::new(0));
         let secondary_count = Arc::new(AtomicUsize::new(0));
 
-        let primary_url = spawn_counting_mock(
-            primary_count.clone(),
-            Arc::new(|_| (500, "")),
-        ).await;
-        let secondary_url = spawn_counting_mock(
-            secondary_count.clone(),
-            Arc::new(|_| (200, OK_SEQ_2000)),
-        ).await;
+        let primary_url = spawn_counting_mock(primary_count.clone(), Arc::new(|_| (500, ""))).await;
+        let secondary_url =
+            spawn_counting_mock(secondary_count.clone(), Arc::new(|_| (200, OK_SEQ_2000))).await;
 
         let client = RpcClient::with_urls(vec![primary_url, secondary_url], 5);
-        let seq: i64 = client.get_latest_ledger().await
+        let seq: i64 = client
+            .get_latest_ledger()
+            .await
             .expect("should succeed via secondary");
         assert_eq!(seq, 2000);
-        assert_eq!(primary_count.load(Ordering::SeqCst), 3,
-            "primary must exhaust 3 attempts before failover");
-        assert!(secondary_count.load(Ordering::SeqCst) >= 1,
-            "secondary must be tried at least once");
+        assert_eq!(
+            primary_count.load(Ordering::SeqCst),
+            3,
+            "primary must exhaust 3 attempts before failover"
+        );
+        assert!(
+            secondary_count.load(Ordering::SeqCst) >= 1,
+            "secondary must be tried at least once"
+        );
     }
 
     #[tokio::test]
     async fn failover_count_metric_increments() {
-        let primary_url = spawn_counting_mock(
-            Arc::new(AtomicUsize::new(0)),
-            Arc::new(|_| (500, "")),
-        ).await;
+        let primary_url =
+            spawn_counting_mock(Arc::new(AtomicUsize::new(0)), Arc::new(|_| (500, ""))).await;
         let secondary_url = spawn_counting_mock(
             Arc::new(AtomicUsize::new(0)),
             Arc::new(|_| (200, OK_SEQ_1000)),
-        ).await;
+        )
+        .await;
 
         let client = RpcClient::with_urls(vec![primary_url, secondary_url], 5);
         client.get_latest_ledger().await.expect("should succeed");
@@ -1240,7 +1426,10 @@ mod tests {
 
     #[test]
     fn host_of_strips_credentials_and_path() {
-        assert_eq!(host_of("https://user:pass@host.example.com/path"), "host.example.com");
+        assert_eq!(
+            host_of("https://user:pass@host.example.com/path"),
+            "host.example.com"
+        );
         assert_eq!(host_of("http://localhost:8080/rpc"), "localhost:8080");
         assert_eq!(host_of("https://rpc.example.com"), "rpc.example.com");
     }
@@ -1289,11 +1478,11 @@ mod tests {
     // sequence of responses; verify the RpcClient retries on transient errors
     // and surfaces them correctly when all attempts are exhausted.
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
     use axum::extract::State;
     use axum::routing::post;
     use axum::Router;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tokio::net::TcpListener;
 
     // ── helpers ───────────────────────────────────────────────────────────
@@ -1318,7 +1507,10 @@ mod tests {
                 .body(axum::body::Body::from(body))
                 .unwrap()
         }
-        let state = S { count, responder: make_response };
+        let state = S {
+            count,
+            responder: make_response,
+        };
         let app = Router::new().route("/", post(handler)).with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1329,8 +1521,102 @@ mod tests {
     // Success response body for getLatestLedger.
     const OK_SEQ_1000: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"sequence":1000}}"#;
     const OK_SEQ_2000: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"sequence":2000}}"#;
-    const ERR_32001: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"processing limit reached"}}"#;
-    const ERR_32602: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid params"}}"#;
+    const ERR_32001: &str =
+        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"processing limit reached"}}"#;
+    const ERR_32602: &str =
+        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid params"}}"#;
+
+    // getNetwork bodies for the network-identity tests (#713).
+    const NET_PUBLIC: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"networkPassphrase":"Public Global Stellar Network ; September 2015"}}"#;
+    const NET_TESTNET: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"networkPassphrase":"Test SDF Network ; September 2015"}}"#;
+    /// Port 1 is never listening, so connections are refused immediately.
+    const DEAD_URL: &str = "http://127.0.0.1:1";
+
+    #[tokio::test]
+    async fn startup_succeeds_when_a_secondary_is_unreachable() {
+        let primary = spawn_counting_mock(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(|_| (200, NET_PUBLIC)),
+        )
+        .await;
+        let client = RpcClient::with_urls(vec![primary, DEAD_URL.to_string()], 5);
+
+        let passphrase = client
+            .validate_network_passphrases()
+            .await
+            .expect("one healthy endpoint is enough to start");
+        assert_eq!(passphrase, "Public Global Stellar Network ; September 2015");
+        assert!(client.is_unverified(1), "dead secondary must be marked unverified");
+        assert!(!client.is_unverified(0), "healthy primary is verified");
+    }
+
+    #[tokio::test]
+    async fn startup_fails_when_no_endpoint_is_reachable() {
+        let client = RpcClient::with_urls(vec![DEAD_URL.to_string(), "http://127.0.0.1:2".to_string()], 5);
+        let err = client.validate_network_passphrases().await.unwrap_err();
+        assert!(err.to_string().contains("no RPC endpoint is reachable"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_reachable_endpoints_that_disagree() {
+        let a = spawn_counting_mock(Arc::new(AtomicUsize::new(0)), Arc::new(|_| (200, NET_PUBLIC))).await;
+        let b = spawn_counting_mock(Arc::new(AtomicUsize::new(0)), Arc::new(|_| (200, NET_TESTNET))).await;
+        let client = RpcClient::with_urls(vec![a, b], 5);
+        let err = client.validate_network_passphrases().await.unwrap_err();
+        assert!(err.to_string().contains("network mismatch"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn secondary_on_another_network_is_rejected_on_first_use() {
+        // Primary answers getNetwork at startup, then fails every call so the
+        // client fails over to the secondary. The secondary is down at startup
+        // (so it is unverified) and reports another network once it is used.
+        let primary = spawn_counting_mock(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(|n| if n == 0 { (200, NET_PUBLIC) } else { (500, "") }),
+        )
+        .await;
+        let secondary = spawn_counting_mock(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(|n| if n == 0 { (500, "") } else { (200, NET_TESTNET) }),
+        )
+        .await;
+        let client = RpcClient::with_urls(vec![primary, secondary], 5);
+        client.validate_network_passphrases().await.expect("startup");
+
+        let err = client.get_latest_ledger().await.unwrap_err();
+        assert!(err.to_string().contains("network mismatch"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn secondary_is_verified_before_serving_after_failover() {
+        // Secondary is down at startup, so it is unverified. On first use the
+        // network check (request 1) runs before the real call (request 2).
+        let primary = spawn_counting_mock(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(|n| if n == 0 { (200, NET_PUBLIC) } else { (500, "") }),
+        )
+        .await;
+        let secondary_count = Arc::new(AtomicUsize::new(0));
+        let secondary = spawn_counting_mock(
+            secondary_count.clone(),
+            Arc::new(|n| match n {
+                0 => (500, ""),
+                1 => (200, NET_PUBLIC),
+                _ => (200, OK_SEQ_2000),
+            }),
+        )
+        .await;
+        let client = RpcClient::with_urls(vec![primary, secondary], 5);
+        client.validate_network_passphrases().await.expect("startup");
+
+        let seq = client.get_latest_ledger().await.expect("served by verified secondary");
+        assert_eq!(seq, 2000);
+        assert!(
+            secondary_count.load(Ordering::SeqCst) >= 2,
+            "secondary must be checked (getNetwork) before the call"
+        );
+    }
 
     #[tokio::test]
     async fn retries_on_5xx_and_eventually_succeeds() {
@@ -1348,18 +1634,18 @@ mod tests {
             .await
             .expect("should succeed after retry");
         assert_eq!(seq, 1000);
-        assert_eq!(count.load(Ordering::SeqCst), 2, "must have made exactly 2 attempts");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "must have made exactly 2 attempts"
+        );
     }
 
     #[tokio::test]
     async fn exhausts_all_attempts_on_persistent_5xx() {
         // Always 500 — all MAX_ATTEMPTS (3) should be exhausted.
         let count = Arc::new(AtomicUsize::new(0));
-        let url = spawn_counting_mock(
-            count.clone(),
-            Arc::new(|_| (500, "")),
-        )
-        .await;
+        let url = spawn_counting_mock(count.clone(), Arc::new(|_| (500, ""))).await;
 
         let client = RpcClient::new(&url, 5);
         let err = client
@@ -1381,11 +1667,7 @@ mod tests {
     async fn does_not_retry_on_4xx() {
         // HTTP 400 is a client error — should fail immediately without retrying.
         let count = Arc::new(AtomicUsize::new(0));
-        let url = spawn_counting_mock(
-            count.clone(),
-            Arc::new(|_| (400, "")),
-        )
-        .await;
+        let url = spawn_counting_mock(count.clone(), Arc::new(|_| (400, ""))).await;
 
         let client = RpcClient::new(&url, 5);
         let err = client
@@ -1403,11 +1685,7 @@ mod tests {
     async fn does_not_retry_on_non_transient_rpc_error() {
         // RPC error -32602 (bad params) should surface immediately without retrying.
         let count = Arc::new(AtomicUsize::new(0));
-        let url = spawn_counting_mock(
-            count.clone(),
-            Arc::new(|_| (200, ERR_32602)),
-        )
-        .await;
+        let url = spawn_counting_mock(count.clone(), Arc::new(|_| (200, ERR_32602))).await;
 
         let client = RpcClient::new(&url, 5);
         let err = client
@@ -1429,13 +1707,10 @@ mod tests {
     #[tokio::test]
     async fn does_not_retry_on_method_not_found_rpc_error() {
         // RPC error -32601 (method not found) should surface immediately without retrying.
-        const ERR_32601: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#;
+        const ERR_32601: &str =
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#;
         let count = Arc::new(AtomicUsize::new(0));
-        let url = spawn_counting_mock(
-            count.clone(),
-            Arc::new(|_| (200, ERR_32601)),
-        )
-        .await;
+        let url = spawn_counting_mock(count.clone(), Arc::new(|_| (200, ERR_32601))).await;
 
         let client = RpcClient::new(&url, 5);
         let err = client
@@ -1476,7 +1751,13 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let url = spawn_counting_mock(
             count.clone(),
-            Arc::new(|n| if n < 2 { (200, ERR_32001) } else { (200, OK_SEQ_2000) }),
+            Arc::new(|n| {
+                if n < 2 {
+                    (200, ERR_32001)
+                } else {
+                    (200, OK_SEQ_2000)
+                }
+            }),
         )
         .await;
 
@@ -1486,7 +1767,11 @@ mod tests {
             .await
             .expect("should succeed on third attempt after two -32001 errors");
         assert_eq!(seq, 2000);
-        assert_eq!(count.load(Ordering::SeqCst), 3, "must have made exactly 3 attempts");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            3,
+            "must have made exactly 3 attempts"
+        );
     }
 
     #[tokio::test]
@@ -1505,7 +1790,11 @@ mod tests {
             .await
             .expect("should retry and succeed after 429");
         assert_eq!(seq, 1000);
-        assert_eq!(count.load(Ordering::SeqCst), 2, "must have made 2 attempts (one failed, one succeeded)");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "must have made 2 attempts (one failed, one succeeded)"
+        );
     }
 
     /// Spawn a mock whose responder returns `(status, body, Retry-After)` for
@@ -1879,11 +2168,7 @@ mod tests {
     async fn exhausts_attempts_on_persistent_429() {
         // Issue #395: 429 on all attempts should eventually fail.
         let count = Arc::new(AtomicUsize::new(0));
-        let url = spawn_counting_mock(
-            count.clone(),
-            Arc::new(|_| (429, "")),
-        )
-        .await;
+        let url = spawn_counting_mock(count.clone(), Arc::new(|_| (429, ""))).await;
 
         let client = RpcClient::new(&url, 5);
         let err = client
@@ -1899,5 +2184,240 @@ mod tests {
             3,
             "must attempt exactly MAX_ATTEMPTS=3 times"
         );
+    }
+
+    // ── #720–#722 failover checks ─────────────────────────────────────────
+
+    const PASSPHRASE: &str = "Test SDF Network ; September 2015";
+
+    type Responder = Arc<dyn Fn(&str) -> (u16, String) + Send + Sync>;
+    type MethodLog = Arc<std::sync::Mutex<Vec<String>>>;
+
+    fn responder(f: impl Fn(&str) -> (u16, String) + Send + Sync + 'static) -> Responder {
+        Arc::new(f)
+    }
+
+    /// Mock RPC that records each JSON-RPC method it receives and answers with
+    /// `respond(method)` as `(http_status, body)`. Returns the URL and the log.
+    async fn spawn_method_mock(respond: Responder) -> (String, MethodLog) {
+        #[derive(Clone)]
+        struct S {
+            log: MethodLog,
+            respond: Responder,
+        }
+        async fn handler(State(s): State<S>, body: String) -> axum::response::Response {
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            let method = v["method"].as_str().unwrap_or("").to_string();
+            s.log.lock().unwrap().push(method.clone());
+            let (status, payload) = (s.respond)(&method);
+            axum::response::Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(payload))
+                .unwrap()
+        }
+        let log: MethodLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/", post(handler))
+            .with_state(S { log: log.clone(), respond });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), log)
+    }
+
+    fn method_count(log: &MethodLog, method: &str) -> usize {
+        log.lock().unwrap().iter().filter(|m| m.as_str() == method).count()
+    }
+
+    fn network_body() -> String {
+        format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"networkPassphrase":"{PASSPHRASE}"}}}}"#)
+    }
+
+    fn latest_body(seq: i64) -> String {
+        format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"sequence":{seq}}}}}"#)
+    }
+
+    fn health_body(status: &str, latest: i64) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"{status}","latestLedger":{latest},"oldestLedger":1}}}}"#
+        )
+    }
+
+    fn events_body(latest: i64) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":{latest},"events":[],"cursor":null}}}}"#
+        )
+    }
+
+    /// Pin the network passphrase directly, as `validate_network_passphrases`
+    /// would at startup, without calling a primary that these tests break on purpose.
+    fn pin_passphrase(client: &RpcClient) {
+        *client.network_passphrase.lock().unwrap() = Some(PASSPHRASE.to_string());
+    }
+
+    /// Put the client on failover endpoint `idx`, as if it failed over at `failed_over_at`.
+    fn force_failover_state(client: &RpcClient, idx: usize, failed_over_at: Instant) {
+        let mut st = client.failover.lock().unwrap();
+        st.active_idx = idx;
+        st.last_failover_at = Some(failed_over_at);
+        st.last_probe_at = None;
+        drop(st);
+        client.active_url_idx.store(idx, Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    async fn failover_endpoint_network_checked_once_per_switch() {
+        // #721: primary down. Ten calls must send exactly one getNetwork to the
+        // secondary, not one before every call.
+        let (primary, _) = spawn_method_mock(responder(|_| (500, String::new()))).await;
+        let (secondary, log) = spawn_method_mock(responder(|m| match m {
+            "getNetwork" => (200, network_body()),
+            _ => (200, latest_body(2000)),
+        }))
+        .await;
+
+        let client = RpcClient::with_urls(vec![primary, secondary], 5);
+        pin_passphrase(&client);
+        for _ in 0..10 {
+            assert_eq!(client.get_latest_ledger().await.expect("secondary serves"), 2000);
+        }
+        assert_eq!(method_count(&log, "getNetwork"), 1, "one network check per switch");
+        assert_eq!(method_count(&log, "getLatestLedger"), 10);
+    }
+
+    #[tokio::test]
+    async fn failed_network_check_moves_on_to_next_candidate() {
+        // #721: a failing getNetwork on one secondary must not fail the call;
+        // the next secondary should be tried.
+        let (primary, _) = spawn_method_mock(responder(|_| (500, String::new()))).await;
+        let (bad, bad_log) = spawn_method_mock(responder(|_| (500, String::new()))).await;
+        let (good, _) = spawn_method_mock(responder(|m| match m {
+            "getNetwork" => (200, network_body()),
+            _ => (200, latest_body(2000)),
+        }))
+        .await;
+
+        let client = RpcClient::with_urls(vec![primary, bad, good], 5);
+        pin_passphrase(&client);
+        assert_eq!(client.get_latest_ledger().await.expect("third endpoint serves"), 2000);
+        assert_eq!(
+            method_count(&bad_log, "getLatestLedger"),
+            0,
+            "an endpoint that fails its network check must receive no application traffic"
+        );
+    }
+
+    #[tokio::test]
+    async fn lagging_failover_candidate_is_rejected_for_cursor() {
+        // #720: primary down, secondary tip = cursor - 50. The secondary must not
+        // be used for the page, and the rejection must be reported.
+        let (primary, _) = spawn_method_mock(responder(|_| (500, String::new()))).await;
+        let (secondary, log) = spawn_method_mock(responder(|m| match m {
+            "getNetwork" => (200, network_body()),
+            "getLatestLedger" => (200, latest_body(950)),
+            _ => (200, events_body(950)),
+        }))
+        .await;
+
+        let client = RpcClient::with_urls(vec![primary, secondary], 5);
+        pin_passphrase(&client);
+        // Resuming from cursor 1000 means the first wanted ledger is 1001.
+        let err = client
+            .get_events(Some(1001), &[], None, 10)
+            .await
+            .expect_err("lagging secondary must be rejected");
+        assert!(err.to_string().contains("behind the cursor"), "unexpected error: {err}");
+        assert_eq!(method_count(&log, "getEvents"), 0, "no page may come from a lagging endpoint");
+    }
+
+    #[tokio::test]
+    async fn failover_candidate_at_cursor_is_accepted() {
+        // #720 boundary: tip exactly equal to the cursor is enough.
+        let (primary, _) = spawn_method_mock(responder(|_| (500, String::new()))).await;
+        let (secondary, log) = spawn_method_mock(responder(|m| match m {
+            "getNetwork" => (200, network_body()),
+            "getLatestLedger" => (200, latest_body(1000)),
+            _ => (200, events_body(1000)),
+        }))
+        .await;
+
+        let client = RpcClient::with_urls(vec![primary, secondary], 5);
+        pin_passphrase(&client);
+        let page = client.get_events(Some(1001), &[], None, 10).await.expect("tip == cursor is accepted");
+        assert!(page.events.is_empty());
+        assert_eq!(method_count(&log, "getEvents"), 1);
+    }
+
+    #[tokio::test]
+    async fn primary_probe_runs_at_most_once_per_interval() {
+        // #722: a failed probe still resets the timer. Twenty calls while the
+        // primary is still down must produce one getHealth, not twenty.
+        let (primary, log) = spawn_method_mock(responder(|_| (500, String::new()))).await;
+        let (secondary, _) = spawn_method_mock(responder(|_| (200, latest_body(2000)))).await;
+
+        let client = RpcClient::with_urls(vec![primary, secondary], 5);
+        force_failover_state(&client, 1, Instant::now() - PRIMARY_PROBE_INTERVAL - Duration::from_secs(1));
+        for _ in 0..20 {
+            client.get_latest_ledger().await.expect("secondary serves");
+        }
+        assert_eq!(method_count(&log, "getHealth"), 1);
+        assert_eq!(client.active_url_idx.load(Ordering::Relaxed), 1, "still failed over");
+    }
+
+    #[tokio::test]
+    async fn http_200_with_rpc_error_is_not_failed_back_to() {
+        // #722: an HTTP 200 whose body is a JSON-RPC error is not a healthy primary.
+        let err_body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"boom"}}"#;
+        let (primary, _) = spawn_method_mock(responder(move |_| (200, err_body.to_string()))).await;
+        let (secondary, _) = spawn_method_mock(responder(|m| match m {
+            "getNetwork" => (200, network_body()),
+            _ => (200, latest_body(2000)),
+        }))
+        .await;
+
+        let client = RpcClient::with_urls(vec![primary, secondary], 5);
+        pin_passphrase(&client);
+        force_failover_state(&client, 1, Instant::now() - PRIMARY_PROBE_INTERVAL - Duration::from_secs(1));
+        client.get_latest_ledger().await.expect("secondary serves");
+        assert_eq!(client.active_url_idx.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn unhealthy_primary_status_is_not_failed_back_to() {
+        let (primary, _) = spawn_method_mock(responder(|m| match m {
+            "getHealth" => (200, health_body("unhealthy", 2000)),
+            "getNetwork" => (200, network_body()),
+            _ => (200, latest_body(2000)),
+        }))
+        .await;
+        let (secondary, _) = spawn_method_mock(responder(|m| match m {
+            "getNetwork" => (200, network_body()),
+            _ => (200, latest_body(2000)),
+        }))
+        .await;
+
+        let client = RpcClient::with_urls(vec![primary, secondary], 5);
+        pin_passphrase(&client);
+        force_failover_state(&client, 1, Instant::now() - PRIMARY_PROBE_INTERVAL - Duration::from_secs(1));
+        client.get_latest_ledger().await.expect("secondary serves");
+        assert_eq!(client.active_url_idx.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn healthy_primary_fails_back() {
+        let (primary, _) = spawn_method_mock(responder(|m| match m {
+            "getHealth" => (200, health_body("healthy", 2000)),
+            "getNetwork" => (200, network_body()),
+            _ => (200, latest_body(2000)),
+        }))
+        .await;
+        let (secondary, _) = spawn_method_mock(responder(|_| (200, latest_body(2000)))).await;
+
+        let client = RpcClient::with_urls(vec![primary, secondary], 5);
+        pin_passphrase(&client);
+        force_failover_state(&client, 1, Instant::now() - PRIMARY_PROBE_INTERVAL - Duration::from_secs(1));
+        assert_eq!(client.get_latest_ledger().await.expect("primary serves"), 2000);
+        assert_eq!(client.active_url_idx.load(Ordering::Relaxed), 0, "fails back to primary");
     }
 }

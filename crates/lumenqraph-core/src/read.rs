@@ -191,11 +191,11 @@ fn edit_distance(a: &str, b: &str) -> usize {
         return 4;
     }
     let mut dp = vec![vec![0usize; n + 1]; m + 1];
-    for i in 0..=m {
-        dp[i][0] = i;
+    for (i, row) in dp.iter_mut().enumerate() {
+        row[0] = i;
     }
-    for j in 0..=n {
-        dp[0][j] = j;
+    for (j, cell) in dp[0].iter_mut().enumerate() {
+        *cell = j;
     }
     for i in 1..=m {
         for j in 1..=n {
@@ -214,9 +214,9 @@ fn edit_distance(a: &str, b: &str) -> usize {
 /// Solidity), so this is the naming half of the `is_view` heuristic — best
 /// effort, not a guarantee.
 const MUTATING_PREFIXES: &[&str] = &[
-    "set_", "init", "mint", "burn", "transfer", "approve", "withdraw", "deposit",
-    "pause", "unpause", "upgrade", "admin_", "remove_", "add_", "create_", "delete_",
-    "update_", "cancel", "claim", "deploy", "revoke", "grant", "lock", "unlock",
+    "set_", "init", "mint", "burn", "transfer", "approve", "withdraw", "deposit", "pause",
+    "unpause", "upgrade", "admin_", "remove_", "add_", "create_", "delete_", "update_", "cancel",
+    "claim", "deploy", "revoke", "grant", "lock", "unlock",
 ];
 
 /// Best-effort guess at whether a function is read-only (safe via `/call`) or
@@ -418,12 +418,10 @@ fn json_to_scval(
                 match Strkey::from_string(s)
                     .map_err(|_| bad("invalid muxed address strkey (expected M…)"))?
                 {
-                    Strkey::MuxedAccountEd25519(mux) => {
-                        ScAddress::from_str(
-                            &stellar_strkey::ed25519::PublicKey(mux.ed25519).to_string(),
-                        )
-                        .map_err(|_| bad("could not re-encode muxed address as G… strkey"))?
-                    }
+                    Strkey::MuxedAccountEd25519(mux) => ScAddress::from_str(
+                        &stellar_strkey::ed25519::PublicKey(mux.ed25519).to_string(),
+                    )
+                    .map_err(|_| bad("could not re-encode muxed address as G… strkey"))?,
                     _ => return Err(bad("expected an M… muxed account strkey")),
                 }
             } else {
@@ -789,7 +787,10 @@ pub fn decode_events(
         // #400: use bounded limits — simulation results come from a potentially
         // malicious contract; Limits::none() would allow stack overflow via
         // deeply-nested ScVal types.
-        let xdr_limits = Limits { depth: 500, len: b64.len().max(1) * 3 / 4 + 16 };
+        let xdr_limits = Limits {
+            depth: 500,
+            len: b64.len().max(1) * 3 / 4 + 16,
+        };
         let Ok(diag) = DiagnosticEvent::from_xdr_base64(b64, xdr_limits) else {
             continue;
         };
@@ -1077,8 +1078,14 @@ mod tests {
     #[test]
     fn muxed_account_source_is_accepted() {
         let spec = balance_spec();
-        let call = encode_call(&spec, C, "balance", &serde_json::json!({ "id": G }), Some(M))
-            .expect("M-strkey source_account should be accepted");
+        let call = encode_call(
+            &spec,
+            C,
+            "balance",
+            &serde_json::json!({ "id": G }),
+            Some(M),
+        )
+        .expect("M-strkey source_account should be accepted");
         // Decode the envelope and verify the source is a MuxedEd25519 account.
         let env = TransactionEnvelope::from_xdr_base64(&call.tx_xdr, Limits::none()).unwrap();
         let TransactionEnvelope::Tx(v1) = env else {
@@ -1094,8 +1101,14 @@ mod tests {
     #[test]
     fn g_strkey_source_still_works() {
         let spec = balance_spec();
-        let call = encode_call(&spec, C, "balance", &serde_json::json!({ "id": G }), Some(G))
-            .expect("G-strkey source_account should still be accepted");
+        let call = encode_call(
+            &spec,
+            C,
+            "balance",
+            &serde_json::json!({ "id": G }),
+            Some(G),
+        )
+        .expect("G-strkey source_account should still be accepted");
         let env = TransactionEnvelope::from_xdr_base64(&call.tx_xdr, Limits::none()).unwrap();
         let TransactionEnvelope::Tx(v1) = env else {
             panic!("expected v1 envelope")
@@ -1598,9 +1611,8 @@ mod tests {
 
         /// Test that unsupported types return precise error messages.
         fn unsupported_type_spec() -> Vec<u8> {
-            use stellar_xdr::curr::ScSpecUdtUnionCaseVoidV0;
             // Specs with val, result, error, muxed_address args
-            let entries = vec![
+            let entries = [
                 ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
                     doc: "".try_into().unwrap(),
                     name: "val_arg".try_into().unwrap(),
@@ -1681,32 +1693,54 @@ mod tests {
             let err = unsupported_args_of("val_arg", json!({"v": null})).unwrap_err();
             let msg = format!("{err}");
             assert!(msg.contains("Val"), "error should mention Val type: {msg}");
-            assert!(msg.contains("not yet supported"), "error should be clear: {msg}");
+            assert!(
+                msg.contains("not yet supported"),
+                "error should be clear: {msg}"
+            );
         }
 
         #[test]
         fn result_type_is_unsupported() {
             let err = unsupported_args_of("result_arg", json!({"r": null})).unwrap_err();
             let msg = format!("{err}");
-            assert!(msg.contains("Result"), "error should mention Result type: {msg}");
-            assert!(msg.contains("not yet supported"), "error should be clear: {msg}");
+            assert!(
+                msg.contains("Result"),
+                "error should mention Result type: {msg}"
+            );
+            assert!(
+                msg.contains("not yet supported"),
+                "error should be clear: {msg}"
+            );
         }
 
         #[test]
         fn error_type_is_unsupported() {
             let err = unsupported_args_of("error_arg", json!({"e": null})).unwrap_err();
             let msg = format!("{err}");
-            assert!(msg.contains("Error"), "error should mention Error type: {msg}");
-            assert!(msg.contains("not yet supported"), "error should be clear: {msg}");
+            assert!(
+                msg.contains("Error"),
+                "error should mention Error type: {msg}"
+            );
+            assert!(
+                msg.contains("not yet supported"),
+                "error should be clear: {msg}"
+            );
         }
 
         #[test]
         fn muxed_address_g_strkey_is_accepted() {
             // G… plain public key accepted for MuxedAddress param.
             let result = unsupported_args_of("muxed_arg", json!({"m": G}));
-            assert!(result.is_ok(), "G… strkey should be accepted for MuxedAddress: {:?}", result);
+            assert!(
+                result.is_ok(),
+                "G… strkey should be accepted for MuxedAddress: {:?}",
+                result
+            );
             let args = result.unwrap();
-            assert!(matches!(args[0], ScVal::Address(_)), "should encode as ScVal::Address");
+            assert!(
+                matches!(args[0], ScVal::Address(_)),
+                "should encode as ScVal::Address"
+            );
         }
 
         #[test]
@@ -1715,18 +1749,32 @@ mod tests {
             // Ed25519 key is encoded as ScAddress::Account.
             const M: &str = "MA7QYNF7SOWQ3GLR2BGMZEHXR776WJRK76K2GS4K4BRZ4LHE4AAAAAAAAAAPCIBVZA";
             let result = unsupported_args_of("muxed_arg", json!({"m": M}));
-            assert!(result.is_ok(), "M… strkey should be accepted for MuxedAddress: {:?}", result);
+            assert!(
+                result.is_ok(),
+                "M… strkey should be accepted for MuxedAddress: {:?}",
+                result
+            );
             let args = result.unwrap();
-            assert!(matches!(args[0], ScVal::Address(_)), "should encode as ScVal::Address");
+            assert!(
+                matches!(args[0], ScVal::Address(_)),
+                "should encode as ScVal::Address"
+            );
         }
 
         #[test]
         fn muxed_address_c_strkey_is_accepted() {
             // C… contract strkey accepted for MuxedAddress param.
             let result = unsupported_args_of("muxed_arg", json!({"m": C}));
-            assert!(result.is_ok(), "C… strkey should be accepted for MuxedAddress: {:?}", result);
+            assert!(
+                result.is_ok(),
+                "C… strkey should be accepted for MuxedAddress: {:?}",
+                result
+            );
             let args = result.unwrap();
-            assert!(matches!(args[0], ScVal::Address(_)), "should encode as ScVal::Address");
+            assert!(
+                matches!(args[0], ScVal::Address(_)),
+                "should encode as ScVal::Address"
+            );
         }
 
         #[test]
@@ -1800,22 +1848,36 @@ mod validation_tests {
 
     #[test]
     fn unknown_object_key_is_rejected() {
-        let err = encode_call(&balance_spec(), C, "balance", &json!({"id": G, "extra": 1}), None)
-            .unwrap_err();
+        let err = encode_call(
+            &balance_spec(),
+            C,
+            "balance",
+            &json!({"id": G, "extra": 1}),
+            None,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, EncodeError::UnknownArgument { ref name, .. } if name == "extra"),
             "expected UnknownArgument(extra), got: {err}"
         );
         let msg = format!("{err}");
-        assert!(msg.contains("extra"), "error should name the unknown key: {msg}");
+        assert!(
+            msg.contains("extra"),
+            "error should name the unknown key: {msg}"
+        );
     }
 
     #[test]
     fn unknown_key_suggests_did_you_mean() {
         // "ammount" is 2 edits from "amount" — should trigger a suggestion.
-        let err =
-            encode_call(&transfer_spec(), C, "transfer", &json!({"from": G, "to": G, "ammount": "5"}), None)
-                .unwrap_err();
+        let err = encode_call(
+            &transfer_spec(),
+            C,
+            "transfer",
+            &json!({"from": G, "to": G, "ammount": "5"}),
+            None,
+        )
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("amount"),
@@ -1828,7 +1890,13 @@ mod validation_tests {
         // balance takes 1 arg; passing 2 should fail.
         let err = encode_call(&balance_spec(), C, "balance", &json!([G, G]), None).unwrap_err();
         assert!(
-            matches!(err, EncodeError::WrongArity { expected: 1, got: 2 }),
+            matches!(
+                err,
+                EncodeError::WrongArity {
+                    expected: 1,
+                    got: 2
+                }
+            ),
             "expected WrongArity(1, 2), got: {err}"
         );
     }
@@ -1838,7 +1906,13 @@ mod validation_tests {
         // transfer takes 3 args; passing 2 should fail.
         let err = encode_call(&transfer_spec(), C, "transfer", &json!([G, G]), None).unwrap_err();
         assert!(
-            matches!(err, EncodeError::WrongArity { expected: 3, got: 2 }),
+            matches!(
+                err,
+                EncodeError::WrongArity {
+                    expected: 3,
+                    got: 2
+                }
+            ),
             "expected WrongArity(3, 2), got: {err}"
         );
     }
@@ -1859,7 +1933,7 @@ mod validation_tests {
 
     #[test]
     fn map_with_u32_keys_is_sorted_by_scval_order() {
-        use stellar_xdr::curr::{ScSpecTypeMap, TransactionEnvelope, HostFunction, OperationBody};
+        use stellar_xdr::curr::{HostFunction, OperationBody, ScSpecTypeMap, TransactionEnvelope};
         // A Map with u32 keys. String "10" < "9" lexicographically but ScVal
         // order for U32 is numeric, so 9 < 10.
         let spec_bytes = {

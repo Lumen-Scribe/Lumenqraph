@@ -7,7 +7,9 @@ use serde::Deserialize;
 use crate::keys::{parse_durability, KeyTemplate};
 pub use lumenqraph_core::db::DbConfig;
 
-pub fn redact_database_url(url: &str) -> String { lumenqraph_core::redact_url(url) }
+pub fn redact_database_url(url: &str) -> String {
+    lumenqraph_core::redact_url(url)
+}
 
 #[derive(Clone)]
 pub struct Config {
@@ -60,7 +62,14 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("database_url", &redact_database_url(&self.database_url))
             .field("rpc_url", &lumenqraph_core::redact_url(&self.rpc_url))
-            .field("rpc_urls", &self.rpc_urls.iter().map(|u| lumenqraph_core::redact_url(u)).collect::<Vec<_>>())
+            .field(
+                "rpc_urls",
+                &self
+                    .rpc_urls
+                    .iter()
+                    .map(|u| lumenqraph_core::redact_url(u))
+                    .collect::<Vec<_>>(),
+            )
             .field("contract_ids", &self.contract_ids)
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("page_size", &self.page_size)
@@ -95,7 +104,11 @@ impl Config {
     pub fn db_config() -> anyhow::Result<DbConfig> {
         let max_connections = clamp_with_warning(
             "INDEXER_DATABASE_MAX_CONNECTIONS",
-            env_parse_override("INDEXER_DATABASE_MAX_CONNECTIONS", "DATABASE_MAX_CONNECTIONS", 10u32)?,
+            env_parse_override(
+                "INDEXER_DATABASE_MAX_CONNECTIONS",
+                "DATABASE_MAX_CONNECTIONS",
+                10u32,
+            )?,
             1,
             u32::MAX,
         );
@@ -136,10 +149,9 @@ impl Config {
     }
 
     pub fn from_env() -> anyhow::Result<Self> {
-        let contract_ids: Vec<String> = lumenqraph_core::parse_contract_ids(
-            &std::env::var("CONTRACT_IDS").unwrap_or_default(),
-        )
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let contract_ids: Vec<String> =
+            lumenqraph_core::parse_contract_ids(&std::env::var("CONTRACT_IDS").unwrap_or_default())
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // Parse numeric config with validation.
         let poll_interval_secs = env_parse("POLL_INTERVAL_SECS", 5)?;
@@ -155,10 +167,12 @@ impl Config {
         let page_size = clamp_with_warning("PAGE_SIZE", page_size, 1, 10000);
 
         // Validate POLL_INTERVAL_SECS minimum.
-        let poll_interval_secs = clamp_with_warning("POLL_INTERVAL_SECS", poll_interval_secs, 1, u64::MAX);
+        let poll_interval_secs =
+            clamp_with_warning("POLL_INTERVAL_SECS", poll_interval_secs, 1, u64::MAX);
 
         // Validate MAX_CATCHUP_LEDGERS minimum.
-        let max_catchup_ledgers = clamp_with_warning("MAX_CATCHUP_LEDGERS", max_catchup_ledgers, 1, i64::MAX);
+        let max_catchup_ledgers =
+            clamp_with_warning("MAX_CATCHUP_LEDGERS", max_catchup_ledgers, 1, i64::MAX);
 
         // Validate RETENTION_LEDGERS minimum (0 = disabled).
         let retention_ledgers = if retention_ledgers < 0 {
@@ -197,7 +211,8 @@ impl Config {
         };
 
         // Validate RPC_TIMEOUT_SECS minimum (must be at least 1s).
-        let rpc_timeout_secs = clamp_with_warning("RPC_TIMEOUT_SECS", rpc_timeout_secs, 1, u64::MAX);
+        let rpc_timeout_secs =
+            clamp_with_warning("RPC_TIMEOUT_SECS", rpc_timeout_secs, 1, u64::MAX);
         // Cap on how long a server-requested Retry-After may hold us (#726).
         let rpc_max_retry_after_secs = clamp_with_warning(
             "RPC_MAX_RETRY_AFTER_SECS",
@@ -207,23 +222,34 @@ impl Config {
         );
 
         // Validate SPEC_CACHE_MAX_ENTRIES minimum (must be at least 1).
-        let spec_cache_max_entries = clamp_with_warning("SPEC_CACHE_MAX_ENTRIES", spec_cache_max_entries, 1, usize::MAX);
+        let spec_cache_max_entries = clamp_with_warning(
+            "SPEC_CACHE_MAX_ENTRIES",
+            spec_cache_max_entries,
+            1,
+            usize::MAX,
+        );
 
         // Validate SPEC_FETCH_CONCURRENCY minimum (must be at least 1).
-        let spec_fetch_concurrency = clamp_with_warning("SPEC_FETCH_CONCURRENCY", spec_fetch_concurrency, 1, usize::MAX);
+        let spec_fetch_concurrency = clamp_with_warning(
+            "SPEC_FETCH_CONCURRENCY",
+            spec_fetch_concurrency,
+            1,
+            usize::MAX,
+        );
 
         // Parse ENRICHMENT_WARN_THRESHOLD (0.0-1.0, default 0.5).
         let enrichment_warn_threshold: f64 = env_parse("ENRICHMENT_WARN_THRESHOLD", 0.5)?;
-        let enrichment_warn_threshold = if enrichment_warn_threshold < 0.0 || enrichment_warn_threshold > 1.0 {
-            tracing::warn!(
-                requested = enrichment_warn_threshold,
-                clamped_to = 0.5,
-                "ENRICHMENT_WARN_THRESHOLD must be between 0.0 and 1.0; clamping to 0.5"
-            );
-            0.5
-        } else {
-            enrichment_warn_threshold
-        };
+        let enrichment_warn_threshold =
+            if enrichment_warn_threshold < 0.0 || enrichment_warn_threshold > 1.0 {
+                tracing::warn!(
+                    requested = enrichment_warn_threshold,
+                    clamped_to = 0.5,
+                    "ENRICHMENT_WARN_THRESHOLD must be between 0.0 and 1.0; clamping to 0.5"
+                );
+                0.5
+            } else {
+                enrichment_warn_threshold
+            };
 
         // Validate BALANCE_KEY_DURABILITY strictly (must be "persistent" or
         // "temporary"). A typo here would silently disable per-key indexing,
@@ -253,7 +279,9 @@ impl Config {
             durability: String,
             label: Option<String>,
         }
-        fn default_durability() -> String { "persistent".to_string() }
+        fn default_durability() -> String {
+            "persistent".to_string()
+        }
 
         let key_templates: Vec<KeyTemplate> = std::env::var("KEY_TEMPLATES")
             .ok()
@@ -512,43 +540,81 @@ mod tests {
     #[test]
     fn poll_interval_clamping() {
         // Test POLL_INTERVAL_SECS minimum.
-        assert_eq!(clamp_with_warning("POLL_INTERVAL_SECS", 0u64, 1, u64::MAX), 1);
-        assert_eq!(clamp_with_warning("POLL_INTERVAL_SECS", 1u64, 1, u64::MAX), 1);
-        assert_eq!(clamp_with_warning("POLL_INTERVAL_SECS", 5u64, 1, u64::MAX), 5);
-        assert_eq!(clamp_with_warning("POLL_INTERVAL_SECS", 60u64, 1, u64::MAX), 60);
+        assert_eq!(
+            clamp_with_warning("POLL_INTERVAL_SECS", 0u64, 1, u64::MAX),
+            1
+        );
+        assert_eq!(
+            clamp_with_warning("POLL_INTERVAL_SECS", 1u64, 1, u64::MAX),
+            1
+        );
+        assert_eq!(
+            clamp_with_warning("POLL_INTERVAL_SECS", 5u64, 1, u64::MAX),
+            5
+        );
+        assert_eq!(
+            clamp_with_warning("POLL_INTERVAL_SECS", 60u64, 1, u64::MAX),
+            60
+        );
     }
 
     #[test]
     fn max_catchup_ledgers_clamping() {
         // Test MAX_CATCHUP_LEDGERS minimum.
-        assert_eq!(clamp_with_warning("MAX_CATCHUP_LEDGERS", 0i64, 1, i64::MAX), 1);
-        assert_eq!(clamp_with_warning("MAX_CATCHUP_LEDGERS", 1i64, 1, i64::MAX), 1);
-        assert_eq!(clamp_with_warning("MAX_CATCHUP_LEDGERS", 4000i64, 1, i64::MAX), 4000);
-        assert_eq!(clamp_with_warning("MAX_CATCHUP_LEDGERS", 120000i64, 1, i64::MAX), 120000);
+        assert_eq!(
+            clamp_with_warning("MAX_CATCHUP_LEDGERS", 0i64, 1, i64::MAX),
+            1
+        );
+        assert_eq!(
+            clamp_with_warning("MAX_CATCHUP_LEDGERS", 1i64, 1, i64::MAX),
+            1
+        );
+        assert_eq!(
+            clamp_with_warning("MAX_CATCHUP_LEDGERS", 4000i64, 1, i64::MAX),
+            4000
+        );
+        assert_eq!(
+            clamp_with_warning("MAX_CATCHUP_LEDGERS", 120000i64, 1, i64::MAX),
+            120000
+        );
     }
 
     #[test]
     fn retention_ledgers_validation() {
         // Negative values should be clamped to 0.
-        let retention = -100i64;
-        let clamped = if retention < 0 { 0 } else { retention };
-        assert_eq!(clamped, 0);
+        assert_eq!(
+            clamp_with_warning("RETENTION_LEDGERS", -100i64, 0, i64::MAX),
+            0
+        );
 
         // Zero and positive should pass through.
-        assert_eq!(if 0i64 < 0 { 0 } else { 0i64 }, 0);
-        assert_eq!(if 1000i64 < 0 { 0 } else { 1000i64 }, 1000);
+        assert_eq!(
+            clamp_with_warning("RETENTION_LEDGERS", 0i64, 0, i64::MAX),
+            0
+        );
+        assert_eq!(
+            clamp_with_warning("RETENTION_LEDGERS", 1000i64, 0, i64::MAX),
+            1000
+        );
     }
 
     #[test]
     fn reorg_overlap_ledgers_validation() {
         // Negative values should be clamped to 0.
-        let reorg = -50i64;
-        let clamped = if reorg < 0 { 0 } else { reorg };
-        assert_eq!(clamped, 0);
+        assert_eq!(
+            clamp_with_warning("REORG_OVERLAP_LEDGERS", -50i64, 0, i64::MAX),
+            0
+        );
 
         // Zero and positive should pass through.
-        assert_eq!(if 0i64 < 0 { 0 } else { 0i64 }, 0);
-        assert_eq!(if 100i64 < 0 { 0 } else { 100i64 }, 100);
+        assert_eq!(
+            clamp_with_warning("REORG_OVERLAP_LEDGERS", 0i64, 0, i64::MAX),
+            0
+        );
+        assert_eq!(
+            clamp_with_warning("REORG_OVERLAP_LEDGERS", 100i64, 0, i64::MAX),
+            100
+        );
     }
 
     #[test]
@@ -586,7 +652,10 @@ mod tests {
             // must succeed; all other typos must fail.
             let result = Config::from_env();
             if invalid.is_empty() {
-                assert!(result.is_ok(), "empty BALANCE_KEY_DURABILITY should default");
+                assert!(
+                    result.is_ok(),
+                    "empty BALANCE_KEY_DURABILITY should default"
+                );
             } else {
                 let err = result.expect_err("invalid BALANCE_KEY_DURABILITY must fail");
                 let msg = err.to_string();

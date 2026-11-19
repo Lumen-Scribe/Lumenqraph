@@ -170,7 +170,10 @@ mod reenrich_tests {
         .await
         .expect("Failed to count events");
 
-        assert_eq!(count.0, total_rows as i64, "Should have inserted all 2500 events");
+        assert_eq!(
+            count.0, total_rows as i64,
+            "Should have inserted all 2500 events"
+        );
 
         // Simulate keyset pagination (not OFFSET-based)
         let mut processed = 0;
@@ -188,7 +191,7 @@ mod reenrich_tests {
             .bind(contract_id)
             .bind(last_ledger)
             .bind(&last_event_id)
-            .bind(batch_size as i32)
+            .bind(batch_size)
             .fetch_all(&pool)
             .await
             .expect("Failed to fetch batch");
@@ -325,18 +328,23 @@ mod reenrich_tests {
         .await
         .expect("Failed to count events");
 
-        assert_eq!(count_without_force.0, 0, "Already-enriched event should not match");
+        assert_eq!(
+            count_without_force.0, 0,
+            "Already-enriched event should not match"
+        );
 
         // With --force, we'd select all events (simulated here)
-        let count_with_force: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM events WHERE contract_id = $1",
-        )
-        .bind(contract_id)
-        .fetch_one(&pool)
-        .await
-        .expect("Failed to count events");
+        let count_with_force: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM events WHERE contract_id = $1")
+                .bind(contract_id)
+                .fetch_one(&pool)
+                .await
+                .expect("Failed to count events");
 
-        assert_eq!(count_with_force.0, 1, "With --force, should select all events");
+        assert_eq!(
+            count_with_force.0, 1,
+            "With --force, should select all events"
+        );
 
         cleanup_test_data(&pool, contract_id).await;
     }

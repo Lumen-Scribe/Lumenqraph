@@ -20,22 +20,25 @@ pub enum EventType {
 }
 
 impl EventType {
-    /// The `events.event_type` text value for this kind.
-    pub fn as_str(&self) -> &'static str {
+    /// The lowercase value stored in `events.event_type`.
+    pub fn as_str(self) -> &'static str {
         match self {
             EventType::Contract => "contract",
             EventType::System => "system",
             EventType::Diagnostic => "diagnostic",
         }
     }
+}
 
-    /// Map the `type` string from an RPC or data-lake event. Unknown or missing
-    /// values fall back to `Contract`, the same default the ingest path uses.
-    pub fn from_rpc_str(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "system" => EventType::System,
-            "diagnostic" => EventType::Diagnostic,
-            _ => EventType::Contract,
+impl std::str::FromStr for EventType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "contract" => Ok(EventType::Contract),
+            "system" => Ok(EventType::System),
+            "diagnostic" => Ok(EventType::Diagnostic),
+            other => Err(format!("unknown event type {other:?}")),
         }
     }
 }

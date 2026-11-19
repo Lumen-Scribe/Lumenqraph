@@ -69,10 +69,7 @@ pub fn sanitize_simulation_error(raw: &str) -> String {
         .filter(|c| !c.is_control())
         .collect();
 
-    let collapsed = cleaned
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
 
     let redacted = redact_internal_detail(&collapsed);
 

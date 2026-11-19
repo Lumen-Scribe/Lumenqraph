@@ -11,10 +11,104 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::poller::fetch_and_store;
 use crate::rpc_client::RpcClient;
 use crate::specs::SpecCache;
 use crate::{cursor, poller};
+
+pub async fn run(
+    pool: PgPool,
+    rpc: RpcClient,
+    config: Config,
+    from_ledger: i64,
+) -> anyhow::Result<()> {
+    let tip = rpc.get_latest_ledger().await?;
+    let oldest = tip - poller::max_lookback();
+
+    // If the caller passes 0 (or no explicit --from), try to resume from the
+    // last persisted cursor so an interrupted backfill picks up where it left
+    // off.  A non-zero explicit from_ledger always wins.
+    let resume_from = if from_ledger == 0 {
+        cursor::read_last_processed(&pool)
+            .await?
+            .map(|l| l + 1)
+            .unwrap_or(0)
+    } else {
+        from_ledger
+    };
+
+    let start = resume_from.max(oldest).max(1);
+    if start > resume_from && resume_from > 0 {
+        warn!(
+            requested = resume_from,
+            clamped_to = start,
+            "backfill start is older than RPC retention; clamping"
+        );
+    }
+    info!(from = start, to = tip, "starting backfill");
+
+    let specs = SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
+
+    // Drive the paging loop here so we can checkpoint the cursor after every
+    // successfully stored page.  An interrupted backfill can be resumed by
+    // re-running with from_ledger = 0 (the default): the code above will read
+    // the persisted cursor and continue from the last completed page.
+    let mut cursor_token: Option<String> = None;
+    let mut total_inserted = 0u64;
+    let mut last_page_ledger = start;
+
+    loop {
+        let page = rpc
+            .get_events(
+                Some(start),
+                &config.contract_ids,
+                cursor_token.clone(),
+                config.page_size,
+            )
+            .await?;
+
+        let page_len = page.events.len();
+        let page_max_ledger = page
+            .events
+            .iter()
+            .map(|e| e.ledger)
+            .max()
+            .unwrap_or(last_page_ledger);
+
+        // Build and store this page's events.
+        let mut batch = Vec::with_capacity(page_len);
+        for ev in &page.events {
+            let spec = specs.get(&pool, &rpc, &ev.contract_id, ev.ledger).await;
+            if let Some(new_ev) = crate::convert::to_new_event(ev, spec.as_deref()) {
+                batch.push(new_ev);
+            }
+            // #399: None means unparseable timestamp — event silently skipped here;
+            // error is already logged by parse_ledger_closed_at.
+        }
+        let inserted = crate::store::insert_events(&pool, &batch).await?;
+        total_inserted += inserted;
+
+        // ── checkpoint after each successfully stored page ──────────────────
+        // Writing the cursor here means a crash or Ctrl-C on the *next* page
+        // leaves the cursor pointing at the end of the last page we finished,
+        // so the backfill is resumable with no ledger range lost.
+        last_page_ledger = page_max_ledger;
+        cursor::write_progress(&pool, last_page_ledger, tip, inserted).await?;
+        info!(
+            inserted,
+            page_max_ledger, total_inserted, "backfill page complete (cursor checkpointed)"
+        );
+
+        cursor_token = page.cursor;
+        if page_len < config.page_size as usize || cursor_token.is_none() {
+            break;
+        }
+    }
+
+    // Final cursor advance to the tip so the live poller starts from there.
+    cursor::write_progress(&pool, tip, tip, 0).await?;
+    info!(total_inserted, up_to_ledger = tip, "backfill complete");
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -25,6 +119,7 @@ mod tests {
     //!     cargo test -p lumenqraph-indexer -- --ignored --test-threads=1
 
     use super::*;
+    use crate::poller::fetch_and_store;
     use axum::{extract::State, routing::post, Json, Router};
     use serde_json::{json, Value};
     use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -41,7 +136,10 @@ mod tests {
             .await
             .expect("connect");
         for stmt in ["DROP SCHEMA public CASCADE", "CREATE SCHEMA public"] {
-            sqlx::query(stmt).execute(&pool).await.expect("reset schema");
+            sqlx::query(stmt)
+                .execute(&pool)
+                .await
+                .expect("reset schema");
         }
         sqlx::migrate!("../../migrations")
             .run(&pool)
@@ -153,12 +251,14 @@ mod tests {
             rpc_timeout_secs: 30,
             rpc_max_retry_after_secs: 60,
             rpc_headers: Default::default(),
-            degraded_poll_interval_secs: 300,
             max_consecutive_errors: 20,
+            degraded_poll_interval_secs: 30,
             enrichment_warn_threshold: 0.5,
             key_templates: vec![],
             spec_cache_max_entries: 2000,
             spec_fetch_concurrency: 4,
+            max_consecutive_errors: 20,
+            degraded_poll_interval_secs: 300,
         }
     }
 
@@ -211,7 +311,11 @@ mod tests {
             .await
             .unwrap();
         let last = cursor::read_last_processed(&pool).await.unwrap();
-        assert_eq!(last, Some(1000), "cursor must reflect the last fetched ledger");
+        assert_eq!(
+            last,
+            Some(1000),
+            "cursor must reflect the last fetched ledger"
+        );
     }
 
     /// A second fetch of the same range inserts zero new rows (idempotency).
@@ -383,101 +487,4 @@ mod tests {
             "from_ledger equal to oldest_available must not be clamped further"
         );
     }
-}
-
-pub async fn run(
-    pool: PgPool,
-    rpc: RpcClient,
-    config: Config,
-    from_ledger: i64,
-) -> anyhow::Result<()> {
-    let tip = rpc.get_latest_ledger().await?;
-    let oldest = tip - poller::max_lookback();
-
-    // If the caller passes 0 (or no explicit --from), try to resume from the
-    // last persisted cursor so an interrupted backfill picks up where it left
-    // off.  A non-zero explicit from_ledger always wins.
-    let resume_from = if from_ledger == 0 {
-        cursor::read_last_processed(&pool)
-            .await?
-            .map(|l| l + 1)
-            .unwrap_or(0)
-    } else {
-        from_ledger
-    };
-
-    let start = resume_from.max(oldest).max(1);
-    if start > resume_from && resume_from > 0 {
-        warn!(
-            requested = resume_from,
-            clamped_to = start,
-            "backfill start is older than RPC retention; clamping"
-        );
-    }
-    info!(from = start, to = tip, "starting backfill");
-
-    let specs = SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
-
-    // Drive the paging loop here so we can checkpoint the cursor after every
-    // successfully stored page.  An interrupted backfill can be resumed by
-    // re-running with from_ledger = 0 (the default): the code above will read
-    // the persisted cursor and continue from the last completed page.
-    let mut cursor_token: Option<String> = None;
-    let mut total_inserted = 0u64;
-    let mut last_page_ledger = start;
-
-    loop {
-        let page = rpc
-            .get_events(
-                Some(start),
-                &config.contract_ids,
-                cursor_token.clone(),
-                config.page_size,
-            )
-            .await?;
-
-        let page_len = page.events.len();
-        let page_max_ledger = page
-            .events
-            .iter()
-            .map(|e| e.ledger)
-            .max()
-            .unwrap_or(last_page_ledger);
-
-        // Build and store this page's events.
-        let mut batch = Vec::with_capacity(page_len);
-        for ev in &page.events {
-            let spec = specs.get(&pool, &rpc, &ev.contract_id, ev.ledger).await;
-            if let Some(new_ev) = crate::convert::to_new_event(ev, spec.as_deref()) {
-                batch.push(new_ev);
-            }
-            // #399: None means unparseable timestamp — event silently skipped here;
-            // error is already logged by parse_ledger_closed_at.
-        }
-        let inserted = crate::store::insert_events(&pool, &batch).await?;
-        total_inserted += inserted;
-
-        // ── checkpoint after each successfully stored page ──────────────────
-        // Writing the cursor here means a crash or Ctrl-C on the *next* page
-        // leaves the cursor pointing at the end of the last page we finished,
-        // so the backfill is resumable with no ledger range lost.
-        last_page_ledger = page_max_ledger;
-        cursor::write_progress(&pool, last_page_ledger, tip, inserted).await?;
-        info!(
-            inserted,
-            page_max_ledger,
-            total_inserted,
-            "backfill page complete (cursor checkpointed)"
-        );
-
-        cursor_token = page.cursor;
-        if page_len < config.page_size as usize || cursor_token.is_none() {
-            break;
-        }
-    }
-
-    // Final cursor advance to the tip so the live poller starts from there.
-    cursor::write_progress(&pool, tip, tip, 0).await?;
-    info!(total_inserted, up_to_ledger = tip, "backfill complete");
-    Ok(())
 }

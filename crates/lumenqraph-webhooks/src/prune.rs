@@ -147,22 +147,36 @@ mod tests {
     }
 
     async fn remaining(pool: &PgPool) -> Vec<String> {
-        sqlx::query_scalar("SELECT status || ':' || created_at::date FROM webhook_deliveries ORDER BY id")
-            .fetch_all(pool)
-            .await
-            .unwrap()
+        sqlx::query_scalar(
+            "SELECT status || ':' || created_at::date FROM webhook_deliveries ORDER BY id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
     #[ignore = "needs postgres"]
     async fn old_delivered_and_failed_rows_are_pruned_and_pending_rows_are_kept() {
         let pool = fixture().await;
-        seed(&pool, &[("delivered", 30), ("failed", 30), ("pending", 30), ("delivered", 1)]).await;
+        seed(
+            &pool,
+            &[
+                ("delivered", 30),
+                ("failed", 30),
+                ("pending", 30),
+                ("delivered", 1),
+            ],
+        )
+        .await;
 
         let removed = prune_webhook_deliveries(&pool, 14).await.unwrap();
         assert_eq!(removed, 2);
         assert_eq!(remaining(&pool).await.len(), 2);
-        assert!(remaining(&pool).await.iter().any(|r| r.starts_with("pending:")));
+        assert!(remaining(&pool)
+            .await
+            .iter()
+            .any(|r| r.starts_with("pending:")));
     }
 
     #[tokio::test]

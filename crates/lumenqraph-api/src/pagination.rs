@@ -84,34 +84,8 @@ pub fn encode_contract_cursor(last_seen_ledger: i64, contract_id: &str) -> Strin
 /// Decode a cursor to (last_seen_ledger, contract_id).
 ///
 /// Same wire format as [`decode_cursor`], so both share one implementation.
-pub fn decode_contract_cursor(
-    cursor: Option<&str>,
-) -> Result<Option<(i64, String)>, &'static str> {
+pub fn decode_contract_cursor(cursor: Option<&str>) -> Result<Option<(i64, String)>, &'static str> {
     decode_cursor(cursor)
-}
-
-/// Encode a cursor from an (event_count, contract_id) position.
-///
-/// Used by the MCP `list_contracts` tool, which orders by
-/// `event_count DESC, contract_id` so agents can enumerate every indexed
-/// contract rather than only the top page.
-pub fn encode_contract_count_cursor(event_count: i64, contract_id: &str) -> String {
-    encode_payload(&format!("{event_count}|{contract_id}"))
-}
-
-/// Decode a cursor to (event_count, contract_id).
-///
-/// Same wire format as [`decode_cursor`], so both share one implementation.
-pub fn decode_contract_count_cursor(
-    cursor: Option<&str>,
-) -> Result<Option<(i64, String)>, &'static str> {
-    decode_cursor(cursor)
-}
-
-/// Configuration for keyset (cursor) pagination requests.
-pub struct PaginationConfig {
-    pub after_ledger: Option<i64>,
-    pub after_event_id: Option<String>,
 }
 
 /// A keyset position that round-trips through an opaque `after` string.
@@ -251,17 +225,24 @@ pub struct Page<T> {
 impl<T: Serialize> IntoResponse for Page<T> {
     fn into_response(self) -> Response {
         let deprecated = self.offset_deprecated;
-        let mut response = Json(self).into_response();
-        if deprecated {
-            let headers = response.headers_mut();
-            headers.insert(
-                HeaderName::from_static("deprecation"),
-                HeaderValue::from_static("true"),
-            );
-            if let Ok(value) = HeaderValue::from_str(OFFSET_DEPRECATION_WARNING) {
-                headers.insert(HeaderName::from_static("warning"), value);
-            }
-        }
-        response
+        respond(self, deprecated)
     }
+}
+
+/// Serialize `body` as JSON, adding the offset deprecation headers when
+/// `offset_deprecated` is set. Used by endpoints that wrap [`Page`] in a larger
+/// body.
+pub fn respond<B: Serialize>(body: B, offset_deprecated: bool) -> Response {
+    let mut response = Json(body).into_response();
+    if offset_deprecated {
+        let headers = response.headers_mut();
+        headers.insert(
+            HeaderName::from_static("deprecation"),
+            HeaderValue::from_static("true"),
+        );
+        if let Ok(value) = HeaderValue::from_str(OFFSET_DEPRECATION_WARNING) {
+            headers.insert(HeaderName::from_static("warning"), value);
+        }
+    }
+    response
 }

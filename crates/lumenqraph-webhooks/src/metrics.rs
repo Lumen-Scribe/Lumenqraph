@@ -202,7 +202,10 @@ async fn metrics(State(state): State<MetricsState>, headers: HeaderMap) -> impl 
         Ok(metrics) => {
             body.push_str("# HELP lumenqraph_webhook_pending_backlog Pending webhook deliveries waiting to be sent\n");
             body.push_str("# TYPE lumenqraph_webhook_pending_backlog gauge\n");
-            body.push_str(&format!("lumenqraph_webhook_pending_backlog {}\n", metrics.pending_count));
+            body.push_str(&format!(
+                "lumenqraph_webhook_pending_backlog {}\n",
+                metrics.pending_count
+            ));
 
             body.push_str("# HELP lumenqraph_webhook_oldest_pending_age_seconds Age of oldest pending webhook delivery\n");
             body.push_str("# TYPE lumenqraph_webhook_oldest_pending_age_seconds gauge\n");
@@ -213,30 +216,39 @@ async fn metrics(State(state): State<MetricsState>, headers: HeaderMap) -> impl 
 
             // Keep the dispatcher-maintained gauge in sync with the scrape-time
             // value so it stays accurate even between dispatcher ticks.
-            QUEUE_AGE_OLDEST_SECONDS.store(metrics.oldest_pending_age_secs as f64, Ordering::Relaxed);
+            QUEUE_AGE_OLDEST_SECONDS
+                .store(metrics.oldest_pending_age_secs as f64, Ordering::Relaxed);
 
-            body.push_str("# HELP lumenqraph_webhook_failed_total Terminal failed webhook deliveries\n");
+            body.push_str(
+                "# HELP lumenqraph_webhook_failed_total Terminal failed webhook deliveries\n",
+            );
             body.push_str("# TYPE lumenqraph_webhook_failed_total counter\n");
             body.push_str(&format!(
                 "lumenqraph_webhook_failed_total {}\n",
                 metrics.failed_count
             ));
 
-            body.push_str("# HELP lumenqraph_webhook_delivered_total Total delivered webhook deliveries\n");
+            body.push_str(
+                "# HELP lumenqraph_webhook_delivered_total Total delivered webhook deliveries\n",
+            );
             body.push_str("# TYPE lumenqraph_webhook_delivered_total counter\n");
             body.push_str(&format!(
                 "lumenqraph_webhook_delivered_total {}\n",
                 metrics.delivered_count
             ));
 
-            body.push_str("# HELP lumenqraph_webhook_delivered_last_min Last minute delivered webhooks\n");
+            body.push_str(
+                "# HELP lumenqraph_webhook_delivered_last_min Last minute delivered webhooks\n",
+            );
             body.push_str("# TYPE lumenqraph_webhook_delivered_last_min gauge\n");
             body.push_str(&format!(
                 "lumenqraph_webhook_delivered_last_min {}\n",
                 metrics.delivered_last_min
             ));
 
-            body.push_str("# HELP lumenqraph_webhook_failed_last_min Last minute failed webhooks\n");
+            body.push_str(
+                "# HELP lumenqraph_webhook_failed_last_min Last minute failed webhooks\n",
+            );
             body.push_str("# TYPE lumenqraph_webhook_failed_last_min gauge\n");
             body.push_str(&format!(
                 "lumenqraph_webhook_failed_last_min {}\n",
@@ -249,6 +261,7 @@ async fn metrics(State(state): State<MetricsState>, headers: HeaderMap) -> impl 
     }
 
     (
+        StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         body,
     )
@@ -271,17 +284,15 @@ async fn gather_metrics(pool: &PgPool) -> anyhow::Result<WebhookMetrics> {
     .fetch_one(pool)
     .await?;
 
-    let failed: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'failed'",
-    )
-    .fetch_one(pool)
-    .await?;
+    let failed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'failed'")
+            .fetch_one(pool)
+            .await?;
 
-    let delivered: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'delivered'",
-    )
-    .fetch_one(pool)
-    .await?;
+    let delivered: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'delivered'")
+            .fetch_one(pool)
+            .await?;
 
     let now = Utc::now();
     let one_min_ago = now - chrono::Duration::minutes(1);
@@ -318,8 +329,8 @@ mod tests {
 
     fn state_with_token(token: Option<&str>) -> MetricsState {
         // The pool is never touched by `authorized`, so a lazy pool is fine.
-        let pool = PgPool::connect_lazy("postgres://localhost/unused")
-            .expect("lazy pool construction");
+        let pool =
+            PgPool::connect_lazy("postgres://localhost/unused").expect("lazy pool construction");
         MetricsState {
             pool: Arc::new(pool),
             auth_token: token.map(|t| Arc::new(t.to_string())),
@@ -335,14 +346,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn no_token_configured_allows_requests() {
+    #[tokio::test]
+    async fn no_token_configured_allows_requests() {
         let state = state_with_token(None);
         assert!(state.authorized(&HeaderMap::new()));
     }
 
-    #[test]
-    fn token_configured_rejects_missing_or_wrong_header() {
+    #[tokio::test]
+    async fn token_configured_rejects_missing_or_wrong_header() {
         let state = state_with_token(Some("s3cret"));
         assert!(!state.authorized(&HeaderMap::new()));
 
@@ -355,8 +366,8 @@ mod tests {
         assert!(!state.authorized(&headers));
     }
 
-    #[test]
-    fn token_configured_accepts_matching_bearer() {
+    #[tokio::test]
+    async fn token_configured_accepts_matching_bearer() {
         let state = state_with_token(Some("s3cret"));
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, "Bearer s3cret".parse().unwrap());

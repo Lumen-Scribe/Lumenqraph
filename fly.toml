@@ -1,5 +1,5 @@
 # Fly.io deployment for Lumenqraph. One image (the repo Dockerfile), three
-# process groups sharing a managed Postgres. See docs/DEPLOY.md for the full
+# process groups sharing a managed Postgres. See docs/DEPLOYMENT.md for the full
 # walkthrough (Neon/Supabase Postgres, secrets, scaling).
 #
 #   fly launch --no-deploy --copy-config   # reuse this file

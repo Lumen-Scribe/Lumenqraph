@@ -114,7 +114,7 @@ mod reenrich_keyset_pagination_tests {
                  LIMIT $2 OFFSET $3",
             )
             .bind(contract_id)
-            .bind(batch_size as i32)
+            .bind(batch_size)
             .bind(offset)
             .fetch_all(&pool)
             .await
@@ -138,7 +138,7 @@ mod reenrich_keyset_pagination_tests {
             }
 
             // OFFSET increases regardless of how many rows matched the predicate
-            offset += batch_size as i32;
+            offset += batch_size;
 
             if processed_broken > 300 {
                 // Safety check to avoid infinite loop
@@ -222,7 +222,7 @@ mod reenrich_keyset_pagination_tests {
             .bind(contract_id)
             .bind(last_ledger)
             .bind(&last_event_id)
-            .bind(batch_size as i32)
+            .bind(batch_size)
             .fetch_all(&pool)
             .await
             .expect("Failed to fetch batch");
@@ -320,7 +320,7 @@ mod reenrich_keyset_pagination_tests {
             .bind(contract_id)
             .bind(last_ledger)
             .bind(&last_event_id)
-            .bind(batch_size as i32)
+            .bind(batch_size)
             .fetch_all(&pool)
             .await
             .expect("Failed to fetch batch");
@@ -433,7 +433,7 @@ mod reenrich_keyset_pagination_tests {
             .bind(contract_id)
             .bind(last_ledger)
             .bind(&last_event_id)
-            .bind(batch_size as i32)
+            .bind(batch_size)
             .fetch_all(&pool)
             .await
             .expect("Failed to fetch batch");

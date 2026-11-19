@@ -1,16 +1,15 @@
 //! The read layer — Soroban's answer to `eth_call`, and transaction preview.
 //!
-//! `GET  /contracts/:id/functions` — the contract's callable functions + types.
-//! `POST /contracts/:id/call`       — invoke a view function read-only (via RPC
+//! `GET  /contracts/:contract_id/functions` — the contract's callable functions + types.
+//! `POST /contracts/:contract_id/call`       — invoke a view function read-only (via RPC
 //!                                    `simulateTransaction`) and get a typed result.
-//! `POST /contracts/:id/simulate`   — dry-run *any* call and get the typed result
+//! `POST /contracts/:contract_id/simulate`   — dry-run *any* call and get the typed result
 //!                                    plus the events it would emit and its cost.
 //!
 //! Argument encoding is driven by the contract's on-chain spec (captured at
 //! index time), so calls are type-checked before they ever hit the network.
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
 use axum::Json;
 use lumenqraph_core::read::{self, EncodeError};
 use serde::Deserialize;
@@ -53,7 +52,7 @@ pub struct CallRequest {
     source_account: Option<String>,
 }
 
-/// Query options for `POST /contracts/:id/call`.
+/// Query options for `POST /contracts/:contract_id/call`.
 #[derive(Deserialize, Default)]
 pub struct CallQuery {
     /// Allow a function the view heuristic doesn't recognise as a view.
@@ -68,14 +67,18 @@ pub async fn call_function(
     Query(query): Query<CallQuery>,
     Json(req): Json<CallRequest>,
 ) -> ApiResult<Json<Value>> {
-
     // Estimate request body size (function name + args serialization)
-    let estimated_body_size = req.function.len() + serde_json::to_string(&req.args)
-        .map(|s| s.len())
-        .unwrap_or(0);
+    let estimated_body_size = req.function.len()
+        + serde_json::to_string(&req.args)
+            .map(|s| s.len())
+            .unwrap_or(0);
 
     // Validate request cost before hitting RPC
-    if let Err(e) = validate_call_request(estimated_body_size, &req.args, &state.read_cost_limit_config) {
+    if let Err(e) = validate_call_request(
+        estimated_body_size,
+        &req.args,
+        &state.read_cost_limit_config,
+    ) {
         return Err(ApiError::Status(
             e.http_status(),
             crate::error::ErrorCode::BadRequest,
@@ -109,7 +112,10 @@ pub async fn call_function(
     };
     // Check the read-through cache before hitting RPC.
     if cacheable {
-        if let Some(cached) = state.call_cache.get(&contract_id, &req.function, &req.args, scope) {
+        if let Some(cached) = state
+            .call_cache
+            .get(&contract_id, &req.function, &req.args, scope)
+        {
             return Ok(Json(cached));
         }
     }
@@ -144,7 +150,13 @@ pub async fn call_function(
                 "simulated_at_ledger": latest_ledger,
             });
             if cacheable {
-                state.call_cache.insert(&contract_id, &req.function, &req.args, scope, response.clone());
+                state.call_cache.insert(
+                    &contract_id,
+                    &req.function,
+                    &req.args,
+                    scope,
+                    response.clone(),
+                );
             }
             Ok(Json(response))
         }
@@ -155,8 +167,7 @@ pub async fn call_function(
             tracing::warn!(rpc_error = %msg, "contract simulation failed");
             // If the error is a typed contract error (Error(Contract, #N)), try
             // to resolve the code to its declared name from the spec (#418).
-            let contract_error =
-                build_contract_error_detail(&msg, Some(parsed));
+            let contract_error = build_contract_error_detail(&msg, Some(parsed));
             Err(ApiError::simulation_failed_with_contract_error(
                 format!(
                     "simulation failed: {}",
@@ -168,7 +179,7 @@ pub async fn call_function(
     }
 }
 
-/// `POST /contracts/:id/simulate` — dry-run any call (including state-changing
+/// `POST /contracts/:contract_id/simulate` — dry-run any call (including state-changing
 /// ones like `transfer`) and return the typed result, the events it would emit
 /// (decoded + enriched), and its estimated resource fee — nothing is signed or
 /// submitted. Soroban's answer to Tenderly's transaction preview.
@@ -177,14 +188,18 @@ pub async fn simulate_call(
     ValidContractId(contract_id): ValidContractId,
     Json(req): Json<CallRequest>,
 ) -> ApiResult<Json<Value>> {
-
     // Estimate request body size (function name + args serialization)
-    let estimated_body_size = req.function.len() + serde_json::to_string(&req.args)
-        .map(|s| s.len())
-        .unwrap_or(0);
+    let estimated_body_size = req.function.len()
+        + serde_json::to_string(&req.args)
+            .map(|s| s.len())
+            .unwrap_or(0);
 
     // Validate request cost before hitting RPC
-    if let Err(e) = validate_call_request(estimated_body_size, &req.args, &state.read_cost_limit_config) {
+    if let Err(e) = validate_call_request(
+        estimated_body_size,
+        &req.args,
+        &state.read_cost_limit_config,
+    ) {
         return Err(ApiError::Status(
             e.http_status(),
             crate::error::ErrorCode::BadRequest,
@@ -231,8 +246,7 @@ pub async fn simulate_call(
             // sanitised copy to the caller (see issue #154).
             tracing::warn!(rpc_error = %msg, "contract simulation failed");
             // Resolve typed contract error codes to their declared names (#418).
-            let contract_error =
-                build_contract_error_detail(&msg, Some(parsed));
+            let contract_error = build_contract_error_detail(&msg, Some(parsed));
             Err(ApiError::simulation_failed_with_contract_error(
                 format!(
                     "simulation failed: {}",
@@ -289,6 +303,17 @@ mod tests {
     //!   pointed at a dummy URL and a mocked `simulate` via a lightweight
     //!   in-process HTTP server (or, for simplicity, an inline axum oneshot).
 
+    /// A checksum-valid C-strkey for fixtures. Malformed ids are rejected by the
+    /// contract-id extractor (#440), so fixtures must be well-formed.
+    fn fixture_contract() -> String {
+        stellar_strkey::Contract([0u8; 32]).to_string()
+    }
+
+    /// A second checksum-valid contract id, for "not indexed" cases.
+    fn other_contract() -> String {
+        stellar_strkey::Contract([1u8; 32]).to_string()
+    }
+
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
 
@@ -329,6 +354,7 @@ mod tests {
     }
 
     /// Build a spec section with a zero-argument function: `fn balance() -> u32`
+    #[allow(dead_code)]
     fn zero_arg_spec(name: &str) -> Vec<u8> {
         let entry = ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
             doc: "".try_into().unwrap(),
@@ -394,8 +420,15 @@ mod tests {
             proxy_limiter: Arc::new(RateLimiter::memory()),
             webhook_limiter: Arc::new(RateLimiter::memory()),
             config: Arc::new(crate::config::ApiConfig::test_default()),
-            key_cache: Arc::new(KeyCache::new(256, std::time::Duration::from_secs(30), std::time::Duration::from_secs(5))),
-            ip_config: crate::auth::IpConfig { trusted_proxy_hops: 0, platform_header: None },
+            key_cache: Arc::new(KeyCache::new(
+                256,
+                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(5),
+            )),
+            ip_config: crate::auth::IpConfig {
+                trusted_proxy_hops: 0,
+                platform_header: None,
+            },
             audit_tx: None,
             audit_dropped: Arc::new(AtomicU64::new(0)),
             shutdown: tokio_util::sync::CancellationToken::new(),
@@ -421,16 +454,10 @@ mod tests {
 
     fn app_for(state: AppState) -> Router {
         Router::new()
+            .route("/contracts/:contract_id/call", post(call_function))
+            .route("/contracts/:contract_id/simulate", post(simulate_call))
             .route(
-                "/contracts/:id/call",
-                post(call_function),
-            )
-            .route(
-                "/contracts/:id/simulate",
-                post(simulate_call),
-            )
-            .route(
-                "/contracts/:id/functions",
+                "/contracts/:contract_id/functions",
                 axum::routing::get(list_functions),
             )
             .with_state(state)
@@ -440,8 +467,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_functions_returns_typed_signature() {
-        let contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-        let state = make_state(contract, single_fn_spec("balance"));
+        let contract = fixture_contract();
+        let state = make_state(&contract, single_fn_spec("balance"));
         let app = app_for(state);
 
         let req = Request::builder()
@@ -467,8 +494,8 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_function_returns_400() {
-        let contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-        let state = make_state(contract, single_fn_spec("balance"));
+        let contract = fixture_contract();
+        let state = make_state(&contract, single_fn_spec("balance"));
         let app = app_for(state);
 
         let (status, body) = call(
@@ -490,8 +517,8 @@ mod tests {
 
     #[tokio::test]
     async fn call_refuses_state_changing_function_without_override() {
-        let contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-        let state = make_state(contract, single_fn_spec("transfer"));
+        let contract = fixture_contract();
+        let state = make_state(&contract, single_fn_spec("transfer"));
         let app = app_for(state);
 
         let (status, body) = call(
@@ -508,8 +535,8 @@ mod tests {
 
     #[tokio::test]
     async fn call_still_runs_view_functions() {
-        let contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-        let state = make_state(contract, single_fn_spec("balance"));
+        let contract = fixture_contract();
+        let state = make_state(&contract, single_fn_spec("balance"));
         let app = app_for(state);
 
         let (_, body) = call(
@@ -524,8 +551,8 @@ mod tests {
 
     #[tokio::test]
     async fn call_allows_state_changing_function_with_override() {
-        let contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-        let state = make_state(contract, single_fn_spec("transfer"));
+        let contract = fixture_contract();
+        let state = make_state(&contract, single_fn_spec("transfer"));
         let app = app_for(state);
 
         let (_, body) = call(
@@ -542,8 +569,8 @@ mod tests {
 
     #[tokio::test]
     async fn missing_argument_returns_400() {
-        let contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-        let state = make_state(contract, single_fn_spec("balance"));
+        let contract = fixture_contract();
+        let state = make_state(&contract, single_fn_spec("balance"));
         let app = app_for(state);
 
         let (status, body) = call(
@@ -566,8 +593,8 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_typed_argument_returns_400() {
-        let contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-        let state = make_state(contract, single_fn_spec("balance"));
+        let contract = fixture_contract();
+        let state = make_state(&contract, single_fn_spec("balance"));
         let app = app_for(state);
 
         let (status, body) = call(
@@ -590,8 +617,8 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_address_strkey_returns_400_with_descriptive_message() {
-        let contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-        let state = make_state(contract, single_fn_spec("balance"));
+        let contract = fixture_contract();
+        let state = make_state(&contract, single_fn_spec("balance"));
         let app = app_for(state);
 
         let (status, body) = call(
@@ -617,9 +644,9 @@ mod tests {
         // `make_state` seeds a spec for `contract`, but we test a *different*
         // contract ID that has nothing in the cache — so the handler must hit
         // the database (connect_lazy, will immediately fail) and surface a 404.
-        let seeded = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-        let unknown = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBM";
-        let state = make_state(seeded, single_fn_spec("balance"));
+        let seeded = fixture_contract();
+        let unknown = other_contract();
+        let state = make_state(&seeded, single_fn_spec("balance"));
         let app = app_for(state);
 
         let (status, _body) = call(
@@ -645,8 +672,8 @@ mod tests {
 
     #[tokio::test]
     async fn positional_args_wrong_type_returns_400() {
-        let contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
-        let state = make_state(contract, single_fn_spec("balance"));
+        let contract = fixture_contract();
+        let state = make_state(&contract, single_fn_spec("balance"));
         let app = app_for(state);
 
         let (status, body) = call(
@@ -679,13 +706,15 @@ mod tests {
         );
         let app = Router::new().route(
             "/",
-            post(move |axum::Json(_): axum::Json<serde_json::Value>| async move {
-                axum::Json(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "result": { "error": raw }
-                }))
-            }),
+            post(
+                move |axum::Json(_): axum::Json<serde_json::Value>| async move {
+                    axum::Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": { "error": raw }
+                    }))
+                },
+            ),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -705,9 +734,9 @@ mod tests {
 
     #[tokio::test]
     async fn simulation_error_is_bounded_and_sanitised() {
-        let contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let contract = fixture_contract();
         let rpc_url = error_rpc_server().await;
-        let state = make_state_with_rpc(contract, single_fn_spec("balance"), rpc_url);
+        let state = make_state_with_rpc(&contract, single_fn_spec("balance"), rpc_url);
         let app = app_for(state);
 
         let (status, body) = call(
@@ -724,13 +753,21 @@ mod tests {
 
         // Bounded length — never the raw multi-hundred-char upstream blob.
         assert!(
-            msg.chars().count() <= lumenqraph_core::sanitize::MAX_SIMULATION_ERROR_LEN + "simulation failed: ".len(),
+            msg.chars().count()
+                <= lumenqraph_core::sanitize::MAX_SIMULATION_ERROR_LEN
+                    + "simulation failed: ".len(),
             "client error must be bounded, got: {msg}"
         );
         // Internal detail must not leak through.
-        assert!(!msg.contains("https://internal.rpc"), "leaked endpoint: {msg}");
+        assert!(
+            !msg.contains("https://internal.rpc"),
+            "leaked endpoint: {msg}"
+        );
         assert!(!msg.contains("AAAA"), "leaked XDR blob: {msg}");
-        assert!(!msg.contains('\n') && !msg.contains('\t') && !msg.contains('\x00'), "control char leaked: {msg}");
+        assert!(
+            !msg.contains('\n') && !msg.contains('\t') && !msg.contains('\x00'),
+            "control char leaked: {msg}"
+        );
         assert!(msg.contains("simulation failed"), "expected prefix: {msg}");
     }
 }

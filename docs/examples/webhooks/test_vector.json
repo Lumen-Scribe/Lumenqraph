@@ -1,0 +1,10 @@
+{
+  "description": "Cross-language webhook verification vector. The body is the exact raw HTTP body; the signature is HMAC-SHA256 over '{t}.{body}'. 'now' is a fixed verification time inside the 300s tolerance. Checked in CI by docs/examples/webhooks/* and crates/lumenqraph-core.",
+  "secret": "whsec-doc-vector-7c1e",
+  "timestamp": 1700000000,
+  "now": 1700000060,
+  "tolerance_secs": 300,
+  "header": "t=1700000000,v1=0000000000000000000000000000000000000000000000000000000000000000,v1=8b8264463f41a643074ef665aa376f3079a0752f14938ca41d8b196087e1aaaf",
+  "body": "{\"id\":\"42\",\"type\":\"contract.event\",\"version\":1,\"created_at\":\"2023-11-14T22:13:20Z\",\"data\":{\"event_id\":\"0000000000012345-0000000001\",\"contract_id\":\"CDOCVECTORCONTRACTIDEXAMPLEXXXXXXXXXXXXXXXXXXXXXXXXXXXX\",\"ledger\":12345,\"ledger_closed_at\":\"2023-11-14T22:13:18Z\",\"event_name\":\"transfer\",\"topics\":[\"AAAADwAAAAd0cmFuc2Zlcg==\"],\"decoded_topics\":[\"transfer\"],\"value\":\"AAAADwAAAAQ=\",\"decoded_value\":{\"amount\":\"1000000\",\"currency\":\"€\"},\"enriched\":{\"amount\":1000000},\"tx_hash\":\"abc123\",\"in_successful_call\":true}}",
+  "expected_v1": "8b8264463f41a643074ef665aa376f3079a0752f14938ca41d8b196087e1aaaf"
+}

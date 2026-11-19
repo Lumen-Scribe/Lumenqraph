@@ -11,7 +11,7 @@
 //! `Utc::now()`.
 
 use chrono::{DateTime, TimeZone, Utc};
-use lumenqraph_core::{xdr, ContractSpec, NewEvent};
+use lumenqraph_core::{xdr, ContractSpec, EventType, NewEvent};
 use tracing::error;
 
 use crate::rpc_client::EventInfo;
@@ -49,6 +49,8 @@ pub fn parse_ledger_closed_at(raw: &str) -> Option<DateTime<Utc>> {
 pub fn to_new_event(e: &EventInfo, spec: Option<&ContractSpec>) -> Option<NewEvent> {
     // Parse the timestamp. On failure, return None — never fall back to Utc::now().
     let parsed_ts = parse_ledger_closed_at(&e.ledger_closed_at)?;
+    // Unknown event types cannot satisfy the events.event_type CHECK; skip them.
+    let event_type = EventType::from_rpc_str(&e.event_type)?;
     // The ledger timestamp is authoritative. Backfill and catch-up routinely
     // ingest ledgers older than wall-clock tolerance, so never clamp it.
     let ledger_closed_at = parsed_ts;
@@ -68,7 +70,10 @@ pub fn to_new_event(e: &EventInfo, spec: Option<&ContractSpec>) -> Option<NewEve
         contract_id: e.contract_id.clone(),
         ledger: e.ledger,
         ledger_closed_at,
-        event_type: lumenqraph_core::EventType::from_rpc_str(&e.event_type),
+        // The RPC only emits contract|system|diagnostic, the values the
+        // `events.event_type` CHECK constraint accepts. Anything else cannot be
+        // stored, so the event is skipped.
+        event_type: e.event_type.parse::<EventType>().ok()?,
         topics: e.topic.clone(),
         decoded_topics,
         event_name,
@@ -122,5 +127,4 @@ mod tests {
         // A date without time component is not valid RFC 3339.
         assert!(parse_ledger_closed_at("2024-01-01").is_none());
     }
-
 }

@@ -107,17 +107,11 @@ pub struct ApiConfig {
 
     pub graphql: GraphqlConfig,
 
-
     /// Required `pgp_sym_encrypt` key for webhook secrets. Read and validated
     /// once at startup; handlers never consult the environment directly.
     pub webhook_encryption_key: String,
     /// Retention for delivered/failed webhook deliveries. `0` disables pruning.
     pub webhook_delivery_retention_days: i64,
-
-    /// `pgp_sym_encrypt` key for webhook secrets. `None` falls back to the
-    /// legacy insecure test key (a warning is logged at startup).
-    pub webhook_encryption_key: Option<String>,
-
 
     /// Sibling instances mounted under a path prefix (`INSTANCE_MOUNTS`).
     pub mounts: Vec<(String, String)>,
@@ -134,18 +128,12 @@ impl ApiConfig {
             env_parse("API_MAX_BODY_BYTES", 65536u64)?
         };
 
-
         let webhook_encryption_key = required_env("WEBHOOK_ENCRYPTION_KEY")?;
 
         // Reject bad origins at startup, naming the entry, rather than letting
         // CORS silently never match a browser's Origin header (#581).
         let cors_allowed_origins = env_string("CORS_ALLOWED_ORIGINS", "");
         parse_cors_origins(&cors_allowed_origins)?;
-
-        let webhook_encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY")
-            .ok()
-            .filter(|k| !k.trim().is_empty());
-
 
         let proxy_defaults = ProxyConfig::default();
 
@@ -202,6 +190,7 @@ impl ApiConfig {
             },
 
             webhook_encryption_key,
+            webhook_delivery_retention_days: env_parse("WEBHOOK_DELIVERY_RETENTION_DAYS", 14i64)?,
 
             mounts: crate::routes::proxy::parse_mounts(&env_string("INSTANCE_MOUNTS", "")),
             proxy: ProxyConfig {
@@ -227,22 +216,24 @@ impl ApiConfig {
     }
 }
 
-/// Read a required, non-empty environment value. In particular, the API must
-/// never silently encrypt webhook secrets with a built-in fallback key.
-fn required_env(key: &str) -> anyhow::Result<String> {
-    required_env_value(key, std::env::var(key).ok())
-}
-
-fn required_env_value(key: &str, value: Option<String>) -> anyhow::Result<String> {
-    let value = value.ok_or_else(|| {
-        anyhow::anyhow!("{key} is required; generate a strong value with `openssl rand -hex 32`")
+/// Read and validate `WEBHOOK_ENCRYPTION_KEY` (#644). The API must never
+/// silently encrypt webhook secrets with a built-in fallback key, so a missing,
+/// empty, placeholder or weak value is a startup error naming the variable. The
+/// rules are shared with the webhooks service in `lumenqraph_core::crypto`.
+fn webhook_encryption_key_from_value(value: Option<String>) -> anyhow::Result<String> {
+    let key = value.ok_or_else(|| {
+        anyhow::anyhow!(
+            "WEBHOOK_ENCRYPTION_KEY is required; generate a strong value with `openssl rand -hex 32`"
+        )
     })?;
-    if value.trim().is_empty() {
+    if key.trim().is_empty() {
         anyhow::bail!(
-            "{key} must not be empty; generate a strong value with `openssl rand -hex 32`"
+            "WEBHOOK_ENCRYPTION_KEY must not be empty; generate a strong value with `openssl rand -hex 32`"
         );
     }
-    Ok(value)
+    lumenqraph_core::crypto::validate_webhook_encryption_key(&key)
+        .map_err(|e| anyhow::anyhow!("WEBHOOK_ENCRYPTION_KEY is invalid: {e}"))?;
+    Ok(key)
 }
 
 #[cfg(test)]
@@ -295,10 +286,9 @@ impl ApiConfig {
 
             // Test-only value; production config always reads a required key
             // from the environment.
+            admin_token: None,
             webhook_encryption_key: "test-only-webhook-key".into(),
             webhook_delivery_retention_days: 14,
-
-            webhook_encryption_key: None,
 
             mounts: Vec::new(),
             proxy: ProxyConfig::default(),
@@ -339,21 +329,21 @@ impl fmt::Debug for ApiConfig {
             .field("readyz_max_age_secs", &self.readyz_max_age_secs)
             .field("health_max_lag_ledgers", &self.health_max_lag_ledgers)
             .field("health_max_stale_secs", &self.health_max_stale_secs)
-            .field("readyz_require_fresh_index", &self.readyz_require_fresh_index)
+            .field(
+                "readyz_require_fresh_index",
+                &self.readyz_require_fresh_index,
+            )
             .field("api_key_cache_capacity", &self.api_key_cache_capacity)
             .field("api_key_cache_ttl_secs", &self.api_key_cache_ttl_secs)
-            .field("api_key_cache_neg_ttl_secs", &self.api_key_cache_neg_ttl_secs)
+            .field(
+                "api_key_cache_neg_ttl_secs",
+                &self.api_key_cache_neg_ttl_secs,
+            )
             .field("graphql", &self.graphql)
-
             .field("webhook_encryption_key", &"[REDACTED]")
             .field(
                 "webhook_delivery_retention_days",
                 &self.webhook_delivery_retention_days,
-
-            .field(
-                "webhook_encryption_key",
-                &self.webhook_encryption_key.as_ref().map(|_| "[REDACTED]"),
-
             )
             .field("mounts", &self.mounts)
             .field("proxy", &self.proxy)
@@ -362,7 +352,9 @@ impl fmt::Debug for ApiConfig {
 }
 
 /// Mask the password in `scheme://user:pass@host/...`.
-fn redact_url(url: &str) -> String { lumenqraph_core::redact_url(url) }
+fn redact_url(url: &str) -> String {
+    lumenqraph_core::redact_url(url)
+}
 /*
     if let Some(scheme_end) = url.find("://") {
         let after_scheme = &url[scheme_end + 3..];
@@ -378,7 +370,9 @@ fn redact_url(url: &str) -> String { lumenqraph_core::redact_url(url) }
 
 */
 fn is_set(key: &str) -> bool {
-    std::env::var(key).map(|v| !v.trim().is_empty()).unwrap_or(false)
+    std::env::var(key)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
 }
 
 fn env_string(key: &str, default: &str) -> String {
@@ -420,11 +414,15 @@ pub fn parse_cors_origins(raw: &str) -> anyhow::Result<Vec<String>> {
 }
 
 fn parse_cors_origin(entry: &str) -> anyhow::Result<String> {
-    let invalid = |why: &str| anyhow::anyhow!("invalid CORS_ALLOWED_ORIGINS entry {entry:?}: {why}");
+    let invalid =
+        |why: &str| anyhow::anyhow!("invalid CORS_ALLOWED_ORIGINS entry {entry:?}: {why}");
     if entry.contains('*') {
-        return Err(invalid("wildcards are not supported; list each origin explicitly"));
+        return Err(invalid(
+            "wildcards are not supported; list each origin explicitly",
+        ));
     }
-    let url = url::Url::parse(entry).map_err(|_| invalid("not an absolute URL (expected https://host)"))?;
+    let url = url::Url::parse(entry)
+        .map_err(|_| invalid("not an absolute URL (expected https://host)"))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(invalid("scheme must be http or https"));
     }
@@ -434,8 +432,14 @@ fn parse_cors_origin(entry: &str) -> anyhow::Result<String> {
     if !url.username().is_empty() || url.password().is_some() {
         return Err(invalid("credentials are not allowed"));
     }
-    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() || entry.ends_with('/') {
-        return Err(invalid("must be an origin only: scheme://host[:port], with no path or trailing slash"));
+    if url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || entry.ends_with('/')
+    {
+        return Err(invalid(
+            "must be an origin only: scheme://host[:port], with no path or trailing slash",
+        ));
     }
     Ok(url.origin().ascii_serialization())
 }
@@ -470,20 +474,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn required_webhook_encryption_key_rejects_missing_or_empty_values() {
-        for value in [None, Some(String::new()), Some(" \t\n".to_string())] {
-            let err = required_env_value("WEBHOOK_ENCRYPTION_KEY", value)
+    fn webhook_encryption_key_rejects_missing_empty_placeholder_and_weak_values() {
+        for value in [
+            None,
+            Some(String::new()),
+            Some(" \t\n".to_string()),
+            Some("GENERATE_ME_WITH_openssl_rand_hex_32".to_string()),
+            Some("secret".to_string()),
+        ] {
+            let err = webhook_encryption_key_from_value(value.clone())
                 .unwrap_err()
                 .to_string();
             assert!(
                 err.contains("WEBHOOK_ENCRYPTION_KEY"),
-                "error should name the variable: {err}"
+                "{value:?} should be rejected naming the variable: {err}"
             );
         }
+    }
 
+    #[test]
+    fn webhook_encryption_key_accepts_a_generated_key_unchanged() {
+        let key = "9f3a6c1e0b7d4a2f8e5c91b3d6a04f7e2c8b5d1a9e6f3c0b7a4d2e8f1c5b9a36";
         assert_eq!(
-            required_env_value("WEBHOOK_ENCRYPTION_KEY", Some("secret".into())).unwrap(),
-            "secret"
+            webhook_encryption_key_from_value(Some(key.to_string())).unwrap(),
+            key
         );
     }
 
@@ -552,8 +566,13 @@ mod cors_origin_tests {
 
     #[test]
     fn trailing_slash_fails_and_names_the_entry() {
-        let err = parse_cors_origins("https://a.com/,foo").unwrap_err().to_string();
-        assert!(err.contains("https://a.com/"), "error must name the entry: {err}");
+        let err = parse_cors_origins("https://a.com/,foo")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("https://a.com/"),
+            "error must name the entry: {err}"
+        );
     }
 
     #[test]

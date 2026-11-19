@@ -79,22 +79,22 @@ fn is_reserved_ip(ip: &IpAddr) -> bool {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_reserved_ip(&IpAddr::V4(v4));
             }
-            
+
             // Check for NAT64 well-known prefix (64:ff9b::/96)
             if is_nat64_wellknown(v6) {
                 return true;
             }
-            
+
             // Check for 6to4 (2002::/16) - may contain embedded IPv4
             if is_6to4(v6) {
                 return true;
             }
-            
+
             // Check for IPv4-compatible IPv6 (::/96 except ::/128 and ::1/128)
             if is_ipv4_compatible(v6) {
                 return true;
             }
-            
+
             v6.is_loopback()
                 || v6.is_multicast()
                 || v6.is_unicast_link_local()
@@ -186,7 +186,7 @@ pub async fn validate_webhook_url_at_delivery(url: &str) -> Result<IpAddr, Strin
             .strip_prefix('[')
             .and_then(|s| s.strip_suffix(']'))
             .unwrap_or(host_str);
-        
+
         if let Ok(ip) = addr_str.parse::<IpAddr>() {
             // Re-validate literal IP URLs at delivery time
             if is_reserved_ip(&ip) {
@@ -199,11 +199,11 @@ pub async fn validate_webhook_url_at_delivery(url: &str) -> Result<IpAddr, Strin
         match tokio::net::lookup_host(format!("{}:80", host_str)).await {
             Ok(addrs) => {
                 let addrs: Vec<_> = addrs.collect();
-                
+
                 if addrs.is_empty() {
                     return Err("hostname resolved to no addresses".to_string());
                 }
-                
+
                 // Require ALL resolved addresses to be public
                 for addr in &addrs {
                     if is_reserved_ip(&addr.ip()) {
@@ -213,7 +213,7 @@ pub async fn validate_webhook_url_at_delivery(url: &str) -> Result<IpAddr, Strin
                         ));
                     }
                 }
-                
+
                 // Return the first public address for connection pinning
                 Ok(addrs[0].ip())
             }

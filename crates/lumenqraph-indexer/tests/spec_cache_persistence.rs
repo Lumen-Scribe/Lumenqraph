@@ -102,16 +102,10 @@ mod spec_cache_persistence_tests {
         .await
         .expect("Failed to fetch spec");
 
-        assert_eq!(
-            row.get::<String, _>("contract_id"),
-            contract_id
-        );
+        assert_eq!(row.get::<String, _>("contract_id"), contract_id);
         assert_eq!(row.get::<String, _>("wasm_hash"), "hash1");
-        assert_eq!(
-            row.get::<String, _>("spec_section"),
-            spec_section
-        );
-        assert_eq!(row.get::<bool, _>("has_events"), true);
+        assert_eq!(row.get::<String, _>("spec_section"), spec_section);
+        assert!(row.get::<bool, _>("has_events"));
 
         cleanup_test_data(&pool, contract_id).await;
     }
@@ -125,7 +119,7 @@ mod spec_cache_persistence_tests {
         cleanup_test_data(&pool, contract_id).await;
 
         let hash_v1 = "hash_v1";
-        let hash_v2 = "hash_v2";
+        let _hash_v2 = "hash_v2";
 
         // Insert v1
         sqlx::query(
@@ -147,13 +141,12 @@ mod spec_cache_persistence_tests {
 
         // Check if hash differs (simulating upgrade detection)
         let current_hash = "hash_v2";
-        let stored: (String,) = sqlx::query_as(
-            "SELECT wasm_hash FROM contract_specs WHERE contract_id = $1",
-        )
-        .bind(contract_id)
-        .fetch_one(&pool)
-        .await
-        .expect("Failed to fetch");
+        let stored: (String,) =
+            sqlx::query_as("SELECT wasm_hash FROM contract_specs WHERE contract_id = $1")
+                .bind(contract_id)
+                .fetch_one(&pool)
+                .await
+                .expect("Failed to fetch");
 
         let is_upgraded = stored.0 != current_hash;
         assert!(is_upgraded, "Hash mismatch should indicate upgrade");
@@ -178,15 +171,14 @@ mod spec_cache_persistence_tests {
         .await
         .expect("Failed to insert no-spec marker");
 
-        let row = sqlx::query(
-            "SELECT has_events, wasm_hash FROM contract_specs WHERE contract_id = $1",
-        )
-        .bind(contract_id)
-        .fetch_one(&pool)
-        .await
-        .expect("Failed to fetch");
+        let row =
+            sqlx::query("SELECT has_events, wasm_hash FROM contract_specs WHERE contract_id = $1")
+                .bind(contract_id)
+                .fetch_one(&pool)
+                .await
+                .expect("Failed to fetch");
 
-        assert_eq!(row.get::<bool, _>("has_events"), false);
+        assert!(!row.get::<bool, _>("has_events"));
         assert!(
             row.try_get::<Option<String>, _>("wasm_hash")
                 .unwrap()

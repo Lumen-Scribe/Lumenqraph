@@ -46,7 +46,10 @@ By default, the `lumenqraph-api` serves the explorer directory at its root fallb
 You can host `explorer/index.html` on any static provider (GitHub Pages, Vercel, S3, Netlify, or local filesystem).
 - In the top right header of the UI, fill in the **API base** field with your remote Lumenqraph API URL (e.g. `https://api.lumenqraph.dev`).
 - Input your optional `x-api-key` in the API Key field if your endpoint has authentication enabled (`REQUIRE_API_KEY=true`).
-- Browser configurations (API Base, API Key) are automatically persisted in `localStorage` for convenience.
+- The API base URL is remembered in `localStorage`. The API key is **not** persisted by default: it is kept only for the current tab and is cleared when the tab closes.
+- To keep the key across browser restarts, tick **Remember on this device**. Use **Forget key** to remove it from the page and from the browser.
+- A key saved by an older version of the explorer in `localStorage` is removed on the next load; re-enter it and tick **Remember on this device** if you want it kept.
+- Use a **read-only-scoped** key in the explorer where possible. API keys can carry write access (for example, to webhooks), and anyone using a shared machine can read a remembered key.
 
 ---
 
