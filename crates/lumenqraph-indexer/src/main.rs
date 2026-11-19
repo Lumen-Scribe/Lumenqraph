@@ -229,6 +229,22 @@ fn resolve_backfill_start(
     )
 }
 
+/// Check arguments that can be validated without touching the database or the
+/// RPC, so a typo fails immediately (#712).
+fn validate_args(command: &Command) -> anyhow::Result<()> {
+    if let Command::Reenrich {
+        contract: Some(contract),
+        ..
+    } = command
+    {
+        anyhow::ensure!(
+            lumenqraph_core::is_valid_contract_id(contract),
+            "invalid --contract '{contract}': expected a Soroban contract ID (C...)"
+        );
+    }
+    Ok(())
+}
+
 /// Bind address for the health/metrics HTTP server. Defaults to loopback so
 /// /health and /metrics are not exposed on public interfaces (#605).
 fn http_bind_addr() -> String {
@@ -243,6 +259,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Run);
+    validate_args(&command)?;
     let config = Config::from_env().context("failed to load config")?;
 
     let db = Config::db_config()?;
@@ -288,8 +305,8 @@ async fn main() -> anyhow::Result<()> {
             );
             poller::recover_gaps(&pool, &rpc, &config, &specs).await
         }
-        Command::Reenrich { .. } => {
-            reenrich::run_reenrich(pool, rpc, config, ReenrichOptions::default()).await
+        Command::Reenrich { contract, force } => {
+            reenrich::run_reenrich(pool, rpc, config, ReenrichOptions { contract, force }).await
         }
         Command::Run => {
             let lock = LeaderLock::acquire(&pool).await?;
@@ -337,6 +354,31 @@ mod tests {
     #[test]
     fn zero_cursor_is_treated_as_no_cursor() {
         assert_eq!(resolve_backfill_start(None, Some(0), 100).unwrap(), 100);
+    }
+
+    #[test]
+    fn reenrich_rejects_malformed_contract_before_any_io() {
+        let bad = super::Command::Reenrich {
+            contract: Some("CNOT-A-STRKEY".into()),
+            force: false,
+        };
+        let err = super::validate_args(&bad).unwrap_err();
+        assert!(err.to_string().contains("invalid --contract"));
+    }
+
+    #[test]
+    fn reenrich_accepts_valid_contract_and_none() {
+        let contract = stellar_strkey::Contract([7u8; 32]).to_string();
+        let ok = super::Command::Reenrich {
+            contract: Some(contract),
+            force: true,
+        };
+        assert!(super::validate_args(&ok).is_ok());
+        let none = super::Command::Reenrich {
+            contract: None,
+            force: false,
+        };
+        assert!(super::validate_args(&none).is_ok());
     }
 
     #[test]
