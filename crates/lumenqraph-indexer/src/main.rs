@@ -15,6 +15,9 @@ mod specs;
 mod state;
 mod store;
 
+#[cfg(test)]
+mod projections_tests;
+
 #[cfg(all(test, feature = "smoke-tests"))]
 mod smoke;
 
@@ -53,7 +56,8 @@ enum Command {
     Run,
     /// One-shot catch-up within the RPC retention window.
     Backfill {
-        /// Start ledger; defaults to the persisted cursor or START_LEDGER.
+        /// Start ledger. When omitted, resumes at the persisted cursor + 1, or
+        /// at START_LEDGER if there is no cursor yet. Fails if neither exists.
         ledger: Option<u32>,
     },
     /// Gapless history from a data-lake or Horizon source.
@@ -71,8 +75,10 @@ enum Command {
     RecoverGaps,
     /// Re-enrich historical events with newly available specs.
     Reenrich {
+        /// Only re-enrich events from this contract (a `C...` strkey).
         #[arg(long)]
         contract: Option<String>,
+        /// Recompute enrichment even for events that already have it.
         #[arg(long)]
         force: bool,
     },
@@ -197,6 +203,32 @@ async fn inspect(rpc: &RpcClient, contract_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolve the start ledger for `backfill` (#711).
+///
+/// An explicit ledger always wins. Otherwise resume after the persisted cursor
+/// (`cursor + 1`), falling back to `START_LEDGER` when there is no cursor. A
+/// cursor of 0 means nothing has been processed yet, so it does not count.
+/// Never returns 0: starting from ledger 0 would backfill the whole retention
+/// window instead of resuming.
+fn resolve_backfill_start(
+    explicit: Option<u32>,
+    cursor: Option<i64>,
+    start_ledger: i64,
+) -> anyhow::Result<i64> {
+    if let Some(ledger) = explicit {
+        return Ok(i64::from(ledger));
+    }
+    if let Some(last) = cursor.filter(|c| *c > 0) {
+        return Ok(last + 1);
+    }
+    if start_ledger > 0 {
+        return Ok(start_ledger);
+    }
+    anyhow::bail!(
+        "no backfill start: no persisted cursor and START_LEDGER is unset; pass a ledger explicitly"
+    )
+}
+
 /// Bind address for the health/metrics HTTP server. Defaults to loopback so
 /// /health and /metrics are not exposed on public interfaces (#605).
 fn http_bind_addr() -> String {
@@ -238,7 +270,10 @@ async fn main() -> anyhow::Result<()> {
 
     match command {
         Command::Backfill { ledger } => {
-            backfill::run(pool, rpc, config, ledger.map(i64::from).unwrap_or(0)).await
+            let cursor = cursor::read_last_processed(&pool).await?;
+            let from = resolve_backfill_start(ledger, cursor, config.start_ledger)?;
+            info!(from, "running in backfill mode");
+            backfill::run(pool, rpc, config, from).await
         }
         Command::DeepBackfill {
             from,
@@ -277,5 +312,36 @@ async fn main() -> anyhow::Result<()> {
             poller::run(pool, rpc, config, specs).await
         }
         Command::Migrate | Command::Inspect { .. } => unreachable!("handled above"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_backfill_start;
+
+    #[test]
+    fn explicit_ledger_wins_over_cursor_and_start_ledger() {
+        assert_eq!(resolve_backfill_start(Some(500), Some(900), 100).unwrap(), 500);
+    }
+
+    #[test]
+    fn resumes_after_cursor_when_no_ledger_given() {
+        assert_eq!(resolve_backfill_start(None, Some(900), 100).unwrap(), 901);
+    }
+
+    #[test]
+    fn falls_back_to_start_ledger_without_cursor() {
+        assert_eq!(resolve_backfill_start(None, None, 100).unwrap(), 100);
+    }
+
+    #[test]
+    fn zero_cursor_is_treated_as_no_cursor() {
+        assert_eq!(resolve_backfill_start(None, Some(0), 100).unwrap(), 100);
+    }
+
+    #[test]
+    fn errors_when_neither_cursor_nor_start_ledger_exists() {
+        let err = resolve_backfill_start(None, None, 0).unwrap_err();
+        assert!(err.to_string().contains("pass a ledger explicitly"));
     }
 }
