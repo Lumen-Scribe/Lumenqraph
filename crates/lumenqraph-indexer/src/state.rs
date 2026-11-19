@@ -24,60 +24,6 @@ use crate::specs::SpecCache;
 /// Max keys per `getLedgerEntries` RPC call when batching holder balance snapshots.
 const MAX_BATCH_KEYS: usize = 100;
 
-/// Snapshot a contract's instance storage if it has changed since the last
-/// snapshot. Best-effort: errors are logged, never propagated to the poller.
-pub async fn snapshot(pool: &PgPool, rpc: &RpcClient, specs: &SpecCache, contract_id: &str) {
-    if let Err(e) = try_snapshot(pool, rpc, specs, contract_id).await {
-        warn!(contract_id, error = %e, "state snapshot failed");
-    }
-}
-
-async fn try_snapshot(
-    pool: &PgPool,
-    rpc: &RpcClient,
-    specs: &SpecCache,
-    contract_id: &str,
-) -> anyhow::Result<()> {
-    let Some(instance) = rpc.get_contract_instance(contract_id).await? else {
-        return Ok(());
-    };
-
-    // Reading the instance revealed the current executable — detect upgrades.
-    if let Some(hash) = &instance.wasm_hash {
-        specs.note_wasm_hash(pool, rpc, contract_id, hash, instance.last_modified_ledger).await;
-    }
-
-    // Change detection: the instance's lastModifiedLedgerSeq only advances when
-    // the instance (incl. its storage) actually changes, so if we already have a
-    // row at this ledger, there's nothing new to record.
-    let latest: Option<i64> =
-        sqlx::query_scalar("SELECT max(ledger) FROM contract_state WHERE contract_id = $1")
-            .bind(contract_id)
-            .fetch_one(pool)
-            .await?;
-    if latest == Some(instance.last_modified_ledger) {
-        return Ok(());
-    }
-
-    let storage = decode_storage(&instance.storage);
-    sqlx::query(
-        "INSERT INTO contract_state (contract_id, ledger, storage)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (contract_id, ledger) DO NOTHING",
-    )
-    .bind(contract_id)
-    .bind(instance.last_modified_ledger)
-    .bind(storage)
-    .execute(pool)
-    .await?;
-    debug!(
-        contract_id,
-        ledger = instance.last_modified_ledger,
-        "state snapshot recorded"
-    );
-    Ok(())
-}
-
 /// Snapshot a batch of contract instances in a single `getLedgerEntries` call
 /// with bounded concurrency. State indexing and upgrade detection both use the
 /// instance entry, so this bundles both. Best-effort: errors are logged, never
@@ -117,7 +63,9 @@ async fn try_snapshot_instances_batch(
 
         // Reading the instance revealed the current executable — detect upgrades.
         if let Some(hash) = &instance.wasm_hash {
-            specs.note_wasm_hash(pool, rpc, contract_id, hash, instance.last_modified_ledger).await;
+            specs
+                .note_wasm_hash(pool, rpc, contract_id, hash, instance.last_modified_ledger)
+                .await;
         }
 
         // Change detection: the instance's lastModifiedLedgerSeq only advances when
@@ -298,15 +246,8 @@ pub async fn snapshot_template_keys_batch(
 
         for ((contract_id, key, dur, label), entry_opt) in chunk.iter().zip(results.iter()) {
             let Some(entry) = entry_opt else { continue };
-            if let Err(e) = try_write_snapshot_data(
-                pool,
-                contract_id,
-                key,
-                *dur,
-                label.as_deref(),
-                entry,
-            )
-            .await
+            if let Err(e) =
+                try_write_snapshot_data(pool, contract_id, key, *dur, label.as_deref(), entry).await
             {
                 warn!(contract_id = %contract_id, error = %e, "contract-data snapshot write failed");
             }

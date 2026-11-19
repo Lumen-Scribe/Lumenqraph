@@ -38,8 +38,12 @@ pub fn check(bind_addr: &str, path: &str) -> std::result::Result<(), String> {
     let addr = probe_addr(bind_addr).ok_or_else(|| format!("invalid address {bind_addr:?}"))?;
     let mut stream =
         TcpStream::connect_timeout(&addr, TIMEOUT).map_err(|e| format!("connect {addr}: {e}"))?;
-    stream.set_read_timeout(Some(TIMEOUT)).map_err(|e| e.to_string())?;
-    stream.set_write_timeout(Some(TIMEOUT)).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(TIMEOUT))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(TIMEOUT))
+        .map_err(|e| e.to_string())?;
 
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {addr}\r\nUser-Agent: lumenqraph-healthcheck\r\nConnection: close\r\n\r\n"
@@ -99,15 +103,24 @@ mod tests {
 
     #[test]
     fn wildcard_binds_probe_loopback() {
-        assert_eq!(probe_addr("0.0.0.0:8080").unwrap().to_string(), "127.0.0.1:8080");
+        assert_eq!(
+            probe_addr("0.0.0.0:8080").unwrap().to_string(),
+            "127.0.0.1:8080"
+        );
         assert_eq!(probe_addr("[::]:8080").unwrap().to_string(), "[::1]:8080");
-        assert_eq!(probe_addr("127.0.0.1:9091").unwrap().to_string(), "127.0.0.1:9091");
+        assert_eq!(
+            probe_addr("127.0.0.1:9091").unwrap().to_string(),
+            "127.0.0.1:9091"
+        );
     }
 
     #[test]
     fn parses_status_line() {
         assert_eq!(parse_status("HTTP/1.1 200 OK\r\n"), Some(200));
-        assert_eq!(parse_status("HTTP/1.1 503 Service Unavailable\r\n"), Some(503));
+        assert_eq!(
+            parse_status("HTTP/1.1 503 Service Unavailable\r\n"),
+            Some(503)
+        );
         assert_eq!(parse_status("garbage"), None);
     }
 }

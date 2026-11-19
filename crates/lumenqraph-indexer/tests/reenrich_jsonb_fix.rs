@@ -263,22 +263,27 @@ mod reenrich_jsonb_fix_tests {
         .await
         .expect("Failed to insert event");
 
-        let row = sqlx::query(
-            "SELECT decoded_topics FROM events WHERE event_id = $1",
-        )
-        .bind("complex_event")
-        .fetch_one(&pool)
-        .await
-        .expect("Failed to query");
+        let row = sqlx::query("SELECT decoded_topics FROM events WHERE event_id = $1")
+            .bind("complex_event")
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to query");
 
         let decoded_topics_result: Result<sqlx::types::Json<serde_json::Value>, _> =
             row.try_get("decoded_topics");
 
-        assert!(decoded_topics_result.is_ok(), "Should read complex decoded_topics");
+        assert!(
+            decoded_topics_result.is_ok(),
+            "Should read complex decoded_topics"
+        );
 
         let topics_value = decoded_topics_result.unwrap().0;
         assert!(topics_value.is_array(), "decoded_topics should be an array");
-        assert_eq!(topics_value.as_array().unwrap().len(), 5, "Should have 5 elements");
+        assert_eq!(
+            topics_value.as_array().unwrap().len(),
+            5,
+            "Should have 5 elements"
+        );
         assert_eq!(
             topics_value[0].as_str().unwrap(),
             "complex_event",

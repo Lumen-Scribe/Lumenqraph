@@ -171,7 +171,11 @@ async fn proxy(mount: Arc<Mount>, req: Request) -> Response {
     let max = mount.max_response_bytes;
     if resp.content_length().is_some_and(|len| len > max as u64) {
         tracing::warn!(url, max, "mounted instance response too large");
-        return gateway_error(StatusCode::BAD_GATEWAY, "bad_gateway", "mounted instance response too large");
+        return gateway_error(
+            StatusCode::BAD_GATEWAY,
+            "bad_gateway",
+            "mounted instance response too large",
+        );
     }
     let mut bytes = Vec::with_capacity(resp.content_length().unwrap_or(0) as usize);
     loop {
@@ -226,14 +230,22 @@ fn forwarded_for(headers: &HeaderMap, client_ip: Option<&str>) -> Option<String>
 /// `504` for a timed-out upstream, `502` for anything else.
 fn upstream_error(e: &reqwest::Error, message: &str) -> Response {
     if e.is_timeout() {
-        gateway_error(StatusCode::GATEWAY_TIMEOUT, "gateway_timeout", "mounted instance timed out")
+        gateway_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "gateway_timeout",
+            "mounted instance timed out",
+        )
     } else {
         gateway_error(StatusCode::BAD_GATEWAY, "bad_gateway", message)
     }
 }
 
 fn gateway_error(status: StatusCode, code: &str, message: &str) -> Response {
-    (status, axum::Json(json!({ "code": code, "error": message }))).into_response()
+    (
+        status,
+        axum::Json(json!({ "code": code, "error": message })),
+    )
+        .into_response()
 }
 
 fn skip(name: &HeaderName) -> bool {
@@ -251,7 +263,8 @@ mod tests {
 
     #[test]
     fn parses_mounts_and_skips_junk() {
-        let mounts = parse_mounts("testnet=http://127.0.0.1:8081/, ,bad entry,futurenet=http://x:1");
+        let mounts =
+            parse_mounts("testnet=http://127.0.0.1:8081/, ,bad entry,futurenet=http://x:1");
         assert_eq!(
             mounts,
             vec![
@@ -270,7 +283,10 @@ mod tests {
     fn forwarded_for_appends_client_ip() {
         let mut headers = HeaderMap::new();
         assert_eq!(forwarded_for(&headers, None), None);
-        assert_eq!(forwarded_for(&headers, Some("10.0.0.1")).as_deref(), Some("10.0.0.1"));
+        assert_eq!(
+            forwarded_for(&headers, Some("10.0.0.1")).as_deref(),
+            Some("10.0.0.1")
+        );
         headers.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
         assert_eq!(
             forwarded_for(&headers, Some("10.0.0.1")).as_deref(),
@@ -288,7 +304,12 @@ mod tests {
         let headers: serde_json::Map<String, Value> = req
             .headers()
             .iter()
-            .map(|(k, v)| (k.to_string(), Value::String(v.to_str().unwrap_or("").to_string())))
+            .map(|(k, v)| {
+                (
+                    k.to_string(),
+                    Value::String(v.to_str().unwrap_or("").to_string()),
+                )
+            })
             .collect();
         let body = to_bytes(req.into_body(), usize::MAX).await.unwrap();
         axum::Json(json!({
@@ -350,7 +371,9 @@ mod tests {
     #[tokio::test]
     async fn get_strips_prefix_and_keeps_query() {
         let base = proxy_to_mock(ProxyConfig::default()).await;
-        let resp = reqwest::get(format!("{base}/testnet/contracts?limit=5")).await.unwrap();
+        let resp = reqwest::get(format!("{base}/testnet/contracts?limit=5"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
         let seen = get_json(resp).await;
         assert_eq!(seen["method"], "GET");
@@ -406,7 +429,9 @@ mod tests {
     async fn upstream_error_status_and_body_pass_through() {
         let base = proxy_to_mock(ProxyConfig::default()).await;
         for code in [404u16, 418, 503] {
-            let resp = reqwest::get(format!("{base}/testnet/status/{code}")).await.unwrap();
+            let resp = reqwest::get(format!("{base}/testnet/status/{code}"))
+                .await
+                .unwrap();
             assert_eq!(resp.status().as_u16(), code);
             assert_eq!(resp.text().await.unwrap(), format!("upstream says {code}"));
         }
@@ -419,8 +444,14 @@ mod tests {
         let dead = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
 
-        let base = serve(mount_router(&[("testnet".into(), dead)], &ProxyConfig::default())).await;
-        let resp = reqwest::get(format!("{base}/testnet/contracts")).await.unwrap();
+        let base = serve(mount_router(
+            &[("testnet".into(), dead)],
+            &ProxyConfig::default(),
+        ))
+        .await;
+        let resp = reqwest::get(format!("{base}/testnet/contracts"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 502);
         assert_eq!(get_json(resp).await["code"], "bad_gateway");
     }

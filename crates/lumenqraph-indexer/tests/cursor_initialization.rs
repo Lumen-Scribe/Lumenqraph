@@ -5,7 +5,7 @@
 #[cfg(test)]
 mod cursor_initialization_tests {
     use sqlx::postgres::PgPoolOptions;
-    use sqlx::{PgPool, Row};
+    use sqlx::PgPool;
 
     async fn setup_test_db() -> PgPool {
         let database_url = std::env::var("DATABASE_URL")
@@ -74,12 +74,11 @@ mod cursor_initialization_tests {
         .expect("incr_errors upsert should succeed");
 
         // Check the cursor state
-        let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT last_processed_ledger FROM indexer_cursor WHERE id = 1"
-        )
-        .fetch_optional(&pool)
-        .await
-        .expect("query should succeed");
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT last_processed_ledger FROM indexer_cursor WHERE id = 1")
+                .fetch_optional(&pool)
+                .await
+                .expect("query should succeed");
 
         // The problem: on a fresh database, this inserts with last_processed_ledger = 0
         // which is indistinguishable from "have processed up to ledger 0"
@@ -110,13 +109,15 @@ mod cursor_initialization_tests {
 
         // Scenario: First cycle fails; no cursor row is created by error handling.
         // The pool is clean (no cursor row).
-        let cursor_exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM indexer_cursor WHERE id = 1)"
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("query should succeed");
-        assert!(!cursor_exists, "cursor should not exist after first failure");
+        let cursor_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM indexer_cursor WHERE id = 1)")
+                .fetch_one(&pool)
+                .await
+                .expect("query should succeed");
+        assert!(
+            !cursor_exists,
+            "cursor should not exist after first failure"
+        );
 
         // On the second cycle, read_last_processed returns None,
         // so the logic should fall through to "None if config.start_ledger > 0".
@@ -171,7 +172,7 @@ mod cursor_initialization_tests {
         if rows_affected == 0 {
             sqlx::query(
                 "INSERT INTO indexer_cursor (id, last_processed_ledger, chain_tip_ledger, version)
-                 VALUES (1, $1, $2, 1)"
+                 VALUES (1, $1, $2, 1)",
             )
             .bind(last_processed)
             .bind(chain_tip)
@@ -180,12 +181,11 @@ mod cursor_initialization_tests {
             .expect("insert should succeed");
         }
 
-        let (stored_ledger,): (i64,) = sqlx::query_as(
-            "SELECT last_processed_ledger FROM indexer_cursor WHERE id = 1"
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("query should succeed");
+        let (stored_ledger,): (i64,) =
+            sqlx::query_as("SELECT last_processed_ledger FROM indexer_cursor WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .expect("query should succeed");
 
         assert_eq!(
             stored_ledger, last_processed,

@@ -70,7 +70,7 @@ use sqlx::PgPool;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{debug, info, warn};
 
-use lumenqraph_core::NewEvent;
+use lumenqraph_core::{EventType, NewEvent};
 
 use crate::config::Config;
 use crate::specs::SpecCache;
@@ -231,8 +231,7 @@ impl GalexieSource {
 
     /// Parse one line from the export file into zero or more [`HistoricalEvent`]s.
     pub fn parse_line(line: &str) -> anyhow::Result<Vec<HistoricalEvent>> {
-        let json: serde_json::Value =
-            serde_json::from_str(line).context("invalid JSON line")?;
+        let json: serde_json::Value = serde_json::from_str(line).context("invalid JSON line")?;
 
         // Is this a per-ledger envelope?
         if json.get("events").is_some() {
@@ -439,8 +438,12 @@ pub async fn run(
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             historical_to_new_event(ev, spec.as_deref())
         })) {
-            Ok(new_ev) => {
+            Ok(Some(new_ev)) => {
                 batch.push(new_ev);
+            }
+            Ok(None) => {
+                total_skipped += 1;
+                continue;
             }
             Err(_) => {
                 total_skipped += 1;
@@ -451,11 +454,7 @@ pub async fn run(
         if batch.len() >= batch_size {
             let n = flush_batch(&pool, &mut batch).await?;
             total_inserted += n;
-            debug!(
-                inserted = n,
-                lines_processed,
-                "flushed batch"
-            );
+            debug!(inserted = n, lines_processed, "flushed batch");
         }
     }
 
@@ -466,9 +465,7 @@ pub async fn run(
 
     info!(
         total_inserted,
-        total_skipped,
-        lines_processed,
-        "deep backfill complete"
+        total_skipped, lines_processed, "deep backfill complete"
     );
     Ok(())
 }
@@ -484,7 +481,9 @@ async fn flush_batch(pool: &PgPool, batch: &mut Vec<NewEvent>) -> anyhow::Result
 fn historical_to_new_event(
     ev: HistoricalEvent,
     spec: Option<&lumenqraph_core::ContractSpec>,
-) -> NewEvent {
+) -> Option<NewEvent> {
+    // Unknown event types cannot satisfy the events.event_type CHECK; skip them.
+    let event_type = EventType::from_rpc_str(&ev.event_type)?;
     use lumenqraph_core::xdr;
 
     let decoded_topics = xdr::decode_topics(&ev.topics);
@@ -505,12 +504,17 @@ fn historical_to_new_event(
         ev.paging_token
     };
 
-    NewEvent {
+    Some(NewEvent {
         event_id: ev.event_id,
         contract_id: ev.contract_id,
         ledger: ev.ledger,
         ledger_closed_at: ev.ledger_closed_at,
-        event_type: ev.event_type,
+        // Unknown values fall back to `contract`, the same default used when the
+        // export omits the field.
+        event_type: ev
+            .event_type
+            .parse()
+            .unwrap_or(lumenqraph_core::EventType::Contract),
         topics: ev.topics,
         decoded_topics,
         event_name,
@@ -520,7 +524,7 @@ fn historical_to_new_event(
         tx_hash: ev.tx_hash,
         in_successful_call: ev.in_successful_call,
         paging_token,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -636,7 +640,7 @@ mod tests {
             in_successful_call: true,
             paging_token: String::new(),
         };
-        let new_ev = historical_to_new_event(ev, None);
+        let new_ev = historical_to_new_event(ev, None).expect("known event type");
         assert_eq!(new_ev.paging_token, "myid");
     }
 
@@ -654,7 +658,7 @@ mod tests {
             in_successful_call: true,
             paging_token: "custom-paging".to_string(),
         };
-        let new_ev = historical_to_new_event(ev, None);
+        let new_ev = historical_to_new_event(ev, None).expect("known event type");
         assert_eq!(new_ev.paging_token, "custom-paging");
     }
 }

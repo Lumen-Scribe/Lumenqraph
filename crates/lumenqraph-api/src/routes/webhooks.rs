@@ -11,25 +11,22 @@
 
 use axum::extract::{Extension, Path, Query, State};
 use axum::response::Response;
-use axum::{Extension, Json};
+use axum::Json;
+use hmac::{Hmac, Mac};
 use lumenqraph_core::WebhookSubscription;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use uuid::Uuid;
-use sqlx::PgPool;
-use sqlx::Row as _;
-use tracing::warn;
-use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use sqlx::PgPool;
+use tracing::warn;
+use uuid::Uuid;
 
 use crate::auth::CallerKeyHash;
 use crate::error::{ApiError, ApiResult};
 use crate::pagination::{self, IdCursor, Page, PageRequest};
 use crate::state::AppState;
 use crate::url_validation;
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// Log a webhook lifecycle event to the audit log.
 ///
@@ -152,7 +149,8 @@ pub async fn create_webhook(
         ));
     }
 
-    let contract_ids = normalize_contract_ids(body.contract_id.as_deref(), body.contract_ids.clone());
+    let contract_ids =
+        normalize_contract_ids(body.contract_id.as_deref(), body.contract_ids.clone());
     let event_names = normalize_event_names(body.event_name.as_deref(), body.event_names.clone());
 
     if let Some(ref filter) = body.filter {
@@ -161,7 +159,9 @@ pub async fn create_webhook(
 
     if let Some(ref ids) = contract_ids {
         if ids.len() > 25 {
-            return Err(ApiError::bad_request("contract_ids must contain at most 25 entries"));
+            return Err(ApiError::bad_request(
+                "contract_ids must contain at most 25 entries",
+            ));
         }
         for cid in ids {
             validate_contract_id(cid)?;
@@ -169,7 +169,9 @@ pub async fn create_webhook(
     }
     if let Some(ref names) = event_names {
         if names.len() > 25 {
-            return Err(ApiError::bad_request("event_names must contain at most 25 entries"));
+            return Err(ApiError::bad_request(
+                "event_names must contain at most 25 entries",
+            ));
         }
         for name in names {
             validate_event_name(name)?;
@@ -183,12 +185,11 @@ pub async fn create_webhook(
     // `backfill_start` is the seq *before* the first event we want to
     // backfill; `starting_seq` becomes the current global max (the watermark
     // at which the live stream takes over once the backfill completes).
-    let (starting_seq, backfill_seq): (i64, Option<i64>) = if let Some(ref since) = body.since {
+    let (starting_seq, _backfill_seq): (i64, Option<i64>) = if let Some(ref since) = body.since {
         let backfill_start = calculate_starting_seq(&state.pool, since).await?;
-        let global_max: i64 =
-            sqlx::query_scalar("SELECT COALESCE(max(seq), 0) FROM events")
-                .fetch_one(&state.pool)
-                .await?;
+        let global_max: i64 = sqlx::query_scalar("SELECT COALESCE(max(seq), 0) FROM events")
+            .fetch_one(&state.pool)
+            .await?;
         // Only arm the backfill if there are actually events in the window.
         if backfill_start < global_max {
             (global_max, Some(backfill_start))
@@ -205,7 +206,7 @@ pub async fn create_webhook(
     // Set owner_key_hash from the authenticated caller (#421). Anonymous callers
     // (no API key) create subscriptions with NULL owner, which are only accessible
     // to admin keys.
-    let owner_key_hash: Option<String> = caller.map(|ext| ext.0.0.clone());
+    let owner_key_hash: Option<String> = caller.map(|ext| ext.0 .0.clone());
 
     let sub: WebhookSubscription = sqlx::query_as(
         "INSERT INTO webhook_subscriptions
@@ -228,7 +229,13 @@ pub async fn create_webhook(
     .await?;
 
     let key_prefix = owner_key_hash.as_deref().unwrap_or("anon");
-    log_webhook_action(&state.pool, key_prefix, "webhook_create", &sub.id.to_string()).await;
+    log_webhook_action(
+        &state.pool,
+        key_prefix,
+        "webhook_create",
+        &sub.id.to_string(),
+    )
+    .await;
 
     // Return the secret in the response (this is the only time it's exposed).
     Ok(Json(CreatedWebhook {
@@ -273,7 +280,9 @@ fn validate_webhook_filter(filter: &Value) -> Result<(), ApiError> {
     match filter {
         Value::Object(obj) => {
             if obj.len() > 16 {
-                return Err(ApiError::bad_request("filter contains too many keys (max 16)"));
+                return Err(ApiError::bad_request(
+                    "filter contains too many keys (max 16)",
+                ));
             }
             for (key, value) in obj {
                 if key.len() > 64 {
@@ -312,8 +321,15 @@ fn normalize_contract_ids(
     if let Some(mut list) = multi {
         values.append(&mut list);
     }
-    let values = values.into_iter().filter(|v| !v.is_empty()).collect::<Vec<_>>();
-    if values.is_empty() { None } else { Some(values) }
+    let values = values
+        .into_iter()
+        .filter(|v| !v.is_empty())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
 }
 
 fn normalize_event_names(
@@ -329,15 +345,23 @@ fn normalize_event_names(
     if let Some(mut list) = multi {
         values.append(&mut list);
     }
-    let values = values.into_iter().filter(|v| !v.is_empty()).collect::<Vec<_>>();
-    if values.is_empty() { None } else { Some(values) }
+    let values = values
+        .into_iter()
+        .filter(|v| !v.is_empty())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
 }
 
 async fn calculate_starting_seq(pool: &sqlx::PgPool, since: &str) -> ApiResult<i64> {
     if since.starts_with("last ") {
         let count_str = since.strip_prefix("last ").unwrap_or("0");
-        let count: i64 = count_str.parse()
-            .map_err(|_| ApiError::bad_request("invalid 'last N' format; expected 'last <number>'"))?;
+        let count: i64 = count_str.parse().map_err(|_| {
+            ApiError::bad_request("invalid 'last N' format; expected 'last <number>'")
+        })?;
         if count > MAX_BACKFILL_COUNT {
             return Err(ApiError::bad_request(format!(
                 "since 'last N' exceeds maximum allowed backfill count ({MAX_BACKFILL_COUNT})"
@@ -358,11 +382,12 @@ async fn calculate_starting_seq(pool: &sqlx::PgPool, since: &str) -> ApiResult<i
         let ts = chrono::DateTime::parse_from_rfc3339(since)
             .map_err(|_| ApiError::bad_request("invalid timestamp format; expected ISO-8601"))?
             .with_timezone(&chrono::Utc);
-        let seq: Option<i64> = sqlx::query_scalar("SELECT min(seq) FROM events WHERE ledger_closed_at >= $1")
-            .bind(ts)
-            .fetch_optional(pool)
-            .await?
-            .flatten();
+        let seq: Option<i64> =
+            sqlx::query_scalar("SELECT min(seq) FROM events WHERE ledger_closed_at >= $1")
+                .bind(ts)
+                .fetch_optional(pool)
+                .await?
+                .flatten();
         Ok(seq.unwrap_or(0))
     }
 }
@@ -403,7 +428,20 @@ pub async fn list_webhooks(
 
 /// Public JSON for one subscription row. Never includes the secret.
 fn subscription_json(row: WebhookListRow) -> Value {
-    let (id, url, kind, contract_id, event_name, contract_ids, event_names, filter, active, created_at, auto_disabled_at, auto_disabled_reason) = row;
+    let (
+        id,
+        url,
+        kind,
+        contract_id,
+        event_name,
+        contract_ids,
+        event_names,
+        filter,
+        active,
+        created_at,
+        auto_disabled_at,
+        auto_disabled_reason,
+    ) = row;
     json!({
         "id": id,
         "url": url,
@@ -428,7 +466,7 @@ pub async fn get_webhook(
     caller: Option<Extension<CallerKeyHash>>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let owner_key_hash: Option<String> = caller.map(|ext| ext.0.0.clone());
+    let owner_key_hash: Option<String> = caller.map(|ext| ext.0 .0.clone());
     let row: Option<WebhookListRow> = sqlx::query_as(
         "SELECT id, url, kind, contract_id, event_name, contract_ids, event_names, filter, active, created_at, auto_disabled_at, auto_disabled_reason
          FROM webhook_subscriptions
@@ -456,12 +494,8 @@ pub async fn test_webhook(
     caller: Option<Extension<CallerKeyHash>>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let owner_key_hash: Option<String> = caller.map(|ext| ext.0.0.clone());
-    let encryption_key = state
-        .config
-        .webhook_encryption_key
-        .as_deref()
-        .unwrap_or("default-key-for-testing");
+    let owner_key_hash: Option<String> = caller.map(|ext| ext.0 .0.clone());
+    let encryption_key = state.config.webhook_encryption_key.as_str();
 
     let (url, secret): (String, String) = sqlx::query_as(
         "SELECT url, pgp_sym_decrypt(encrypted_secret, $2)
@@ -508,7 +542,10 @@ pub async fn test_webhook(
     let response = client
         .post(&url)
         .header("Content-Type", "application/json")
-        .header("X-Lumenqraph-Signature", format!("t={timestamp},v1={signature}"))
+        .header(
+            "X-Lumenqraph-Signature",
+            format!("t={timestamp},v1={signature}"),
+        )
         .header("X-Lumenqraph-Delivery-Id", delivery_id.to_string())
         .header("X-Lumenqraph-Timestamp", timestamp.to_string())
         .body(body)
@@ -531,9 +568,15 @@ pub async fn test_webhook(
 
 pub async fn update_webhook(
     State(state): State<AppState>,
+    caller: Option<Extension<CallerKeyHash>>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateWebhook>,
 ) -> ApiResult<Json<Value>> {
+    // Only the owning key may update a subscription (#561), same as the other
+    // management routes. Anonymous callers match nothing.
+    let owner_key_hash: Option<String> = caller.map(|ext| ext.0 .0.clone());
+    let key_prefix = owner_key_hash.as_deref().unwrap_or("anon").to_string();
+
     let touches_event_fields = body.event_name.is_some() || body.event_names.is_some();
     if body.active.is_none()
         && body.url.is_none()
@@ -554,7 +597,9 @@ pub async fn update_webhook(
     }
     if let Some(Some(ref ids)) = body.contract_ids {
         if ids.len() > 25 {
-            return Err(ApiError::bad_request("contract_ids must contain at most 25 entries"));
+            return Err(ApiError::bad_request(
+                "contract_ids must contain at most 25 entries",
+            ));
         }
         for cid in ids {
             validate_contract_id(cid)?;
@@ -562,7 +607,9 @@ pub async fn update_webhook(
     }
     if let Some(Some(ref names)) = body.event_names {
         if names.len() > 25 {
-            return Err(ApiError::bad_request("event_names must contain at most 25 entries"));
+            return Err(ApiError::bad_request(
+                "event_names must contain at most 25 entries",
+            ));
         }
         for name in names {
             validate_event_name(name)?;
@@ -603,7 +650,7 @@ pub async fn update_webhook(
                 auto_disabled_at     = CASE WHEN $14 THEN NULL ELSE auto_disabled_at END,
                 auto_disabled_reason = CASE WHEN $14 THEN NULL ELSE auto_disabled_reason END,
                 consecutive_failures = CASE WHEN $14 THEN 0 ELSE consecutive_failures END
-          WHERE id = $1
+          WHERE id = $1 AND owner_key_hash IS NOT DISTINCT FROM $15
           RETURNING id, url, kind, contract_id, event_name, contract_ids, event_names, filter, active, created_at, auto_disabled_at, auto_disabled_reason",
     )
     .bind(id)
@@ -620,10 +667,12 @@ pub async fn update_webhook(
     .bind(set_filter)
     .bind(&filter)
     .bind(reactivate)
-    .fetch_one(&state.pool)
-    .await?;
+    .bind(&owner_key_hash)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("webhook subscription not found"))?;
 
-    log_webhook_action(&state.pool, "webhook_update", &id.to_string()).await;
+    log_webhook_action(&state.pool, &key_prefix, "webhook_update", &id.to_string()).await;
 
     Ok(Json(webhook_row_json(row)))
 }
@@ -639,7 +688,20 @@ fn split_clearable<T>(field: Option<Option<T>>) -> (bool, Option<T>) {
 
 /// Serializes a subscription row in the same shape as `list_webhooks`.
 fn webhook_row_json(row: WebhookListRow) -> Value {
-    let (id, url, kind, contract_id, event_name, contract_ids, event_names, filter, active, created_at, auto_disabled_at, auto_disabled_reason) = row;
+    let (
+        id,
+        url,
+        kind,
+        contract_id,
+        event_name,
+        contract_ids,
+        event_names,
+        filter,
+        active,
+        created_at,
+        auto_disabled_at,
+        auto_disabled_reason,
+    ) = row;
     json!({
         "id": id,
         "url": url,
@@ -661,17 +723,20 @@ pub async fn delete_webhook(
     caller: Option<Extension<CallerKeyHash>>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let result = sqlx::query("DELETE FROM webhook_subscriptions WHERE id = $1 AND owner_key_hash = $2")
-        .bind(id)
-        .bind(&caller.0)
-        .execute(&state.pool)
-        .await?;
+    let result =
+        sqlx::query("DELETE FROM webhook_subscriptions WHERE id = $1 AND owner_key_hash = $2")
+            .bind(id)
+            .bind(caller.as_ref().map(|ext| ext.0 .0.clone()))
+            .execute(&state.pool)
+            .await?;
 
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found("webhook subscription not found"));
     }
 
-    let key_prefix = caller.map(|ext| ext.0.0.clone()).unwrap_or_else(|| "anon".to_string());
+    let key_prefix = caller
+        .map(|ext| ext.0 .0.clone())
+        .unwrap_or_else(|| "anon".to_string());
     log_webhook_action(&state.pool, &key_prefix, "webhook_delete", &id.to_string()).await;
     Ok(Json(json!({ "deleted": true })))
 }
@@ -736,12 +801,13 @@ pub async fn list_webhook_deliveries(
 ) -> ApiResult<Response> {
     let page = PageRequest::<IdCursor>::parse(q.limit, 500, q.offset, q.after.as_deref())?;
 
-    let exists: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id = $1 AND owner_key_hash = $2)")
-            .bind(id)
-            .bind(&caller.0)
-            .fetch_one(&state.pool)
-            .await?;
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id = $1 AND owner_key_hash = $2)",
+    )
+    .bind(id)
+    .bind(&caller.0)
+    .fetch_one(&state.pool)
+    .await?;
     if !exists {
         return Err(ApiError::not_found("subscription not found"));
     }
@@ -806,7 +872,7 @@ const REDRIVE_JITTER_SECS: f64 = 300.0;
 /// (optionally only those created at or after `since`) back to pending.
 pub async fn redrive_webhook(
     State(state): State<AppState>,
-    Extension(caller): Extension<CallerKeyHash>,
+    Extension(_caller): Extension<CallerKeyHash>,
     Path(id): Path<Uuid>,
     Query(query): Query<RedriveQuery>,
 ) -> ApiResult<Json<Value>> {
@@ -944,17 +1010,11 @@ pub async fn rotate_webhook_secret(
         .unwrap_or_else(default_grace_seconds);
     validate_grace_seconds(grace_seconds)?;
 
-
     // The required key is validated and loaded once at API startup.
-    let encryption_key = state.config.webhook_encryption_key.as_str();
+    let _encryption_key = state.config.webhook_encryption_key.as_str();
 
     // Same key source as create_webhook (#441); no public fallback is read from the environment.
-    let encryption_key = state
-        .config
-        .webhook_encryption_key
-        .as_deref()
-        .unwrap_or("default-key-for-testing");
-
+    let encryption_key = state.config.webhook_encryption_key.as_str();
 
     let new_secret = random_secret();
 
@@ -972,15 +1032,23 @@ pub async fn rotate_webhook_secret(
     .bind(&new_secret)
     .bind(encryption_key)
     .bind(id)
-    .bind(&caller.0)
+    .bind(caller.as_ref().map(|ext| ext.0 .0.clone()))
     .fetch_optional(&state.pool)
     .await?;
 
     let (id, previous_expires_at) =
         updated.ok_or_else(|| ApiError::not_found("webhook subscription not found"))?;
 
-    let key_prefix = caller.map(|ext| ext.0.0.clone()).unwrap_or_else(|| "anon".to_string());
-    log_webhook_action(&state.pool, &key_prefix, "webhook_rotate_secret", &id.to_string()).await;
+    let key_prefix = caller
+        .map(|ext| ext.0 .0.clone())
+        .unwrap_or_else(|| "anon".to_string());
+    log_webhook_action(
+        &state.pool,
+        &key_prefix,
+        "webhook_rotate_secret",
+        &id.to_string(),
+    )
+    .await;
 
     Ok(Json(json!({
         "id": id,
@@ -1017,7 +1085,10 @@ mod tests {
 
         assert_eq!(json["url"], "https://example.com/hook");
         assert_eq!(json["active"], true);
-        assert!(json.get("secret").is_none(), "secret must not be serialized: {json}");
+        assert!(
+            json.get("secret").is_none(),
+            "secret must not be serialized: {json}"
+        );
         assert!(json.get("encrypted_secret").is_none());
     }
 }

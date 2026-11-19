@@ -30,7 +30,7 @@ groups:
       # Indexer stalled alert
       - alert: LumenqraphIndexerStalled
         expr: |
-          increase(lumenqraph_indexer_ingested_total[5m]) == 0
+          increase(lumenqraph_indexer_events_ingested_total[5m]) == 0
           and
           on(instance) lumenqraph_indexer_lag_ledgers > 0
         for: 5m
@@ -75,7 +75,7 @@ groups:
       # Data ingestion rate too low alert
       - alert: LumenqraphIngestRateLow
         expr: |
-          rate(lumenqraph_indexer_ingested_total[5m]) < 1
+          rate(lumenqraph_indexer_events_ingested_total[5m]) < 1
         for: 10m
         labels:
           severity: warning

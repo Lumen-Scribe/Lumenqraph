@@ -12,7 +12,9 @@ use crate::metrics_middleware::escape_label_value;
 use crate::state::AppState;
 
 pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
-    let status: Option<(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
+    // Column order matches the SELECT below.
+    type CursorRow = (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64);
+    let status: Option<CursorRow> = sqlx::query_as(
         "SELECT last_processed_ledger, chain_tip_ledger, events_ingested_total, errors_total,
                 events_enriched_total, events_not_enriched_total, spec_fetch_failures_total,
                 rpc_calls_total, rpc_errors_total, rpc_errors_32001_total, consecutive_errors
@@ -25,12 +27,24 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
         .fetch_one(&state.pool)
         .await?;
 
-    let (last, tip, ingested, errors, enriched, not_enriched, spec_fetch_failures,
-         rpc_calls, rpc_errors, rpc_errors_32001, consecutive_errors) = status.unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+    let (
+        last,
+        tip,
+        ingested,
+        errors,
+        enriched,
+        not_enriched,
+        spec_fetch_failures,
+        rpc_calls,
+        rpc_errors,
+        rpc_errors_32001,
+        consecutive_errors,
+    ) = status.unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
     let lag = (tip - last).max(0);
     let lag_time_secs = lag * 5; // Approximate ~5 seconds per ledger
     let requests = state.http_requests.load(Ordering::Relaxed);
     let audit_dropped = state.audit_dropped.load(Ordering::Relaxed);
+    let rate_limit_backend_errors = crate::rate_limit::backend_error_count();
 
     let cache_hits = state.call_cache.hits();
     let cache_misses = state.call_cache.misses();

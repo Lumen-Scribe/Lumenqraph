@@ -73,7 +73,7 @@ fn synthetic_new_events(n: usize) -> Vec<NewEvent> {
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".into(),
             ledger: 1_000_000 + i as i64,
             ledger_closed_at: Utc::now(),
-            event_type: "contract".into(),
+            event_type: lumenqraph_core::EventType::Contract,
             topics: vec![TRANSFER_TOPIC_B64.into()],
             decoded_topics: vec![json!("transfer")],
             event_name: Some("transfer".into()),
@@ -124,26 +124,20 @@ fn bench_xdr_decode(c: &mut Criterion) {
 
     for &batch in &[1usize, 100, 1_000, 10_000] {
         group.throughput(Throughput::Elements(batch as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(batch),
-            &batch,
-            |b, &n| {
-                let raw = synthetic_raw_events(n);
-                b.iter(|| {
-                    // Replicate what `convert::to_new_event` does for XDR.
-                    let mut results = Vec::with_capacity(n);
-                    for (topics, value) in &raw {
-                        let decoded_topics = xdr::decode_topics(topics);
-                        let decoded_value = xdr::decode_scval_base64(value);
-                        let event_name = topics
-                            .first()
-                            .and_then(|t| xdr::event_name_from_topic(t));
-                        results.push((decoded_topics, decoded_value, event_name));
-                    }
-                    results
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(batch), &batch, |b, &n| {
+            let raw = synthetic_raw_events(n);
+            b.iter(|| {
+                // Replicate what `convert::to_new_event` does for XDR.
+                let mut results = Vec::with_capacity(n);
+                for (topics, value) in &raw {
+                    let decoded_topics = xdr::decode_topics(topics);
+                    let decoded_value = xdr::decode_scval_base64(value);
+                    let event_name = topics.first().and_then(|t| xdr::event_name_from_topic(t));
+                    results.push((decoded_topics, decoded_value, event_name));
+                }
+                results
+            });
+        });
     }
 
     group.finish();
@@ -157,28 +151,24 @@ fn bench_enrichment(c: &mut Criterion) {
 
     for &batch in &[1usize, 100, 1_000, 10_000] {
         group.throughput(Throughput::Elements(batch as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(batch),
-            &batch,
-            |b, &n| {
-                let events = synthetic_new_events(n);
-                b.iter(|| {
-                    // Replicate what `convert::to_new_event` does for enrichment.
-                    let mut enriched_count = 0usize;
-                    for ev in &events {
-                        if let Some(name) = &ev.event_name {
-                            if spec
-                                .enrich_event(name, &ev.decoded_topics, &ev.decoded_value)
-                                .is_some()
-                            {
-                                enriched_count += 1;
-                            }
+        group.bench_with_input(BenchmarkId::from_parameter(batch), &batch, |b, &n| {
+            let events = synthetic_new_events(n);
+            b.iter(|| {
+                // Replicate what `convert::to_new_event` does for enrichment.
+                let mut enriched_count = 0usize;
+                for ev in &events {
+                    if let Some(name) = &ev.event_name {
+                        if spec
+                            .enrich_event(name, &ev.decoded_topics, &ev.decoded_value)
+                            .is_some()
+                        {
+                            enriched_count += 1;
                         }
                     }
-                    enriched_count
-                });
-            },
-        );
+                }
+                enriched_count
+            });
+        });
     }
 
     group.finish();
@@ -358,62 +348,54 @@ fn bench_db_insert(c: &mut Criterion) {
 
     for &batch in &[10usize, 100, 500, 1_000] {
         group.throughput(Throughput::Elements(batch as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(batch),
-            &batch,
-            |b, &n| {
-                b.to_async(&rt).iter_batched(
-                    // Setup: generate a fresh set of events with unique IDs.
-                    || synthetic_new_events(n),
-                    // Routine: insert the batch and clean up.
-                    |events| {
-                        let pool = pool.clone();
-                        async move {
-                            // Inline the core of `store::insert_events` to avoid
-                            // depending on the private indexer module.
-                            let event_ids: Vec<_> =
-                                events.iter().map(|e| e.event_id.clone()).collect();
-                            let contract_ids: Vec<_> =
-                                events.iter().map(|e| e.contract_id.clone()).collect();
-                            let ledgers: Vec<i64> =
-                                events.iter().map(|e| e.ledger).collect();
-                            let closed_ats: Vec<_> =
-                                events.iter().map(|e| e.ledger_closed_at).collect();
-                            let event_types: Vec<_> =
-                                events.iter().map(|e| e.event_type.clone()).collect();
-                            let topics_json: Vec<String> = events
-                                .iter()
-                                .map(|e| serde_json::to_string(&e.topics).unwrap())
-                                .collect();
-                            let decoded_topics_json: Vec<String> = events
-                                .iter()
-                                .map(|e| serde_json::to_string(&e.decoded_topics).unwrap())
-                                .collect();
-                            let event_names: Vec<Option<String>> =
-                                events.iter().map(|e| e.event_name.clone()).collect();
-                            let values: Vec<_> =
-                                events.iter().map(|e| e.value.clone()).collect();
-                            let decoded_values_json: Vec<String> = events
-                                .iter()
-                                .map(|e| serde_json::to_string(&e.decoded_value).unwrap())
-                                .collect();
-                            let enriched_json: Vec<Option<String>> = events
-                                .iter()
-                                .map(|e| {
-                                    e.enriched
-                                        .as_ref()
-                                        .map(|v| serde_json::to_string(v).unwrap())
-                                })
-                                .collect();
-                            let tx_hashes: Vec<_> =
-                                events.iter().map(|e| e.tx_hash.clone()).collect();
-                            let in_successful_calls: Vec<bool> =
-                                events.iter().map(|e| e.in_successful_call).collect();
-                            let paging_tokens: Vec<_> =
-                                events.iter().map(|e| e.paging_token.clone()).collect();
+        group.bench_with_input(BenchmarkId::from_parameter(batch), &batch, |b, &n| {
+            b.to_async(&rt).iter_batched(
+                // Setup: generate a fresh set of events with unique IDs.
+                || synthetic_new_events(n),
+                // Routine: insert the batch and clean up.
+                |events| {
+                    let pool = pool.clone();
+                    async move {
+                        // Inline the core of `store::insert_events` to avoid
+                        // depending on the private indexer module.
+                        let event_ids: Vec<_> = events.iter().map(|e| e.event_id.clone()).collect();
+                        let contract_ids: Vec<_> =
+                            events.iter().map(|e| e.contract_id.clone()).collect();
+                        let ledgers: Vec<i64> = events.iter().map(|e| e.ledger).collect();
+                        let closed_ats: Vec<_> =
+                            events.iter().map(|e| e.ledger_closed_at).collect();
+                        let event_types: Vec<_> = events.iter().map(|e| e.event_type).collect();
+                        let topics_json: Vec<String> = events
+                            .iter()
+                            .map(|e| serde_json::to_string(&e.topics).unwrap())
+                            .collect();
+                        let decoded_topics_json: Vec<String> = events
+                            .iter()
+                            .map(|e| serde_json::to_string(&e.decoded_topics).unwrap())
+                            .collect();
+                        let event_names: Vec<Option<String>> =
+                            events.iter().map(|e| e.event_name.clone()).collect();
+                        let values: Vec<_> = events.iter().map(|e| e.value.clone()).collect();
+                        let decoded_values_json: Vec<String> = events
+                            .iter()
+                            .map(|e| serde_json::to_string(&e.decoded_value).unwrap())
+                            .collect();
+                        let enriched_json: Vec<Option<String>> = events
+                            .iter()
+                            .map(|e| {
+                                e.enriched
+                                    .as_ref()
+                                    .map(|v| serde_json::to_string(v).unwrap())
+                            })
+                            .collect();
+                        let tx_hashes: Vec<_> = events.iter().map(|e| e.tx_hash.clone()).collect();
+                        let in_successful_calls: Vec<bool> =
+                            events.iter().map(|e| e.in_successful_call).collect();
+                        let paging_tokens: Vec<_> =
+                            events.iter().map(|e| e.paging_token.clone()).collect();
 
-                            sqlx::query(
-                                "INSERT INTO events (
+                        sqlx::query(
+                            "INSERT INTO events (
                                     event_id, contract_id, ledger, ledger_closed_at, event_type,
                                     topics, decoded_topics, event_name, value, decoded_value,
                                     enriched, tx_hash, in_successful_call, paging_token
@@ -433,36 +415,35 @@ fn bench_db_insert(c: &mut Criterion) {
                                     enriched, tx_hash, in_successful_call, paging_token
                                  )
                                  ON CONFLICT (event_id) DO NOTHING",
-                            )
-                            .bind(&event_ids)
-                            .bind(&contract_ids)
-                            .bind(&ledgers)
-                            .bind(&closed_ats)
-                            .bind(&event_types)
-                            .bind(&topics_json)
-                            .bind(&decoded_topics_json)
-                            .bind(&event_names)
-                            .bind(&values)
-                            .bind(&decoded_values_json)
-                            .bind(&enriched_json)
-                            .bind(&tx_hashes)
-                            .bind(&in_successful_calls)
-                            .bind(&paging_tokens)
+                        )
+                        .bind(&event_ids)
+                        .bind(&contract_ids)
+                        .bind(&ledgers)
+                        .bind(&closed_ats)
+                        .bind(&event_types)
+                        .bind(&topics_json)
+                        .bind(&decoded_topics_json)
+                        .bind(&event_names)
+                        .bind(&values)
+                        .bind(&decoded_values_json)
+                        .bind(&enriched_json)
+                        .bind(&tx_hashes)
+                        .bind(&in_successful_calls)
+                        .bind(&paging_tokens)
+                        .execute(&pool)
+                        .await
+                        .expect("insert_events");
+
+                        // Clean up so subsequent iterations start fresh.
+                        sqlx::query("DELETE FROM events")
                             .execute(&pool)
                             .await
-                            .expect("insert_events");
-
-                            // Clean up so subsequent iterations start fresh.
-                            sqlx::query("DELETE FROM events")
-                                .execute(&pool)
-                                .await
-                                .expect("cleanup");
-                        }
-                    },
-                    BatchSize::PerIteration,
-                );
-            },
-        );
+                            .expect("cleanup");
+                    }
+                },
+                BatchSize::PerIteration,
+            );
+        });
     }
 
     group.finish();

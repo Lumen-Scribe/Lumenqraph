@@ -1,4 +1,21 @@
 //! Lumenqraph indexer CLI and process orchestration.
+//!
+//! Usage:
+//!   lumenqraph-indexer                          # live tail (default)
+//!   lumenqraph-indexer migrate                  # apply database migrations, then exit
+//!   lumenqraph-indexer backfill [LEDGER]        # one-shot catch-up within RPC window
+//!   lumenqraph-indexer deep-backfill --from N   # gapless history from a data-lake export
+//!   lumenqraph-indexer recover-gaps             # replay all recorded missed ranges
+//!   lumenqraph-indexer reenrich [--contract C] [--force]
+//!   lumenqraph-indexer inspect <CONTRACT>       # print a contract's on-chain interface
+//!
+//! `--help` and `--version` are handled by clap before any environment config
+//! is read, so they work without `DATABASE_URL` or any RPC settings.
+//!
+//! Concurrency model: the live poller elects a single active instance via the
+//! leader advisory lock (`INDEXER_LOCK_ID`). Migrations run under a separate
+//! short lock (`MIGRATION_LOCK_ID`) so a standby never blocks anyone from
+//! migrating.
 
 mod backfill;
 mod config;
@@ -8,12 +25,17 @@ mod deep_backfill;
 mod http;
 mod keys;
 mod poller;
+#[cfg(test)]
+mod projections_tests;
 mod reenrich;
 mod retention;
 mod rpc_client;
 mod specs;
 mod state;
 mod store;
+
+#[cfg(test)]
+mod projections_tests;
 
 #[cfg(all(test, feature = "smoke-tests"))]
 mod smoke;
@@ -23,21 +45,36 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use lumenqraph_core::ContractSpec;
+use sqlx::postgres::PgConnection;
+use tokio::sync::Mutex;
 use tracing::info;
 
 use config::Config;
 use deep_backfill::{GalexieSource, HistoricalSource};
-use rpc_client::RpcClient;
 use reenrich::ReenrichOptions;
+use rpc_client::RpcClient;
 
 const INDEXER_LOCK_ID: i64 = 0x6c756d656e717261;
 const MIGRATION_LOCK_ID: i64 = 0x6c756d656e717262;
 
+/// Version, commit and build time shown by `--version` (clap prints the name).
+fn version_string() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        format!(
+            "{}\ncommit: {}\nbuilt: {}",
+            env!("CARGO_PKG_VERSION"),
+            option_env!("LUMENQRAPH_GIT_SHA").unwrap_or("unknown"),
+            option_env!("LUMENQRAPH_BUILD_TIME").unwrap_or("unknown"),
+        )
+    })
+}
+
 #[derive(Parser)]
 #[command(
     name = "lumenqraph-indexer",
-    version,
     about = "Lumenqraph indexer — tails Soroban RPC and writes decoded events into Postgres"
 )]
 struct Cli {
@@ -45,15 +82,17 @@ struct Cli {
     command: Option<Command>,
 }
 
+#[derive(Subcommand)]
 enum Command {
     /// Live tail (the default).
     Run,
     /// One-shot catch-up within the RPC retention window.
     Backfill {
-        /// Start ledger; defaults to the persisted cursor or START_LEDGER.
+        /// Start ledger. When omitted, resumes at the persisted cursor + 1, or
+        /// at START_LEDGER if there is no cursor yet. Fails if neither exists.
         ledger: Option<u32>,
     },
-    /// Gapless history from a data-lake or Horizon source.
+    /// Gapless history from a data-lake export.
     DeepBackfill {
         #[arg(long)]
         from: u32,
@@ -68,8 +107,10 @@ enum Command {
     RecoverGaps,
     /// Re-enrich historical events with newly available specs.
     Reenrich {
+        /// Only re-enrich events from this contract (a `C...` strkey).
         #[arg(long)]
         contract: Option<String>,
+        /// Recompute enrichment even for events that already have it.
         #[arg(long)]
         force: bool,
     },
@@ -79,8 +120,11 @@ enum Command {
     Migrate,
 }
 
+/// Holds the session-level Postgres advisory lock that makes exactly one
+/// live indexer the leader. The connection is pinged periodically; if it dies
+/// the lock is gone and the process exits so another instance can take over.
 struct LeaderLock {
-    conn: Arc<Mutex<PgConnection>>,
+    conn: Arc<tokio::sync::Mutex<PgConnection>>,
 }
 
 impl LeaderLock {
@@ -103,9 +147,9 @@ impl LeaderLock {
                 .await
                 .context("failed while waiting for leader lock")?;
         }
-        info!("indexer leader lock acquired");
+        info!("indexer leader lock acquired; this instance is now active");
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Arc::new(tokio::sync::Mutex::new(conn)),
         })
     }
 
@@ -130,6 +174,19 @@ impl LeaderLock {
 fn skip_migrations() -> bool {
     matches!(
         std::env::var("SKIP_MIGRATIONS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Returns true when `ALLOW_NETWORK_CHANGE` is set to a truthy value. It lets
+/// the database be re-pinned to a different Soroban network (#714).
+fn allow_network_change() -> bool {
+    matches!(
+        std::env::var("ALLOW_NETWORK_CHANGE")
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase()
@@ -171,14 +228,7 @@ async fn run_deep_backfill(
         )),
         other => anyhow::bail!("unknown source type '{other}'; supported: galexie"),
     };
-    deep_backfill::run(
-        pool,
-        config,
-        source,
-        i64::from(from),
-        to.map(i64::from),
-    )
-    .await
+    deep_backfill::run(pool, config, source, i64::from(from), to.map(i64::from)).await
 }
 
 async fn inspect(rpc: &RpcClient, contract_id: &str) -> anyhow::Result<()> {
@@ -196,14 +246,66 @@ async fn inspect(rpc: &RpcClient, contract_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolve the start ledger for `backfill` (#711).
+///
+/// An explicit ledger always wins. Otherwise resume after the persisted cursor
+/// (`cursor + 1`), falling back to `START_LEDGER` when there is no cursor. A
+/// cursor of 0 means nothing has been processed yet, so it does not count.
+/// Never returns 0: starting from ledger 0 would backfill the whole retention
+/// window instead of resuming.
+fn resolve_backfill_start(
+    explicit: Option<u32>,
+    cursor: Option<i64>,
+    start_ledger: i64,
+) -> anyhow::Result<i64> {
+    if let Some(ledger) = explicit {
+        return Ok(i64::from(ledger));
+    }
+    if let Some(last) = cursor.filter(|c| *c > 0) {
+        return Ok(last + 1);
+    }
+    if start_ledger > 0 {
+        return Ok(start_ledger);
+    }
+    anyhow::bail!(
+        "no backfill start: no persisted cursor and START_LEDGER is unset; pass a ledger explicitly"
+    )
+}
+
+/// Check arguments that can be validated without touching the database or the
+/// RPC, so a typo fails immediately (#712).
+fn validate_args(command: &Command) -> anyhow::Result<()> {
+    if let Command::Reenrich {
+        contract: Some(contract),
+        ..
+    } = command
+    {
+        anyhow::ensure!(
+            lumenqraph_core::is_valid_contract_id(contract),
+            "invalid --contract '{contract}': expected a Soroban contract ID (C...)"
+        );
+    }
+    Ok(())
+}
+
+/// Bind address for the health/metrics HTTP server. Defaults to loopback so
+/// /health and /metrics are not exposed on public interfaces (#605).
+fn http_bind_addr() -> String {
+    std::env::var("INDEXER_HTTP_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:9090".to_string())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let _ = dotenvy::dotenv();
+    // Parse arguments before touching any environment config so that
+    // `--help` and `--version` succeed on a bare environment (#651).
+    // Parsed before any config is read, so `--help`/`--version` need no env (#651).
+    let matches = Cli::command().version(version_string()).get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    let command = cli.command.unwrap_or(Command::Run);
 
+    let _ = dotenvy::dotenv();
     lumenqraph_core::telemetry::init_tracing();
 
-    let cli = Cli::parse();
-    let command = cli.command.unwrap_or(Command::Run);
     let config = Config::from_env().context("failed to load config")?;
 
     let db = Config::db_config()?;
@@ -212,72 +314,79 @@ async fn main() -> anyhow::Result<()> {
     // Build the RPC client with all configured endpoints (#398).
     // RPC_URLS takes precedence over RPC_URL; both are parsed by Config::from_env.
     let rpc = RpcClient::with_urls(config.rpc_urls.clone(), config.rpc_timeout_secs);
-    let network_passphrase = rpc.validate_network_passphrases().await?;
-    info!(%network_passphrase, endpoints = config.rpc_urls.len(), "validated RPC network identity");
+    // Only commands that use the RPC need a reachable endpoint, and then only
+    // one of them (#713). `migrate` and `deep-backfill` make no RPC calls.
+    let live_passphrase = if matches!(command, Command::Migrate | Command::DeepBackfill { .. }) {
+        None
+    } else {
+        let network_passphrase = rpc.validate_network_passphrases().await?;
+        info!(%network_passphrase, endpoints = config.rpc_urls.len(), "validated RPC network identity");
+        Some(network_passphrase)
+    };
 
-    match &command {
+    match command {
         Command::Migrate => return run_migrations(&pool).await,
-        Command::Inspect { contract_id } => return inspect(&rpc, contract_id).await,
+        Command::Inspect { contract_id } => return inspect(&rpc, &contract_id).await,
         _ => {}
     }
 
     // SKIP_MIGRATIONS lets the all-in-one entrypoint skip the migrator when it
     // has already run `lumenqraph-indexer migrate` (#603).
-    if !skip_migrations() {
-        run_migrations(&pool).await?;
-    } else {
+    if skip_migrations() {
         info!("SKIP_MIGRATIONS is set; skipping database migrations");
+    } else {
+        run_migrations(&pool).await?;
     }
+
     match command {
         Command::Backfill { ledger } => {
             backfill::run(pool, rpc, config, ledger.map(i64::from).unwrap_or(0)).await
         }
-        Command::DeepBackfill { from, to, source, input } => {
-            run_deep_backfill(pool, config, from, to, source, input).await
-        }
+        Command::DeepBackfill {
+            from,
+            to,
+            source,
+            input,
+        } => run_deep_backfill(pool, config, from, to, source, input).await,
         Command::RecoverGaps => {
-            let specs = specs::SpecCache::new(
-                config.spec_cache_max_entries,
-                config.spec_fetch_concurrency,
-            );
+            let specs =
+                specs::SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
             poller::recover_gaps(&pool, &rpc, &config, &specs).await
         }
-        Command::Reenrich { .. } => reenrich::run_reenrich(pool, rpc, config).await,
+        Command::Reenrich { contract, force } => {
+            reenrich::run_reenrich(pool, rpc, config, ReenrichOptions { contract, force }).await
+        }
         Command::Run => {
             let lock = LeaderLock::acquire(&pool).await?;
             lock.spawn_keepalive();
+
+            info!(
+                rpc_host = %rpc.active_endpoint_host(),
+                rpc_endpoints = config.rpc_urls.len(),
+                contracts = ?config.contract_ids,
+                poll_secs = config.poll_interval_secs,
+                "starting lumenqraph indexer (live)"
+            );
+
             let specs = Arc::new(specs::SpecCache::new(
                 config.spec_cache_max_entries,
                 config.spec_fetch_concurrency,
             ));
-            let pool_for_http = Arc::new(pool.clone());
+            info!(
+                rpc_host = %rpc.active_endpoint_host(),
+                rpc_endpoints = config.rpc_urls.len(),
+                contracts = ?config.contract_ids,
+                poll_secs = config.poll_interval_secs,
+                "starting lumenqraph indexer (live)"
+            );
             // Default to loopback so /health and /metrics are not exposed on
             // public interfaces (#605). Set INDEXER_HTTP_BIND_ADDR=0.0.0.0:9090
             // (or the private network address) to allow Prometheus scraping.
             let bind_addr = std::env::var("INDEXER_HTTP_BIND_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:9090".to_string());
-            http::start_http_server(pool_for_http, Arc::clone(&specs), &bind_addr).await?;
+            http::start_http_server(Arc::new(pool.clone()), Arc::clone(&specs), &bind_addr).await?;
             poller::run(pool, rpc, config, specs).await
         }
-        Command::Migrate | Command::Inspect { .. } => unreachable!(),
+        Command::Migrate | Command::Inspect { .. } => unreachable!("handled above"),
     }
-
-    info!(
-        rpc_host = %rpc.active_endpoint_host(),
-        rpc_endpoints = config.rpc_urls.len(),
-        contracts = ?config.contract_ids,
-        poll_secs = config.poll_interval_secs,
-        "starting lumenqraph indexer (live)"
-    );
-
-    let pool_arc = std::sync::Arc::new(pool.clone());
-    let specs_arc = std::sync::Arc::new(specs);
-    // Default to loopback so /health and /metrics are not exposed on public
-    // interfaces (#605). Set INDEXER_HTTP_BIND_ADDR=0.0.0.0:9090 (or the
-    // private network address) to allow Prometheus scraping.
-    let bind_addr = std::env::var("INDEXER_HTTP_BIND_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:9090".to_string());
-    http::start_http_server(pool_arc, specs_arc.clone(), &bind_addr).await?;
-
-    poller::run(pool, rpc, config, specs_arc).await
 }

@@ -6,9 +6,11 @@ method.
 """
 
 import asyncio
+import io
 import unittest
-from typing import Any, Dict
-from unittest.mock import patch, MagicMock
+import urllib.error
+from typing import Any, Dict, Optional
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from lumenqraph import AsyncLumenqraphClient, LumenqraphError
 
@@ -171,6 +173,99 @@ class TestAsyncClientContextManager(unittest.IsolatedAsyncioTestCase):
         async with AsyncLumenqraphClient(base_url="http://test") as lq:
             self.assertIsInstance(lq, AsyncLumenqraphClient)
         # No exception — aclose is a no-op but must not raise.
+
+
+class FakeOk(io.BytesIO):
+    """Stand-in for a successful ``urlopen`` response."""
+
+    def __enter__(self) -> "FakeOk":
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+
+def _http_503(headers: Optional[Dict[str, str]] = None) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("http://test", 503, "unavailable", headers or {}, io.BytesIO(b"{}"))
+
+
+class TestAsyncRetries(unittest.IsolatedAsyncioTestCase):
+    """Retries run in the coroutine: backoff is an asyncio sleep, and cancellation stops them."""
+
+    async def test_retry_after_is_awaited_before_the_next_attempt(self):
+        attempts = []
+
+        def fake_urlopen(req, timeout=None):
+            attempts.append(req)
+            if len(attempts) == 1:
+                raise _http_503({"Retry-After": "2"})
+            return FakeOk(b'{"status": "ok"}')
+
+        lq = AsyncLumenqraphClient(base_url="http://test")
+        sleep = AsyncMock()
+        with patch("lumenqraph._http.urllib.request.urlopen", side_effect=fake_urlopen), \
+                patch("lumenqraph.async_client.asyncio.sleep", sleep), \
+                patch("lumenqraph._http._full_jitter", return_value=0):
+            result = await lq.health()
+
+        self.assertEqual(result, {"status": "ok"})
+        self.assertEqual(len(attempts), 2)
+        sleep.assert_awaited_once_with(2.0)
+
+    async def test_cancelling_the_task_stops_further_attempts(self):
+        attempts = []
+
+        def always_503(req, timeout=None):
+            attempts.append(req)
+            raise _http_503()
+
+        # A long base delay keeps the task parked in asyncio.sleep, so the
+        # cancel lands between attempts.
+        lq = AsyncLumenqraphClient(base_url="http://test", retry={"base_delay_ms": 60_000})
+        with patch("lumenqraph._http.urllib.request.urlopen", side_effect=always_503), \
+                patch("lumenqraph._http._full_jitter", side_effect=lambda ceiling: ceiling):
+            task = asyncio.create_task(lq.health())
+            for _ in range(200):
+                if attempts:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(len(attempts), 1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            await asyncio.sleep(0.1)
+
+        self.assertEqual(len(attempts), 1, "no attempt may run after cancellation")
+
+    async def test_gives_up_after_max_retries(self):
+        attempts = []
+
+        def always_503(req, timeout=None):
+            attempts.append(req)
+            raise _http_503()
+
+        lq = AsyncLumenqraphClient(base_url="http://test", retry={"max_retries": 2, "base_delay_ms": 1})
+        with patch("lumenqraph._http.urllib.request.urlopen", side_effect=always_503), \
+                patch("lumenqraph.async_client.asyncio.sleep", AsyncMock()):
+            with self.assertRaises(LumenqraphError) as ctx:
+                await lq.health()
+
+        self.assertEqual(ctx.exception.status, 503)
+        self.assertEqual(len(attempts), 3)
+
+    async def test_client_errors_are_not_retried(self):
+        attempts = []
+
+        def bad_request(req, timeout=None):
+            attempts.append(req)
+            raise urllib.error.HTTPError("http://test", 400, "bad", {}, io.BytesIO(b'{"error": "bad"}'))
+
+        lq = AsyncLumenqraphClient(base_url="http://test")
+        with patch("lumenqraph._http.urllib.request.urlopen", side_effect=bad_request):
+            with self.assertRaises(LumenqraphError):
+                await lq.health()
+
+        self.assertEqual(len(attempts), 1)
 
 
 if __name__ == "__main__":

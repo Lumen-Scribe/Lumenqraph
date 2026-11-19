@@ -38,8 +38,6 @@ pub enum ContractKind {
     Amm,
     /// A liquidity pool emitting `deposit`/`withdraw` events.
     LiquidityPool,
-    /// Anything else, or unknown.
-    Other,
 }
 
 /// Supplies the [`ContractKind`] for a contract id. In production this is backed
@@ -113,18 +111,13 @@ pub async fn insert_events_with_resolver(
         contract_ids.push(e.contract_id.clone());
         ledgers.push(e.ledger);
         closed_ats.push(e.ledger_closed_at);
-        event_types.push(e.event_type.clone());
+        event_types.push(e.event_type.as_str().to_string());
         topics_json.push(serde_json::to_string(&e.topics)?);
         decoded_topics_json.push(serde_json::to_string(&e.decoded_topics)?);
         event_names.push(e.event_name.clone());
         values.push(e.value.clone());
         decoded_values_json.push(serde_json::to_string(&e.decoded_value)?);
-        enriched_json.push(
-            e.enriched
-                .as_ref()
-                .map(|v| serde_json::to_string(v))
-                .transpose()?,
-        );
+        enriched_json.push(e.enriched.as_ref().map(serde_json::to_string).transpose()?);
         tx_hashes.push(e.tx_hash.clone());
         in_successful_calls.push(e.in_successful_call);
         paging_tokens.push(e.paging_token.clone());
@@ -194,8 +187,7 @@ pub async fn insert_events_with_resolver(
             .collect();
 
         if !transfers.is_empty() {
-            let t_event_ids: Vec<String> =
-                transfers.iter().map(|t| t.event_id.clone()).collect();
+            let t_event_ids: Vec<String> = transfers.iter().map(|t| t.event_id.clone()).collect();
             let t_contract_ids: Vec<String> =
                 transfers.iter().map(|t| t.contract_id.clone()).collect();
             let t_from_addrs: Vec<Option<String>> =
@@ -204,9 +196,8 @@ pub async fn insert_events_with_resolver(
                 transfers.iter().map(|t| t.to_addr.clone()).collect();
             let t_amounts: Vec<String> = transfers.iter().map(|t| t.amount.clone()).collect();
             let t_kinds: Vec<String> = transfers.iter().map(|t| t.kind.clone()).collect();
-            let t_amounts_numeric: Vec<Option<String>> = transfers.iter().map(|t| {
-                Some(t.amount.clone())
-            }).collect();
+            let t_amounts_numeric: Vec<Option<String>> =
+                transfers.iter().map(|t| Some(t.amount.clone())).collect();
             let t_ledgers: Vec<i64> = transfers.iter().map(|t| t.ledger).collect();
             let t_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
                 transfers.iter().map(|t| t.ledger_closed_at).collect();
@@ -261,13 +252,10 @@ async fn project_verticals(
         let s_event_ids: Vec<String> = swaps.iter().map(|s| s.event_id.clone()).collect();
         let s_contract_ids: Vec<String> = swaps.iter().map(|s| s.contract_id.clone()).collect();
         let s_senders: Vec<Option<String>> = swaps.iter().map(|s| s.sender.clone()).collect();
-        let s_recipients: Vec<Option<String>> =
-            swaps.iter().map(|s| s.recipient.clone()).collect();
+        let s_recipients: Vec<Option<String>> = swaps.iter().map(|s| s.recipient.clone()).collect();
         let s_token_ins: Vec<Option<String>> = swaps.iter().map(|s| s.token_in.clone()).collect();
-        let s_token_outs: Vec<Option<String>> =
-            swaps.iter().map(|s| s.token_out.clone()).collect();
-        let s_amount_ins: Vec<Option<String>> =
-            swaps.iter().map(|s| s.amount_in.clone()).collect();
+        let s_token_outs: Vec<Option<String>> = swaps.iter().map(|s| s.token_out.clone()).collect();
+        let s_amount_ins: Vec<Option<String>> = swaps.iter().map(|s| s.amount_in.clone()).collect();
         let s_amount_outs: Vec<Option<String>> =
             swaps.iter().map(|s| s.amount_out.clone()).collect();
         let s_ledgers: Vec<i64> = swaps.iter().map(|s| s.ledger).collect();
@@ -345,8 +333,7 @@ async fn project_verticals(
         let l_event_ids: Vec<String> = liqs.iter().map(|l| l.event_id.clone()).collect();
         let l_contract_ids: Vec<String> = liqs.iter().map(|l| l.contract_id.clone()).collect();
         let l_kinds: Vec<String> = liqs.iter().map(|l| l.kind.clone()).collect();
-        let l_providers: Vec<Option<String>> =
-            liqs.iter().map(|l| l.provider.clone()).collect();
+        let l_providers: Vec<Option<String>> = liqs.iter().map(|l| l.provider.clone()).collect();
         let l_token_as: Vec<Option<String>> = liqs.iter().map(|l| l.token_a.clone()).collect();
         let l_token_bs: Vec<Option<String>> = liqs.iter().map(|l| l.token_b.clone()).collect();
         let l_amount_as: Vec<Option<String>> = liqs.iter().map(|l| l.amount_a.clone()).collect();
@@ -387,10 +374,7 @@ async fn project_verticals(
 /// If an event already exists (same event_id), update mutable fields (decoded values, enrichment)
 /// in case the RPC returned different content for a recently-passed ledger (shallow reorg).
 /// Returns (inserted, updated) counts.
-pub async fn upsert_events(
-    pool: &PgPool,
-    events: &[NewEvent],
-) -> anyhow::Result<(u64, u64)> {
+pub async fn upsert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result<(u64, u64)> {
     if events.is_empty() {
         return Ok((0, 0));
     }
@@ -416,18 +400,13 @@ pub async fn upsert_events(
         contract_ids.push(e.contract_id.clone());
         ledgers.push(e.ledger);
         closed_ats.push(e.ledger_closed_at);
-        event_types.push(e.event_type.clone());
+        event_types.push(e.event_type.as_str().to_string());
         topics_json.push(serde_json::to_string(&e.topics)?);
         decoded_topics_json.push(serde_json::to_string(&e.decoded_topics)?);
         event_names.push(e.event_name.clone());
         values.push(e.value.clone());
         decoded_values_json.push(serde_json::to_string(&e.decoded_value)?);
-        enriched_json.push(
-            e.enriched
-                .as_ref()
-                .map(|v| serde_json::to_string(v))
-                .transpose()?,
-        );
+        enriched_json.push(e.enriched.as_ref().map(serde_json::to_string).transpose()?);
         tx_hashes.push(e.tx_hash.clone());
         in_successful_calls.push(e.in_successful_call);
         paging_tokens.push(e.paging_token.clone());
@@ -506,8 +485,7 @@ pub async fn upsert_events(
             .collect();
 
         if !transfers.is_empty() {
-            let t_event_ids: Vec<String> =
-                transfers.iter().map(|t| t.event_id.clone()).collect();
+            let t_event_ids: Vec<String> = transfers.iter().map(|t| t.event_id.clone()).collect();
             let t_contract_ids: Vec<String> =
                 transfers.iter().map(|t| t.contract_id.clone()).collect();
             let t_from_addrs: Vec<Option<String>> =
@@ -516,9 +494,8 @@ pub async fn upsert_events(
                 transfers.iter().map(|t| t.to_addr.clone()).collect();
             let t_amounts: Vec<String> = transfers.iter().map(|t| t.amount.clone()).collect();
             let t_kinds: Vec<String> = transfers.iter().map(|t| t.kind.clone()).collect();
-            let t_amounts_numeric: Vec<Option<String>> = transfers.iter().map(|t| {
-                Some(t.amount.clone())
-            }).collect();
+            let t_amounts_numeric: Vec<Option<String>> =
+                transfers.iter().map(|t| Some(t.amount.clone())).collect();
             let t_ledgers: Vec<i64> = transfers.iter().map(|t| t.ledger).collect();
             let t_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
                 transfers.iter().map(|t| t.ledger_closed_at).collect();
@@ -621,15 +598,10 @@ fn as_i128_amount(v: &Value) -> Option<String> {
                 None
             }
         }
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Some(i.to_string())
-            } else if let Some(u) = n.as_u64() {
-                Some(u.to_string())
-            } else {
-                None
-            }
-        }
+        Value::Number(n) => n
+            .as_i64()
+            .map(|i| i.to_string())
+            .or_else(|| n.as_u64().map(|u| u.to_string())),
         _ => None,
     }
 }
@@ -682,7 +654,10 @@ fn extract_transfer(e: &NewEvent, resolve: &ContractKindResolver<'_>) -> Option<
     };
 
     let (from_addr, to_addr) = match kind {
-        "transfer" => (as_addr(e.decoded_topics.get(1)), as_addr(e.decoded_topics.get(2))),
+        "transfer" => (
+            as_addr(e.decoded_topics.get(1)),
+            as_addr(e.decoded_topics.get(2)),
+        ),
         "mint" => (None, as_addr(e.decoded_topics.get(1))),
         "burn" | "clawback" => (as_addr(e.decoded_topics.get(1)), None),
         _ => return None,
@@ -764,7 +739,10 @@ fn extract_nft_event(e: &NewEvent, resolve: &ContractKindResolver<'_>) -> Option
     };
 
     let (from_addr, to_addr) = match kind {
-        "transfer" => (as_addr(e.decoded_topics.get(1)), as_addr(e.decoded_topics.get(2))),
+        "transfer" => (
+            as_addr(e.decoded_topics.get(1)),
+            as_addr(e.decoded_topics.get(2)),
+        ),
         "mint" => (None, as_addr(e.decoded_topics.get(1))),
         "burn" => (as_addr(e.decoded_topics.get(1)), None),
         _ => return None,
@@ -828,7 +806,17 @@ fn extract_liquidity_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fungible(_: &str) -> Option<ContractKind> {
+        Some(ContractKind::FungibleToken)
+    }
     use serde_json::json;
+
+    /// Test resolver: treats every contract as a confirmed fungible token so the
+    /// transfer projection itself is what the assertions exercise.
+    fn fungible(_contract_id: &str) -> Option<ContractKind> {
+        Some(ContractKind::FungibleToken)
+    }
 
     fn event(name: Option<&str>, topics: Vec<Value>, value: Value) -> NewEvent {
         NewEvent {
@@ -836,7 +824,7 @@ mod tests {
             contract_id: "C1".into(),
             ledger: 42,
             ledger_closed_at: chrono::Utc::now(),
-            event_type: "contract".into(),
+            event_type: lumenqraph_core::EventType::Contract,
             topics: vec![],
             decoded_topics: topics,
             event_name: name.map(|s| s.to_string()),
@@ -856,7 +844,7 @@ mod tests {
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
             json!("300"),
         );
-        let t = extract_transfer(&e).expect("transfer should be recognised");
+        let t = extract_transfer(&e, &fungible).expect("transfer should be recognised");
         assert_eq!(t.from_addr.as_deref(), Some("GFROM"));
         assert_eq!(t.to_addr.as_deref(), Some("GTO"));
         assert_eq!(t.amount, "300");
@@ -870,7 +858,7 @@ mod tests {
             vec![json!("mint"), json!("GRECIPIENT")],
             json!("1000"),
         );
-        let t = extract_transfer(&e).expect("mint should be recognised");
+        let t = extract_transfer(&e, &fungible).expect("mint should be recognised");
         assert_eq!(t.from_addr, None);
         assert_eq!(t.to_addr.as_deref(), Some("GRECIPIENT"));
         assert_eq!(t.amount, "1000");
@@ -884,7 +872,7 @@ mod tests {
             vec![json!("burn"), json!("GBURNER")],
             json!("500"),
         );
-        let t = extract_transfer(&e).expect("burn should be recognised");
+        let t = extract_transfer(&e, &fungible).expect("burn should be recognised");
         assert_eq!(t.from_addr.as_deref(), Some("GBURNER"));
         assert_eq!(t.to_addr, None);
         assert_eq!(t.amount, "500");
@@ -898,7 +886,7 @@ mod tests {
             vec![json!("clawback"), json!("GVICTIM")],
             json!("750"),
         );
-        let t = extract_transfer(&e).expect("clawback should be recognised");
+        let t = extract_transfer(&e, &fungible).expect("clawback should be recognised");
         assert_eq!(t.from_addr.as_deref(), Some("GVICTIM"));
         assert_eq!(t.to_addr, None);
         assert_eq!(t.amount, "750");
@@ -908,7 +896,7 @@ mod tests {
     #[test]
     fn ignores_other_events() {
         let e = event(Some("approval"), vec![json!("approval")], json!("1"));
-        assert!(extract_transfer(&e).is_none());
+        assert!(extract_transfer(&e, &fungible).is_none());
     }
 
     #[test]
@@ -918,14 +906,14 @@ mod tests {
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
             json!(300),
         );
-        let t = extract_transfer(&e).unwrap();
+        let t = extract_transfer(&e, &fungible).unwrap();
         assert_eq!(t.amount, "300");
     }
 
     #[test]
     fn missing_address_topics_are_none() {
         let e = event(Some("transfer"), vec![json!("transfer")], json!("5"));
-        let t = extract_transfer(&e).unwrap();
+        let t = extract_transfer(&e, &fungible).unwrap();
         assert!(t.from_addr.is_none());
         assert!(t.to_addr.is_none());
         assert_eq!(t.amount, "5");
@@ -939,7 +927,7 @@ mod tests {
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
             json!(42),
         );
-        let t = extract_transfer(&e);
+        let t = extract_transfer(&e, &fungible);
         // Future: This should return None for non-token contracts
         // For now, we're testing the current behavior and documenting the expected fix
         assert!(t.is_some(), "Current behavior: accepts any transfer event");
@@ -952,7 +940,7 @@ mod tests {
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
             json!({"token_id": 123}),
         );
-        let t = extract_transfer(&e);
+        let t = extract_transfer(&e, &fungible);
         assert!(t.is_some(), "should handle complex token_id object");
     }
 
@@ -969,7 +957,7 @@ mod tests {
             ],
             json!("500"),
         );
-        let t = extract_transfer(&e);
+        let t = extract_transfer(&e, &fungible);
         assert!(t.is_some(), "should handle SAC transfer with asset topic");
         let transfer = t.unwrap();
         assert_eq!(transfer.from_addr.as_deref(), Some("GFROM"));
@@ -982,14 +970,10 @@ mod tests {
         let muxed_addr = "MAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
         let e = event(
             Some("transfer"),
-            vec![
-                json!("transfer"),
-                json!("GFROM"),
-                json!(muxed_addr),
-            ],
+            vec![json!("transfer"), json!("GFROM"), json!(muxed_addr)],
             json!("1000"),
         );
-        let t = extract_transfer(&e);
+        let t = extract_transfer(&e, &fungible);
         assert!(t.is_some(), "should handle muxed address in topic");
         let transfer = t.unwrap();
         // Current behavior: treats muxed address as regular string
@@ -1007,7 +991,7 @@ mod tests {
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
             map_value,
         );
-        let t = extract_transfer(&e);
+        let t = extract_transfer(&e, &fungible);
         assert!(t.is_some(), "should handle CAP-67 map value");
         let transfer = t.unwrap();
         // Current behavior: stringifies entire map
@@ -1020,9 +1004,9 @@ mod tests {
         let e = event(
             Some("transfer"),
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
-            json!(0xDEADBEEF),
+            json!(0xDEADBEEFu64),
         );
-        let t = extract_transfer(&e).expect("should handle numeric value");
+        let t = extract_transfer(&e, &fungible).expect("should handle numeric value");
         assert_eq!(t.amount, "3735928559");
     }
 
@@ -1034,7 +1018,7 @@ mod tests {
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
             vector_value,
         );
-        let t = extract_transfer(&e);
+        let t = extract_transfer(&e, &fungible);
         assert!(t.is_some(), "should not panic on vector value");
     }
 
@@ -1052,9 +1036,10 @@ mod tests {
             vec![json!("mint"), json!("GRECIPIENT")],
             struct_value,
         );
-        let t = extract_transfer(&e);
+        let t = extract_transfer(&e, &fungible);
         assert!(t.is_some(), "should handle complex struct value");
-        assert!(t.unwrap().amount.contains("field") || t.unwrap().amount.contains("nested"));
+        let amount = t.unwrap().amount;
+        assert!(amount.contains("field") || amount.contains("nested"));
     }
 
     #[test]
@@ -1064,7 +1049,7 @@ mod tests {
             vec![json!("burn"), json!("GBURNER")],
             json!(null),
         );
-        let t = extract_transfer(&e);
+        let t = extract_transfer(&e, &fungible);
         assert!(t.is_some(), "should handle null value");
         assert_eq!(t.unwrap().amount, "null");
     }
@@ -1076,7 +1061,7 @@ mod tests {
             vec![json!("clawback"), json!("GVICTIM")],
             json!(true),
         );
-        let t = extract_transfer(&e);
+        let t = extract_transfer(&e, &fungible);
         assert!(t.is_some(), "should handle boolean value");
         assert_eq!(t.unwrap().amount, "true");
     }
@@ -1103,7 +1088,7 @@ mod tests {
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
             json!("1000"),
         );
-        let t = extract_transfer(&e).expect("should extract transfer");
+        let t = extract_transfer(&e, &fungible).expect("should extract transfer");
         assert_eq!(t.from_addr.as_deref(), Some("GFROM"));
         assert_eq!(t.to_addr.as_deref(), Some("GTO"));
         assert_eq!(t.amount, "1000");
@@ -1122,8 +1107,8 @@ mod tests {
             vec![json!("transfer"), json!("GFROM"), json!("GTO2")],
             json!("1000"),
         );
-        let t1 = extract_transfer(&e1).unwrap();
-        let t2 = extract_transfer(&e2).unwrap();
+        let t1 = extract_transfer(&e1, &fungible).unwrap();
+        let t2 = extract_transfer(&e2, &fungible).unwrap();
         assert_ne!(t1.to_addr, t2.to_addr);
     }
 
@@ -1140,8 +1125,8 @@ mod tests {
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
             json!("2000"),
         );
-        let t1 = extract_transfer(&e1).unwrap();
-        let t2 = extract_transfer(&e2).unwrap();
+        let t1 = extract_transfer(&e1, &fungible).unwrap();
+        let t2 = extract_transfer(&e2, &fungible).unwrap();
         assert_ne!(t1.amount, t2.amount);
     }
 }

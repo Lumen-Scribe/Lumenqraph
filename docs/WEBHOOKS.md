@@ -49,67 +49,99 @@ FROM webhook_subscriptions
 WHERE auto_disabled_at IS NOT NULL;
 ```
 
-## Payload Shapes
+## Payload Envelope
 
-### Event Payload
-
-When a contract event matches a subscription with `kind = 'event'`, the webhook body contains the raw event row:
+Every delivery body is a JSON envelope. The `X-Lumenqraph-Event` header carries the same `type` value, so you can route on either.
 
 ```json
 {
-  "event_id": "...",
-  "contract_id": "CADQZ...",
-  "ledger": 12345,
-  "ledger_closed_at": "2025-01-15T10:30:00Z",
-  "event_type": "contract",
-  "topics": [
-    "AAAADwAAAAd0cmFuc2Zlcg==",
-    "..."
-  ],
-  "decoded_topics": [...],
-  "event_name": "transfer",
-  "value": "AAAADwAA...",
-  "decoded_value": {
-    "from": "GBVFX...",
-    "to": "GBVFY...",
-    "amount": "1000000"
-  },
-  "enriched": {
-    "from": "GBVFX...",
-    "to": "GBVFY...",
-    "amount": 1000000
-  },
-  "tx_hash": "...",
-  "in_successful_call": true,
-  "paging_token": "...",
-  "created_at": "2025-01-15T10:30:01Z"
+  "id": "12345",
+  "type": "contract.event",
+  "version": 1,
+  "created_at": "2025-01-15T10:30:01Z",
+  "data": {
+    "event_id": "0000000000012345-0000000001",
+    "contract_id": "CADQZ...",
+    "ledger": 12345,
+    "ledger_closed_at": "2025-01-15T10:30:00Z",
+    "event_name": "transfer",
+    "topics": ["AAAADwAAAAd0cmFuc2Zlcg==", "..."],
+    "decoded_topics": ["..."],
+    "value": "AAAADwAA...",
+    "decoded_value": { "from": "GBVFX...", "to": "GBVFY...", "amount": "1000000" },
+    "enriched": { "from": "GBVFX...", "to": "GBVFY...", "amount": 1000000 },
+    "tx_hash": "...",
+    "in_successful_call": true
+  }
 }
 ```
 
-**Note:** The `seq` field is present in the database but removed from the webhook payload to avoid exposing internal sequencing.
+### Envelope fields
 
-### Upgrade Payload
+| Field | Type | Meaning |
+|-------|------|---------|
+| `id` | string | Delivery ID. Same value as `X-Lumenqraph-Delivery-Id`; use it to deduplicate. |
+| `type` | string | `contract.event` or `contract.upgraded`. Determines the shape of `data`. |
+| `version` | integer | Envelope schema version. Currently `1`. It changes only for breaking envelope changes. |
+| `created_at` | string | RFC 3339 UTC time the delivery was created. |
+| `data` | object | The payload for `type`, described below. |
 
-When a contract's WASM executable changes and matches an `kind = 'upgrade'` subscription, the webhook body contains:
+Within a version, new optional fields may be added. Ignore fields you do not recognise rather than rejecting the delivery.
+
+### `contract.event` data
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `event_id` | string | Identifier of the indexed event. |
+| `contract_id` | string | Emitting contract (`C...` strkey). |
+| `ledger` | integer | Ledger sequence containing the event. |
+| `ledger_closed_at` | string | RFC 3339 UTC close time of that ledger. |
+| `event_name` | string \| null | Name taken from the first topic, when it is a symbol. |
+| `topics` | string[] | Base64 XDR topics, as emitted. |
+| `value` | string | Base64 XDR event value. |
+| `decoded_topics` | any | Topics decoded to JSON. |
+| `decoded_value` | any | Value decoded to JSON. |
+| `enriched` | object \| null | Named, typed record from the contract spec; `null` when no spec matched. |
+| `tx_hash` | string | Hash of the transaction that emitted the event. |
+| `in_successful_call` | boolean | Whether the emitting call succeeded. |
+
+The internal `seq` column is not included in the payload.
+
+### `contract.upgraded` data
 
 ```json
 {
+  "id": "12346",
   "type": "contract.upgraded",
-  "contract_id": "CADQZ...",
-  "version": 2,
-  "wasm_hash": "abc123...",
-  "previous_wasm_hash": "abc122...",
-  "breaking": true,
-  "diff": {
+  "version": 1,
+  "created_at": "2025-01-15T10:30:00Z",
+  "data": {
+    "contract_id": "CADQZ...",
+    "version": 2,
+    "wasm_hash": "abc123...",
+    "previous_wasm_hash": "abc122...",
     "breaking": true,
-    "summary": [
-      "removed function withdraw() -> void",
-      "added function emergencyWithdraw() -> void"
-    ]
-  },
-  "observed_at": "2025-01-15T10:30:00Z"
+    "diff": {
+      "breaking": true,
+      "summary": [
+        "removed function withdraw() -> void",
+        "added function emergencyWithdraw() -> void"
+      ]
+    },
+    "observed_at": "2025-01-15T10:30:00Z"
+  }
 }
 ```
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `contract_id` | string | Upgraded contract. |
+| `version` | integer | Interface version after the upgrade. |
+| `wasm_hash` | string | Hash of the new WASM. |
+| `previous_wasm_hash` | string \| null | Hash of the WASM it replaced. |
+| `breaking` | boolean | Whether the interface diff contains breaking changes. |
+| `diff` | object | `breaking` flag and human-readable `summary` lines. |
+| `observed_at` | string | RFC 3339 UTC time the upgrade was observed. |
 
 **Version 1 is never delivered** — it's the baseline interface when we first see a contract, not an upgrade. Only version 2+ trigger upgrade webhooks.
 
@@ -130,75 +162,34 @@ The header is a comma-separated list of `key=value` pairs:
 
 ### Bytes Signed
 
-The HMAC is computed over the string `"{t}.{body}"`, where `{t}` is the timestamp from the header and `{body}` is the exact bytes sent in the HTTP POST body. No whitespace normalization or canonicalization occurs — sign the raw bytes as-is.
+The HMAC is computed over the string `"{t}.{body}"`, where `{t}` is the timestamp **exactly as it appears in the header** and `{body}` is the exact bytes sent in the HTTP POST body. No whitespace normalization or canonicalization occurs — sign the raw bytes as-is. Use the raw body, not a re-serialized JSON object.
 
 ### Replay Protection
 
-Reject deliveries whose `t` is too far from the current time (a tolerance of 5 minutes / 300 seconds is typical). This prevents an attacker from replaying a previously captured, validly signed request. You should also deduplicate on `X-Lumenqraph-Delivery-Id`.
+Reject deliveries whose `t` is too far from the current time. A tolerance of 300 seconds (5 minutes) is recommended; the examples below use it. This prevents an attacker from replaying a previously captured, validly signed request. You should also deduplicate on the `X-Lumenqraph-Delivery-Id` header (or the envelope `id`).
 
 ### Verification Examples
 
+The Node.js, Python and Go examples below are the files in [`docs/examples/webhooks/`](examples/webhooks/). CI runs their test suites against the committed [cross-language test vector](#cross-language-test-vector), so these snippets are known to verify correctly.
+
 #### Node.js / JavaScript
 
-Use the built-in `crypto.timingSafeEqual()` for constant-time comparison to prevent timing attacks:
+Uses the built-in `crypto.timingSafeEqual()` for constant-time comparison. Pass the current Unix time as `nowSecs` only when testing; the default reads the clock.
 
 ```javascript
-const crypto = require("crypto");
 
-const TOLERANCE_SECS = 300;
+```
 
-function verifyWebhookSignature(rawBody, signatureHeader, secret) {
-  // Parse "t=<ts>,v1=<hex>[,v1=<hex>...]"
-  let timestamp = null;
-  const signatures = [];
-  for (const part of signatureHeader.split(",")) {
-    const idx = part.indexOf("=");
-    if (idx === -1) continue;
-    const key = part.slice(0, idx).trim();
-    const value = part.slice(idx + 1).trim();
-    if (key === "t") timestamp = Number(value);
-    else if (key === "v1") signatures.push(value);
-  }
+#### Python
 
-  if (!Number.isFinite(timestamp) || signatures.length === 0) {
-    return false;
-  }
+```python
 
-  // Reject stale or future-dated deliveries (replay protection)
-  const now = Math.floor(Date.now() / 1000);
-  if (Math.abs(now - timestamp) > TOLERANCE_SECS) {
-    return false;
-  }
+```
 
-  // HMAC-SHA256 over "{t}.{body}"
-  const signedPayload = `${timestamp}.${rawBody}`;
-  const expected = crypto
-    .createHmac("sha256", secret)
-    .update(signedPayload)
-    .digest("hex");
+#### Go
 
-  // Accept if any v1 matches (supports secret rotation)
-  return signatures.some((sig) => {
-    const a = Buffer.from(sig.toLowerCase(), "hex");
-    const b = Buffer.from(expected, "hex");
-    return a.length === b.length && crypto.timingSafeEqual(a, b);
-  });
-}
+```go
 
-// Usage in Express.js
-app.post("/webhooks/lumenqraph", express.raw({ type: "application/json" }), (req, res) => {
-  const signature = req.headers["x-lumenqraph-signature"];
-  const secret = process.env.LUMENQRAPH_WEBHOOK_SECRET;
-
-  if (!signature || !verifyWebhookSignature(req.body, signature, secret)) {
-    return res.status(401).json({ error: "Invalid signature" });
-  }
-
-  // Process the webhook
-  const payload = JSON.parse(req.body);
-  console.log("Event:", payload.event_id);
-  res.json({ status: "ok" });
-});
 ```
 
 #### Rust
@@ -249,6 +240,10 @@ async fn webhook_handler(
     Ok(StatusCode::OK)
 }
 ```
+
+### Cross-language test vector
+
+[`docs/examples/webhooks/test_vector.json`](examples/webhooks/test_vector.json) holds a fixed secret, timestamp, raw body and header (with one rotated, non-matching `v1` value). Every verifier must accept it at `now` and reject a modified body, a wrong secret, and a delivery outside the tolerance. `scripts/check_webhook_examples.py` runs the Node, Python, Go and Rust checks, and confirms that each snippet above matches its file. The Rust check runs as part of `lumenqraph-core`'s tests.
 
 ## HTTP Headers
 
@@ -305,7 +300,7 @@ Webhook service behavior is controlled by environment variables (see [`docs/CONF
 | `WEBHOOK_MAX_CONCURRENT_PER_HOST` | 5 | Max concurrent deliveries to a single host |
 | `WEBHOOK_MAX_CONCURRENT_DELIVERIES` | 100 | Max total concurrent deliveries |
 | `WEBHOOK_FAILURE_THRESHOLD` | 10 | Consecutive failures before auto-disable |
-| `WEBHOOK_ENCRYPTION_KEY` | **REQUIRED** | Symmetric key for encrypting secrets at rest (pgcrypto). Generate with `openssl rand -hex 32`. Both API and webhooks services will refuse to start without this variable. |
+| `WEBHOOK_ENCRYPTION_KEY` | **REQUIRED** | Symmetric key for encrypting secrets at rest (pgcrypto). Generate with `openssl rand -hex 32`. Must be 64 hex characters or at least 43 base64 characters with enough variety. Both services refuse to start if it is missing, blank, the `.env.example` placeholder, or weak. |
 
 ## Database Schema
 

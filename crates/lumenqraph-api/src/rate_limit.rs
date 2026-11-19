@@ -129,10 +129,14 @@ impl RateLimitBackend for MemoryBackend {
                 },
             );
         }
-        let bucket = shard.get_mut(identity).expect("present: just checked or inserted");
+        let bucket = shard
+            .get_mut(identity)
+            .expect("present: just checked or inserted");
 
         // Refill tokens based on elapsed monotonic time (never negative).
-        let elapsed = now.saturating_duration_since(bucket.last_refill).as_secs_f64();
+        let elapsed = now
+            .saturating_duration_since(bucket.last_refill)
+            .as_secs_f64();
         let refilled = elapsed * tokens_per_sec;
         bucket.tokens = (bucket.tokens + refilled).min(limit_per_min as f64);
         bucket.last_refill = now;
@@ -192,7 +196,9 @@ impl RateLimitSettings {
         let backend = match backend.trim().to_ascii_lowercase().as_str() {
             "memory" => BackendKind::Memory,
             "redis" => BackendKind::Redis,
-            other => anyhow::bail!("invalid RATE_LIMIT_BACKEND={other:?}: expected memory or redis"),
+            other => {
+                anyhow::bail!("invalid RATE_LIMIT_BACKEND={other:?}: expected memory or redis")
+            }
         };
         let redis_url = redis_url
             .map(str::trim)
@@ -204,7 +210,9 @@ impl RateLimitSettings {
         let fail_mode = match fail_mode.trim().to_ascii_lowercase().as_str() {
             "open" => FailMode::Open,
             "closed" => FailMode::Closed,
-            other => anyhow::bail!("invalid RATE_LIMIT_FAIL_MODE={other:?}: expected open or closed"),
+            other => {
+                anyhow::bail!("invalid RATE_LIMIT_FAIL_MODE={other:?}: expected open or closed")
+            }
         };
         Ok(Self {
             backend,
@@ -271,7 +279,11 @@ pub struct RedisBackend {
 }
 
 impl RedisBackend {
-    pub async fn connect(redis_url: &str, namespace: &str, fail_mode: FailMode) -> anyhow::Result<Self> {
+    pub async fn connect(
+        redis_url: &str,
+        namespace: &str,
+        fail_mode: FailMode,
+    ) -> anyhow::Result<Self> {
         let client = redis::Client::open(redis_url)?;
         let conn = redis::aio::ConnectionManager::new(client).await?;
         Ok(Self {
@@ -393,10 +405,9 @@ impl RateLimiter {
         let backend = match settings.backend {
             BackendKind::Memory => Backend::Memory(MemoryBackend::new()),
             BackendKind::Redis => {
-                let url = settings
-                    .redis_url
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("REDIS_URL must be set when RATE_LIMIT_BACKEND=redis"))?;
+                let url = settings.redis_url.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("REDIS_URL must be set when RATE_LIMIT_BACKEND=redis")
+                })?;
                 let redis = RedisBackend::connect(url, namespace, settings.fail_mode)
                     .await
                     .context("connecting to Redis for rate limiting")?;
@@ -464,14 +475,20 @@ mod tests {
         let rpc = memory_limiter();
         assert!(general.check("anon:1", 1).await.allowed);
         assert!(!general.check("anon:1", 1).await.allowed);
-        assert!(rpc.check("anon:1", 1).await.allowed, "rpc budget must not be spent by general traffic");
+        assert!(
+            rpc.check("anon:1", 1).await.allowed,
+            "rpc budget must not be spent by general traffic"
+        );
     }
 
     #[tokio::test]
     async fn redis_keys_are_namespaced_per_limiter() {
         assert_eq!(redis_key("rpc", "anon:1"), "ratelimit:rpc:anon:1");
         assert_ne!(redis_key("rpc", "anon:1"), redis_key("main", "anon:1"));
-        assert_ne!(redis_key("webhook", "key:abc"), redis_key("proxy", "key:abc"));
+        assert_ne!(
+            redis_key("webhook", "key:abc"),
+            redis_key("proxy", "key:abc")
+        );
     }
 
     #[test]
@@ -508,7 +525,8 @@ mod tests {
 
     #[tokio::test]
     async fn build_fails_fast_when_redis_is_unreachable() {
-        let settings = RateLimitSettings::parse("redis", Some("redis://127.0.0.1:1"), "open").unwrap();
+        let settings =
+            RateLimitSettings::parse("redis", Some("redis://127.0.0.1:1"), "open").unwrap();
         assert!(RateLimiter::build(&settings, "test").await.is_err());
     }
 
@@ -554,7 +572,10 @@ mod tests {
         assert!(!status.allowed);
         assert!(status.retry_after_secs.is_some());
         let retry = status.retry_after_secs.unwrap();
-        assert!(retry > 50 && retry <= 61, "retry_after should be ~60s, got {retry}s");
+        assert!(
+            retry > 50 && retry <= 61,
+            "retry_after should be ~60s, got {retry}s"
+        );
     }
 
     #[tokio::test]
@@ -574,7 +595,10 @@ mod tests {
         for i in 0..(SHARDS * 16) {
             backend.check(&format!("cold-{i}"), 60);
             // Touch "hot" so it stays most-recently-used in its shard.
-            assert!(!backend.check("hot", 1).allowed, "hot bucket was evicted at {i}");
+            assert!(
+                !backend.check("hot", 1).allowed,
+                "hot bucket was evicted at {i}"
+            );
         }
     }
 }

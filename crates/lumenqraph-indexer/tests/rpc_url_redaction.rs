@@ -13,6 +13,12 @@ fn keyed_url_redaction_preserves_only_scheme_host_and_port() {
 
 #[test]
 fn redaction_handles_short_urls_without_secrets() {
-    assert_eq!(redact_url("http://localhost:8000/rpc"), "http://localhost:8000");
-    assert_eq!(redact_url("https://rpc.example.com:8545?apikey=secret"), "https://rpc.example.com:8545");
+    assert_eq!(
+        redact_url("http://localhost:8000/rpc"),
+        "http://localhost:8000"
+    );
+    assert_eq!(
+        redact_url("https://rpc.example.com:8545?apikey=secret"),
+        "https://rpc.example.com:8545"
+    );
 }

@@ -47,10 +47,16 @@ impl CostError {
     pub fn message(&self) -> String {
         match self {
             CostError::RequestTooLarge { size, limit } => {
-                format!("request body too large: {} bytes (limit: {} bytes)", size, limit)
+                format!(
+                    "request body too large: {} bytes (limit: {} bytes)",
+                    size, limit
+                )
             }
             CostError::ArgsTooLarge { size, limit } => {
-                format!("args field too large: {} bytes (limit: {} bytes)", size, limit)
+                format!(
+                    "args field too large: {} bytes (limit: {} bytes)",
+                    size, limit
+                )
             }
         }
     }
