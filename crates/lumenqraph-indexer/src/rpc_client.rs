@@ -17,6 +17,7 @@
 //! The active endpoint (host only, no credentials) and total failover count are
 //! exposed via `take_metrics()`.
 
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -63,6 +64,17 @@ pub struct RpcClient {
     active_url_idx: AtomicUsize,
     /// Network passphrase pinned during startup and checked before failover.
     network_passphrase: Mutex<Option<String>>,
+    /// Indices of endpoints that were unreachable at startup and have not yet
+    /// been verified. They are verified before their first use (#713).
+    unverified: Mutex<HashSet<usize>>,
+}
+
+/// Outcome of checking an endpoint's network identity before use.
+enum NetworkCheck {
+    /// The endpoint reports the pinned passphrase.
+    Verified,
+    /// The endpoint could not be queried right now. It is skipped, not fatal.
+    Unreachable(anyhow::Error),
 }
 
 /// Identifies the sending binary's actual release to RPC operators who key off
@@ -378,6 +390,7 @@ impl RpcClient {
             failover_count: AtomicU64::new(0),
             active_url_idx: AtomicUsize::new(0),
             network_passphrase: Mutex::new(None),
+            unverified: Mutex::new(HashSet::new()),
         }
     }
 
@@ -388,35 +401,88 @@ impl RpcClient {
         host_of(self.urls.get(idx).unwrap_or(&self.urls[0]))
     }
 
-    /// Fetch `getNetwork` from every configured endpoint and pin the common
-    /// passphrase. A disagreement is a startup error, never a silent failover.
+    /// Ask one endpoint for its network passphrase (`getNetwork`).
+    async fn fetch_network_passphrase(&self, url: &str) -> anyhow::Result<String> {
+        let req = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getNetwork", "params": {} });
+        let response = self
+            .http
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::USER_AGENT, USER_AGENT)
+            .json(&req)
+            .send()
+            .await
+            .with_context(|| format!("getNetwork request failed for RPC host {}", host_of(url)))?
+            .error_for_status()
+            .with_context(|| format!("getNetwork failed for RPC host {}", host_of(url)))?;
+        let rpc: RpcResponse<NetworkResult> = response
+            .json()
+            .await
+            .with_context(|| format!("getNetwork response decode failed for RPC host {}", host_of(url)))?;
+        Ok(rpc
+            .result
+            .ok_or_else(|| anyhow!("getNetwork returned no result for RPC host {}", host_of(url)))?
+            .network_passphrase)
+    }
+
+    /// Pin the network passphrase at startup (#713).
+    ///
+    /// Requires at least one reachable endpoint. Endpoints that are unreachable
+    /// are logged and marked unverified, so they are checked before first use
+    /// instead of blocking startup. Two reachable endpoints that disagree on the
+    /// passphrase are still a hard error.
     pub async fn validate_network_passphrases(&self) -> anyhow::Result<String> {
-        let mut expected: Option<String> = None;
-        for url in &self.urls {
-            let req = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getNetwork", "params": {} });
-            let response = self.http.post(url).header(reqwest::header::CONTENT_TYPE, "application/json").header(reqwest::header::USER_AGENT, USER_AGENT).json(&req).send().await
-                .with_context(|| format!("getNetwork request failed for RPC host {}", host_of(url)))?
-                .error_for_status().with_context(|| format!("getNetwork failed for RPC host {}", host_of(url)))?;
-            let rpc: RpcResponse<NetworkResult> = response.json().await.with_context(|| format!("getNetwork response decode failed for RPC host {}", host_of(url)))?;
-            let passphrase = rpc.result.ok_or_else(|| anyhow!("getNetwork returned no result for RPC host {}", host_of(url)))?.network_passphrase;
-            if let Some(ref prior) = expected {
-                if prior != &passphrase { anyhow::bail!("RPC network mismatch: endpoint {} returned a different network passphrase", host_of(url)); }
-            } else { expected = Some(passphrase); }
+        let mut pinned: Option<String> = None;
+        for (idx, url) in self.urls.iter().enumerate() {
+            match self.fetch_network_passphrase(url).await {
+                Ok(passphrase) => match &pinned {
+                    Some(prior) if prior != &passphrase => anyhow::bail!(
+                        "RPC network mismatch: endpoint {} returned a different network passphrase",
+                        host_of(url)
+                    ),
+                    Some(_) => {}
+                    None => pinned = Some(passphrase),
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        endpoint = %host_of(url),
+                        %error,
+                        "RPC endpoint unreachable at startup; it will be verified before first use"
+                    );
+                    self.unverified.lock().unwrap().insert(idx);
+                }
+            }
         }
-        let passphrase = expected.expect("at least one RPC URL is required");
+        let passphrase = pinned.ok_or_else(|| {
+            anyhow!("no RPC endpoint is reachable ({} configured)", self.urls.len())
+        })?;
         *self.network_passphrase.lock().unwrap() = Some(passphrase.clone());
         Ok(passphrase)
     }
 
-    async fn check_endpoint_network(&self, idx: usize) -> anyhow::Result<()> {
+    /// Check an endpoint's network identity before it serves traffic.
+    ///
+    /// A wrong network is a hard error. An endpoint that cannot be reached is
+    /// reported as [`NetworkCheck::Unreachable`] so the caller can skip it.
+    async fn check_endpoint_network(&self, idx: usize) -> anyhow::Result<NetworkCheck> {
         let expected = self.network_passphrase.lock().unwrap().clone();
-        let Some(expected) = expected else { return Ok(()); };
+        let Some(expected) = expected else {
+            return Ok(NetworkCheck::Verified);
+        };
         let url = self.url_at(idx).to_string();
-        let req = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getNetwork", "params": {} });
-        let rpc: RpcResponse<NetworkResult> = self.http.post(&url).header(reqwest::header::CONTENT_TYPE, "application/json").header(reqwest::header::USER_AGENT, USER_AGENT).json(&req).send().await?.error_for_status()?.json().await?;
-        let actual = rpc.result.ok_or_else(|| anyhow!("getNetwork returned no result for RPC host {}", host_of(&url)))?.network_passphrase;
-        if actual != expected { anyhow::bail!("RPC failover network mismatch at {}", host_of(&url)); }
-        Ok(())
+        let actual = match self.fetch_network_passphrase(&url).await {
+            Ok(passphrase) => passphrase,
+            Err(error) => return Ok(NetworkCheck::Unreachable(error)),
+        };
+        if actual != expected {
+            anyhow::bail!("RPC failover network mismatch at {}", host_of(&url));
+        }
+        self.unverified.lock().unwrap().remove(&idx);
+        Ok(NetworkCheck::Verified)
+    }
+
+    fn is_unverified(&self, idx: usize) -> bool {
+        self.unverified.lock().unwrap().contains(&idx)
     }
 
     /// Return the URL at `idx` (clamped to the list length).
@@ -543,9 +609,23 @@ impl RpcClient {
             let url = self.url_at(url_idx).to_string();
 
             // Never send application traffic to a failover endpoint until its
-            // network identity has been re-checked.
-            if url_idx != 0 {
-                self.check_endpoint_network(url_idx).await?;
+            // network identity has been re-checked, or to an endpoint that was
+            // unreachable at startup and never verified (#713). An unreachable
+            // endpoint is skipped; a wrong network is a hard error.
+            if url_idx != 0 || self.is_unverified(url_idx) {
+                match self.check_endpoint_network(url_idx).await? {
+                    NetworkCheck::Verified => {}
+                    NetworkCheck::Unreachable(error) => {
+                        tracing::warn!(
+                            endpoint = %host_of(&url),
+                            %error,
+                            "RPC endpoint unreachable; skipping"
+                        );
+                        last_err = Some(error);
+                        self.try_failover(url_idx);
+                        continue;
+                    }
+                }
             }
 
             for attempt in 0..MAX_ATTEMPTS_PER_URL {
@@ -1149,6 +1229,98 @@ mod tests {
     const OK_SEQ_2000: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"sequence":2000}}"#;
     const ERR_32001: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"processing limit reached"}}"#;
     const ERR_32602: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid params"}}"#;
+
+    // getNetwork bodies for the network-identity tests (#713).
+    const NET_PUBLIC: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"networkPassphrase":"Public Global Stellar Network ; September 2015"}}"#;
+    const NET_TESTNET: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"networkPassphrase":"Test SDF Network ; September 2015"}}"#;
+    /// Port 1 is never listening, so connections are refused immediately.
+    const DEAD_URL: &str = "http://127.0.0.1:1";
+
+    #[tokio::test]
+    async fn startup_succeeds_when_a_secondary_is_unreachable() {
+        let primary = spawn_counting_mock(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(|_| (200, NET_PUBLIC)),
+        )
+        .await;
+        let client = RpcClient::with_urls(vec![primary, DEAD_URL.to_string()], 5);
+
+        let passphrase = client
+            .validate_network_passphrases()
+            .await
+            .expect("one healthy endpoint is enough to start");
+        assert_eq!(passphrase, "Public Global Stellar Network ; September 2015");
+        assert!(client.is_unverified(1), "dead secondary must be marked unverified");
+        assert!(!client.is_unverified(0), "healthy primary is verified");
+    }
+
+    #[tokio::test]
+    async fn startup_fails_when_no_endpoint_is_reachable() {
+        let client = RpcClient::with_urls(vec![DEAD_URL.to_string(), "http://127.0.0.1:2".to_string()], 5);
+        let err = client.validate_network_passphrases().await.unwrap_err();
+        assert!(err.to_string().contains("no RPC endpoint is reachable"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_reachable_endpoints_that_disagree() {
+        let a = spawn_counting_mock(Arc::new(AtomicUsize::new(0)), Arc::new(|_| (200, NET_PUBLIC))).await;
+        let b = spawn_counting_mock(Arc::new(AtomicUsize::new(0)), Arc::new(|_| (200, NET_TESTNET))).await;
+        let client = RpcClient::with_urls(vec![a, b], 5);
+        let err = client.validate_network_passphrases().await.unwrap_err();
+        assert!(err.to_string().contains("network mismatch"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn secondary_on_another_network_is_rejected_on_first_use() {
+        // Primary answers getNetwork at startup, then fails every call so the
+        // client fails over to the secondary. The secondary is down at startup
+        // (so it is unverified) and reports another network once it is used.
+        let primary = spawn_counting_mock(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(|n| if n == 0 { (200, NET_PUBLIC) } else { (500, "") }),
+        )
+        .await;
+        let secondary = spawn_counting_mock(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(|n| if n == 0 { (500, "") } else { (200, NET_TESTNET) }),
+        )
+        .await;
+        let client = RpcClient::with_urls(vec![primary, secondary], 5);
+        client.validate_network_passphrases().await.expect("startup");
+
+        let err = client.get_latest_ledger().await.unwrap_err();
+        assert!(err.to_string().contains("network mismatch"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn secondary_is_verified_before_serving_after_failover() {
+        // Secondary is down at startup, so it is unverified. On first use the
+        // network check (request 1) runs before the real call (request 2).
+        let primary = spawn_counting_mock(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(|n| if n == 0 { (200, NET_PUBLIC) } else { (500, "") }),
+        )
+        .await;
+        let secondary_count = Arc::new(AtomicUsize::new(0));
+        let secondary = spawn_counting_mock(
+            secondary_count.clone(),
+            Arc::new(|n| match n {
+                0 => (500, ""),
+                1 => (200, NET_PUBLIC),
+                _ => (200, OK_SEQ_2000),
+            }),
+        )
+        .await;
+        let client = RpcClient::with_urls(vec![primary, secondary], 5);
+        client.validate_network_passphrases().await.expect("startup");
+
+        let seq = client.get_latest_ledger().await.expect("served by verified secondary");
+        assert_eq!(seq, 2000);
+        assert!(
+            secondary_count.load(Ordering::SeqCst) >= 2,
+            "secondary must be checked (getNetwork) before the call"
+        );
+    }
 
     #[tokio::test]
     async fn retries_on_5xx_and_eventually_succeeds() {

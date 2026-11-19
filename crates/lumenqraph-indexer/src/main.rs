@@ -268,8 +268,12 @@ async fn main() -> anyhow::Result<()> {
     // Build the RPC client with all configured endpoints (#398).
     // RPC_URLS takes precedence over RPC_URL; both are parsed by Config::from_env.
     let rpc = RpcClient::with_urls(config.rpc_urls.clone(), config.rpc_timeout_secs);
-    let network_passphrase = rpc.validate_network_passphrases().await?;
-    info!(%network_passphrase, endpoints = config.rpc_urls.len(), "validated RPC network identity");
+    // Only commands that use the RPC need a reachable endpoint, and then only
+    // one of them (#713). `migrate` and `deep-backfill` make no RPC calls.
+    if !matches!(command, Command::Migrate | Command::DeepBackfill { .. }) {
+        let network_passphrase = rpc.validate_network_passphrases().await?;
+        info!(%network_passphrase, endpoints = config.rpc_urls.len(), "validated RPC network identity");
+    }
 
     match &command {
         Command::Migrate => return run_migrations(&pool).await,
