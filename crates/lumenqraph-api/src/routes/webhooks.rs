@@ -457,11 +457,7 @@ pub async fn test_webhook(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
     let owner_key_hash: Option<String> = caller.map(|ext| ext.0.0.clone());
-    let encryption_key = state
-        .config
-        .webhook_encryption_key
-        .as_deref()
-        .unwrap_or("default-key-for-testing");
+    let encryption_key = state.config.webhook_encryption_key.as_str();
 
     let (url, secret): (String, String) = sqlx::query_as(
         "SELECT url, pgp_sym_decrypt(encrypted_secret, $2)
@@ -945,16 +941,8 @@ pub async fn rotate_webhook_secret(
     validate_grace_seconds(grace_seconds)?;
 
 
-    // The required key is validated and loaded once at API startup.
+    // Same key source as create_webhook: validated once at startup, no fallback (#441).
     let encryption_key = state.config.webhook_encryption_key.as_str();
-
-    // Same key source as create_webhook (#441); no public fallback is read from the environment.
-    let encryption_key = state
-        .config
-        .webhook_encryption_key
-        .as_deref()
-        .unwrap_or("default-key-for-testing");
-
 
     let new_secret = random_secret();
 

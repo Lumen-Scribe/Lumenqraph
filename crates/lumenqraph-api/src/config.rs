@@ -114,11 +114,6 @@ pub struct ApiConfig {
     /// Retention for delivered/failed webhook deliveries. `0` disables pruning.
     pub webhook_delivery_retention_days: i64,
 
-    /// `pgp_sym_encrypt` key for webhook secrets. `None` falls back to the
-    /// legacy insecure test key (a warning is logged at startup).
-    pub webhook_encryption_key: Option<String>,
-
-
     /// Sibling instances mounted under a path prefix (`INSTANCE_MOUNTS`).
     pub mounts: Vec<(String, String)>,
     pub proxy: ProxyConfig,
@@ -141,11 +136,6 @@ impl ApiConfig {
         // CORS silently never match a browser's Origin header (#581).
         let cors_allowed_origins = env_string("CORS_ALLOWED_ORIGINS", "");
         parse_cors_origins(&cors_allowed_origins)?;
-
-        let webhook_encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY")
-            .ok()
-            .filter(|k| !k.trim().is_empty());
-
 
         let proxy_defaults = ProxyConfig::default();
 
@@ -298,8 +288,6 @@ impl ApiConfig {
             webhook_encryption_key: "test-only-webhook-key".into(),
             webhook_delivery_retention_days: 14,
 
-            webhook_encryption_key: None,
-
             mounts: Vec::new(),
             proxy: ProxyConfig::default(),
         }
@@ -349,11 +337,6 @@ impl fmt::Debug for ApiConfig {
             .field(
                 "webhook_delivery_retention_days",
                 &self.webhook_delivery_retention_days,
-
-            .field(
-                "webhook_encryption_key",
-                &self.webhook_encryption_key.as_ref().map(|_| "[REDACTED]"),
-
             )
             .field("mounts", &self.mounts)
             .field("proxy", &self.proxy)
