@@ -88,86 +88,8 @@ impl LeaderLock {
         let mut conn = pool
             .acquire()
             .await
-            .context("failed to acquire advisory lock (blocking)")?;
-    }
-
-    info!("indexer leader lock acquired; this instance is now active");
-
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .context("failed to run migrations")?;
-
-    if args.get(1).map(String::as_str) == Some("reenrich") {
-        info!("running in reenrich mode");
-        let result = reenrich::run_reenrich(pool.clone(), rpc, config).await;
-
-        // Release the advisory lock on exit.
-        info!("releasing indexer leader lock");
-        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(INDEXER_LOCK_ID)
-            .execute(&pool)
-            .await;
-
-        return result;
-    }
-
-    if args.get(1).map(String::as_str) == Some("backfill") {
-        let from = args
-            .get(2)
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(config.start_ledger);
-        info!(from, "running in backfill mode");
-        let result = backfill::run(pool.clone(), rpc, config, from).await;
-
-        // Release the advisory lock on exit.
-        info!("releasing indexer leader lock");
-        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(INDEXER_LOCK_ID)
-            .execute(&pool)
-            .await;
-
-        return result;
-    }
-
-    // deep-backfill: ingest beyond the RPC retention window from a data-lake
-    // source. Parse manual args: --from, --to, --source, --input (repeatable).
-    if args.get(1).map(String::as_str) == Some("deep-backfill") {
-        let result = run_deep_backfill(args, pool.clone(), config).await;
-        
-        // Release the advisory lock on exit.
-        info!("releasing indexer leader lock");
-        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(INDEXER_LOCK_ID)
-            .execute(&pool)
-            .await;
-        
-        return result;
-    }
-
-    if args.get(1).map(String::as_str) == Some("recover-gaps") {
-        info!("running in recover-gaps mode");
-        let specs = specs::SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
-        let result = poller::recover_gaps(&pool, &rpc, &config, &specs).await;
-
-        // Release the advisory lock on exit.
-        info!("releasing indexer leader lock");
-        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(INDEXER_LOCK_ID)
-            .execute(&pool)
-            .await;
-
-        return result;
-    }
-
-    info!(
-        rpc_host = %rpc.active_endpoint_host(),
-        contracts = ?config.contract_ids,
-        poll_secs = config.poll_interval_secs,
-        "starting lumenqraph indexer (live)"
-    );
-
-        info!("acquiring indexer leader lock (id {})", INDEXER_LOCK_ID);
+            .context("failed to acquire advisory-lock connection")?
+            .detach();
         let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
             .bind(INDEXER_LOCK_ID)
             .fetch_one(&mut conn)

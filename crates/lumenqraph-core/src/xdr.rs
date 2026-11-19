@@ -260,7 +260,7 @@ fn i256_to_decimal(p: &stellar_xdr::curr::Int256Parts) -> String {
     let negative = (p.hi_hi as i64) < 0;
     if !negative {
         let unsigned = stellar_xdr::curr::UInt256Parts {
-            hi_hi: p.hi_hi,
+            hi_hi: p.hi_hi as u64,
             hi_lo: p.hi_lo,
             lo_hi: p.lo_hi,
             lo_lo: p.lo_lo,
@@ -268,7 +268,7 @@ fn i256_to_decimal(p: &stellar_xdr::curr::Int256Parts) -> String {
         return u256_to_decimal(&unsigned);
     }
     // Negate via two's complement: invert all bits then add one.
-    let mut limbs = [p.hi_hi, p.hi_lo, p.lo_hi, p.lo_lo];
+    let mut limbs = [p.hi_hi as u64, p.hi_lo, p.lo_hi, p.lo_lo];
     for limb in limbs.iter_mut() {
         *limb = !*limb;
     }
