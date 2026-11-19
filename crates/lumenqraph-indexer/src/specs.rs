@@ -297,8 +297,8 @@ async fn record_version(
     wasm_hash: &str,
     spec_section: &str,
     spec: &ContractSpec,
-    /// Whether the spec section was fully decoded (#401). When `false`, diffs
-    /// against this version are suppressed to prevent false "removal" alerts.
+    // Whether the spec section was fully decoded (#401). When `false`, diffs
+    // against this version are suppressed to prevent false "removal" alerts.
     complete: bool,
     ledger: i64,
 ) -> anyhow::Result<()> {
@@ -381,8 +381,8 @@ async fn persist(
     wasm_hash: &str,
     spec_section: &str,
     spec: &ContractSpec,
-    /// Whether the spec section was fully decoded (#401). Persisted so the
-    /// API can surface it in the interface response.
+    // Whether the spec section was fully decoded (#401). Persisted so the
+    // API can surface it in the interface response.
     complete: bool,
 ) -> anyhow::Result<()> {
     sqlx::query(

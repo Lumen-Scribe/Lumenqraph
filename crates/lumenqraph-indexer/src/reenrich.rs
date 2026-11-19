@@ -58,7 +58,7 @@ pub async fn run_reenrich(
 
     loop {
         let rows = if let Some(contract) = options.contract.as_deref() {
-            let query = if let Some((ledger, event_id)) = cursor.as_ref() {
+            let query = if cursor.is_some() {
                 format!(
                     "SELECT ledger, event_id, contract_id, decoded_topics, event_name, decoded_value
                      FROM events WHERE {filter} AND contract_id = $1 AND (ledger, event_id) > ($2, $3)

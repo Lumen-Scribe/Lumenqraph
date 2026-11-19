@@ -19,7 +19,7 @@
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
@@ -237,6 +237,14 @@ pub fn is_non_retryable_rpc_error(err: &anyhow::Error) -> bool {
 #[serde(rename_all = "camelCase")]
 struct LatestLedgerResult {
     sequence: i64,
+}
+
+/// `getHealth` result: the provider's currently retained ledger window.
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcHealth {
+    pub oldest_ledger: i64,
+    pub latest_ledger: i64,
 }
 
 #[derive(Deserialize)]
@@ -991,6 +999,12 @@ struct LedgerEntryItem {
     xdr: String,
     #[serde(default)]
     last_modified_ledger_seq: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
     // ── #398 Failover tests ────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1048,11 +1062,6 @@ struct LedgerEntryItem {
         assert_eq!(host_of("https://rpc.example.com"), "rpc.example.com");
     }
 
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     fn ids(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("C{i}")).collect()

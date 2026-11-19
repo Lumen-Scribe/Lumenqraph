@@ -19,6 +19,28 @@ pub enum EventType {
     Diagnostic,
 }
 
+impl EventType {
+    /// The `events.event_type` text value, as stored in the database.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventType::Contract => "contract",
+            EventType::System => "system",
+            EventType::Diagnostic => "diagnostic",
+        }
+    }
+
+    /// Parse the `type` field of an RPC event. Returns `None` for values the
+    /// database CHECK constraint would reject.
+    pub fn from_rpc_str(s: &str) -> Option<Self> {
+        match s {
+            "contract" => Some(EventType::Contract),
+            "system" => Some(EventType::System),
+            "diagnostic" => Some(EventType::Diagnostic),
+            _ => None,
+        }
+    }
+}
+
 /// The kind of a materialized NFT event, mirroring the `nft_events.event_kind`
 /// CHECK constraint ("mint" | "transfer" | "burn").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]

@@ -113,7 +113,7 @@ pub async fn insert_events_with_resolver(
         contract_ids.push(e.contract_id.clone());
         ledgers.push(e.ledger);
         closed_ats.push(e.ledger_closed_at);
-        event_types.push(e.event_type.clone());
+        event_types.push(e.event_type.as_str().to_string());
         topics_json.push(serde_json::to_string(&e.topics)?);
         decoded_topics_json.push(serde_json::to_string(&e.decoded_topics)?);
         event_names.push(e.event_name.clone());
@@ -416,7 +416,7 @@ pub async fn upsert_events(
         contract_ids.push(e.contract_id.clone());
         ledgers.push(e.ledger);
         closed_ats.push(e.ledger_closed_at);
-        event_types.push(e.event_type.clone());
+        event_types.push(e.event_type.as_str().to_string());
         topics_json.push(serde_json::to_string(&e.topics)?);
         decoded_topics_json.push(serde_json::to_string(&e.decoded_topics)?);
         event_names.push(e.event_name.clone());

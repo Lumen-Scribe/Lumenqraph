@@ -193,6 +193,7 @@ async fn metrics(
     }
 
     (
+        axum::http::StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         body,
     )

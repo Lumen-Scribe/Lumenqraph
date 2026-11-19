@@ -11,7 +11,6 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::poller::fetch_and_store;
 use crate::rpc_client::RpcClient;
 use crate::specs::SpecCache;
 use crate::{cursor, poller};
@@ -25,6 +24,7 @@ mod tests {
     //!     cargo test -p lumenqraph-indexer -- --ignored --test-threads=1
 
     use super::*;
+    use crate::poller::fetch_and_store;
     use axum::{extract::State, routing::post, Json, Router};
     use serde_json::{json, Value};
     use sqlx::{postgres::PgPoolOptions, PgPool};
