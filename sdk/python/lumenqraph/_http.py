@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import email.utils
 import json
+import random
 import time
 import uuid
 import urllib.error
@@ -160,20 +161,107 @@ def _retry_after_ms(header: str | None) -> int | None:
     return max(0, int((when.timestamp() - time.time()) * 1000))
 
 
+def _full_jitter(ceiling_ms: int) -> int:
+    """Pick a delay uniformly in ``[0, ceiling_ms]`` (AWS "full jitter").
+
+    Spreads retries from many clients apart so they do not all hit the server
+    again at the same instant. Kept as a module function so tests can pin it.
+    """
+    return random.randint(0, max(0, ceiling_ms))
+
+
+class _TransientError(Exception):
+    """Internal: one attempt failed in a way that may be retried.
+
+    ``error`` is what the caller gets if no retry is made. ``retry_after_ms``
+    is the server's ``Retry-After`` hint, when it sent one.
+    """
+
+    def __init__(self, error: LumenqraphError, retry_after_ms: int | None = None):
+        super().__init__(str(error))
+        self.error = error
+        self.retry_after_ms = retry_after_ms
+
+
 class Transport:
-    """Sends one request with retry/backoff and maps failures to :class:`LumenqraphError`."""
+    """Sends requests with retry/backoff and maps failures to :class:`LumenqraphError`.
+
+    The work is split so the sync and async clients share one policy:
+
+    * :meth:`prepare_headers` runs once per logical request, so every retry
+      carries the same ``Idempotency-Key``.
+    * :meth:`send_once` makes exactly one HTTP attempt and raises
+      :class:`_TransientError` for retryable failures.
+    * :meth:`retry_delay_ms` computes the wait before the next attempt.
+
+    :meth:`send` loops with a blocking sleep. The async client runs
+    :meth:`send_once` in an executor and awaits its own sleep, so cancelling
+    the task stops further attempts.
+    """
 
     def __init__(self, retry: ResolvedRetry):
         self.retry = retry
 
-    def _delay_ms(self, attempt: int, retry_after: int | None = None) -> int:
-        backoff = self.retry["base_delay_ms"] * (2 ** attempt)
-        if retry_after is not None:
-            backoff = max(backoff, retry_after)
-        return min(backoff, self.retry["max_delay_ms"])
+    def retry_delay_ms(self, attempt: int, retry_after_ms: int | None = None) -> int:
+        """Delay before retry number ``attempt + 1``.
+
+        Full jitter over the capped exponential backoff, then floored at the
+        server's ``Retry-After`` so the client never retries earlier than asked.
+        """
+        ceiling = min(self.retry["base_delay_ms"] * (2 ** attempt), self.retry["max_delay_ms"])
+        delay = _full_jitter(ceiling)
+        if retry_after_ms is not None:
+            delay = max(delay, retry_after_ms)
+        return delay
+
+    def should_retry(self, method: str, url: str) -> bool:
+        """Only idempotent requests are retried (see :func:`_is_idempotent_url`)."""
+        return _is_idempotent_url(method, url)
+
+    def prepare_headers(self, method: str, url: str, headers: Mapping[str, str]) -> dict[str, str]:
+        """Copy ``headers`` and attach an ``Idempotency-Key`` to non-idempotent POSTs."""
+        req_headers = dict(headers)
+        if _should_attach_idempotency_key(method, url):
+            present = {k.lower() for k in req_headers}
+            if "idempotency-key" not in present:
+                req_headers["Idempotency-Key"] = str(uuid.uuid4())
+        return req_headers
 
     def _sleep(self, ms: int) -> None:
         time.sleep(ms / 1000.0)
+
+    def send_once(
+        self,
+        method: str,
+        url: str,
+        body: bytes | None,
+        headers: Mapping[str, str],
+        raw: bool = False,
+    ) -> Any:
+        """Make one HTTP attempt and return the decoded response.
+
+        Raises :class:`_TransientError` for 429/502/503/504 and network errors,
+        and :class:`LumenqraphError` for anything else.
+        """
+        timeout = self.retry["timeout_ms"] / 1000.0
+        req = urllib.request.Request(url, data=body, headers=dict(headers), method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                text: str = resp.read().decode("utf-8")
+                if raw:
+                    return text
+                return json.loads(text) if text else None
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            text = exc.read().decode("utf-8")
+            parsed = _parse_body(text)
+            error = LumenqraphError(_error_message(status, parsed, text), status, parsed)
+            if status in RETRYABLE_STATUSES:
+                retry_after = _retry_after_ms(exc.headers.get("Retry-After") if exc.headers else None)
+                raise _TransientError(error, retry_after) from None
+            raise error from None
+        except urllib.error.URLError as exc:
+            raise _TransientError(LumenqraphError(f"Network error: {exc.reason}", 0, None)) from None
 
     def send(
         self,
@@ -183,42 +271,23 @@ class Transport:
         headers: Mapping[str, str],
         raw: bool = False,
     ) -> Any:
-        """Send a request with retry/backoff.
+        """Send a request with blocking retry/backoff.
 
         Only idempotent methods (GET, HEAD, PUT, DELETE) and safe POSTs (/call, /simulate)
         are retried on network errors or retryable status codes (429, 502, 503, 504).
         Non-idempotent POSTs are not retried by default; an ``Idempotency-Key`` header
         is attached when absent to enable server-side deduplication.
         """
-        timeout = self.retry["timeout_ms"] / 1000.0
-        max_retries = self.retry["max_retries"]
+        req_headers = self.prepare_headers(method, url, headers)
+        should_retry = self.should_retry(method, url)
         attempt = 0
-        should_retry = _is_idempotent_url(method, url)
-        req_headers = dict(headers)
-        if _should_attach_idempotency_key(method, url):
-            if "Idempotency-Key" not in req_headers and "idempotency-key" not in {k.lower(): v for k, v in req_headers.items()}:
-                req_headers["Idempotency-Key"] = str(uuid.uuid4())
         while True:
-            req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
             try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    text: str = resp.read().decode("utf-8")
-                    if raw:
-                        return text
-                    return json.loads(text) if text else None
-            except urllib.error.HTTPError as exc:
-                status = exc.code
-                text = exc.read().decode("utf-8")
-                parsed = _parse_body(text)
-                if not should_retry or status not in RETRYABLE_STATUSES or attempt >= max_retries:
-                    raise LumenqraphError(_error_message(status, parsed, text), status, parsed) from None
-                retry_after = _retry_after_ms(exc.headers.get("Retry-After") if exc.headers else None)
-                self._sleep(self._delay_ms(attempt, retry_after))
-                attempt += 1
-            except urllib.error.URLError as exc:
-                if not should_retry or attempt >= max_retries:
-                    raise LumenqraphError(f"Network error: {exc.reason}", 0, None) from None
-                self._sleep(self._delay_ms(attempt))
+                return self.send_once(method, url, body, req_headers, raw)
+            except _TransientError as exc:
+                if not should_retry or attempt >= self.retry["max_retries"]:
+                    raise exc.error from None
+                self._sleep(self.retry_delay_ms(attempt, exc.retry_after_ms))
                 attempt += 1
 
     def stream_lines(self, url: str, headers: Mapping[str, str]) -> Iterator[str]:
