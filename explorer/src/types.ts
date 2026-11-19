@@ -34,6 +34,13 @@ export interface Transfer {
   amount: string;
 }
 
+/** Cursor-paginated list envelope returned by list endpoints. Pass `next_cursor` as `after` for the next page. */
+export interface Page<T> {
+  data: T[];
+  has_more: boolean;
+  next_cursor: string | null;
+}
+
 export interface ContractState {
   versions: Array<{
     ledger: number;

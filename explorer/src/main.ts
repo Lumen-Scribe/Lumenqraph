@@ -1,12 +1,29 @@
 import { injectStyles } from './styles';
 import * as api from './api';
 import * as ui from './ui';
+import type { Contract, EventRecord, Transfer } from './types';
 
 let selected: string | null = null;
 let tab = 'events';
 let healthTimer: NodeJS.Timeout | null = null;
 let mounts: Record<string, string> = {};
 let ifaceVersion: number | null = null;
+
+// Contract list, paged by `next_cursor`. Polling refreshes the first page
+// without discarding pages the user has already loaded.
+let contractRows: Contract[] = [];
+let contractCursor: string | null = null;
+let contractHasMore = false;
+
+// The events or transfers table for the selected contract, paged the same way.
+interface Listing {
+  kind: 'events' | 'transfers';
+  cid: string;
+  rows: Array<EventRecord | Transfer>;
+  cursor: string | null;
+  hasMore: boolean;
+}
+let listing: Listing | null = null;
 
 function $<T extends HTMLElement>(id: string): T {
   return document.getElementById(id) as T;
@@ -27,13 +44,67 @@ async function loadHealth(): Promise<void> {
   }
 }
 
+function renderContracts(): void {
+  ui.updateContractList(contractRows, selected, contractHasMore);
+}
+
 async function loadContracts(): Promise<void> {
   try {
-    const rows = await api.listContracts();
-    ui.updateContractList(rows, selected);
-    if (!selected && rows[0]) selectContract(rows[0].contract_id);
+    const page = await api.listContracts();
+    // Keep rows from pages loaded earlier. Only the first page is refreshed.
+    const extra = contractRows.filter(r => !page.data.some(f => f.contract_id === r.contract_id));
+    if (extra.length === 0) {
+      contractCursor = page.next_cursor;
+      contractHasMore = page.has_more;
+    }
+    contractRows = [...page.data, ...extra];
+    renderContracts();
+    if (!selected && contractRows[0]) selectContract(contractRows[0].contract_id);
   } catch (e) {
     ui.toast('Contracts: ' + (e instanceof Error ? e.message : String(e)));
+  }
+}
+
+async function loadMoreContracts(): Promise<void> {
+  if (!contractHasMore || !contractCursor) return;
+  try {
+    const page = await api.listContracts(contractCursor);
+    const seen = new Set(contractRows.map(r => r.contract_id));
+    contractRows = [...contractRows, ...page.data.filter(r => !seen.has(r.contract_id))];
+    contractCursor = page.next_cursor;
+    contractHasMore = page.has_more;
+    renderContracts();
+  } catch (e) {
+    ui.toast('Contracts: ' + (e instanceof Error ? e.message : String(e)));
+  }
+}
+
+function renderListing(): void {
+  if (!listing) return;
+  const table = listing.kind === 'events'
+    ? ui.renderEventsTable(listing.rows as EventRecord[])
+    : ui.renderTransfersTable(listing.rows as Transfer[]);
+  ui.setContent(table + ui.loadMoreControl(listing.hasMore));
+}
+
+async function loadMoreRows(): Promise<void> {
+  const current = listing;
+  if (!current || !current.hasMore || !current.cursor) return;
+  const btn = document.getElementById('loadMoreBtn') as HTMLButtonElement | null;
+  if (btn) btn.disabled = true;
+  try {
+    const page = current.kind === 'events'
+      ? await api.listEvents(current.cid, 50, current.cursor)
+      : await api.listTransfers(current.cid, 50, current.cursor);
+    // The user may have switched contract or tab while this request was in flight.
+    if (listing !== current) return;
+    current.rows = [...current.rows, ...page.data];
+    current.cursor = page.next_cursor;
+    current.hasMore = page.has_more;
+    renderListing();
+  } catch (e) {
+    ui.toast('Load more: ' + (e instanceof Error ? e.message : String(e)));
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -100,12 +171,11 @@ async function loadTab(): Promise<void> {
   const cid = selected;
   ui.setLoading();
   try {
-    if (tab === 'events') {
-      const rows = await api.listEvents(cid);
-      ui.setContent(ui.renderEventsTable(rows));
-    } else if (tab === 'transfers') {
-      const rows = await api.listTransfers(cid);
-      ui.setContent(ui.renderTransfersTable(rows));
+    if (tab === 'events' || tab === 'transfers') {
+      const kind: Listing['kind'] = tab === 'transfers' ? 'transfers' : 'events';
+      const page = kind === 'events' ? await api.listEvents(cid) : await api.listTransfers(cid);
+      listing = { kind, cid, rows: page.data, cursor: page.next_cursor, hasMore: page.has_more };
+      renderListing();
     } else if (tab === 'state') {
       const s = await api.getState(cid);
       const v = s.versions && s.versions[0];
@@ -177,6 +247,13 @@ window.addEventListener('DOMContentLoaded', () => {
   window.addEventListener('setTab', (e: Event) => {
     const evt = e as CustomEvent<{ tab: string }>;
     setTab(evt.detail.tab);
+  });
+
+  window.addEventListener('loadMoreContracts', () => { loadMoreContracts(); });
+
+  // One delegate on #detail covers the "Load more" button, which is re-rendered with each table.
+  $<HTMLElement>('detail').addEventListener('click', (e: Event) => {
+    if ((e.target as HTMLElement).closest('#loadMoreBtn')) loadMoreRows();
   });
 
   window.addEventListener('viewVersion', (e: Event) => {

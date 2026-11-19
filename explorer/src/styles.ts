@@ -76,6 +76,8 @@ export const styles = `
   .clist li { padding: .5rem .6rem; border-radius: 8px; cursor: pointer; }
   .clist li:hover { background: var(--surface-2); }
   .clist li.active { background: var(--accent-soft); outline: 1px solid var(--accent); }
+  .clist li.more { color: var(--muted); font-size: .8rem; text-align: center; }
+  .loadmore { display: flex; justify-content: center; padding: .6rem; }
   .clist .cid { font-family: ui-monospace, monospace; font-size: .74rem; word-break: break-all; }
   .clist .meta { font-size: .74rem; color: var(--muted); margin-top: .1rem; }
 

@@ -1,5 +1,5 @@
 import { getBase } from './api';
-import type { EventRecord, Transfer, ContractFunction, ContractEvent, ContractStruct, ContractUnion, ContractEnum, VersionInfo, VersionDiff, DiffSection } from './types';
+import type { Contract, EventRecord, Transfer, ContractFunction, ContractEvent, ContractStruct, ContractUnion, ContractEnum, VersionInfo, VersionDiff, DiffSection } from './types';
 
 function $<T extends HTMLElement>(id: string): T {
   return document.getElementById(id) as T;
@@ -79,7 +79,7 @@ export function updateNetworkLinks(network: string | undefined): void {
   }
 }
 
-export function updateContractList(contracts: Array<Record<string, unknown>>, selected: string | null): void {
+export function updateContractList(contracts: Contract[], selected: string | null, hasMore = false): void {
   const ul = $<HTMLUListElement>('clist');
   if (!contracts.length) {
     ul.innerHTML = '<li class="muted" style="cursor:default">No contracts indexed yet.</li>';
@@ -89,13 +89,25 @@ export function updateContractList(contracts: Array<Record<string, unknown>>, se
   for (const c of contracts) {
     const li = document.createElement('li');
     li.className = c.contract_id === selected ? 'active' : '';
-    const cid = c.contract_id as string;
+    const cid = c.contract_id;
     li.innerHTML = `<div class="cid">${esc(short(cid, 10))}
         <a class="ext" href="${seUrl('contract', cid)}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="View on Stellar.Expert">↗</a></div>
       <div class="meta">${fmt(c.event_count)} events · ledgers ${fmt(c.first_seen_ledger)}–${fmt(c.last_seen_ledger)}</div>`;
     li.onclick = () => window.dispatchEvent(new CustomEvent('selectContract', { detail: { cid } }));
     ul.appendChild(li);
   }
+  if (hasMore) {
+    const more = document.createElement('li');
+    more.className = 'more';
+    more.textContent = 'Load more contracts';
+    more.onclick = () => window.dispatchEvent(new CustomEvent('loadMoreContracts'));
+    ul.appendChild(more);
+  }
+}
+
+/** "Load more" control under a paginated table. Clicks are handled by the #detail delegate in main.ts. */
+export function loadMoreControl(hasMore: boolean): string {
+  return hasMore ? '<div class="loadmore"><button id="loadMoreBtn" type="button">Load more</button></div>' : '';
 }
 
 export function setDetailTitle(cid: string): void {
