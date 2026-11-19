@@ -52,6 +52,7 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use config::Config;
+use lumenqraph_core::ContractSpec;
 use deep_backfill::{GalexieSource, HistoricalSource};
 use reenrich::ReenrichOptions;
 use rpc_client::RpcClient;
@@ -134,6 +135,7 @@ impl LeaderLock {
             .await
             .context("failed to acquire advisory-lock connection")?
             .detach();
+        info!("acquiring indexer leader lock (id {})", INDEXER_LOCK_ID);
         let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
             .bind(INDEXER_LOCK_ID)
             .fetch_one(&mut conn)
@@ -168,6 +170,32 @@ impl LeaderLock {
             }
         });
     }
+}
+
+/// Take the indexer leader lock without blocking, for one-shot commands
+/// (`backfill`, `deep-backfill`, `recover-gaps`, `reenrich`). These write to the
+/// same tables as the live poller and to `indexer_cursor`, so they must not run
+/// beside it or beside each other (#710). Refuses with a clear message instead
+/// of waiting. The lock is session-scoped: it is released when the returned
+/// connection is dropped at the end of the command.
+async fn try_one_shot_lock(pool: &sqlx::PgPool, command: &str) -> anyhow::Result<PgConnection> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .context("failed to acquire advisory-lock connection")?
+        .detach();
+    let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+        .bind(INDEXER_LOCK_ID)
+        .fetch_one(&mut conn)
+        .await
+        .context("failed to query the leader lock")?;
+    anyhow::ensure!(
+        acquired,
+        "refusing to run `{command}`: another indexer or one-shot job holds the leader lock. \
+         Stop the live indexer (or wait for the other job) and retry."
+    );
+    info!(command, "one-shot command holds the leader lock");
+    Ok(conn)
 }
 
 /// Returns true when `SKIP_MIGRATIONS` is set to a truthy value.
@@ -345,20 +373,23 @@ async fn main() -> anyhow::Result<()> {
 
     match command {
         Command::Backfill { ledger } => {
+            let _lock = try_one_shot_lock(&pool, "backfill").await?;
             backfill::run(pool, rpc, config, ledger.map(i64::from).unwrap_or(0)).await
         }
-        Command::DeepBackfill {
-            from,
-            to,
-            source,
-            input,
-        } => run_deep_backfill(pool, config, from, to, source, input).await,
+        Command::DeepBackfill { from, to, source, input } => {
+            let _lock = try_one_shot_lock(&pool, "deep-backfill").await?;
+            run_deep_backfill(pool, config, from, to, source, input).await
+        }
         Command::RecoverGaps => {
-            let specs =
-                specs::SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
+            let _lock = try_one_shot_lock(&pool, "recover-gaps").await?;
+            let specs = specs::SpecCache::new(
+                config.spec_cache_max_entries,
+                config.spec_fetch_concurrency,
+            );
             poller::recover_gaps(&pool, &rpc, &config, &specs).await
         }
         Command::Reenrich { contract, force } => {
+            let _lock = try_one_shot_lock(&pool, "reenrich").await?;
             reenrich::run_reenrich(pool, rpc, config, ReenrichOptions { contract, force }).await
         }
         Command::Run => {
@@ -393,5 +424,50 @@ async fn main() -> anyhow::Result<()> {
             poller::run(pool, rpc, config, specs).await
         }
         Command::Migrate | Command::Inspect { .. } => unreachable!("handled above"),
+    }
+}
+
+#[cfg(test)]
+mod one_shot_lock_tests {
+    use super::*;
+    use lumenqraph_core::db_test::TestDb;
+
+    /// A one-shot command must refuse while the live indexer holds the leader lock,
+    /// and two one-shot commands must not overlap (#710).
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore] // Requires TEST_DATABASE_URL (CI runs `--ignored`)
+    async fn one_shot_commands_refuse_while_the_leader_lock_is_held() {
+        let db = TestDb::new_with_migrations("../../migrations").await;
+
+        // Stand in for the live indexer.
+        let leader = LeaderLock::acquire(db.pool()).await.expect("leader acquires");
+
+        let err = try_one_shot_lock(db.pool(), "backfill")
+            .await
+            .expect_err("backfill must not run beside the live indexer");
+        assert!(err.to_string().contains("refusing to run `backfill`"), "got: {err}");
+
+        // Release the leader. Dropping its connection releases the session lock; the
+        // server may take a moment to notice, so retry briefly.
+        drop(leader);
+        let mut held = None;
+        for _ in 0..50 {
+            match try_one_shot_lock(db.pool(), "reenrich").await {
+                Ok(conn) => {
+                    held = Some(conn);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        let first = held.expect("one-shot runs once the leader is gone");
+
+        // A second one-shot must not start while the first is still running.
+        let err = try_one_shot_lock(db.pool(), "recover-gaps")
+            .await
+            .expect_err("one-shot commands must not overlap");
+        assert!(err.to_string().contains("refusing to run `recover-gaps`"), "got: {err}");
+
+        drop(first);
     }
 }

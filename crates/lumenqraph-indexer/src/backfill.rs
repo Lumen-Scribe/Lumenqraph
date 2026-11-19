@@ -92,7 +92,7 @@ pub async fn run(
         // leaves the cursor pointing at the end of the last page we finished,
         // so the backfill is resumable with no ledger range lost.
         last_page_ledger = page_max_ledger;
-        cursor::write_progress(&pool, last_page_ledger, tip, inserted).await?;
+        cursor::write_progress_locked(&pool, last_page_ledger, tip, inserted).await?;
         info!(
             inserted,
             page_max_ledger, total_inserted, "backfill page complete (cursor checkpointed)"
@@ -105,7 +105,7 @@ pub async fn run(
     }
 
     // Final cursor advance to the tip so the live poller starts from there.
-    cursor::write_progress(&pool, tip, tip, 0).await?;
+    cursor::write_progress_locked(&pool, tip, tip, 0).await?;
     info!(total_inserted, up_to_ledger = tip, "backfill complete");
     Ok(())
 }
@@ -240,6 +240,8 @@ mod tests {
             page_size,
             start_ledger: 0,
             max_catchup_ledgers: 4000,
+            max_consecutive_errors: 20,
+            degraded_poll_interval_secs: 300,
             state_indexing: false,
             key_indexing: false,
             balance_key_symbol: "Balance".into(),
@@ -307,7 +309,7 @@ mod tests {
         assert_eq!(count, 3);
 
         // Write cursor and verify it's readable (what backfill::run does after fetch).
-        cursor::write_progress(&pool, 1000, 1000, inserted)
+        cursor::write_progress_locked(&pool, 1000, 1000, inserted)
             .await
             .unwrap();
         let last = cursor::read_last_processed(&pool).await.unwrap();
@@ -419,17 +421,22 @@ mod tests {
         let pool = fixture().await;
         let tip = 1000i64;
 
-        // Serve only one page (page 2 would need a second request, which the
-        // mock never receives because we stop after the first page).
+        // Page 1 is full and signals "there is more"; page 2 is empty and
+        // terminal, so the scan ends after two requests.
         let rpc_url = spawn_mock_rpc(
             tip,
-            vec![MockPage {
-                cursor_in: None,
-                events: vec![make_event("e1", 500), make_event("e2", 501)],
-                // Return a cursor that signals "there is more" — but we won't
-                // request it (simulating an error mid-backfill).
-                cursor_out: Some("page2".into()),
-            }],
+            vec![
+                MockPage {
+                    cursor_in: None,
+                    events: vec![make_event("e1", 500), make_event("e2", 501)],
+                    cursor_out: Some("page2".into()),
+                },
+                MockPage {
+                    cursor_in: Some("page2".into()),
+                    events: vec![],
+                    cursor_out: None,
+                },
+            ],
         )
         .await;
 
@@ -444,7 +451,7 @@ mod tests {
 
         // Checkpoint after this page (ledger 501 is the max from page 1).
         let page_max_ledger = 501i64;
-        cursor::write_progress(&pool, page_max_ledger, tip, inserted)
+        cursor::write_progress_locked(&pool, page_max_ledger, tip, inserted)
             .await
             .unwrap();
 

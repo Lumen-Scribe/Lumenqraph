@@ -646,7 +646,7 @@ mod tests {
         std::env::remove_var("RPC_URLS");
         std::env::remove_var("KEY_TEMPLATES");
 
-        for invalid in ["instance", "temp", "temporarily", ""] {
+        for invalid in ["instance", "temp", "persistant", "temporarily", ""] {
             std::env::set_var("BALANCE_KEY_DURABILITY", invalid);
             // Empty string is treated as unset (defaults to persistent), so it
             // must succeed; all other typos must fail.

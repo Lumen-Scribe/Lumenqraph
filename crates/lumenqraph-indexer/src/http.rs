@@ -347,6 +347,7 @@ struct IndexerMetrics {
     unrecoverable_missed_ranges: i64,
 }
 
+#[allow(clippy::type_complexity)] // one row mirrors the indexer_cursor columns
 async fn gather_metrics(pool: &PgPool) -> anyhow::Result<IndexerMetrics> {
     // Column order matches the SELECT below.
     type CursorRow = (
