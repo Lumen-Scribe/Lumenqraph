@@ -11,7 +11,7 @@
 //! `Utc::now()`.
 
 use chrono::{DateTime, TimeZone, Utc};
-use lumenqraph_core::{xdr, ContractSpec, NewEvent};
+use lumenqraph_core::{xdr, ContractSpec, EventType, NewEvent};
 use tracing::error;
 
 use crate::rpc_client::EventInfo;
@@ -46,6 +46,18 @@ pub fn parse_ledger_closed_at(raw: &str) -> Option<DateTime<Utc>> {
 /// Returns `None` when the `ledgerClosedAt` timestamp cannot be parsed — the
 /// event is skipped entirely rather than stored with a fabricated timestamp.
 /// All other missing/malformed fields are handled gracefully with defaults.
+/// Map the RPC/data-lake event type string onto the typed model. Only the three
+/// values the `events.event_type` CHECK constraint accepts are valid; anything
+/// else is rejected so the event is skipped rather than failing the whole batch.
+pub fn parse_event_type(raw: &str) -> Option<EventType> {
+    match raw {
+        "contract" => Some(EventType::Contract),
+        "system" => Some(EventType::System),
+        "diagnostic" => Some(EventType::Diagnostic),
+        _ => None,
+    }
+}
+
 pub fn to_new_event(e: &EventInfo, spec: Option<&ContractSpec>) -> Option<NewEvent> {
     // Parse the timestamp. On failure, return None — never fall back to Utc::now().
     let parsed_ts = parse_ledger_closed_at(&e.ledger_closed_at)?;
@@ -68,7 +80,7 @@ pub fn to_new_event(e: &EventInfo, spec: Option<&ContractSpec>) -> Option<NewEve
         contract_id: e.contract_id.clone(),
         ledger: e.ledger,
         ledger_closed_at,
-        event_type: e.event_type.clone(),
+        event_type: parse_event_type(&e.event_type)?,
         topics: e.topic.clone(),
         decoded_topics,
         event_name,

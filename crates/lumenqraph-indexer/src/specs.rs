@@ -297,8 +297,8 @@ async fn record_version(
     wasm_hash: &str,
     spec_section: &str,
     spec: &ContractSpec,
-    /// Whether the spec section was fully decoded (#401). When `false`, diffs
-    /// against this version are suppressed to prevent false "removal" alerts.
+    // Whether the spec section was fully decoded (#401). When `false`, diffs
+    // against this version are suppressed to prevent false "removal" alerts.
     complete: bool,
     ledger: i64,
 ) -> anyhow::Result<()> {
@@ -381,8 +381,8 @@ async fn persist(
     wasm_hash: &str,
     spec_section: &str,
     spec: &ContractSpec,
-    /// Whether the spec section was fully decoded (#401). Persisted so the
-    /// API can surface it in the interface response.
+    // Whether the spec section was fully decoded (#401). Persisted so the
+    // API can surface it in the interface response.
     complete: bool,
 ) -> anyhow::Result<()> {
     sqlx::query(
@@ -498,7 +498,7 @@ mod tests {
     async fn first_interface_is_a_baseline_with_no_diff() {
         let pool = fixture().await;
         let (section, spec) = spec_with(&["balance"]);
-        record_version(&pool, "C1", "hash1", &section, &spec, 100)
+        record_version(&pool, "C1", "hash1", &section, &spec, true, 100)
             .await
             .unwrap();
 
@@ -523,7 +523,7 @@ mod tests {
         // Every restart and every cache miss re-reads the spec; only a genuine
         // change may append to the history.
         for _ in 0..3 {
-            record_version(&pool, "C1", "hash1", &section, &spec, 100)
+            record_version(&pool, "C1", "hash1", &section, &spec, true, 100)
                 .await
                 .unwrap();
         }
@@ -535,13 +535,13 @@ mod tests {
     async fn an_upgrade_appends_a_version_with_its_diff() {
         let pool = fixture().await;
         let (s1, spec1) = spec_with(&["balance", "withdraw"]);
-        record_version(&pool, "C1", "hash1", &s1, &spec1, 100)
+        record_version(&pool, "C1", "hash1", &s1, &spec1, true, 100)
             .await
             .unwrap();
 
         // v2 drops withdraw and adds pause: a breaking change.
         let (s2, spec2) = spec_with(&["balance", "pause"]);
-        record_version(&pool, "C1", "hash2", &s2, &spec2, 101)
+        record_version(&pool, "C1", "hash2", &s2, &spec2, true, 101)
             .await
             .unwrap();
 
@@ -571,12 +571,12 @@ mod tests {
     async fn a_code_only_upgrade_is_recorded_as_a_non_breaking_empty_diff() {
         let pool = fixture().await;
         let (section, spec) = spec_with(&["balance"]);
-        record_version(&pool, "C1", "hash1", &section, &spec, 100)
+        record_version(&pool, "C1", "hash1", &section, &spec, true, 100)
             .await
             .unwrap();
         // New code, identical interface — e.g. a bug fix. Still an upgrade worth
         // recording, but nothing an integration needs to react to.
-        record_version(&pool, "C1", "hash2", &section, &spec, 101)
+        record_version(&pool, "C1", "hash2", &section, &spec, true, 101)
             .await
             .unwrap();
 
@@ -612,7 +612,7 @@ mod tests {
         .unwrap();
 
         let (s2, spec2) = spec_with(&["balance"]);
-        record_version(&pool, "C1", "hash2", &s2, &spec2, 101)
+        record_version(&pool, "C1", "hash2", &s2, &spec2, true, 101)
             .await
             .unwrap();
 

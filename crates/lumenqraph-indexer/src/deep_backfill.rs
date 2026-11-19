@@ -510,7 +510,9 @@ fn historical_to_new_event(
         contract_id: ev.contract_id,
         ledger: ev.ledger,
         ledger_closed_at: ev.ledger_closed_at,
-        event_type: ev.event_type,
+        // The data-lake source defaults to "contract" and only emits the three
+        // valid values; fall back to the same default rather than dropping the event.
+        event_type: crate::convert::parse_event_type(&ev.event_type).unwrap_or(lumenqraph_core::EventType::Contract),
         topics: ev.topics,
         decoded_topics,
         event_name,

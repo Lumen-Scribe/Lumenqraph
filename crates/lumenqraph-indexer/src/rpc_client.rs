@@ -239,6 +239,13 @@ struct LatestLedgerResult {
     sequence: i64,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcHealth {
+    pub oldest_ledger: i64,
+    pub latest_ledger: i64,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NetworkResult {
@@ -991,63 +998,6 @@ struct LedgerEntryItem {
     xdr: String,
     #[serde(default)]
     last_modified_ledger_seq: i64,
-    // ── #398 Failover tests ────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn failover_to_secondary_when_primary_down() {
-        let primary_count = Arc::new(AtomicUsize::new(0));
-        let secondary_count = Arc::new(AtomicUsize::new(0));
-
-        let primary_url = spawn_counting_mock(
-            primary_count.clone(),
-            Arc::new(|_| (500, "")),
-        ).await;
-        let secondary_url = spawn_counting_mock(
-            secondary_count.clone(),
-            Arc::new(|_| (200, OK_SEQ_2000)),
-        ).await;
-
-        let client = RpcClient::with_urls(vec![primary_url, secondary_url], 5);
-        let seq: i64 = client.get_latest_ledger().await
-            .expect("should succeed via secondary");
-        assert_eq!(seq, 2000);
-        assert_eq!(primary_count.load(Ordering::SeqCst), 3,
-            "primary must exhaust 3 attempts before failover");
-        assert!(secondary_count.load(Ordering::SeqCst) >= 1,
-            "secondary must be tried at least once");
-    }
-
-    #[tokio::test]
-    async fn failover_count_metric_increments() {
-        let primary_url = spawn_counting_mock(
-            Arc::new(AtomicUsize::new(0)),
-            Arc::new(|_| (500, "")),
-        ).await;
-        let secondary_url = spawn_counting_mock(
-            Arc::new(AtomicUsize::new(0)),
-            Arc::new(|_| (200, OK_SEQ_1000)),
-        ).await;
-
-        let client = RpcClient::with_urls(vec![primary_url, secondary_url], 5);
-        client.get_latest_ledger().await.expect("should succeed");
-
-        let (_, _, _, failovers) = client.take_metrics();
-        assert_eq!(failovers, 1, "one failover should be recorded");
-    }
-
-    #[test]
-    fn active_endpoint_host_returns_host_only() {
-        let client = RpcClient::new("https://soroban-testnet.stellar.org/rpc", 5);
-        assert_eq!(client.active_endpoint_host(), "soroban-testnet.stellar.org");
-    }
-
-    #[test]
-    fn host_of_strips_credentials_and_path() {
-        assert_eq!(host_of("https://user:pass@host.example.com/path"), "host.example.com");
-        assert_eq!(host_of("http://localhost:8080/rpc"), "localhost:8080");
-        assert_eq!(host_of("https://rpc.example.com"), "rpc.example.com");
-    }
-
 }
 
 #[cfg(test)]
@@ -1366,4 +1316,62 @@ mod tests {
             "must attempt exactly MAX_ATTEMPTS=3 times"
         );
     }
+
+    // ── #398 Failover tests ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn failover_to_secondary_when_primary_down() {
+        let primary_count = Arc::new(AtomicUsize::new(0));
+        let secondary_count = Arc::new(AtomicUsize::new(0));
+
+        let primary_url = spawn_counting_mock(
+            primary_count.clone(),
+            Arc::new(|_| (500, "")),
+        ).await;
+        let secondary_url = spawn_counting_mock(
+            secondary_count.clone(),
+            Arc::new(|_| (200, OK_SEQ_2000)),
+        ).await;
+
+        let client = RpcClient::with_urls(vec![primary_url, secondary_url], 5);
+        let seq: i64 = client.get_latest_ledger().await
+            .expect("should succeed via secondary");
+        assert_eq!(seq, 2000);
+        assert_eq!(primary_count.load(Ordering::SeqCst), 3,
+            "primary must exhaust 3 attempts before failover");
+        assert!(secondary_count.load(Ordering::SeqCst) >= 1,
+            "secondary must be tried at least once");
+    }
+
+    #[tokio::test]
+    async fn failover_count_metric_increments() {
+        let primary_url = spawn_counting_mock(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(|_| (500, "")),
+        ).await;
+        let secondary_url = spawn_counting_mock(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(|_| (200, OK_SEQ_1000)),
+        ).await;
+
+        let client = RpcClient::with_urls(vec![primary_url, secondary_url], 5);
+        client.get_latest_ledger().await.expect("should succeed");
+
+        let (_, _, _, failovers) = client.take_metrics();
+        assert_eq!(failovers, 1, "one failover should be recorded");
+    }
+
+    #[test]
+    fn active_endpoint_host_returns_host_only() {
+        let client = RpcClient::new("https://soroban-testnet.stellar.org/rpc", 5);
+        assert_eq!(client.active_endpoint_host(), "soroban-testnet.stellar.org");
+    }
+
+    #[test]
+    fn host_of_strips_credentials_and_path() {
+        assert_eq!(host_of("https://user:pass@host.example.com/path"), "host.example.com");
+        assert_eq!(host_of("http://localhost:8080/rpc"), "localhost:8080");
+        assert_eq!(host_of("https://rpc.example.com"), "rpc.example.com");
+    }
+
 }

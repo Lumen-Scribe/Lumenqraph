@@ -155,6 +155,8 @@ mod tests {
             key_templates: vec![],
             spec_cache_max_entries: 2000,
             spec_fetch_concurrency: 4,
+            degraded_poll_interval_secs: 300,
+            max_consecutive_errors: 20,
         }
     }
 

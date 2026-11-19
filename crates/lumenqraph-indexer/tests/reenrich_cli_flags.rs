@@ -116,7 +116,7 @@ mod reenrich_cli_flags_tests {
             "SELECT COUNT(*) FROM events
              WHERE contract_id = $1 AND enriched IS NULL AND event_name IS NOT NULL",
         )
-        .bind(contract_1)
+        .bind(contract_1.clone())
         .fetch_one(&pool)
         .await
         .expect("Failed to count");
@@ -125,7 +125,7 @@ mod reenrich_cli_flags_tests {
             "SELECT COUNT(*) FROM events
              WHERE contract_id = $1 AND enriched IS NULL AND event_name IS NOT NULL",
         )
-        .bind(contract_2)
+        .bind(contract_2.clone())
         .fetch_one(&pool)
         .await
         .expect("Failed to count");
