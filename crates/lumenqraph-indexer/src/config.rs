@@ -22,6 +22,11 @@ pub struct Config {
     pub rpc_urls: Vec<String>,
     /// Contract IDs to index. Empty => index all contract events.
     pub contract_ids: Vec<String>,
+    /// Topic filters pushed down to `getEvents` (#728). Each inner vector is
+    /// one topic pattern (up to 5 segments, `*` = wildcard), e.g.
+    /// `[["transfer","*","*"],["swap"]]`. Empty => no topic filtering.
+    /// Env `EVENT_TOPIC_FILTERS`, a JSON array of topic patterns.
+    pub event_topic_filters: Vec<Vec<String>>,
     pub poll_interval_secs: u64,
     pub page_size: u32,
     pub start_ledger: i64,
@@ -71,6 +76,7 @@ impl std::fmt::Debug for Config {
                     .collect::<Vec<_>>(),
             )
             .field("contract_ids", &self.contract_ids)
+            .field("event_topic_filters", &self.event_topic_filters)
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("page_size", &self.page_size)
             .field("start_ledger", &self.start_ledger)
@@ -152,6 +158,20 @@ impl Config {
         let contract_ids: Vec<String> =
             lumenqraph_core::parse_contract_ids(&std::env::var("CONTRACT_IDS").unwrap_or_default())
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // Parse EVENT_TOPIC_FILTERS (#728): a JSON array of topic patterns,
+        // e.g. `[["transfer","*","*"],["swap"]]`. Each pattern is one topic
+        // set; `*` is a wildcard segment.
+        let event_topic_filters: Vec<Vec<String>> = std::env::var("EVENT_TOPIC_FILTERS")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| -> anyhow::Result<Vec<Vec<String>>> {
+                serde_json::from_str(&s)
+                    .map_err(|e| anyhow::anyhow!("invalid EVENT_TOPIC_FILTERS JSON: {e}"))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        validate_event_filters(&contract_ids, &event_topic_filters)?;
 
         // Parse numeric config with validation.
         let poll_interval_secs = env_parse("POLL_INTERVAL_SECS", 5)?;
@@ -349,6 +369,7 @@ impl Config {
             key_indexing: env_bool("KEY_INDEXING", false),
             upgrade_watch: env_bool("UPGRADE_WATCH", !contract_ids.is_empty()),
             contract_ids,
+            event_topic_filters,
             balance_key_symbol: std::env::var("BALANCE_KEY_SYMBOL")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
@@ -368,6 +389,79 @@ impl Config {
             degraded_poll_interval_secs,
         })
     }
+}
+
+/// Maximum number of filter slots Soroban RPC accepts in one `getEvents` call.
+pub const MAX_EVENT_FILTERS: usize = 5;
+/// Maximum number of topic segments per filter (each may be `*`).
+pub const MAX_TOPIC_SEGMENTS: usize = 5;
+/// Maximum number of contract IDs per filter slot.
+pub const MAX_CONTRACT_IDS_PER_FILTER: usize = 5;
+
+/// Validate `EVENT_TOPIC_FILTERS` and its combination with `CONTRACT_IDS`
+/// against the Soroban RPC `getEvents` limits (#728).
+///
+/// The RPC accepts at most 5 filters, each with at most 5 topic segments and
+/// at most 5 contract IDs. When both `CONTRACT_IDS` and topic filters are set
+/// the indexer builds the cross product (one filter per contract × topic
+/// pattern), so the product must fit in `MAX_EVENT_FILTERS`.
+pub fn validate_event_filters(
+    contract_ids: &[String],
+    topic_filters: &[Vec<String>],
+) -> anyhow::Result<()> {
+    for (i, pattern) in topic_filters.iter().enumerate() {
+        if pattern.is_empty() {
+            return Err(anyhow::anyhow!(
+                "EVENT_TOPIC_FILTERS entry {i} is empty; each topic pattern needs at least one segment"
+            ));
+        }
+        if pattern.len() > MAX_TOPIC_SEGMENTS {
+            return Err(anyhow::anyhow!(
+                "EVENT_TOPIC_FILTERS entry {i} has {} segments; Soroban RPC allows at most {}",
+                pattern.len(),
+                MAX_TOPIC_SEGMENTS
+            ));
+        }
+    }
+
+    if topic_filters.is_empty() {
+        // Only contract filters; the RPC limit is per-filter contract IDs.
+        if contract_ids.len() > MAX_EVENT_FILTERS * MAX_CONTRACT_IDS_PER_FILTER {
+            return Err(anyhow::anyhow!(
+                "CONTRACT_IDS has {} entries; Soroban RPC allows at most {} ({} filters x {} ids)",
+                contract_ids.len(),
+                MAX_EVENT_FILTERS * MAX_CONTRACT_IDS_PER_FILTER,
+                MAX_EVENT_FILTERS,
+                MAX_CONTRACT_IDS_PER_FILTER
+            ));
+        }
+        return Ok(());
+    }
+
+    if contract_ids.is_empty() {
+        if topic_filters.len() > MAX_EVENT_FILTERS {
+            return Err(anyhow::anyhow!(
+                "EVENT_TOPIC_FILTERS has {} patterns; Soroban RPC allows at most {} filters",
+                topic_filters.len(),
+                MAX_EVENT_FILTERS
+            ));
+        }
+        return Ok(());
+    }
+
+    // Cross product of contract IDs and topic patterns must fit in the slots.
+    let total = contract_ids.len().saturating_mul(topic_filters.len());
+    if total > MAX_EVENT_FILTERS {
+        return Err(anyhow::anyhow!(
+            "CONTRACT_IDS ({}) x EVENT_TOPIC_FILTERS ({}) = {} filters exceeds the Soroban RPC limit of {}; \
+             reduce CONTRACT_IDS or EVENT_TOPIC_FILTERS",
+            contract_ids.len(),
+            topic_filters.len(),
+            total,
+            MAX_EVENT_FILTERS
+        ));
+    }
+    Ok(())
 }
 
 /// Clamp a numeric config value to [min, max] and log a warning if clamped.
@@ -623,6 +717,89 @@ mod tests {
         const MAX_IDS_PER_FILTER: usize = 5;
         const MAX_FILTERS: usize = 5;
         assert_eq!(MAX_IDS_PER_FILTER * MAX_FILTERS, 25);
+    }
+
+    #[test]
+    fn event_topic_filters_validation_accepts_within_limits() {
+        // No filters at all is fine.
+        assert!(validate_event_filters(&[], &[]).is_ok());
+        // Wildcards and multiple patterns within limits.
+        let filters = vec![
+            vec!["transfer".to_string(), "*".to_string(), "*".to_string()],
+            vec!["swap".to_string()],
+        ];
+        assert!(validate_event_filters(&[], &filters).is_ok());
+        // Exactly 5 patterns is allowed.
+        let five = vec![vec!["a".to_string()]; MAX_EVENT_FILTERS];
+        assert!(validate_event_filters(&[], &five).is_ok());
+    }
+
+    #[test]
+    fn event_topic_filters_validation_rejects_too_many_patterns() {
+        let six = vec![vec!["a".to_string()]; MAX_EVENT_FILTERS + 1];
+        let err = validate_event_filters(&[], &six).unwrap_err().to_string();
+        assert!(err.contains("EVENT_TOPIC_FILTERS"), "{err}");
+        assert!(err.contains("at most 5"), "{err}");
+    }
+
+    #[test]
+    fn event_topic_filters_validation_rejects_too_many_segments() {
+        let too_long = vec![vec!["a".to_string(); MAX_TOPIC_SEGMENTS + 1]];
+        let err = validate_event_filters(&[], &too_long).unwrap_err().to_string();
+        assert!(err.contains("segments"), "{err}");
+        // Empty pattern is rejected.
+        let empty = vec![Vec::<String>::new()];
+        assert!(validate_event_filters(&[], &empty).is_err());
+    }
+
+    #[test]
+    fn event_topic_filters_validation_rejects_oversized_cross_product() {
+        let contracts = vec!["C1".to_string(), "C2".to_string(), "C3".to_string()];
+        let filters = vec![vec!["transfer".to_string()], vec!["swap".to_string()]];
+        // 3 x 2 = 6 > 5.
+        let err = validate_event_filters(&contracts, &filters)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds"), "{err}");
+        assert!(err.contains("CONTRACT_IDS"), "{err}");
+        // 2 x 2 = 4 fits.
+        assert!(validate_event_filters(&contracts[..2], &filters).is_ok());
+    }
+
+    #[test]
+    fn event_topic_filters_parsed_from_env() {
+        let _guard = env_lock();
+        let saved: Vec<(String, Option<String>)> = ["DATABASE_URL", "RPC_URL", "RPC_URLS", "CONTRACT_IDS", "EVENT_TOPIC_FILTERS"]
+            .iter()
+            .map(|k| ((*k).to_string(), std::env::var(k).ok()))
+            .collect();
+
+        std::env::set_var("DATABASE_URL", "postgres://localhost/test");
+        std::env::set_var("RPC_URL", "https://example.com");
+        std::env::remove_var("RPC_URLS");
+        std::env::remove_var("CONTRACT_IDS");
+        std::env::set_var("EVENT_TOPIC_FILTERS", r#"[["transfer","*","*"],["swap"]]"#);
+
+        let cfg = Config::from_env().expect("config should load");
+        assert_eq!(
+            cfg.event_topic_filters,
+            vec![
+                vec!["transfer".to_string(), "*".to_string(), "*".to_string()],
+                vec!["swap".to_string()],
+            ]
+        );
+        assert!(format!("{cfg:?}").contains("event_topic_filters"));
+
+        // Invalid JSON fails fast.
+        std::env::set_var("EVENT_TOPIC_FILTERS", "not json");
+        assert!(Config::from_env().is_err());
+
+        for (key, value) in saved {
+            match value {
+                Some(v) => std::env::set_var(&key, v),
+                None => std::env::remove_var(&key),
+            }
+        }
     }
 
     #[test]

@@ -555,7 +555,9 @@ async fn fetch_and_store_with_shutdown(
             }
             batch.push(new_event);
         }
-        total_inserted += store::insert_events(pool, &batch).await?;
+        total_inserted +=
+            store::insert_events_with_resolver(pool, &batch, &specs.contract_kind_resolver())
+                .await?;
 
         // Pages are ordered by ledger, so every ledger below this page's last
         // event is complete. Checkpoint it so a crash does not replay the cycle (#717).
@@ -914,7 +916,9 @@ async fn replay_range(
             }
         }
         if !batch.is_empty() {
-            inserted_total += store::insert_events(pool, &batch).await?;
+            inserted_total +=
+                store::insert_events_with_resolver(pool, &batch, &specs.contract_kind_resolver())
+                    .await?;
         }
         if ts_parse_errors > 0 {
             let _ = cursor::track_timestamp_parse_error(pool, ts_parse_errors).await;
@@ -990,7 +994,9 @@ async fn fetch_and_upsert(
         }
 
         if !batch.is_empty() {
-            let (_, updated) = store::upsert_events(pool, &batch).await?;
+            let (_, updated) =
+                store::upsert_events_with_resolver(pool, &batch, &specs.contract_kind_resolver())
+                    .await?;
             total_updated += updated;
         }
 

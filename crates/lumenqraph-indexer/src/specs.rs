@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lru::LruCache;
-use lumenqraph_core::{ContractSpec, SpecDiff};
+use lumenqraph_core::{ContractKind, ContractSpec, SpecDiff};
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
@@ -45,6 +45,8 @@ struct Cached {
     spec: CachedSpec,
     /// The executable hash the cached spec was parsed from (`None` for SAC).
     wasm_hash: Option<String>,
+    /// What kind of contract this is, resolved from its executable/spec.
+    kind: ContractKind,
 }
 
 impl Default for Cached {
@@ -52,6 +54,7 @@ impl Default for Cached {
         Self {
             spec: CachedSpec::NoSpec,
             wasm_hash: None,
+            kind: ContractKind::Unknown,
         }
     }
 }
@@ -96,6 +99,22 @@ impl SpecCache {
             })
     }
 
+    /// Resolve the [`ContractKind`] for a contract from the in-memory cache.
+    ///
+    /// Returns `None` when the contract has not been resolved yet (no cache
+    /// entry, or a transient fetch error), so callers can decide whether to
+    /// treat an unknown contract as a token. A contract is only reported as
+    /// [`ContractKind::FungibleToken`] when it is a Stellar Asset Contract or
+    /// its WASM spec declares the full SEP-41 interface.
+    pub fn contract_kind(&self, contract_id: &str) -> Option<ContractKind> {
+        let map = self.inner.lock().unwrap();
+        let cached = map.get(contract_id)?;
+        match &cached.spec {
+            CachedSpec::FetchError { .. } => None,
+            _ => Some(cached.kind),
+        }
+    }
+
     /// The spec for a contract, fetching+parsing+persisting on first use.
     /// Distinguishes transient failures (retryable) from permanent failures (SAC).
     /// Concurrent fetches are bounded by the semaphore; already-cached lookups bypass it.
@@ -125,11 +144,11 @@ impl SpecCache {
             .acquire()
             .await
             .expect("semaphore acquire failed");
-        let (spec, wasm_hash, is_permanent) = load(pool, rpc, contract_id, ledger).await;
-        let cached_spec = match spec {
+        let loaded = load(pool, rpc, contract_id, ledger).await;
+        let cached_spec = match &loaded.spec {
             Some(s) => CachedSpec::Spec(s.clone()),
             None => {
-                if is_permanent {
+                if loaded.is_permanent {
                     CachedSpec::NoSpec
                 } else {
                     CachedSpec::FetchError {
@@ -144,7 +163,8 @@ impl SpecCache {
                 contract_id.to_string(),
                 Cached {
                     spec: cached_spec.clone(),
-                    wasm_hash,
+                    wasm_hash: loaded.wasm_hash,
+                    kind: loaded.kind,
                 },
             );
             // LruCache::len() is O(1) and accounts for any eviction this insert
@@ -227,16 +247,23 @@ pub async fn check_for_upgrade(
     }
 }
 
-/// Returns `(parsed spec, wasm hash, is_permanent_failure)`. The hash is present for any WASM contract
+/// The result of loading a contract's interface.
+struct Loaded {
+    /// The parsed spec, if the contract has a decodable one.
+    spec: Option<Arc<ContractSpec>>,
+    /// The executable hash (`None` for a Stellar Asset Contract).
+    wasm_hash: Option<String>,
+    /// Whether the failure (if any) is permanent and should not be retried.
+    is_permanent: bool,
+    /// The resolved contract kind.
+    kind: ContractKind,
+}
+
+/// Returns the loaded interface. The hash is present for any WASM contract
 /// (even if its spec fails to parse) and `None` for a Stellar Asset Contract.
-/// `is_permanent_failure` is true when the failure is not retryable (SAC, parse error),
+/// `is_permanent` is true when the failure is not retryable (SAC, parse error),
 /// and false for transient failures (RPC error).
-async fn load(
-    pool: &PgPool,
-    rpc: &RpcClient,
-    contract_id: &str,
-    ledger: i64,
-) -> (Option<Arc<ContractSpec>>, Option<String>, bool) {
+async fn load(pool: &PgPool, rpc: &RpcClient, contract_id: &str, ledger: i64) -> Loaded {
     let (wasm_hash, wasm) = match rpc.get_contract_wasm(contract_id).await {
         Ok(Some(w)) => w,
         Ok(None) => {
@@ -244,19 +271,35 @@ async fn load(
                 contract_id,
                 "contract has no WASM spec (e.g. SAC); skipping"
             );
-            // Permanent: RPC succeeded but returned no WASM (SAC).
-            return (None, None, true);
+            // Permanent: RPC succeeded but returned no WASM. A contract with no
+            // WASM executable is a Stellar Asset Contract, which is a token.
+            return Loaded {
+                spec: None,
+                wasm_hash: None,
+                is_permanent: true,
+                kind: ContractKind::FungibleToken,
+            };
         }
         Err(e) => {
             warn!(contract_id, error = %e, "failed to fetch contract WASM");
             // Transient: RPC error; should retry.
-            return (None, None, false);
+            return Loaded {
+                spec: None,
+                wasm_hash: None,
+                is_permanent: false,
+                kind: ContractKind::Unknown,
+            };
         }
     };
 
     let Some(parsed) = ContractSpec::from_wasm(&wasm) else {
         // Permanent: WASM exists but spec parsing failed entirely.
-        return (None, Some(wasm_hash), true);
+        return Loaded {
+            spec: None,
+            wasm_hash: Some(wasm_hash),
+            is_permanent: true,
+            kind: ContractKind::Unknown,
+        };
     };
 
     // #401: log partial parse so operators can investigate the contract.
@@ -272,6 +315,11 @@ async fn load(
 
     let spec = parsed.spec;
     let complete = parsed.complete;
+    let kind = if is_sep41_token(&spec) {
+        ContractKind::FungibleToken
+    } else {
+        ContractKind::Unknown
+    };
 
     // The raw section (hex) lets the read layer re-parse exact argument types.
     let spec_section = lumenqraph_core::spec::spec_section_of(&wasm)
@@ -311,7 +359,31 @@ async fn load(
     {
         warn!(contract_id, error = %e, "failed to record contract spec version");
     }
-    (Some(Arc::new(spec)), Some(wasm_hash), true)
+    Loaded {
+        spec: Some(Arc::new(spec)),
+        wasm_hash: Some(wasm_hash),
+        is_permanent: true,
+        kind,
+    }
+}
+
+/// Whether a parsed WASM spec declares the SEP-41 fungible token interface.
+///
+/// SEP-41 requires `balance`, `transfer`, `decimals`, `name` and `symbol` with
+/// the standard signatures. A contract that merely happens to expose a
+/// `transfer` function (e.g. an NFT) must not be treated as a fungible token,
+/// so the check requires all five functions with matching arities.
+fn is_sep41_token(spec: &ContractSpec) -> bool {
+    fn has(spec: &ContractSpec, name: &str, arity: usize) -> bool {
+        spec.functions
+            .iter()
+            .any(|f| f.name == name && f.inputs.len() == arity)
+    }
+    has(spec, "balance", 1)
+        && has(spec, "transfer", 3)
+        && has(spec, "decimals", 0)
+        && has(spec, "name", 0)
+        && has(spec, "symbol", 0)
 }
 
 /// Append this interface to the contract's version history, unless it's the
@@ -520,6 +592,83 @@ mod tests {
         .iter()
         .map(|r| (r.get(0), r.get(1), r.get(2)))
         .collect()
+    }
+
+    /// A spec section (hex) exposing exactly the named functions, each with the
+    /// given input arity, plus the ContractSpec it parses to.
+    fn spec_with_arities(functions: &[(&str, usize)]) -> (String, ContractSpec) {
+        let mut body = Vec::new();
+        for (name, arity) in functions {
+            let inputs: Vec<ScSpecTypeDef> = (0..*arity).map(|_| ScSpecTypeDef::U32).collect();
+            let entry = ScSpecEntry::FunctionV0(ScSpecFunctionV0 {
+                doc: "".try_into().unwrap(),
+                name: ScSymbol((*name).try_into().unwrap()),
+                inputs: inputs.try_into().unwrap(),
+                outputs: vec![ScSpecTypeDef::U32].try_into().unwrap(),
+            });
+            body.extend(entry.to_xdr(Limits::none()).unwrap());
+        }
+        let spec = ContractSpec::from_spec_xdr_simple(&body).expect("test spec should parse");
+        (hex::encode(&body), spec)
+    }
+
+    #[test]
+    fn a_sep41_spec_is_a_fungible_token() {
+        let (_, spec) = spec_with_arities(&[
+            ("balance", 1),
+            ("transfer", 3),
+            ("decimals", 0),
+            ("name", 0),
+            ("symbol", 0),
+        ]);
+        assert!(is_sep41_token(&spec));
+    }
+
+    #[test]
+    fn a_spec_without_decimals_is_not_a_fungible_token() {
+        // An NFT: has transfer/balance but no decimals.
+        let (_, spec) = spec_with_arities(&[("balance", 1), ("transfer", 3), ("name", 0)]);
+        assert!(!is_sep41_token(&spec));
+    }
+
+    #[test]
+    fn a_sac_contract_resolves_to_fungible_token() {
+        let cache = SpecCache::new(16, 1);
+        cache.inner.lock().unwrap().put(
+            "CSAC".to_string(),
+            Cached {
+                spec: CachedSpec::NoSpec,
+                wasm_hash: None,
+                kind: ContractKind::FungibleToken,
+            },
+        );
+        assert_eq!(
+            cache.contract_kind("CSAC"),
+            Some(ContractKind::FungibleToken)
+        );
+    }
+
+    #[test]
+    fn a_wasm_contract_without_decimals_is_not_a_fungible_token() {
+        let cache = SpecCache::new(16, 1);
+        let (_, spec) = spec_with_arities(&[("balance", 1), ("transfer", 3), ("name", 0)]);
+        let kind = if is_sep41_token(&spec) {
+            ContractKind::FungibleToken
+        } else {
+            ContractKind::Unknown
+        };
+        cache.inner.lock().unwrap().put(
+            "CNFT".to_string(),
+            Cached {
+                spec: CachedSpec::Spec(Arc::new(spec)),
+                wasm_hash: Some("hash".into()),
+                kind,
+            },
+        );
+        assert_ne!(
+            cache.contract_kind("CNFT"),
+            Some(ContractKind::FungibleToken)
+        );
     }
 
     #[tokio::test]

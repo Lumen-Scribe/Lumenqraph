@@ -18,12 +18,24 @@
 
 #[cfg(test)]
 mod projection_tests {
-    use crate::store;
+    use crate::store::{self, ContractKind};
     use chrono::Utc;
     use lumenqraph_core::{EventType, NewEvent};
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
     use sqlx::Row;
+
+    /// Resolver that treats every contract as a fungible token (SAC / SEP-41).
+    /// Used by tests that exercise the token projection path.
+    fn all_fungible(_contract_id: &str) -> Option<ContractKind> {
+        Some(ContractKind::FungibleToken)
+    }
+
+    /// Resolver that treats no contract as a fungible token.
+    /// Used by tests that assert non-token events are not projected.
+    fn none_fungible(_contract_id: &str) -> Option<ContractKind> {
+        None
+    }
 
     /// Deterministic, valid contract strkey.
     fn contract_strkey(seed: u8) -> String {
@@ -229,9 +241,9 @@ mod projection_tests {
             }),
         );
 
-        store::insert_events(&pool, &[event])
+        store::insert_events_with_resolver(&pool, &[event], all_fungible)
             .await
-            .expect("insert_events should succeed");
+            .expect("insert_events_with_resolver should succeed");
 
         let row = sqlx::query(
             "SELECT sender, sell_token, buy_token, sell_amount, buy_amount, raw_event_name
@@ -284,9 +296,9 @@ mod projection_tests {
             json!("token_123"),
         );
 
-        store::insert_events(&pool, &[event])
+        store::insert_events_with_resolver(&pool, &[event], none_fungible)
             .await
-            .expect("insert_events should succeed");
+            .expect("insert_events_with_resolver should succeed");
 
         let row = sqlx::query(
             "SELECT event_kind, from_addr, to_addr, token_id
@@ -329,9 +341,9 @@ mod projection_tests {
             json!("nft_id_456"),
         );
 
-        store::insert_events(&pool, &[event])
+        store::insert_events_with_resolver(&pool, &[event], none_fungible)
             .await
-            .expect("insert_events should succeed");
+            .expect("insert_events_with_resolver should succeed");
 
         let row = sqlx::query(
             "SELECT event_kind, from_addr, to_addr, token_id
@@ -378,9 +390,9 @@ mod projection_tests {
             json!("nft_id_789"),
         );
 
-        store::insert_events(&pool, &[event])
+        store::insert_events_with_resolver(&pool, &[event], none_fungible)
             .await
-            .expect("insert_events should succeed");
+            .expect("insert_events_with_resolver should succeed");
 
         let count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM token_transfers WHERE event_id = $1")
@@ -392,6 +404,77 @@ mod projection_tests {
         assert_eq!(
             count.0, 0,
             "NFT transfer must not be projected into token_transfers"
+        );
+
+        cleanup_test_data(&pool, &contract_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires test database setup
+    async fn test_nft_transfer_not_projected_with_spec_cache_resolver() {
+        // Issue #729: The spec-cache-backed resolver must classify an NFT
+        // contract as a non-token, so its `transfer` event does not create a
+        // `token_transfers` row even when the value parses as an integer.
+        let pool = setup_test_db().await;
+        let contract_id = contract_strkey(0x6c);
+        let from = account_strkey(0x6d);
+        let to = account_strkey(0x6e);
+
+        cleanup_test_data(&pool, &contract_id).await;
+
+        // Build a spec cache that knows this contract's WASM spec lacks the
+        // SEP-41 `decimals` entry, so it is not a fungible token.
+        let mut cache = store::SpecCache::default();
+        cache.record_wasm_spec(
+            &contract_id,
+            json!({
+                "functions": [
+                    { "name": "transfer", "inputs": [
+                        { "name": "from", "type": "address" },
+                        { "name": "to", "type": "address" },
+                        { "name": "token_id", "type": "u32" }
+                    ], "outputs": [] },
+                    { "name": "balance", "inputs": [
+                        { "name": "id", "type": "address" }
+                    ], "outputs": [{ "type": "i128" }] },
+                    { "name": "name", "inputs": [], "outputs": [{ "type": "string" }] },
+                    { "name": "symbol", "inputs": [], "outputs": [{ "type": "string" }] }
+                ]
+            }),
+        );
+
+        let resolver = cache.resolver();
+        assert_eq!(
+            resolver(&contract_id),
+            None,
+            "WASM spec without `decimals` must not resolve to FungibleToken"
+        );
+
+        let event_id = "nft_transfer_event_spec_cache_1";
+        let event = new_event(
+            event_id,
+            &contract_id,
+            1004,
+            "transfer",
+            json!(["transfer", from, to]),
+            json!("42"),
+        );
+
+        store::insert_events_with_resolver(&pool, &[event], resolver)
+            .await
+            .expect("insert_events_with_resolver should succeed");
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM token_transfers WHERE event_id = $1")
+                .bind(event_id)
+                .fetch_one(&pool)
+                .await
+                .expect("Failed to count token_transfers");
+
+        assert_eq!(
+            count.0, 0,
+            "NFT transfer must not be projected into token_transfers when the \
+             spec-cache resolver classifies the contract as a non-token"
         );
 
         cleanup_test_data(&pool, &contract_id).await;
@@ -418,9 +501,9 @@ mod projection_tests {
             json!("12345"),
         );
 
-        store::insert_events(&pool, &[event])
+        store::insert_events_with_resolver(&pool, &[event], all_fungible)
             .await
-            .expect("insert_events should succeed");
+            .expect("insert_events_with_resolver should succeed");
 
         let row = sqlx::query(
             "SELECT from_addr, to_addr, amount, amount_numeric::text AS amount_numeric
@@ -472,9 +555,9 @@ mod projection_tests {
             }),
         );
 
-        store::insert_events(&pool, &[event])
+        store::insert_events_with_resolver(&pool, &[event], none_fungible)
             .await
-            .expect("insert_events should succeed");
+            .expect("insert_events_with_resolver should succeed");
 
         let row = sqlx::query(
             "SELECT event_kind, provider, amount_a, amount_b, shares, raw_event_name

@@ -96,6 +96,40 @@ CONTRACT_IDS=
 CONTRACT_IDS=CADQZ123...,CADQZ456...,CADQZ789...
 ```
 
+#### `EVENT_TOPIC_FILTERS`
+| Property | Value |
+|----------|-------|
+| **Default** | (empty) — no topic filtering, every event matching `CONTRACT_IDS` is fetched |
+| **Example** | `[["transfer","*","*"],["swap"]]` |
+| **Valid Range** | JSON array of topic patterns. Each pattern is an array of 1–5 topic segments; each segment is a symbol name (encoded as a base64 ScVal symbol before being sent to RPC) or `*` (wildcard, passed through unchanged). At most 5 patterns (RPC filter slots) and at most 5 segments per pattern. |
+| **Services** | Indexer |
+| **Tradeoff** | **Scope** vs **Completeness**: Topic filters are pushed down to Soroban RPC's `getEvents`, so the RPC only returns matching events. This is the main lever for making index-all mode (`CONTRACT_IDS` empty) affordable: instead of every contract event on the network, you fetch only the events you care about. The tradeoff is that events whose topics don't match are never indexed — there is no post-filter fallback. |
+
+**How it works:**
+
+- Each pattern becomes one RPC event filter. Segments are matched positionally against the event's topics: `["transfer","*","*"]` matches any event whose first topic is the symbol `transfer`, regardless of the next two topics. `["swap"]` matches any event whose first topic is `swap`.
+- Symbol segments are encoded as base64 ScVal symbols (the same encoding the RPC expects); `*` is sent as-is so the RPC treats it as a wildcard.
+- Soroban RPC accepts at most **5 filters**, each with at most **5 topic segments**. `EVENT_TOPIC_FILTERS` is validated against these limits at startup; exceeding them fails fast with an error naming the setting.
+- When both `CONTRACT_IDS` and `EVENT_TOPIC_FILTERS` are set, the indexer builds the **cross product** (each contract × each topic pattern). If that product exceeds the 5-filter RPC limit, startup fails with a clear message — narrow `CONTRACT_IDS` or `EVENT_TOPIC_FILTERS` so the product fits.
+
+**Interaction with enrichment and the upgrade watch:**
+
+- **Enrichment** only sees the events that pass the topic filter. Events that are filtered out at the RPC are never decoded, so contract specs are only fetched for contracts that actually emit matching events. This also means `ENRICHMENT_WARN_THRESHOLD` is computed over the filtered stream, not network-wide volume.
+- **Upgrade watch** in index-all mode tracks "contracts seen this cycle" — i.e. contracts that emitted at least one event that passed the filter. With a narrow topic filter, far fewer contracts are seen, so upgrade detection only covers contracts that emit your filtered events. If you need upgrade detection for a specific contract that doesn't emit matching events, list it in `CONTRACT_IDS` (bounded mode tracks every listed contract regardless of topics).
+
+**Example:**
+```bash
+# Index only SEP-41 transfer events from any token (index-all + topic filter)
+CONTRACT_IDS=
+EVENT_TOPIC_FILTERS=[["transfer","*","*"]]
+
+# Index transfer and swap events from a bounded set of contracts
+CONTRACT_IDS=CADQZ123...,CADQZ456...
+EVENT_TOPIC_FILTERS=[["transfer","*","*"],["swap"]]
+```
+
+**Mainnet sizing example:** On mainnet, index-all without topic filters pulls hundreds of events per ledger across every contract. Filtering to SEP-41 `transfer` events (`[["transfer","*","*"]]`) typically cuts the fetched volume by an order of magnitude or more, because most contract events are not token transfers. That directly reduces RPC paging, JSON decoding, and disk growth — often enough that `RETENTION_LEDGERS` can be relaxed. Measure against your own RPC before sizing: run with the filter for a day and compare `events` row growth and RPC call counts to the unfiltered baseline.
+
 ### Polling & Catchup
 
 #### `POLL_INTERVAL_SECS`
@@ -686,6 +720,7 @@ WEBHOOK_MAX_CONCURRENT_DELIVERIES=100
 
 # Indexing
 CONTRACT_IDS="CADQZ...,CADQZ...,..."  # Bounded set (required for production)
+EVENT_TOPIC_FILTERS=[["transfer","*","*"]]  # Optional: push topic filters down to RPC
 POLL_INTERVAL_SECS=5
 PAGE_SIZE=1000
 MAX_CATCHUP_LEDGERS=4000
@@ -712,6 +747,9 @@ redacted) is logged at startup. Examples of validation errors:
 ❌ DATABASE_URL is required
 ❌ RPC_URL is required
 ❌ invalid CONTRACT_ID C1234: expected a C… strkey
+❌ EVENT_TOPIC_FILTERS has 6 patterns; Soroban RPC allows at most 5 filters
+❌ EVENT_TOPIC_FILTERS pattern 0 has 6 segments; Soroban RPC allows at most 5 topic segments
+❌ CONTRACT_IDS × EVENT_TOPIC_FILTERS = 12 filters; Soroban RPC allows at most 5 — narrow CONTRACT_IDS or EVENT_TOPIC_FILTERS
 ❌ PAGE_SIZE 10001 out of range [1, 10000]; clamping to 10000
 ❌ POLL_INTERVAL_SECS cannot be zero; clamping to 1
 ❌ RETENTION_LEDGERS cannot be negative; clamping to 0
@@ -740,6 +778,7 @@ Fix errors by adjusting `.env` and restarting.
 
 **All-Contracts Indexing (Rare)**
 - `CONTRACT_IDS=` (empty)
+- `EVENT_TOPIC_FILTERS=[["transfer","*","*"]]` — push topic filters down to RPC so index-all only fetches the events you care about
 - `UPGRADE_WATCH=false`, `STATE_INDEXING=false`, `KEY_INDEXING=false`
 - `POLL_INTERVAL_SECS=10`, `PAGE_SIZE=5000`
 - `RETENTION_LEDGERS=43200` (3 days) — keep DB small
@@ -764,6 +803,6 @@ cargo deny check
 
 - [WEBHOOKS.md](WEBHOOKS.md) — Webhook-specific configuration
 - [SECURITY_MODEL.md](SECURITY_MODEL.md) — Security hardening checklist
-- [SCHEMA.md](SCHEMA.md) — Database schema (affected by KEY_INDEXING, STATE_INDEXING, RETENTION_LEDGERS)
+- [SCHEMA.md](SCHEMA.md) — Database schema (affected by KEY_INDEXING, STATE_INDEXING, RETENTION_LEDGERS, EVENT_TOPIC_FILTERS)
 - [DEPLOYMENT.md](DEPLOYMENT.md) — Production deployment guide
 - [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — Common configuration issues and fixes

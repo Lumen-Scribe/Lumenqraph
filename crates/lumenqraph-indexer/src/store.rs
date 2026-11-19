@@ -48,23 +48,15 @@ pub enum ContractKind {
 pub type ContractKindResolver<'a> = dyn Fn(&str) -> Option<ContractKind> + 'a;
 
 /// Default resolver used by [`insert_events`] when no spec cache is available.
-/// It only recognises Stellar Asset Contracts by their well-known contract id
-/// prefix; everything else is treated as unknown so that non-token `transfer`
-/// events are not projected (issue #600).
-fn default_contract_kind(contract_id: &str) -> Option<ContractKind> {
-    if is_sac_contract_id(contract_id) {
-        Some(ContractKind::FungibleToken)
-    } else {
-        None
-    }
-}
-
-/// A Stellar Asset Contract id is the SHA-256 of the asset, so it cannot be
-/// distinguished by prefix alone. We instead accept the conventional marker
-/// used by the indexer for SACs: contract ids that decode as a valid `C...`
-/// strkey are treated as candidates and further gated by the event shape.
-fn is_sac_contract_id(contract_id: &str) -> bool {
-    contract_id.len() == 56 && contract_id.starts_with('C')
+///
+/// A contract id alone cannot tell us whether a contract is a fungible token:
+/// every Soroban contract id is a 56-character `C…` strkey, so a prefix check
+/// would accept *every* contract (issue #729). Without a spec cache we cannot
+/// confirm the contract kind, so we return `None` and the projection is skipped.
+/// Callers that have a `SpecCache` should use [`insert_events_with_resolver`]
+/// with a cache-backed resolver instead.
+fn default_contract_kind(_contract_id: &str) -> Option<ContractKind> {
+    None
 }
 
 /// Insert a batch of events (+ derived transfers) in one transaction using a
@@ -74,8 +66,41 @@ fn is_sac_contract_id(contract_id: &str) -> bool {
 /// one UNNEST INSERT for events (RETURNING newly-inserted IDs) and one UNNEST
 /// INSERT for their derived token_transfers. This avoids the per-row round-trip
 /// overhead that dominates at high PAGE_SIZE values.
+///
+/// This uses [`default_contract_kind`], which cannot confirm any contract kind,
+/// so no vertical projections are written. Callers that have a `SpecCache`
+/// (e.g. the poller) should call [`insert_events_with_resolver`] with a
+/// cache-backed resolver so confirmed tokens are projected (issue #729).
 pub async fn insert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result<u64> {
     insert_events_with_resolver(pool, events, &default_contract_kind).await
+}
+
+/// SQL that deletes `token_transfers` rows whose contract is not a confirmed
+/// fungible token (issue #729). Before #729 the default resolver treated every
+/// 56-character `C…` contract id as a fungible token, so NFT and custom
+/// contracts polluted `token_transfers`. Run this once after deploying the fix,
+/// passing the set of confirmed token contract ids (SACs plus contracts whose
+/// WASM spec declares SEP-41):
+///
+/// ```sql
+/// DELETE FROM token_transfers
+///  WHERE contract_id <> ALL($1::text[]);
+/// ```
+///
+/// The helper below executes exactly that statement and returns the number of
+/// deleted rows. It is intended as a one-off cleanup / `reproject` step.
+pub async fn delete_non_token_transfers(
+    pool: &PgPool,
+    confirmed_token_contract_ids: &[String],
+) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        "DELETE FROM token_transfers
+          WHERE contract_id <> ALL($1::text[])",
+    )
+    .bind(confirmed_token_contract_ids)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 /// Like [`insert_events`] but with an explicit contract-kind resolver, so the
@@ -477,7 +502,9 @@ pub async fn upsert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result
         debug!(count = updated, "events updated due to shallow reorg");
     }
 
-    // Project token_transfers only for newly inserted events
+    // Project token_transfers only for newly inserted events. The default
+    // resolver cannot confirm any contract kind, so nothing is projected here;
+    // callers with a spec cache should use `insert_events_with_resolver`.
     if inserted > 0 {
         let transfers: Vec<Transfer> = events
             .iter()
@@ -898,6 +925,26 @@ mod tests {
         assert!(extract_transfer(&e, &fungible).is_none());
     }
 
+    // Issue #729: the default resolver must not treat every `C…` strkey as a
+    // fungible token. Without a spec cache the kind is unknown, so a transfer
+    // from an arbitrary contract is skipped.
+    #[test]
+    fn default_resolver_does_not_assume_fungible_token() {
+        let sac_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        assert_eq!(sac_id.len(), 56);
+        assert_eq!(default_contract_kind(sac_id), None);
+
+        let e = event(
+            Some("transfer"),
+            vec![json!("transfer"), json!("GFROM"), json!("GTO")],
+            json!("300"),
+        );
+        assert!(
+            extract_transfer(&e, &default_contract_kind).is_none(),
+            "unknown contract kind must not project a transfer"
+        );
+    }
+
     #[test]
     fn non_string_amount_is_stringified() {
         let e = event(
@@ -918,18 +965,23 @@ mod tests {
         assert_eq!(t.amount, "5");
     }
 
-    // Issue #385: Non-token contracts with transfer events should not be projected
+    // Issue #385 / #729: Non-token contracts with transfer events should not be
+    // projected. A resolver that reports the contract as an NFT must skip the
+    // fungible transfer projection even when the value parses as an integer.
     #[test]
     fn nft_transfer_with_token_id_should_be_rejected() {
+        fn nft(_contract_id: &str) -> Option<ContractKind> {
+            Some(ContractKind::NonFungibleToken)
+        }
         let e = event(
             Some("transfer"),
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
             json!(42),
         );
-        let t = extract_transfer(&e, &fungible);
-        // Future: This should return None for non-token contracts
-        // For now, we're testing the current behavior and documenting the expected fix
-        assert!(t.is_some(), "Current behavior: accepts any transfer event");
+        assert!(
+            extract_transfer(&e, &nft).is_none(),
+            "NFT contract transfers must not project into token_transfers"
+        );
     }
 
     #[test]

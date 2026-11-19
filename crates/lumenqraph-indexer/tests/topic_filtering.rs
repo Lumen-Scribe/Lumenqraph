@@ -6,6 +6,10 @@
 
 #[cfg(test)]
 mod topic_filtering_tests {
+    use lumenqraph_indexer::rpc_client::{
+        build_event_filters, encode_topic_filter, EventFilter, TopicFilterError,
+        MAX_EVENT_FILTERS, MAX_TOPICS_PER_FILTER,
+    };
     use sqlx::postgres::PgPoolOptions;
     use sqlx::{PgPool, Row};
 
@@ -264,5 +268,191 @@ mod topic_filtering_tests {
         assert_eq!(result[1].get::<String, _>("event_id"), "event2");
 
         cleanup_test_data(&pool, contract_id).await;
+    }
+
+    // ------------------------------------------------------------------
+    // EVENT_TOPIC_FILTERS -> getEvents `topics` pushdown
+    // ------------------------------------------------------------------
+
+    /// Minimal mock of the Soroban RPC `getEvents` JSON-RPC endpoint.
+    ///
+    /// It records the raw request body and replies with an empty event page so
+    /// the client stops paging immediately.
+    mod mock_rpc {
+        use std::sync::{Arc, Mutex};
+
+        use axum::{extract::State, routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        #[derive(Clone, Default)]
+        pub struct MockRpc {
+            pub requests: Arc<Mutex<Vec<Value>>>,
+        }
+
+        impl MockRpc {
+            pub fn requests(&self) -> Vec<Value> {
+                self.requests.lock().unwrap().clone()
+            }
+
+            /// Returns the `topics` field of the first `getEvents` filter, if any.
+            pub fn first_filter_topics(&self) -> Option<Value> {
+                self.requests()
+                    .into_iter()
+                    .find(|req| req.get("method").and_then(Value::as_str) == Some("getEvents"))
+                    .and_then(|req| req.get("params").cloned())
+                    .and_then(|params| params.get("filters").cloned())
+                    .and_then(|filters| filters.get(0).cloned())
+                    .and_then(|filter| filter.get("topics").cloned())
+            }
+        }
+
+        async fn handle(
+            State(state): State<MockRpc>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            state.requests.lock().unwrap().push(body.clone());
+            let id = body.get("id").cloned().unwrap_or(Value::Null);
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "events": [],
+                    "latestLedger": 1,
+                    "cursor": "0"
+                }
+            }))
+        }
+
+        /// Spawns the mock RPC on an ephemeral port and returns its URL.
+        pub async fn spawn() -> (MockRpc, String) {
+            let state = MockRpc::default();
+            let app = Router::new()
+                .route("/", post(handle))
+                .with_state(state.clone());
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock rpc");
+            let addr = listener.local_addr().expect("mock rpc addr");
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("mock rpc serve");
+            });
+
+            (state, format!("http://{}", addr))
+        }
+    }
+
+    #[test]
+    fn test_encode_topic_filter_symbols_and_wildcards() {
+        // Symbols are encoded as base64 ScVal symbols; `*` passes through.
+        let encoded = encode_topic_filter(&["transfer".to_string(), "*".to_string()]);
+        assert_eq!(encoded.len(), 2);
+        assert_eq!(encoded[1], "*");
+        // base64 of the ScVal symbol "transfer" (scvSymbol = 0x0e)
+        assert_eq!(encoded[0], "AAAADwAAAAh0cmFuc2Zlcg==");
+    }
+
+    #[test]
+    fn test_build_event_filters_topics_only() {
+        let patterns = vec![
+            vec!["transfer".to_string(), "*".to_string(), "*".to_string()],
+            vec!["swap".to_string()],
+        ];
+        let filters = build_event_filters(&[], &patterns).expect("filters");
+        assert_eq!(filters.len(), 2);
+        assert!(filters.iter().all(|f| f.contract_ids.is_empty()));
+        assert_eq!(filters[0].topics.as_ref().unwrap().len(), 3);
+        assert_eq!(filters[0].topics.as_ref().unwrap()[1], "*");
+        assert_eq!(filters[1].topics.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_build_event_filters_cross_product_with_contracts() {
+        let contracts = vec!["CAAA".to_string(), "CBBB".to_string()];
+        let patterns = vec![
+            vec!["transfer".to_string()],
+            vec!["swap".to_string()],
+        ];
+        let filters = build_event_filters(&contracts, &patterns).expect("filters");
+        // 2 contracts x 2 topic patterns
+        assert_eq!(filters.len(), 4);
+        for filter in &filters {
+            assert_eq!(filter.contract_ids.len(), 1);
+            assert!(filter.topics.is_some());
+        }
+    }
+
+    #[test]
+    fn test_build_event_filters_rejects_too_many_filters() {
+        let contracts: Vec<String> = (0..MAX_EVENT_FILTERS + 1)
+            .map(|i| format!("C{:0>55}", i))
+            .collect();
+        let err = build_event_filters(&contracts, &[]).unwrap_err();
+        assert!(matches!(err, TopicFilterError::TooManyFilters { .. }));
+    }
+
+    #[test]
+    fn test_build_event_filters_rejects_too_many_topics() {
+        let pattern: Vec<String> = (0..MAX_TOPICS_PER_FILTER + 1)
+            .map(|i| format!("topic{}", i))
+            .collect();
+        let err = build_event_filters(&[], &[pattern]).unwrap_err();
+        assert!(matches!(err, TopicFilterError::TooManyTopics { .. }));
+    }
+
+    #[test]
+    fn test_build_event_filters_rejects_cross_product_overflow() {
+        let contracts: Vec<String> = (0..3).map(|i| format!("C{}", i)).collect();
+        let patterns: Vec<Vec<String>> = (0..3).map(|i| vec![format!("t{}", i)]).collect();
+        // 3 x 3 = 9 > MAX_EVENT_FILTERS (5)
+        let err = build_event_filters(&contracts, &patterns).unwrap_err();
+        assert!(matches!(err, TopicFilterError::TooManyFilters { .. }));
+    }
+
+    #[test]
+    fn test_event_filter_serializes_topics_field() {
+        let filter = EventFilter {
+            event_type: "contract".to_string(),
+            contract_ids: vec![],
+            topics: Some(vec![
+                encode_topic_filter(&["transfer".to_string()])[0].clone(),
+                "*".to_string(),
+            ]),
+        };
+        let json = serde_json::to_value(&filter).expect("serialize");
+        assert_eq!(json["type"], "contract");
+        assert_eq!(json["topics"][1], "*");
+        // `topics` must be omitted entirely when unset.
+        let bare = EventFilter {
+            event_type: "contract".to_string(),
+            contract_ids: vec![],
+            topics: None,
+        };
+        let bare_json = serde_json::to_value(&bare).expect("serialize");
+        assert!(bare_json.get("topics").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_topics_reach_get_events_request() {
+        let (mock, url) = mock_rpc::spawn().await;
+
+        let patterns = vec![
+            vec!["transfer".to_string(), "*".to_string(), "*".to_string()],
+            vec!["swap".to_string()],
+        ];
+        let filters = build_event_filters(&[], &patterns).expect("filters");
+
+        let client = lumenqraph_indexer::rpc_client::RpcClient::new(&url);
+        // Empty page from the mock means this returns immediately.
+        let _ = client.get_events(1, &filters, None, 100).await;
+
+        let topics = mock
+            .first_filter_topics()
+            .expect("getEvents request must carry a topics field");
+        let topics = topics.as_array().expect("topics must be an array");
+        assert_eq!(topics.len(), 3);
+        assert_eq!(topics[1], "*");
+        assert_eq!(topics[2], "*");
+        assert_eq!(topics[0], "AAAADwAAAAh0cmFuc2Zlcg==");
     }
 }

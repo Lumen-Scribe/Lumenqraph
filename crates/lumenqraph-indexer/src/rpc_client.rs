@@ -93,10 +93,23 @@ pub struct RpcClient {
     // ── per-cycle metrics (reset by `take_metrics`) ──────────────────────
     /// Total HTTP attempts (including retries).
     pub calls_made: AtomicU64,
-    /// Total call failures (all causes).
+    /// Total call failures (all causes). Every failed attempt is counted once,
+    /// including retried attempts (#727).
     pub calls_failed: AtomicU64,
     /// Failures due to RPC -32001 (processing limit exceeded).
     pub calls_failed_32001: AtomicU64,
+    /// Failed attempts caused by a transport error (connect/timeout/etc.).
+    pub calls_failed_transport: AtomicU64,
+    /// Failed attempts caused by a retryable HTTP 5xx status.
+    pub calls_failed_http_5xx: AtomicU64,
+    /// Failed attempts caused by HTTP 429 (too many requests).
+    pub calls_failed_http_429: AtomicU64,
+    /// Failed attempts whose response body could not be decoded.
+    pub calls_failed_decode: AtomicU64,
+    /// Failed attempts caused by a JSON-RPC error object.
+    pub calls_failed_rpc: AtomicU64,
+    /// Number of whole calls that failed after every endpoint was exhausted.
+    pub calls_exhausted: AtomicU64,
     /// Number of endpoint failovers since last `take_metrics`.
     pub failover_count: AtomicU64,
     /// Index of the currently active URL (snapshot for metrics, updated on
@@ -376,6 +389,10 @@ struct EventFilter {
     filter_type: &'static str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     contract_ids: Vec<String>,
+    /// Topic patterns, each a list of base64 ScVal segments (`*` wildcards are
+    /// passed through as-is). Omitted when empty (#728).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    topics: Vec<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -389,11 +406,27 @@ struct Pagination {
 const MAX_IDS_PER_FILTER: usize = 5;
 /// …and at most this many filters in one request.
 const MAX_FILTERS: usize = 5;
+/// …and at most this many topic segments per topic pattern.
+const MAX_TOPIC_SEGMENTS: usize = 5;
 
 /// Spread the watchlist across getEvents filters (the filters are OR'd by the
 /// RPC). An empty watchlist stays a single bare `contract` filter, which
 /// matches every contract's events.
 fn event_filters(contract_ids: &[String]) -> anyhow::Result<Vec<EventFilter>> {
+    event_filters_with_topics(contract_ids, &[])
+}
+
+/// Build getEvents filters from contract IDs and topic patterns (#728).
+///
+/// Topic patterns are already base64-encoded ScVal segments (`*` wildcards are
+/// passed through). When both are set the filters are the cross product of the
+/// contract-ID chunks and the topic patterns, within the RPC's 5-filter limit.
+/// An empty watchlist with no topics stays a single bare `contract` filter,
+/// which matches every contract's events.
+fn event_filters_with_topics(
+    contract_ids: &[String],
+    topic_patterns: &[Vec<String>],
+) -> anyhow::Result<Vec<EventFilter>> {
     if contract_ids.len() > MAX_IDS_PER_FILTER * MAX_FILTERS {
         return Err(anyhow!(
             "getEvents supports at most {} contract IDs ({} filters x {} IDs); got {}",
@@ -403,19 +436,56 @@ fn event_filters(contract_ids: &[String]) -> anyhow::Result<Vec<EventFilter>> {
             contract_ids.len()
         ));
     }
-    if contract_ids.is_empty() {
-        return Ok(vec![EventFilter {
-            filter_type: "contract",
-            contract_ids: vec![],
-        }]);
+    if topic_patterns.len() > MAX_FILTERS {
+        return Err(anyhow!(
+            "getEvents supports at most {} topic filters; got {}",
+            MAX_FILTERS,
+            topic_patterns.len()
+        ));
     }
-    Ok(contract_ids
-        .chunks(MAX_IDS_PER_FILTER)
-        .map(|chunk| EventFilter {
-            filter_type: "contract",
-            contract_ids: chunk.to_vec(),
-        })
-        .collect())
+    for pattern in topic_patterns {
+        if pattern.len() > MAX_TOPIC_SEGMENTS {
+            return Err(anyhow!(
+                "getEvents supports at most {} topic segments per filter; got {}",
+                MAX_TOPIC_SEGMENTS,
+                pattern.len()
+            ));
+        }
+    }
+
+    let id_chunks: Vec<Vec<String>> = if contract_ids.is_empty() {
+        vec![vec![]]
+    } else {
+        contract_ids.chunks(MAX_IDS_PER_FILTER).map(<[String]>::to_vec).collect()
+    };
+    let topic_sets: Vec<Vec<String>> = if topic_patterns.is_empty() {
+        vec![vec![]]
+    } else {
+        topic_patterns.to_vec()
+    };
+
+    let total = id_chunks.len() * topic_sets.len();
+    if total > MAX_FILTERS {
+        return Err(anyhow!(
+            "getEvents supports at most {} filters; {} contract-ID chunks x {} topic filters = {}",
+            MAX_FILTERS,
+            id_chunks.len(),
+            topic_sets.len(),
+            total
+        ));
+    }
+
+    let mut filters = Vec::with_capacity(total);
+    for chunk in &id_chunks {
+        for topics in &topic_sets {
+            filters.push(EventFilter {
+                filter_type: "contract",
+                contract_ids: chunk.clone(),
+                topics: if topics.is_empty() { vec![] } else { vec![topics.clone()] },
+            });
+        }
+    }
+    Ok(filters)
 }
 
 #[derive(Deserialize, Debug)]
@@ -497,6 +567,12 @@ impl RpcClient {
             calls_made: AtomicU64::new(0),
             calls_failed: AtomicU64::new(0),
             calls_failed_32001: AtomicU64::new(0),
+            calls_failed_transport: AtomicU64::new(0),
+            calls_failed_http_5xx: AtomicU64::new(0),
+            calls_failed_http_429: AtomicU64::new(0),
+            calls_failed_decode: AtomicU64::new(0),
+            calls_failed_rpc: AtomicU64::new(0),
+            calls_exhausted: AtomicU64::new(0),
             failover_count: AtomicU64::new(0),
             active_url_idx: AtomicUsize::new(0),
             network_passphrase: Mutex::new(None),
@@ -516,6 +592,25 @@ impl RpcClient {
     /// Count one ledger entry (or batch key) skipped by a batch helper (#724).
     fn record_ledger_entry_decode_error(&self) {
         self.ledger_entry_decode_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one failed attempt, both in the aggregate and in its class
+    /// counter (#727). `class` is a short label such as `transport`, `http_5xx`,
+    /// `http_429`, `decode` or `rpc_<code>`.
+    fn record_attempt_failure(&self, class: &str, endpoint: &str) {
+        self.calls_failed.fetch_add(1, Ordering::Relaxed);
+        match class {
+            "transport" => self.calls_failed_transport.fetch_add(1, Ordering::Relaxed),
+            "http_5xx" => self.calls_failed_http_5xx.fetch_add(1, Ordering::Relaxed),
+            "http_429" => self.calls_failed_http_429.fetch_add(1, Ordering::Relaxed),
+            "decode" => self.calls_failed_decode.fetch_add(1, Ordering::Relaxed),
+            _ => self.calls_failed_rpc.fetch_add(1, Ordering::Relaxed),
+        };
+        tracing::debug!(
+            endpoint = %endpoint,
+            class,
+            "rpc attempt failed"
+        );
     }
 
     /// Return and reset the number of ledger entries skipped since the last
@@ -935,6 +1030,7 @@ impl RpcClient {
 
                 let response = match result {
                     Err(e) => {
+                        self.record_attempt_failure("transport", &host_of(&url));
                         last_err = Some(anyhow!(e).context(format!("rpc {method} request failed")));
                         continue; // retry same URL
                     }
@@ -955,6 +1051,12 @@ impl RpcClient {
                         let ctx_err =
                             anyhow!(e).context(format!("rpc {method} returned http error"));
                         if is_retryable {
+                            let class = if status.map(|s| s.as_u16()) == Some(429) {
+                                "http_429"
+                            } else {
+                                "http_5xx"
+                            };
+                            self.record_attempt_failure(class, &host_of(&url));
                             if matches!(status.map(|s| s.as_u16()), Some(429 | 503)) {
                                 retry_after = retry_after_header
                                     .as_deref()
@@ -963,7 +1065,7 @@ impl RpcClient {
                             last_err = Some(ctx_err);
                             continue; // retry same URL
                         }
-                        self.calls_failed.fetch_add(1, Ordering::Relaxed);
+                        self.record_attempt_failure("http_4xx", &host_of(&url));
                         return Err(ctx_err);
                     }
                     Ok(r) => r,
@@ -971,6 +1073,7 @@ impl RpcClient {
 
                 let resp: RpcResponse<R> = match response.json().await {
                     Err(e) => {
+                        self.record_attempt_failure("decode", &host_of(&url));
                         last_err = Some(
                             anyhow!(e).context(format!("rpc {method} response decode failed")),
                         );
@@ -980,8 +1083,9 @@ impl RpcClient {
                 };
 
                 if let Some(err) = resp.error {
-                    self.calls_failed.fetch_add(1, Ordering::Relaxed);
                     let rpc_err = SorobanRpcError::new(err.code, err.message, method);
+                    let class = format!("rpc_{}", rpc_err.code);
+                    self.record_attempt_failure(&class, &host_of(&url));
                     if rpc_err.is_retryable() {
                         if rpc_err.code == -32001 {
                             self.calls_failed_32001.fetch_add(1, Ordering::Relaxed);
@@ -1007,7 +1111,9 @@ impl RpcClient {
             }
         }
 
-        self.calls_failed.fetch_add(1, Ordering::Relaxed);
+        // Every attempt has already been counted in `calls_failed`; this only
+        // records that the whole call gave up (#727).
+        self.calls_exhausted.fetch_add(1, Ordering::Relaxed);
         Err(last_err.unwrap_or_else(|| {
             anyhow!("rpc {method} failed on all {} endpoint(s)", self.urls.len())
         }))
@@ -1089,6 +1195,29 @@ impl RpcClient {
         cursor: Option<String>,
         limit: u32,
     ) -> anyhow::Result<GetEventsResult> {
+        self.get_events_bounded_with_topics(
+            start_ledger,
+            end_ledger,
+            contract_ids,
+            &[],
+            cursor,
+            limit,
+        )
+        .await
+    }
+
+    /// Like [`get_events_bounded`], but also pushes topic filters down to the
+    /// RPC (#728). `topic_patterns` are base64-encoded ScVal segments with `*`
+    /// wildcards passed through.
+    pub async fn get_events_bounded_with_topics(
+        &self,
+        start_ledger: Option<i64>,
+        end_ledger: Option<i64>,
+        contract_ids: &[String],
+        topic_patterns: &[Vec<String>],
+        cursor: Option<String>,
+        limit: u32,
+    ) -> anyhow::Result<GetEventsResult> {
         // A failover candidate must have reached the ledger just before the first
         // one we ask for, i.e. the cursor we are resuming from (#720). Continuation
         // pages carry a paging token instead, so there is no ledger to check.
@@ -1101,7 +1230,7 @@ impl RpcClient {
         let params = GetEventsParams {
             end_ledger: if start_ledger.is_some() { end_ledger } else { None },
             start_ledger,
-            filters: event_filters(contract_ids)?,
+            filters: event_filters_with_topics(contract_ids, topic_patterns)?,
             pagination: Pagination { limit, cursor },
             xdr_format: "base64",
         };
@@ -1336,6 +1465,25 @@ impl RpcClient {
         (calls, errors, errors_32001, failovers)
     }
 
+    /// Return and reset the number of whole calls that failed after every
+    /// endpoint was exhausted (#727). Separate from `calls_failed`, which counts
+    /// every failed attempt.
+    pub fn take_calls_exhausted(&self) -> u64 {
+        self.calls_exhausted.swap(0, Ordering::Acquire)
+    }
+
+    /// Return and reset the per-class failed-attempt counters (#727) as
+    /// `(transport, http_5xx, http_429, decode, rpc)`.
+    pub fn take_failure_classes(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.calls_failed_transport.swap(0, Ordering::Acquire),
+            self.calls_failed_http_5xx.swap(0, Ordering::Acquire),
+            self.calls_failed_http_429.swap(0, Ordering::Acquire),
+            self.calls_failed_decode.swap(0, Ordering::Acquire),
+            self.calls_failed_rpc.swap(0, Ordering::Acquire),
+        )
+    }
+
     /// Fetch and XDR-decode a single ledger entry by key, with the ledger it was
     /// last modified at. `None` if absent.
     async fn get_ledger_entry(
@@ -1536,6 +1684,50 @@ mod tests {
         let filters = event_filters(&[]).unwrap();
         assert_eq!(filters.len(), 1);
         assert!(filters[0].contract_ids.is_empty());
+        assert!(filters[0].topics.is_empty());
+    }
+
+    #[test]
+    fn topic_filters_are_emitted_with_wildcards() {
+        let topics = vec![vec!["transfer".to_string(), "*".to_string(), "*".to_string()]];
+        let filters = event_filters_with_topics(&[], &topics).unwrap();
+        assert_eq!(filters.len(), 1);
+        assert!(filters[0].contract_ids.is_empty());
+        assert_eq!(filters[0].topics, topics);
+    }
+
+    #[test]
+    fn contract_ids_and_topics_form_a_cross_product() {
+        let topics = vec![vec!["swap".to_string()], vec!["transfer".to_string()]];
+        let filters = event_filters_with_topics(&ids(7), &topics).unwrap();
+        // 2 ID chunks x 2 topic patterns = 4 filters.
+        assert_eq!(filters.len(), 4);
+        assert!(filters.iter().all(|f| f.topics.len() == 1));
+    }
+
+    #[test]
+    fn topic_filter_limits_are_validated() {
+        let too_many = vec![vec!["a".to_string()]; MAX_FILTERS + 1];
+        let err = event_filters_with_topics(&[], &too_many).err().unwrap().to_string();
+        assert!(err.contains("topic filters"), "unexpected error: {err}");
+
+        let too_deep = vec![vec!["a".to_string(); MAX_TOPIC_SEGMENTS + 1]];
+        let err = event_filters_with_topics(&[], &too_deep).err().unwrap().to_string();
+        assert!(err.contains("topic segments"), "unexpected error: {err}");
+
+        let cross = vec![vec!["a".to_string()]; 3];
+        let err = event_filters_with_topics(&ids(25), &cross).err().unwrap().to_string();
+        assert!(err.contains("filters"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn topic_filters_serialize_into_get_events_params() {
+        let topics = vec![vec!["transfer".to_string(), "*".to_string()]];
+        let filters = event_filters_with_topics(&[], &topics).unwrap();
+        let json = serde_json::to_value(&filters[0]).unwrap();
+        assert_eq!(json["topics"][0][0], "transfer");
+        assert_eq!(json["topics"][0][1], "*");
+        assert!(json.get("contractIds").is_none(), "empty contractIds are omitted");
     }
 
     #[test]
@@ -1732,6 +1924,64 @@ mod tests {
             2,
             "must have made exactly 2 attempts"
         );
+    }
+
+    #[tokio::test]
+    async fn retried_attempts_are_counted_as_errors() {
+        // Issue #727: 502, 502, 200 must report 3 calls, 2 errors, 0 exhausted.
+        let count = Arc::new(AtomicUsize::new(0));
+        let url = spawn_counting_mock(
+            count.clone(),
+            Arc::new(|n| if n < 2 { (502, "") } else { (200, OK_SEQ_1000) }),
+        )
+        .await;
+
+        let client = RpcClient::new(&url, 5);
+        let seq: i64 = client.get_latest_ledger().await.expect("third attempt succeeds");
+        assert_eq!(seq, 1000);
+
+        let (calls, errors, _, _) = client.take_metrics();
+        assert_eq!(calls, 3, "every attempt counts as a call");
+        assert_eq!(errors, 2, "every failed attempt counts as an error");
+        assert_eq!(client.take_calls_exhausted(), 0, "the call did not exhaust");
+
+        let (transport, http_5xx, http_429, decode, rpc) = client.take_failure_classes();
+        assert_eq!((transport, http_429, decode, rpc), (0, 0, 0, 0));
+        assert_eq!(http_5xx, 2, "both failures are classified as 5xx");
+    }
+
+    #[tokio::test]
+    async fn exhausted_calls_are_counted_separately() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let url = spawn_counting_mock(count.clone(), Arc::new(|_| (500, ""))).await;
+
+        let client = RpcClient::new(&url, 5);
+        assert!(client.get_latest_ledger().await.is_err());
+
+        let (calls, errors, _, _) = client.take_metrics();
+        assert_eq!(calls, 3);
+        assert_eq!(errors, 3, "each failed attempt is counted once");
+        assert_eq!(client.take_calls_exhausted(), 1, "the whole call failed once");
+    }
+
+    #[tokio::test]
+    async fn topics_reach_get_events() {
+        // Issue #728: the `topics` field must be sent to getEvents.
+        let (url, log) = spawn_rpc_mock(Arc::new(|_m: &str, _n: usize, _r: &serde_json::Value| {
+            (200, EMPTY_EVENTS.to_string())
+        }))
+        .await;
+        let client = RpcClient::new(&url, 5);
+        let topics = vec![vec!["transfer".to_string(), "*".to_string()]];
+        client
+            .get_events_bounded_with_topics(Some(10), None, &[], &topics, None, 10)
+            .await
+            .expect("getEvents");
+
+        let requests = log.lock().unwrap().clone();
+        let filters = &requests[0]["params"]["filters"];
+        assert_eq!(filters[0]["topics"][0][0], "transfer");
+        assert_eq!(filters[0]["topics"][0][1], "*");
     }
 
     #[tokio::test]

@@ -191,6 +191,107 @@ mod spec_cache_persistence_tests {
 
     #[tokio::test]
     #[ignore]
+    async fn test_contract_kind_persisted_and_resolved() {
+        let pool = setup_test_db().await;
+        let sac_contract = "C3333333333333333333333333333333333333333333333333333333";
+        let wasm_contract = "C4444444444444444444444444444444444444444444444444444444";
+
+        cleanup_test_data(&pool, sac_contract).await;
+        cleanup_test_data(&pool, wasm_contract).await;
+
+        // A SAC has no wasm_hash and no interface; it is identified by its
+        // StellarAsset executable, which the indexer records as a NoSpec marker.
+        sqlx::query(
+            "INSERT INTO contract_specs (contract_id, wasm_hash, interface, spec_section, has_events)
+             VALUES ($1, NULL, NULL, NULL, false)",
+        )
+        .bind(sac_contract)
+        .execute(&pool)
+        .await
+        .expect("Failed to insert SAC marker");
+
+        // A WASM contract with a full SEP-41 interface.
+        let sep41_interface = r#"{
+            "functions": [
+                {"name": "balance", "inputs": [{"name": "id", "type": "address"}], "outputs": [{"type": "i128"}]},
+                {"name": "transfer", "inputs": [{"name": "from", "type": "address"}, {"name": "to", "type": "address"}, {"name": "amount", "type": "i128"}], "outputs": []},
+                {"name": "decimals", "inputs": [], "outputs": [{"type": "u32"}]},
+                {"name": "name", "inputs": [], "outputs": [{"type": "string"}]},
+                {"name": "symbol", "inputs": [], "outputs": [{"type": "string"}]}
+            ]
+        }"#;
+
+        sqlx::query(
+            "INSERT INTO contract_specs (contract_id, wasm_hash, interface, spec_section, has_events)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(wasm_contract)
+        .bind("wasm_hash_sep41")
+        .bind(sep41_interface)
+        .bind("spec_section_sep41")
+        .bind(true)
+        .execute(&pool)
+        .await
+        .expect("Failed to insert SEP-41 spec");
+
+        // Simulate a restart: reload both rows from the database.
+        let sac_row = sqlx::query(
+            "SELECT wasm_hash, interface FROM contract_specs WHERE contract_id = $1",
+        )
+        .bind(sac_contract)
+        .fetch_one(&pool)
+        .await
+        .expect("Failed to fetch SAC row");
+
+        assert!(
+            sac_row
+                .try_get::<Option<String>, _>("wasm_hash")
+                .unwrap()
+                .is_none(),
+            "SAC should have no wasm_hash"
+        );
+        assert!(
+            sac_row
+                .try_get::<Option<serde_json::Value>, _>("interface")
+                .unwrap()
+                .is_none(),
+            "SAC should have no interface"
+        );
+
+        let wasm_row = sqlx::query(
+            "SELECT wasm_hash, interface FROM contract_specs WHERE contract_id = $1",
+        )
+        .bind(wasm_contract)
+        .fetch_one(&pool)
+        .await
+        .expect("Failed to fetch WASM row");
+
+        assert_eq!(
+            wasm_row.get::<String, _>("wasm_hash"),
+            "wasm_hash_sep41"
+        );
+        let interface: serde_json::Value = wasm_row.get("interface");
+        let functions = interface
+            .get("functions")
+            .and_then(|f| f.as_array())
+            .expect("interface should declare functions");
+        let names: Vec<&str> = functions
+            .iter()
+            .filter_map(|f| f.get("name").and_then(|n| n.as_str()))
+            .collect();
+        for required in ["balance", "transfer", "decimals", "name", "symbol"] {
+            assert!(
+                names.contains(&required),
+                "SEP-41 interface should declare `{required}`"
+            );
+        }
+
+        cleanup_test_data(&pool, sac_contract).await;
+        cleanup_test_data(&pool, wasm_contract).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
     async fn test_multiple_contracts_in_cache() {
         let pool = setup_test_db().await;
         let contract_1 = "C1111111111111111111111111111111111111111111111111111111";
