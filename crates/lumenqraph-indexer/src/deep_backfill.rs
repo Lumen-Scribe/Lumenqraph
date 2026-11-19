@@ -434,7 +434,11 @@ pub async fn run(
 
     for ev in staging {
         lines_processed += 1;
-        let spec = specs.get_cached(&ev.contract_id);
+        // Enrich with the spec version in force at the event's ledger, not the
+        // contract's current spec: deep-backfilled events predate upgrades.
+        let spec = specs
+            .get(&pool, &config.soroban_rpc_url, &ev.contract_id, ev.ledger)
+            .await;
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             historical_to_new_event(ev, spec.as_deref())
         })) {

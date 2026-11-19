@@ -31,7 +31,8 @@ mod spec_version_enrichment_tests {
                 spec_section TEXT,
                 diff JSONB,
                 breaking BOOLEAN,
-                ledger BIGINT,
+                observed_ledger BIGINT,
+                upgrade_ledger BIGINT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 PRIMARY KEY (contract_id, version)
             )",
@@ -79,6 +80,29 @@ mod spec_version_enrichment_tests {
             .ok();
     }
 
+    /// Selects the newest spec version whose `upgrade_ledger` is at or before
+    /// the given event ledger. This mirrors what `SpecCache::get` does in
+    /// production (binary search over per-contract sorted versions).
+    async fn version_at_ledger(
+        pool: &PgPool,
+        contract_id: &str,
+        ledger: i64,
+    ) -> Option<(i32, serde_json::Value)> {
+        let row = sqlx::query(
+            "SELECT version, interface FROM contract_spec_versions
+             WHERE contract_id = $1 AND upgrade_ledger <= $2
+             ORDER BY upgrade_ledger DESC
+             LIMIT 1",
+        )
+        .bind(contract_id)
+        .bind(ledger)
+        .fetch_optional(pool)
+        .await
+        .expect("Failed to query version at ledger");
+
+        row.map(|r| (r.get::<i32, _>("version"), r.get::<serde_json::Value, _>("interface")))
+    }
+
     #[tokio::test]
     #[ignore]
     async fn test_events_enriched_with_version_at_ledger() {
@@ -87,11 +111,10 @@ mod spec_version_enrichment_tests {
 
         cleanup_test_data(&pool, contract_id).await;
 
-        let upgrade_ledger = 1000i64;
-
+        // v1 is live from ledger 100, v2 from ledger 200.
         sqlx::query(
             "INSERT INTO contract_spec_versions
-            (contract_id, version, wasm_hash, interface, ledger)
+            (contract_id, version, wasm_hash, interface, upgrade_ledger)
             VALUES
             ($1, 1, $2, $3, $4),
             ($1, 2, $5, $6, $7)",
@@ -99,10 +122,10 @@ mod spec_version_enrichment_tests {
         .bind(contract_id)
         .bind("hash_v1")
         .bind(r#"{"events":[{"name":"transfer_v1"}]}"#)
-        .bind(upgrade_ledger - 1) // v1 active at ledger 999
+        .bind(100i64)
         .bind("hash_v2")
         .bind(r#"{"events":[{"name":"transfer_v2"}]}"#)
-        .bind(upgrade_ledger) // v2 active at ledger 1000
+        .bind(200i64)
         .execute(&pool)
         .await
         .expect("Failed to insert spec versions");
@@ -117,29 +140,33 @@ mod spec_version_enrichment_tests {
         )
         .bind("event_before_upgrade")
         .bind(contract_id)
-        .bind(upgrade_ledger - 1)
+        .bind(150i64)
         .bind("event_after_upgrade")
         .bind(contract_id)
-        .bind(upgrade_ledger + 1)
+        .bind(250i64)
         .execute(&pool)
         .await
         .expect("Failed to insert test events");
 
-        let result: Vec<_> = sqlx::query(
-            "SELECT version, ledger FROM contract_spec_versions
-             WHERE contract_id = $1
-             ORDER BY ledger ASC",
-        )
-        .bind(contract_id)
-        .fetch_all(&pool)
-        .await
-        .expect("Failed to query");
+        // Event at ledger 150 must be enriched with v1's names.
+        let (v_before, iface_before) = version_at_ledger(&pool, contract_id, 150)
+            .await
+            .expect("Expected a spec version for ledger 150");
+        assert_eq!(v_before, 1);
+        assert_eq!(
+            iface_before["events"][0]["name"].as_str(),
+            Some("transfer_v1")
+        );
 
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].get::<i32, _>("version"), 1);
-        assert_eq!(result[0].get::<i64, _>("ledger"), upgrade_ledger - 1);
-        assert_eq!(result[1].get::<i32, _>("version"), 2);
-        assert_eq!(result[1].get::<i64, _>("ledger"), upgrade_ledger);
+        // Event at ledger 250 must be enriched with v2's names.
+        let (v_after, iface_after) = version_at_ledger(&pool, contract_id, 250)
+            .await
+            .expect("Expected a spec version for ledger 250");
+        assert_eq!(v_after, 2);
+        assert_eq!(
+            iface_after["events"][0]["name"].as_str(),
+            Some("transfer_v2")
+        );
 
         cleanup_test_data(&pool, contract_id).await;
     }
@@ -155,7 +182,7 @@ mod spec_version_enrichment_tests {
         // Insert spec versions at different ledgers
         sqlx::query(
             "INSERT INTO contract_spec_versions
-            (contract_id, version, wasm_hash, interface, ledger)
+            (contract_id, version, wasm_hash, interface, upgrade_ledger)
             VALUES
             ($1, 1, $2, $3, $4),
             ($1, 2, $5, $6, $7),
@@ -164,19 +191,19 @@ mod spec_version_enrichment_tests {
         .bind(contract_id)
         .bind("hash_v1")
         .bind(r#"{"version":"v1"}"#)
-        .bind(100)
+        .bind(100i64)
         .bind("hash_v2")
         .bind(r#"{"version":"v2"}"#)
-        .bind(500)
+        .bind(500i64)
         .bind("hash_v3")
         .bind(r#"{"version":"v3"}"#)
-        .bind(1000)
+        .bind(1000i64)
         .execute(&pool)
         .await
         .expect("Failed to insert spec versions");
 
         let versions: Vec<_> = sqlx::query(
-            "SELECT version, ledger FROM contract_spec_versions
+            "SELECT version, upgrade_ledger FROM contract_spec_versions
              WHERE contract_id = $1
              ORDER BY version ASC",
         )
@@ -201,23 +228,23 @@ mod spec_version_enrichment_tests {
 
         cleanup_test_data(&pool, contract_id).await;
 
-        let detection_ledger = 2000i64;
+        let upgrade_ledger = 2000i64;
 
         sqlx::query(
             "INSERT INTO contract_spec_versions
-            (contract_id, version, wasm_hash, interface, ledger)
+            (contract_id, version, wasm_hash, interface, upgrade_ledger)
             VALUES ($1, 1, $2, $3, $4)",
         )
         .bind(contract_id)
         .bind("hash_v1")
         .bind(r#"{"events":[]}"#)
-        .bind(detection_ledger)
+        .bind(upgrade_ledger)
         .execute(&pool)
         .await
         .expect("Failed to insert spec version");
 
         let row: (i64,) = sqlx::query_as(
-            "SELECT ledger FROM contract_spec_versions
+            "SELECT upgrade_ledger FROM contract_spec_versions
              WHERE contract_id = $1 AND version = 1",
         )
         .bind(contract_id)
@@ -225,7 +252,7 @@ mod spec_version_enrichment_tests {
         .await
         .expect("Failed to query");
 
-        assert_eq!(row.0, detection_ledger);
+        assert_eq!(row.0, upgrade_ledger);
 
         cleanup_test_data(&pool, contract_id).await;
     }

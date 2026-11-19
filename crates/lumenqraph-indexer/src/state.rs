@@ -62,9 +62,24 @@ async fn try_snapshot_instances_batch(
         };
 
         // Reading the instance revealed the current executable — detect upgrades.
+        //
+        // `instance.last_modified_ledger` advances on *any* instance-storage
+        // write, not just on executable updates, so it is not the ledger at
+        // which the new executable went live. Pass it only as the "observed"
+        // ledger (an upper bound on when we first saw this hash); the exact
+        // upgrade ledger is left unknown here and must be filled from an exact
+        // source (executable-update event/diagnostic, the
+        // `update_current_contract_wasm` tx, or historical probing).
         if let Some(hash) = &instance.wasm_hash {
             specs
-                .note_wasm_hash(pool, rpc, contract_id, hash, instance.last_modified_ledger)
+                .note_wasm_hash(
+                    pool,
+                    rpc,
+                    contract_id,
+                    hash,
+                    instance.last_modified_ledger,
+                    None,
+                )
                 .await;
         }
 

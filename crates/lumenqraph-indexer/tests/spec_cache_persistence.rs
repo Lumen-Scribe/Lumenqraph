@@ -189,6 +189,93 @@ mod spec_cache_persistence_tests {
         cleanup_test_data(&pool, contract_id).await;
     }
 
+    /// Issue #738: transient spec-fetch failures must respect `FETCH_ERROR_TTL`.
+    ///
+    /// A mock RPC that always fails `getLedgerEntries` is used. Ten cycles of
+    /// `note_wasm_hash` within the 60s error TTL must only trigger a single
+    /// fetch, instead of refetching on every cycle.
+    #[tokio::test]
+    async fn test_fetch_error_ttl_respected_across_note_wasm_hash_cycles() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        use lumenqraph_indexer::specs::SpecCache;
+
+        let contract_id = "CAAAA1111111111111111111111111111111111111111111111111111";
+        let wasm_hash = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let counter = fetch_count.clone();
+
+        // Mock RPC: every `getLedgerEntries` call fails.
+        let cache = SpecCache::with_fetcher(move |_contract: &str| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err::<Option<Vec<u8>>, String>("rpc unavailable".to_string())
+            }
+        });
+
+        for _ in 0..10 {
+            // Simulate the event loop / snapshot batch observing the live hash.
+            cache.note_wasm_hash(contract_id, wasm_hash).await;
+            // And a `get` that hits the cached FetchError.
+            let _ = cache.get(contract_id).await;
+        }
+
+        assert_eq!(
+            fetch_count.load(Ordering::SeqCst),
+            1,
+            "transient failures must be cached for FETCH_ERROR_TTL, not refetched every cycle"
+        );
+    }
+
+    /// Issue #738: at most one fetch per contract is in flight.
+    ///
+    /// Ten concurrent `get`s for the same contract must coalesce into a single
+    /// WASM fetch.
+    #[tokio::test]
+    async fn test_concurrent_gets_single_flight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        use lumenqraph_indexer::specs::SpecCache;
+
+        let contract_id = "CBBBB2222222222222222222222222222222222222222222222222222";
+
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let counter = fetch_count.clone();
+
+        let cache = Arc::new(SpecCache::with_fetcher(move |_contract: &str| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                // Simulate a slow RPC so concurrent callers overlap.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                Ok::<Option<Vec<u8>>, String>(None)
+            }
+        }));
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let cache = cache.clone();
+            let contract_id = contract_id.to_string();
+            handles.push(tokio::spawn(async move {
+                let _ = cache.get(&contract_id).await;
+            }));
+        }
+
+        for handle in handles {
+            handle.await.expect("task panicked");
+        }
+
+        assert_eq!(
+            fetch_count.load(Ordering::SeqCst),
+            1,
+            "concurrent misses for one contract must coalesce into a single fetch"
+        );
+    }
+
     #[tokio::test]
     #[ignore]
     async fn test_multiple_contracts_in_cache() {

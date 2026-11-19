@@ -211,8 +211,9 @@ async fn contract_interface_at_version(
     version: i32,
     headers: &HeaderMap,
 ) -> Result<axum::response::Response, ApiError> {
-    let row: Option<(SqlxJson<Value>, String, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT interface, wasm_hash, observed_at FROM contract_spec_versions
+    let row: Option<(SqlxJson<Value>, String, DateTime<Utc>, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT interface, wasm_hash, observed_at, observed_ledger, upgrade_ledger
+         FROM contract_spec_versions
          WHERE contract_id = $1 AND version = $2",
     )
     .bind(contract_id)
@@ -221,16 +222,26 @@ async fn contract_interface_at_version(
     .await?;
 
     match row {
-        Some((interface, wasm_hash, observed_at)) => {
+        Some((interface, wasm_hash, observed_at, observed_ledger, upgrade_ledger)) => {
             let etag = generate_etag(&wasm_hash);
             if check_if_none_match(headers, &etag) {
                 return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
             }
+            // `upgrade_ledger` is exact when known; otherwise `observed_ledger`
+            // is an upper bound on when the executable went live (#737).
+            let (ledger, ledger_precision) = match upgrade_ledger {
+                Some(l) => (l, "exact"),
+                None => (observed_ledger, "observed_upper_bound"),
+            };
             let mut response = Json(json!({
                 "contract_id": contract_id,
                 "version": version,
                 "wasm_hash": wasm_hash,
                 "observed_at": observed_at,
+                "observed_ledger": observed_ledger,
+                "upgrade_ledger": upgrade_ledger,
+                "ledger": ledger,
+                "ledger_precision": ledger_precision,
                 "interface": interface.0,
             }))
             .into_response();
@@ -315,7 +326,8 @@ pub async fn contract_interface_history(
         return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
     }
 
-    // (version, wasm_hash, previous_wasm_hash, diff, breaking, observed_at)
+    // (version, wasm_hash, previous_wasm_hash, diff, breaking, observed_at,
+    //  observed_ledger, upgrade_ledger)
     type VersionRow = (
         i32,
         String,
@@ -323,6 +335,8 @@ pub async fn contract_interface_history(
         Option<SqlxJson<Value>>,
         bool,
         DateTime<Utc>,
+        i64,
+        Option<i64>,
     );
 
     // Fetch limit+1 rows so we can detect whether a next page exists without
@@ -332,7 +346,8 @@ pub async fn contract_interface_history(
         // the cursor. The unknown-cursor case returns empty rather than
         // silently restarting at the newest page.
         sqlx::query_as(
-            "SELECT version, wasm_hash, previous_wasm_hash, diff, breaking, observed_at
+            "SELECT version, wasm_hash, previous_wasm_hash, diff, breaking, observed_at,
+                    observed_ledger, upgrade_ledger
              FROM contract_spec_versions
              WHERE contract_id = $1
                AND version < $2
@@ -346,7 +361,8 @@ pub async fn contract_interface_history(
         .await?
     } else {
         sqlx::query_as(
-            "SELECT version, wasm_hash, previous_wasm_hash, diff, breaking, observed_at
+            "SELECT version, wasm_hash, previous_wasm_hash, diff, breaking, observed_at,
+                    observed_ledger, upgrade_ledger
              FROM contract_spec_versions
              WHERE contract_id = $1
              ORDER BY version DESC
@@ -376,7 +392,24 @@ pub async fn contract_interface_history(
     let versions: Vec<Value> = rows
         .into_iter()
         .map(
-            |(version, wasm_hash, previous_wasm_hash, diff, breaking, observed_at)| {
+            |(
+                version,
+                wasm_hash,
+                previous_wasm_hash,
+                diff,
+                breaking,
+                observed_at,
+                observed_ledger,
+                upgrade_ledger,
+            )| {
+                // `upgrade_ledger` is the first ledger at which the new
+                // executable was live, when we could determine it exactly.
+                // Otherwise we only know the first ledger at which we saw it,
+                // which is an upper bound on the upgrade ledger (#737).
+                let (ledger, ledger_precision) = match upgrade_ledger {
+                    Some(l) => (l, "exact"),
+                    None => (observed_ledger, "observed_upper_bound"),
+                };
                 json!({
                     "version": version,
                     "wasm_hash": wasm_hash,
@@ -386,6 +419,14 @@ pub async fn contract_interface_history(
                     "diff": diff.map(|d| d.0),
                     "breaking": breaking,
                     "observed_at": observed_at,
+                    "observed_ledger": observed_ledger,
+                    "upgrade_ledger": upgrade_ledger,
+                    // Which ledger value is returned above and how precise it
+                    // is: `exact` when `upgrade_ledger` is known, otherwise
+                    // `observed_upper_bound` (the upgrade happened at or before
+                    // `observed_ledger`).
+                    "ledger": ledger,
+                    "ledger_precision": ledger_precision,
                 })
             },
         )
@@ -455,12 +496,43 @@ pub async fn contract_interface_diff(
     // Both are Some: load_spec rejects an unparseable version above.
     let diff = SpecDiff::between(old.parsed.as_ref().unwrap(), new.parsed.as_ref().unwrap());
 
+    let to_ledger = load_version_ledger(&state, &contract_id, to).await?;
+
     Ok(Json(json!({
         "contract_id": contract_id,
         "from": from,
         "to": to,
         "diff": diff.to_json(),
+        // Ledger attribution for the `to` version, with its precision (#737).
+        "ledger": to_ledger.0,
+        "ledger_precision": to_ledger.1,
     })))
+}
+
+/// The ledger to attribute a version to, and how precise it is: `exact` when
+/// the upgrade ledger is known, otherwise `observed_upper_bound` (the version
+/// was first observed at that ledger, so the upgrade happened at or before it).
+async fn load_version_ledger(
+    state: &AppState,
+    contract_id: &str,
+    version: i32,
+) -> ApiResult<(i64, &'static str)> {
+    let row: Option<(i64, Option<i64>)> = sqlx::query_as(
+        "SELECT observed_ledger, upgrade_ledger FROM contract_spec_versions
+         WHERE contract_id = $1 AND version = $2",
+    )
+    .bind(contract_id)
+    .bind(version)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    match row {
+        Some((observed_ledger, Some(upgrade_ledger))) => Ok((upgrade_ledger, "exact")),
+        Some((observed_ledger, None)) => Ok((observed_ledger, "observed_upper_bound")),
+        None => Err(ApiError::not_found(format!(
+            "no version {version} recorded for this contract"
+        ))),
+    }
 }
 
 /// Validate a `from`..`to` interface-diff range (#211): `from` must be a real
@@ -786,6 +858,12 @@ pub async fn refresh_contract(
 
     // The current interface is already stored, so a failed history write is
     // logged rather than failing the refresh.
+    //
+    // `ledger` from `get_contract_wasm` is the instance's
+    // `last_modified_ledger`, which changes on every instance-storage write,
+    // not just on executable updates. It is therefore only an observation
+    // ledger (an upper bound on the upgrade), never an exact upgrade ledger
+    // (#737).
     if let Err(e) = record_spec_version(
         &state.pool,
         &contract_id,
@@ -794,6 +872,7 @@ pub async fn refresh_contract(
         &spec,
         complete,
         ledger,
+        None,
     )
     .await
     {
@@ -812,6 +891,14 @@ pub async fn refresh_contract(
 /// the newest stored version. The diff is skipped when the new spec is
 /// incomplete (#401), so a partial parse can't report removals that never
 /// happened.
+///
+/// `observed_ledger` is the first ledger at which we saw this version, which is
+/// an upper bound on when the executable went live. `upgrade_ledger` is only
+/// set when an exact source (executable-update event/diagnostic, the
+/// `update_current_contract_wasm` transaction, or a historical binary search)
+/// pins it down; otherwise it stays `NULL` and consumers must treat
+/// `observed_ledger` as an upper bound (#737).
+#[allow(clippy::too_many_arguments)]
 async fn record_spec_version(
     pool: &sqlx::PgPool,
     contract_id: &str,
@@ -819,7 +906,8 @@ async fn record_spec_version(
     spec_section: &str,
     spec: &ContractSpec,
     complete: bool,
-    ledger: i64,
+    observed_ledger: i64,
+    upgrade_ledger: Option<i64>,
 ) -> anyhow::Result<()> {
     let previous: Option<(i32, String, String)> = sqlx::query_as(
         "SELECT version, wasm_hash, spec_section FROM contract_spec_versions
@@ -844,8 +932,8 @@ async fn record_spec_version(
 
     sqlx::query(
         "INSERT INTO contract_spec_versions
-            (contract_id, version, wasm_hash, previous_wasm_hash, interface, spec_section, diff, breaking, ledger, spec_complete)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            (contract_id, version, wasm_hash, previous_wasm_hash, interface, spec_section, diff, breaking, observed_ledger, upgrade_ledger, spec_complete)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          ON CONFLICT (contract_id, version) DO NOTHING",
     )
     .bind(contract_id)
@@ -856,7 +944,8 @@ async fn record_spec_version(
     .bind(spec_section)
     .bind(diff.as_ref().map(|d| d.to_json()))
     .bind(diff.as_ref().is_some_and(|d| d.breaking))
-    .bind(ledger)
+    .bind(observed_ledger)
+    .bind(upgrade_ledger)
     .bind(complete)
     .execute(pool)
     .await?;

@@ -130,6 +130,10 @@ pub async fn run_reenrich(
                 }
             };
 
+            // Pass the event's own ledger so the spec version in force at that
+            // ledger is used, not the contract's current spec. This keeps
+            // `reenrich --force` from overwriting correct historical enrichment
+            // with a newer version's field names after an upgrade.
             let spec = specs.get(&pool, &rpc, &contract_id, ledger).await;
             let enriched = spec
                 .as_deref()
