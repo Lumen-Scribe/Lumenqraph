@@ -317,6 +317,37 @@ pub struct EnrichmentMetrics {
     pub not_enriched_count: u64,
 }
 
+/// Per-cycle counters shared by the three event loops, so they all flush the
+/// same way. The timestamp-parse count is kept apart from the enrichment
+/// counts on purpose: a cycle where no event parses still has to report its
+/// failures, otherwise `timestamp_parse_errors_total` never moves when the RPC
+/// changes its timestamp format (#719).
+#[derive(Default)]
+struct CycleCounters {
+    enriched: u64,
+    not_enriched: u64,
+    ts_parse_errors: u64,
+}
+
+impl CycleCounters {
+    /// Write the accumulated counts once a scan has completed. Called even when
+    /// nothing parsed, so a cycle of all-failing timestamps still reports them.
+    /// Not called on error or shutdown exits: those cycles are re-run from the
+    /// same cursor and their counts are written then, once. The timestamp write
+    /// is best-effort, and the enrichment write is attempted even if it fails.
+    async fn flush(&self, pool: &PgPool) -> anyhow::Result<()> {
+        if self.ts_parse_errors > 0 {
+            if let Err(e) = cursor::track_timestamp_parse_error(pool, self.ts_parse_errors).await {
+                warn!(error = %e, dropped = self.ts_parse_errors, "failed to record timestamp parse errors");
+            }
+        }
+        if self.enriched > 0 || self.not_enriched > 0 {
+            cursor::track_enrichment(pool, self.enriched, self.not_enriched).await?;
+        }
+        Ok(())
+    }
+}
+
 /// Page through events from `start` to the tip, storing each page. Shared by the
 /// live poller and the backfill command. Returns (total_inserted, enrichment_metrics).
 pub async fn fetch_and_store(
@@ -341,9 +372,7 @@ async fn fetch_and_store_with_shutdown(
 ) -> anyhow::Result<(u64, EnrichmentMetrics)> {
     let mut cursor_token: Option<String> = None;
     let mut total_inserted = 0u64;
-    let mut enriched_count = 0u64;
-    let mut not_enriched_count = 0u64;
-    let mut ts_parse_errors = 0u64; // #399
+    let mut counters = CycleCounters::default();
     let mut page_count = 0usize;
     let mut last_seen_ledger = start;
     // Contracts seen this cycle, used to bound per-contract instance reads when
@@ -363,7 +392,15 @@ async fn fetch_and_store_with_shutdown(
     > = std::collections::HashMap::new();
     loop {
         if shutdown.is_cancelled() {
-            return Ok((total_inserted, EnrichmentMetrics { enriched_count, not_enriched_count }));
+            // Not flushed: the cycle did not complete and will be re-run from
+            // the same cursor, so its counts are recorded then, once.
+            return Ok((
+                total_inserted,
+                EnrichmentMetrics {
+                    enriched_count: counters.enriched,
+                    not_enriched_count: counters.not_enriched,
+                },
+            ));
         }
         let page = match rpc
             .get_events(
@@ -404,14 +441,14 @@ async fn fetch_and_store_with_shutdown(
             }
             let Some(new_event) = to_new_event(ev, spec.as_deref()) else {
                 // #399: timestamp parse failure — event skipped, counter incremented.
-                ts_parse_errors += 1;
+                counters.ts_parse_errors += 1;
                 continue;
             };
             // Track enrichment coverage: count enriched vs not-enriched events
             if new_event.enriched.is_some() {
-                enriched_count += 1;
+                counters.enriched += 1;
             } else {
-                not_enriched_count += 1;
+                counters.not_enriched += 1;
             }
             // Discover holder addresses to snapshot per-key balances for.
             if config.key_indexing {
@@ -442,13 +479,9 @@ async fn fetch_and_store_with_shutdown(
         }
     }
 
-    // Record enrichment metrics for this cycle
-    if enriched_count > 0 || not_enriched_count > 0 {
-        cursor::track_enrichment(pool, enriched_count, not_enriched_count).await?;
-        if ts_parse_errors > 0 {
-            let _ = cursor::track_timestamp_parse_error(pool, ts_parse_errors).await;
-        }
-    }
+    // Record enrichment and timestamp-parse metrics for this cycle, whatever
+    // the events in it did (#719).
+    counters.flush(pool).await?;
 
     // Read each tracked contract's instance entry. With an explicit CONTRACT_IDS
     // list we track those contracts every cycle; in index-all mode we restrict
@@ -481,7 +514,7 @@ async fn fetch_and_store_with_shutdown(
     // Keys are batched into chunked getLedgerEntries calls so per-cycle RPC cost
     // scales with the number of batches, not the number of individual holders.
     if config.key_indexing && !holders_by_contract.is_empty() {
-        let durability = keys::parse_durability(&config.balance_key_durability);
+        let durability = keys::parse_durability(&config.balance_key_durability)?;
         state::snapshot_balances_batch(
             pool,
             rpc,
@@ -506,8 +539,8 @@ async fn fetch_and_store_with_shutdown(
     Ok((
         total_inserted,
         EnrichmentMetrics {
-            enriched_count,
-            not_enriched_count,
+            enriched_count: counters.enriched,
+            not_enriched_count: counters.not_enriched,
         },
     ))
 }
@@ -580,6 +613,9 @@ pub async fn recover_gaps(
 
         let mut cursor_token: Option<String> = None;
         let mut total_inserted = 0u64;
+        // Per range: a range that fails part-way is retried in full, so its
+        // counts are only written once the range completes (#719).
+        let mut counters = CycleCounters::default();
 
         loop {
             let page = rpc
@@ -604,7 +640,7 @@ pub async fn recover_gaps(
                     batch.push(new_event);
                 } else {
                     // #399: unparseable timestamp — skip event.
-                    ts_parse_errors += 1;
+                    counters.ts_parse_errors += 1;
                 }
             }
 
@@ -622,6 +658,8 @@ pub async fn recover_gaps(
                 break;
             }
         }
+
+        counters.flush(pool).await?;
 
         sqlx::query("UPDATE missed_ranges SET recovered_at = NOW() WHERE id = $1")
             .bind(range.id)
@@ -655,8 +693,7 @@ async fn fetch_and_upsert(
 ) -> anyhow::Result<u64> {
     let mut cursor_token: Option<String> = None;
     let mut total_updated = 0u64;
-    let mut enriched_count = 0u64;
-    let mut not_enriched_count = 0u64;
+    let mut counters = CycleCounters::default();
 
     loop {
         if shutdown.is_cancelled() {
@@ -672,29 +709,25 @@ async fn fetch_and_upsert(
             .await?;
 
         let mut batch: Vec<NewEvent> = Vec::with_capacity(page.events.len());
+        let mut past_end = false;
         for ev in &page.events {
-            // Stop if we've moved past the reorg window.
+            // Stop at the first event past the reorg window. The events before it
+            // on this page are still upserted below.
             if ev.ledger > end {
-                // Record enrichment metrics for reorg scan
-                if enriched_count > 0 || not_enriched_count > 0 {
-                    let _ = cursor::track_enrichment(pool, enriched_count, not_enriched_count).await;
-                    if ts_parse_errors > 0 {
-                        let _ = cursor::track_timestamp_parse_error(pool, ts_parse_errors).await;
-                    }
-                }
-                return Ok(total_updated);
+                past_end = true;
+                break;
             }
             let spec = specs.get(pool, rpc, &ev.contract_id, ev.ledger).await;
             let Some(new_event) = to_new_event(ev, spec.as_deref()) else {
                 // #399: unparseable timestamp — skip event.
-                ts_parse_errors += 1;
+                counters.ts_parse_errors += 1;
                 continue;
             };
             // Track enrichment coverage: count enriched vs not-enriched events
             if new_event.enriched.is_some() {
-                enriched_count += 1;
+                counters.enriched += 1;
             } else {
-                not_enriched_count += 1;
+                counters.not_enriched += 1;
             }
             batch.push(new_event);
         }
@@ -704,6 +737,9 @@ async fn fetch_and_upsert(
             total_updated += updated;
         }
 
+        if past_end {
+            break;
+        }
         cursor_token = page.cursor;
         let n = batch.len();
         if n < config.page_size as usize || cursor_token.is_none() {
@@ -711,10 +747,8 @@ async fn fetch_and_upsert(
         }
     }
 
-    // Record enrichment metrics for reorg scan
-    if enriched_count > 0 || not_enriched_count > 0 {
-        cursor::track_enrichment(pool, enriched_count, not_enriched_count).await?;
-    }
+    // Record enrichment and timestamp-parse metrics for the reorg scan (#719).
+    counters.flush(pool).await?;
 
     Ok(total_updated)
 }
