@@ -170,7 +170,7 @@ pub async fn insert_events_with_resolver(
 
     let inserted_count = inserted_rows.len() as u64;
 
-    // Project token_transfers only for events that were newly inserted.
+    // Project token_transfers and verticals only for events that were newly inserted.
     if inserted_count > 0 {
         let inserted_ids: std::collections::HashSet<String> = inserted_rows
             .iter()
@@ -182,51 +182,7 @@ pub async fn insert_events_with_resolver(
             .filter(|e| inserted_ids.contains(&e.event_id))
             .collect();
 
-        let transfers: Vec<Transfer> = new_events
-            .iter()
-            .filter_map(|e| extract_transfer(e, resolve))
-            .collect();
-
-        if !transfers.is_empty() {
-            let t_event_ids: Vec<String> = transfers.iter().map(|t| t.event_id.clone()).collect();
-            let t_contract_ids: Vec<String> =
-                transfers.iter().map(|t| t.contract_id.clone()).collect();
-            let t_from_addrs: Vec<Option<String>> =
-                transfers.iter().map(|t| t.from_addr.clone()).collect();
-            let t_to_addrs: Vec<Option<String>> =
-                transfers.iter().map(|t| t.to_addr.clone()).collect();
-            let t_amounts: Vec<String> = transfers.iter().map(|t| t.amount.clone()).collect();
-            let t_kinds: Vec<String> = transfers.iter().map(|t| t.kind.clone()).collect();
-            let t_amounts_numeric: Vec<Option<String>> =
-                transfers.iter().map(|t| Some(t.amount.clone())).collect();
-            let t_ledgers: Vec<i64> = transfers.iter().map(|t| t.ledger).collect();
-            let t_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
-                transfers.iter().map(|t| t.ledger_closed_at).collect();
-
-            sqlx::query(
-                "INSERT INTO token_transfers
-                    (event_id, contract_id, from_addr, to_addr, amount, kind, amount_numeric, ledger, ledger_closed_at)
-                 SELECT * FROM UNNEST(
-                    $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::numeric[], $8::bigint[], $9::timestamptz[]
-                 ) AS t(event_id, contract_id, from_addr, to_addr, amount, kind, amount_numeric, ledger, ledger_closed_at)
-                 ON CONFLICT (event_id) DO NOTHING",
-            )
-            .bind(&t_event_ids)
-            .bind(&t_contract_ids)
-            .bind(&t_from_addrs)
-            .bind(&t_to_addrs)
-            .bind(&t_amounts)
-            .bind(&t_kinds)
-            .bind(&t_amounts_numeric)
-            .bind(&t_ledgers)
-            .bind(&t_closed_ats)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        // Vertical projections (#599): swaps, NFT events and liquidity events.
-        // Written in the same transaction as the events insert.
-        project_verticals(&mut tx, &new_events, resolve).await?;
+        project_derived(&mut tx, &new_events, resolve).await?;
     }
 
     // Wake the API's SSE fan-out. Postgres delivers NOTIFY only on commit, so
@@ -236,6 +192,84 @@ pub async fn insert_events_with_resolver(
         .await?;
     tx.commit().await?;
     Ok(inserted_count)
+}
+
+/// Project the derived rows (`token_transfers`, `amm_swaps`, `nft_events`,
+/// `liquidity_events`) for the given events. Shared by the insert and upsert
+/// paths so their projection logic cannot drift (#733).
+async fn project_derived(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    events: &[&NewEvent],
+    resolve: &ContractKindResolver<'_>,
+) -> anyhow::Result<()> {
+    let transfers: Vec<Transfer> = events
+        .iter()
+        .filter_map(|e| extract_transfer(e, resolve))
+        .collect();
+
+    if !transfers.is_empty() {
+        let t_event_ids: Vec<String> = transfers.iter().map(|t| t.event_id.clone()).collect();
+        let t_contract_ids: Vec<String> = transfers.iter().map(|t| t.contract_id.clone()).collect();
+        let t_from_addrs: Vec<Option<String>> =
+            transfers.iter().map(|t| t.from_addr.clone()).collect();
+        let t_to_addrs: Vec<Option<String>> = transfers.iter().map(|t| t.to_addr.clone()).collect();
+        let t_amounts: Vec<String> = transfers.iter().map(|t| t.amount.clone()).collect();
+        let t_kinds: Vec<String> = transfers.iter().map(|t| t.kind.clone()).collect();
+        let t_amounts_numeric: Vec<Option<String>> =
+            transfers.iter().map(|t| Some(t.amount.clone())).collect();
+        let t_ledgers: Vec<i64> = transfers.iter().map(|t| t.ledger).collect();
+        let t_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
+            transfers.iter().map(|t| t.ledger_closed_at).collect();
+
+        sqlx::query(
+            "INSERT INTO token_transfers
+                (event_id, contract_id, from_addr, to_addr, amount, kind, amount_numeric, ledger, ledger_closed_at)
+             SELECT * FROM UNNEST(
+                $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::numeric[], $8::bigint[], $9::timestamptz[]
+             ) AS t(event_id, contract_id, from_addr, to_addr, amount, kind, amount_numeric, ledger, ledger_closed_at)
+             ON CONFLICT (event_id) DO NOTHING",
+        )
+        .bind(&t_event_ids)
+        .bind(&t_contract_ids)
+        .bind(&t_from_addrs)
+        .bind(&t_to_addrs)
+        .bind(&t_amounts)
+        .bind(&t_kinds)
+        .bind(&t_amounts_numeric)
+        .bind(&t_ledgers)
+        .bind(&t_closed_ats)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    // Vertical projections (#599): swaps, NFT events and liquidity events.
+    // Written in the same transaction as the events insert.
+    project_verticals(tx, events, resolve).await?;
+
+    Ok(())
+}
+
+/// Delete the derived rows for the given event ids so they can be re-projected
+/// after an event's content changed during a reorg re-scan (#733).
+async fn delete_derived(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    event_ids: &[String],
+) -> anyhow::Result<()> {
+    if event_ids.is_empty() {
+        return Ok(());
+    }
+    for table in [
+        "token_transfers",
+        "amm_swaps",
+        "nft_events",
+        "liquidity_events",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE event_id = ANY($1::text[])"))
+            .bind(event_ids)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Write `amm_swaps`, `nft_events` and `liquidity_events` rows for the given
@@ -372,10 +406,22 @@ async fn project_verticals(
 }
 
 /// Insert a batch of events with upsert semantics for reorg handling.
-/// If an event already exists (same event_id), update mutable fields (decoded values, enrichment)
-/// in case the RPC returned different content for a recently-passed ledger (shallow reorg).
+/// If an event already exists (same event_id) with *different* content, every
+/// content column (raw and decoded) is replaced and its derived rows are
+/// re-projected, in case the RPC returned different content for a
+/// recently-passed ledger (shallow reorg). Identical rows are left untouched.
 /// Returns (inserted, updated) counts.
 pub async fn upsert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result<(u64, u64)> {
+    upsert_events_with_resolver(pool, events, &default_contract_kind).await
+}
+
+/// Like [`upsert_events`] but with an explicit contract-kind resolver, so the
+/// caller can pass the `SpecCache`-backed lookup.
+pub async fn upsert_events_with_resolver(
+    pool: &PgPool,
+    events: &[NewEvent],
+    resolve: &ContractKindResolver<'_>,
+) -> anyhow::Result<(u64, u64)> {
     if events.is_empty() {
         return Ok((0, 0));
     }
@@ -436,9 +482,16 @@ pub async fn upsert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result
             enriched, tx_hash, in_successful_call, paging_token
          )
          ON CONFLICT (event_id) DO UPDATE SET
+            topics = EXCLUDED.topics,
+            value = EXCLUDED.value,
             decoded_topics = EXCLUDED.decoded_topics,
             decoded_value = EXCLUDED.decoded_value,
-            enriched = EXCLUDED.enriched
+            enriched = EXCLUDED.enriched,
+            tx_hash = EXCLUDED.tx_hash,
+            in_successful_call = EXCLUDED.in_successful_call,
+            ledger_closed_at = EXCLUDED.ledger_closed_at
+         WHERE (events.topics, events.value, events.tx_hash, events.in_successful_call)
+               IS DISTINCT FROM (EXCLUDED.topics, EXCLUDED.value, EXCLUDED.tx_hash, EXCLUDED.in_successful_call)
          RETURNING event_id, (xmax = 0) AS inserted",
     )
     .bind(&event_ids)
@@ -461,6 +514,7 @@ pub async fn upsert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result
     let mut inserted = 0u64;
     let mut updated = 0u64;
     let mut inserted_ids = std::collections::HashSet::new();
+    let mut updated_ids: Vec<String> = Vec::new();
 
     for row in rows {
         let event_id: String = row.try_get("event_id")?;
@@ -470,6 +524,7 @@ pub async fn upsert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result
             inserted_ids.insert(event_id);
         } else {
             updated += 1;
+            updated_ids.push(event_id);
         }
     }
 
@@ -477,50 +532,26 @@ pub async fn upsert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result
         debug!(count = updated, "events updated due to shallow reorg");
     }
 
-    // Project token_transfers only for newly inserted events
+    // Re-project derived rows for updated events: drop the stale projections
+    // and re-insert them from the new content, using the same resolver as the
+    // insert path (#733).
+    if !updated_ids.is_empty() {
+        delete_derived(&mut tx, &updated_ids).await?;
+        let updated_set: std::collections::HashSet<&String> = updated_ids.iter().collect();
+        let changed_events: Vec<&NewEvent> = events
+            .iter()
+            .filter(|e| updated_set.contains(&e.event_id))
+            .collect();
+        project_derived(&mut tx, &changed_events, resolve).await?;
+    }
+
+    // Project derived rows for newly inserted events.
     if inserted > 0 {
-        let transfers: Vec<Transfer> = events
+        let new_events: Vec<&NewEvent> = events
             .iter()
             .filter(|e| inserted_ids.contains(&e.event_id))
-            .filter_map(|e| extract_transfer(e, &default_contract_kind))
             .collect();
-
-        if !transfers.is_empty() {
-            let t_event_ids: Vec<String> = transfers.iter().map(|t| t.event_id.clone()).collect();
-            let t_contract_ids: Vec<String> =
-                transfers.iter().map(|t| t.contract_id.clone()).collect();
-            let t_from_addrs: Vec<Option<String>> =
-                transfers.iter().map(|t| t.from_addr.clone()).collect();
-            let t_to_addrs: Vec<Option<String>> =
-                transfers.iter().map(|t| t.to_addr.clone()).collect();
-            let t_amounts: Vec<String> = transfers.iter().map(|t| t.amount.clone()).collect();
-            let t_kinds: Vec<String> = transfers.iter().map(|t| t.kind.clone()).collect();
-            let t_amounts_numeric: Vec<Option<String>> =
-                transfers.iter().map(|t| Some(t.amount.clone())).collect();
-            let t_ledgers: Vec<i64> = transfers.iter().map(|t| t.ledger).collect();
-            let t_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
-                transfers.iter().map(|t| t.ledger_closed_at).collect();
-
-            sqlx::query(
-                "INSERT INTO token_transfers
-                    (event_id, contract_id, from_addr, to_addr, amount, kind, amount_numeric, ledger, ledger_closed_at)
-                 SELECT * FROM UNNEST(
-                    $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::numeric[], $8::bigint[], $9::timestamptz[]
-                 ) AS t(event_id, contract_id, from_addr, to_addr, amount, kind, amount_numeric, ledger, ledger_closed_at)
-                 ON CONFLICT (event_id) DO NOTHING",
-            )
-            .bind(&t_event_ids)
-            .bind(&t_contract_ids)
-            .bind(&t_from_addrs)
-            .bind(&t_to_addrs)
-            .bind(&t_amounts)
-            .bind(&t_kinds)
-            .bind(&t_amounts_numeric)
-            .bind(&t_ledgers)
-            .bind(&t_closed_ats)
-            .execute(&mut *tx)
-            .await?;
-        }
+        project_derived(&mut tx, &new_events, resolve).await?;
     }
 
     // Wake the API's SSE fan-out. Postgres delivers NOTIFY only on commit, so
@@ -587,6 +618,15 @@ fn as_addr(v: Option<&Value>) -> Option<String> {
     }
 }
 
+/// Look up a spec-declared event parameter by name in the enrichment payload
+/// (`enriched.params.<name>.value`). Returns `None` when enrichment is absent
+/// or the parameter is not present.
+fn enriched_param(e: &NewEvent, name: &str) -> Option<String> {
+    let enriched = e.enriched.as_ref()?;
+    let params = enriched.get("params")?;
+    as_addr(params.get(name).and_then(|p| p.get("value")))
+}
+
 /// Extract a decimal amount from a decoded value. Accepts a JSON string or a
 /// JSON number that is an integer (i128). Returns `None` for anything else so
 /// non-numeric values are never stringified into `amount` (issue #600).
@@ -612,11 +652,17 @@ fn as_i128_amount(v: &Value) -> Option<String> {
 /// SEP-41 tokens (or SACs), and for values that are not a valid amount.
 ///
 /// transfer: Topics: [symbol "transfer", from Address, to Address]
-/// mint: Topics: [symbol "mint", to Address]
+/// mint: Topics: [symbol "mint", to Address] (CAP-67 SAC / custom SEP-41) or
+///       [symbol "mint", admin Address, to Address, asset] (legacy pre-CAP-67 SAC)
 /// burn: Topics: [symbol "burn", from Address]
-/// clawback: Topics: [symbol "clawback", from Address]
+/// clawback: Topics: [symbol "clawback", from Address] (CAP-67 SAC / custom SEP-41)
+///       or [symbol "clawback", admin Address, from Address, asset] (legacy SAC)
 /// All have Value: i128 amount (decoded as a decimal string) or, under CAP-67,
 /// a map `{amount, to_muxed_id}`.
+///
+/// For `mint`/`clawback` the address is taken from the spec-declared parameter
+/// names when enrichment is available, otherwise from the topic count so the
+/// legacy SAC layouts (which carry the admin at index 1) are handled (#734).
 fn extract_transfer(e: &NewEvent, resolve: &ContractKindResolver<'_>) -> Option<Transfer> {
     let event_name = e.event_name.as_deref()?;
     let kind = match event_name {
@@ -659,8 +705,31 @@ fn extract_transfer(e: &NewEvent, resolve: &ContractKindResolver<'_>) -> Option<
             as_addr(e.decoded_topics.get(1)),
             as_addr(e.decoded_topics.get(2)),
         ),
-        "mint" => (None, as_addr(e.decoded_topics.get(1))),
-        "burn" | "clawback" => (as_addr(e.decoded_topics.get(1)), None),
+        "mint" => {
+            let to = enriched_param(e, "to").or_else(|| {
+                // Legacy SAC: [mint, admin, to, asset]; CAP-67 SAC (3 topics)
+                // and custom SEP-41 (2 topics): [mint, to].
+                if e.decoded_topics.len() >= 4 {
+                    as_addr(e.decoded_topics.get(2))
+                } else {
+                    as_addr(e.decoded_topics.get(1))
+                }
+            });
+            (None, to)
+        }
+        "burn" => (as_addr(e.decoded_topics.get(1)), None),
+        "clawback" => {
+            let from = enriched_param(e, "from").or_else(|| {
+                // Legacy SAC: [clawback, admin, from, asset]; otherwise
+                // [clawback, from].
+                if e.decoded_topics.len() >= 4 {
+                    as_addr(e.decoded_topics.get(2))
+                } else {
+                    as_addr(e.decoded_topics.get(1))
+                }
+            });
+            (from, None)
+        }
         _ => return None,
     };
 
@@ -890,6 +959,69 @@ mod tests {
         assert_eq!(t.to_addr, None);
         assert_eq!(t.amount, "750");
         assert_eq!(t.kind, "clawback");
+    }
+
+    // Issue #734: legacy (pre-CAP-67) SAC mint/clawback carry the admin at index 1.
+    #[test]
+    fn extracts_legacy_sac_mint_recipient_not_admin() {
+        let e = event(
+            Some("mint"),
+            vec![json!("mint"), json!("GADMIN"), json!("GRECIPIENT"), json!("native")],
+            json!("1000"),
+        );
+        let t = extract_transfer(&e, &fungible).expect("legacy mint should be recognised");
+        assert_eq!(t.from_addr, None);
+        assert_eq!(t.to_addr.as_deref(), Some("GRECIPIENT"));
+        assert_eq!(t.kind, "mint");
+    }
+
+    #[test]
+    fn extracts_cap67_sac_mint_recipient() {
+        let e = event(
+            Some("mint"),
+            vec![json!("mint"), json!("GRECIPIENT"), json!("native")],
+            json!("1000"),
+        );
+        let t = extract_transfer(&e, &fungible).expect("CAP-67 mint should be recognised");
+        assert_eq!(t.to_addr.as_deref(), Some("GRECIPIENT"));
+    }
+
+    #[test]
+    fn extracts_legacy_sac_clawback_victim_not_admin() {
+        let e = event(
+            Some("clawback"),
+            vec![json!("clawback"), json!("GADMIN"), json!("GVICTIM"), json!("native")],
+            json!("750"),
+        );
+        let t = extract_transfer(&e, &fungible).expect("legacy clawback should be recognised");
+        assert_eq!(t.from_addr.as_deref(), Some("GVICTIM"));
+        assert_eq!(t.to_addr, None);
+        assert_eq!(t.kind, "clawback");
+    }
+
+    #[test]
+    fn extracts_cap67_sac_clawback_victim() {
+        let e = event(
+            Some("clawback"),
+            vec![json!("clawback"), json!("GVICTIM"), json!("native")],
+            json!("750"),
+        );
+        let t = extract_transfer(&e, &fungible).expect("CAP-67 clawback should be recognised");
+        assert_eq!(t.from_addr.as_deref(), Some("GVICTIM"));
+    }
+
+    #[test]
+    fn enriched_params_take_precedence_for_mint() {
+        let mut e = event(
+            Some("mint"),
+            vec![json!("mint"), json!("GADMIN"), json!("GWRONG"), json!("native")],
+            json!("1000"),
+        );
+        e.enriched = Some(json!({
+            "params": { "to": { "value": "GRECIPIENT" } }
+        }));
+        let t = extract_transfer(&e, &fungible).expect("mint should be recognised");
+        assert_eq!(t.to_addr.as_deref(), Some("GRECIPIENT"));
     }
 
     #[test]
