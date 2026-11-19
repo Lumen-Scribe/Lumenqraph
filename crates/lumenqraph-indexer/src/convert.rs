@@ -11,7 +11,7 @@
 //! `Utc::now()`.
 
 use chrono::{DateTime, TimeZone, Utc};
-use lumenqraph_core::{xdr, ContractSpec, NewEvent};
+use lumenqraph_core::{xdr, ContractSpec, EventType, NewEvent};
 use tracing::error;
 
 use crate::rpc_client::EventInfo;
@@ -68,7 +68,9 @@ pub fn to_new_event(e: &EventInfo, spec: Option<&ContractSpec>) -> Option<NewEve
         contract_id: e.contract_id.clone(),
         ledger: e.ledger,
         ledger_closed_at,
-        event_type: e.event_type.clone(),
+        // The RPC only emits contract | system | diagnostic; anything else is
+        // treated as a contract event rather than dropping the ledger data.
+        event_type: EventType::from_rpc(&e.event_type).unwrap_or(EventType::Contract),
         topics: e.topic.clone(),
         decoded_topics,
         event_name,

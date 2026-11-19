@@ -193,6 +193,7 @@ async fn metrics(
     }
 
     (
+        axum::http::StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         body,
     )
@@ -358,7 +359,7 @@ mod tests {
             .expect("lazy pool");
         HttpState {
             pool: Arc::new(pool),
-            spec_cache: Arc::new(SpecCache::new()),
+            spec_cache: Arc::new(SpecCache::new(16, 4)),
             metrics_bearer_token: token.map(|t| Arc::new(t.to_string())),
         }
     }

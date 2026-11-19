@@ -16,24 +16,27 @@ async fn test_custom_headers_are_passed_in_requests() {
     let headers_received_clone = headers_received.clone();
 
     #[derive(Clone)]
-    struct State {
+    struct Recorder {
         headers: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     async fn handler(
-        State(state): State<State>,
-        axum::http::HeaderMap: axum::http::HeaderMap,
-    ) -> (u16, &'static str) {
+        State(state): State<Recorder>,
+        request_headers: axum::http::HeaderMap,
+    ) -> (axum::http::StatusCode, &'static str) {
         // Capture Authorization header if present
-        if let Some(auth) = axum::http::HeaderMap.get("authorization") {
+        if let Some(auth) = request_headers.get("authorization") {
             if let Ok(val) = auth.to_str() {
                 state.headers.lock().unwrap().push(val.to_string());
             }
         }
-        (200, r#"{"jsonrpc":"2.0","id":1,"result":{"sequence":1000}}"#)
+        (
+            axum::http::StatusCode::OK,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"sequence":1000}}"#,
+        )
     }
 
-    let state = State { headers: headers_received_clone };
+    let state = Recorder { headers: headers_received_clone };
     let app = Router::new().route("/", post(handler)).with_state(state);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

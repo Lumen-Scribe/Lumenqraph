@@ -25,7 +25,7 @@ mod projection_tests {
 
     /// Deterministic, valid account (ed25519 public key) strkey.
     fn account_strkey(seed: u8) -> String {
-        stellar_strkey::Ed25519PublicKey([seed; 32]).to_string()
+        stellar_strkey::Strkey::PublicKeyEd25519(stellar_strkey::ed25519::PublicKey([seed; 32])).to_string()
     }
 
     fn new_event(
@@ -41,9 +41,9 @@ mod projection_tests {
             contract_id: contract_id.to_string(),
             ledger,
             ledger_closed_at: Utc::now(),
-            event_type: "contract".to_string(),
-            topics: json!([]),
-            decoded_topics: topics,
+            event_type: lumenqraph_core::EventType::Contract,
+            topics: vec![],
+            decoded_topics: topics.as_array().cloned().unwrap_or_default(),
             event_name: Some(event_name.to_string()),
             value: String::new(),
             decoded_value: value,

@@ -70,7 +70,7 @@ use sqlx::PgPool;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{debug, info, warn};
 
-use lumenqraph_core::NewEvent;
+use lumenqraph_core::{EventType, NewEvent};
 
 use crate::config::Config;
 use crate::specs::SpecCache;
@@ -510,7 +510,7 @@ fn historical_to_new_event(
         contract_id: ev.contract_id,
         ledger: ev.ledger,
         ledger_closed_at: ev.ledger_closed_at,
-        event_type: ev.event_type,
+        event_type: EventType::from_rpc(&ev.event_type).unwrap_or(EventType::Contract),
         topics: ev.topics,
         decoded_topics,
         event_name,

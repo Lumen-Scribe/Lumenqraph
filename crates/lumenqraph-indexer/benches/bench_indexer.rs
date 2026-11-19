@@ -73,7 +73,7 @@ fn synthetic_new_events(n: usize) -> Vec<NewEvent> {
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".into(),
             ledger: 1_000_000 + i as i64,
             ledger_closed_at: Utc::now(),
-            event_type: "contract".into(),
+            event_type: lumenqraph_core::EventType::Contract,
             topics: vec![TRANSFER_TOPIC_B64.into()],
             decoded_topics: vec![json!("transfer")],
             event_name: Some("transfer".into()),

@@ -142,6 +142,8 @@ mod tests {
             page_size,
             start_ledger: 0,
             max_catchup_ledgers: 4000,
+            max_consecutive_errors: 20,
+            degraded_poll_interval_secs: 300,
             state_indexing: false,
             key_indexing: false,
             balance_key_symbol: "Balance".into(),

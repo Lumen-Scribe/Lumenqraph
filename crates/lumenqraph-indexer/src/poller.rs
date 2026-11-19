@@ -481,7 +481,7 @@ async fn fetch_and_store_with_shutdown(
     // Keys are batched into chunked getLedgerEntries calls so per-cycle RPC cost
     // scales with the number of batches, not the number of individual holders.
     if config.key_indexing && !holders_by_contract.is_empty() {
-        let durability = keys::parse_durability(&config.balance_key_durability);
+        let durability = keys::parse_durability(&config.balance_key_durability)?;
         state::snapshot_balances_batch(
             pool,
             rpc,
@@ -580,6 +580,7 @@ pub async fn recover_gaps(
 
         let mut cursor_token: Option<String> = None;
         let mut total_inserted = 0u64;
+        let mut ts_parse_errors = 0u64; // #399
 
         loop {
             let page = rpc
@@ -657,6 +658,7 @@ async fn fetch_and_upsert(
     let mut total_updated = 0u64;
     let mut enriched_count = 0u64;
     let mut not_enriched_count = 0u64;
+    let mut ts_parse_errors = 0u64; // #399
 
     loop {
         if shutdown.is_cancelled() {
