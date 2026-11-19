@@ -111,6 +111,13 @@ pub async fn run(pool: PgPool, rpc: RpcClient, config: Config, specs: Arc<SpecCa
                     return Err(e);
                 }
 
+                // Another writer committed to the cursor: this process must not keep
+                // advancing it alongside that writer (#709).
+                if e.downcast_ref::<cursor::CursorConflict>().is_some() {
+                    error!(error = %e, "cursor conflict; stopping poller");
+                    return Err(e);
+                }
+
                 consecutive_errors += 1;
                 let _ = cursor::incr_errors(&pool).await;
                 let _ = cursor::set_consecutive_errors(&pool, consecutive_errors).await;
@@ -191,7 +198,10 @@ async fn poll_once(
     let cycle_span_for_record = cycle_span.clone();
     async move {
 
-    let mut start = match cursor::read_last_processed(pool).await? {
+    // One read gives both the position and the version every write this cycle
+    // must match (#709).
+    let snapshot = cursor::read_snapshot(pool).await?;
+    let mut start = match snapshot.last_processed {
         Some(c) => c + 1,
         None if config.start_ledger > 0 => config.start_ledger,
         None => latest,
@@ -199,7 +209,7 @@ async fn poll_once(
 
     if start > latest {
         // Nothing new closed; still record the tip so lag reflects reality.
-        cursor::write_progress(pool, start - 1, latest, 0).await?;
+        cursor::write_progress(pool, snapshot.version, start - 1, latest, 0).await?;
         return Ok(None);
     }
 
@@ -214,7 +224,7 @@ async fn poll_once(
             "fresh-start ledger clamped to earliest servable ledger"
         );
         if oldest_available > start {
-            record_missed_range_classified(pool, start, oldest_available - 1, "retention-window skip", false).await?;
+            record_gap_best_effort(pool, start, oldest_available - 1, "retention-window skip", false).await;
         }
         start = oldest_available;
     }
@@ -230,7 +240,7 @@ async fn poll_once(
              datalake backfill for gapless history, or raise MAX_CATCHUP_LEDGERS)"
         );
         if clamped > start {
-            record_missed_range_classified(pool, start, clamped - 1, "catch-up skip", true).await?;
+            record_gap_best_effort(pool, start, clamped - 1, "catch-up skip", true).await;
         }
         start = clamped;
     }
@@ -298,7 +308,7 @@ async fn poll_once(
         cursor::track_rpc_call(pool, rpc_calls, rpc_errors, rpc_errors_32001, rpc_failovers).await?;
     }
 
-    cursor::write_progress(pool, latest, latest, inserted).await?;
+    cursor::write_progress(pool, snapshot.version, latest, latest, inserted).await?;
     if inserted > 0 {
         info!(inserted, up_to_ledger = latest, "indexed events");
     }
@@ -510,6 +520,29 @@ async fn fetch_and_store_with_shutdown(
             not_enriched_count,
         },
     ))
+}
+
+/// Record a deliberately skipped range without letting a failure to write the
+/// record stop ingestion (#707). The skip is already happening, so the cursor
+/// must still advance; the failure is logged so it can be recovered by hand.
+async fn record_gap_best_effort(
+    pool: &PgPool,
+    from_ledger: i64,
+    to_ledger: i64,
+    reason: &str,
+    recoverable: bool,
+) {
+    if let Err(error) =
+        record_missed_range_classified(pool, from_ledger, to_ledger, reason, recoverable).await
+    {
+        error!(
+            %error,
+            from = from_ledger,
+            to = to_ledger,
+            reason,
+            "failed to record skipped ledger range; continuing so the cursor can advance"
+        );
+    }
 }
 
 /// Record a ledger range missed due to a mid-batch page RPC failure.
@@ -868,5 +901,145 @@ mod tests {
         // Processing limit (-32001) is retryable
         let retryable = anyhow::anyhow!(SorobanRpcError::new(-32001, "limit reached", "getEvents"));
         assert!(!is_non_retryable_rpc_error(&retryable));
+    }
+}
+
+#[cfg(test)]
+mod db_tests {
+    use super::*;
+    use lumenqraph_core::db_test::TestDb;
+    use serde_json::{json, Value};
+
+    /// A JSON-RPC stub that reports a fixed retention window and an empty event
+    /// stream. Enough to drive `poll_once` through the skip-ahead logic.
+    async fn spawn_mock_rpc(latest: i64, oldest: i64) -> String {
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<Value>| async move {
+                let result = match req["method"].as_str().unwrap_or_default() {
+                    "getLatestLedger" => json!({ "id": "tip", "protocolVersion": 21, "sequence": latest }),
+                    "getHealth" => json!({
+                        "status": "healthy",
+                        "latestLedger": latest,
+                        "oldestLedger": oldest,
+                        "ledgerRetentionWindow": latest - oldest + 1
+                    }),
+                    "getEvents" => json!({ "latestLedger": latest, "events": [], "cursor": null }),
+                    other => json!({ "error": format!("unexpected method {other}") }),
+                };
+                Json(json!({ "jsonrpc": "2.0", "id": 1, "result": result }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    fn test_config(start_ledger: i64) -> Config {
+        Config {
+            database_url: String::new(),
+            rpc_url: String::new(),
+            rpc_urls: vec![],
+            contract_ids: vec![],
+            poll_interval_secs: 5,
+            page_size: 200,
+            start_ledger,
+            max_catchup_ledgers: 4000,
+            state_indexing: false,
+            key_indexing: false,
+            balance_key_symbol: "Balance".into(),
+            balance_key_durability: "persistent".into(),
+            retention_ledgers: 0,
+            spec_version_retention: 0,
+            upgrade_watch: false,
+            reorg_overlap_ledgers: 0,
+            rpc_timeout_secs: 5,
+            enrichment_warn_threshold: 0.5,
+            key_templates: vec![],
+            spec_cache_max_entries: 16,
+            spec_fetch_concurrency: 2,
+            degraded_poll_interval_secs: 300,
+            max_consecutive_errors: 20,
+        }
+    }
+
+    async fn run_cycle(db: &TestDb, rpc_url: &str, config: &Config) -> anyhow::Result<Option<i64>> {
+        let rpc = RpcClient::with_urls(vec![rpc_url.to_string()], 5);
+        let specs = SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
+        poll_once(db.pool(), &rpc, config, &specs, &CancellationToken::new()).await
+    }
+
+    async fn missed_ranges(pool: &PgPool) -> Vec<(i64, i64, Option<String>, bool)> {
+        // Same projection `recover_gaps` reads, so this also checks the schema it needs (#707).
+        sqlx::query_as(
+            "SELECT from_ledger, to_ledger, reason, recoverable FROM missed_ranges
+             WHERE recovered_at IS NULL AND recoverable = TRUE ORDER BY from_ledger ASC",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A fresh database whose tip is far past the catch-up window must record the
+    /// skipped range and move the cursor to the tip (#707).
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore] // Requires TEST_DATABASE_URL (CI runs `--ignored`)
+    async fn catch_up_skip_is_recorded_and_cursor_advances() {
+        let db = TestDb::new_with_migrations("../../migrations").await;
+        let url = spawn_mock_rpc(10_000, 1).await;
+        let config = test_config(1);
+
+        let processed = run_cycle(&db, &url, &config).await.expect("cycle should succeed");
+        assert_eq!(processed, Some(10_000));
+
+        // clamped = 10_000 - 4_000 = 6_000, so the skipped range is 1..=5_999.
+        let ranges = missed_ranges(db.pool()).await;
+        assert_eq!(ranges.len(), 1, "one skipped range expected: {ranges:?}");
+        assert_eq!(ranges[0].0, 1);
+        assert_eq!(ranges[0].1, 5_999);
+        assert_eq!(ranges[0].2.as_deref(), Some("catch-up skip"));
+
+        assert_eq!(cursor::read_last_processed(db.pool()).await.unwrap(), Some(10_000));
+    }
+
+    /// The gap record is written best-effort: if it cannot be stored, the cycle
+    /// still succeeds and the cursor still advances (#707).
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn failing_gap_record_does_not_block_the_cursor() {
+        let db = TestDb::new_with_migrations("../../migrations").await;
+        let url = spawn_mock_rpc(10_000, 1).await;
+        let config = test_config(1);
+
+        sqlx::query("ALTER TABLE missed_ranges RENAME TO missed_ranges_unavailable")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let processed = run_cycle(&db, &url, &config).await.expect("cycle must not fail on the gap record");
+        assert_eq!(processed, Some(10_000));
+        assert_eq!(cursor::read_last_processed(db.pool()).await.unwrap(), Some(10_000));
+    }
+
+    /// On a fresh database, START_LEDGER is the first ledger processed. The first
+    /// quiet cycle records no gap and leaves the cursor at the tip (#708).
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn start_ledger_is_respected_on_a_fresh_database() {
+        let db = TestDb::new_with_migrations("../../migrations").await;
+        let url = spawn_mock_rpc(10_000, 1).await;
+        // Bad counter first: it used to create the row with a fabricated position.
+        cursor::incr_errors(db.pool()).await.unwrap();
+        let config = test_config(9_500);
+
+        let processed = run_cycle(&db, &url, &config).await.expect("first cycle must not error");
+        assert_eq!(processed, Some(10_000));
+        // Had START_LEDGER been ignored, the cycle would start at 1 and record a gap.
+        assert!(missed_ranges(db.pool()).await.is_empty());
+        assert_eq!(cursor::read_last_processed(db.pool()).await.unwrap(), Some(10_000));
     }
 }

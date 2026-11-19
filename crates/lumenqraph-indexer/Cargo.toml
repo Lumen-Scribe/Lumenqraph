@@ -39,6 +39,7 @@ tower-http.workspace = true
 clap.workspace = true
 
 [dev-dependencies]
+lumenqraph-core = { workspace = true, features = ["db-test"] }
 hmac.workspace = true
 sha2.workspace = true
 reqwest.workspace = true

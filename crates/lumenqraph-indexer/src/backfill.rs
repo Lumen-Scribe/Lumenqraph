@@ -205,7 +205,7 @@ mod tests {
         assert_eq!(count, 3);
 
         // Write cursor and verify it's readable (what backfill::run does after fetch).
-        cursor::write_progress(&pool, 1000, 1000, inserted)
+        cursor::write_progress_locked(&pool, 1000, 1000, inserted)
             .await
             .unwrap();
         let last = cursor::read_last_processed(&pool).await.unwrap();
@@ -338,7 +338,7 @@ mod tests {
 
         // Checkpoint after this page (ledger 501 is the max from page 1).
         let page_max_ledger = 501i64;
-        cursor::write_progress(&pool, page_max_ledger, tip, inserted)
+        cursor::write_progress_locked(&pool, page_max_ledger, tip, inserted)
             .await
             .unwrap();
 
@@ -460,7 +460,7 @@ pub async fn run(
         // leaves the cursor pointing at the end of the last page we finished,
         // so the backfill is resumable with no ledger range lost.
         last_page_ledger = page_max_ledger;
-        cursor::write_progress(&pool, last_page_ledger, tip, inserted).await?;
+        cursor::write_progress_locked(&pool, last_page_ledger, tip, inserted).await?;
         info!(
             inserted,
             page_max_ledger,
@@ -475,7 +475,7 @@ pub async fn run(
     }
 
     // Final cursor advance to the tip so the live poller starts from there.
-    cursor::write_progress(&pool, tip, tip, 0).await?;
+    cursor::write_progress_locked(&pool, tip, tip, 0).await?;
     info!(total_inserted, up_to_ledger = tip, "backfill complete");
     Ok(())
 }

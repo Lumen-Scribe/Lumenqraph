@@ -298,3 +298,48 @@ async fn main() -> anyhow::Result<()> {
         Command::Migrate | Command::Inspect { .. } => unreachable!(),
     }
 }
+
+#[cfg(test)]
+mod one_shot_lock_tests {
+    use super::*;
+    use lumenqraph_core::db_test::TestDb;
+
+    /// A one-shot command must refuse while the live indexer holds the leader lock,
+    /// and two one-shot commands must not overlap (#710).
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore] // Requires TEST_DATABASE_URL (CI runs `--ignored`)
+    async fn one_shot_commands_refuse_while_the_leader_lock_is_held() {
+        let db = TestDb::new_with_migrations("../../migrations").await;
+
+        // Stand in for the live indexer.
+        let leader = LeaderLock::acquire(db.pool()).await.expect("leader acquires");
+
+        let err = try_one_shot_lock(db.pool(), "backfill")
+            .await
+            .expect_err("backfill must not run beside the live indexer");
+        assert!(err.to_string().contains("refusing to run `backfill`"), "got: {err}");
+
+        // Release the leader. Dropping its connection releases the session lock; the
+        // server may take a moment to notice, so retry briefly.
+        drop(leader);
+        let mut held = None;
+        for _ in 0..50 {
+            match try_one_shot_lock(db.pool(), "reenrich").await {
+                Ok(conn) => {
+                    held = Some(conn);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+        let first = held.expect("one-shot runs once the leader is gone");
+
+        // A second one-shot must not start while the first is still running.
+        let err = try_one_shot_lock(db.pool(), "recover-gaps")
+            .await
+            .expect_err("one-shot commands must not overlap");
+        assert!(err.to_string().contains("refusing to run `recover-gaps`"), "got: {err}");
+
+        drop(first);
+    }
+}
