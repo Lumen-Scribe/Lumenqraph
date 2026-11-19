@@ -45,8 +45,10 @@ use crate::spec::ContractSpec;
 /// The ordering reflects impact: `Additive < PotentiallyBreaking < Breaking`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum Severity {
     /// Only new items were added; no existing consumer is affected.
+    #[default]
     Additive,
     /// Existing consumers *may* break depending on how they decode the type
     /// (e.g. exhaustive match on an enum whose case list grew).
@@ -55,12 +57,6 @@ pub enum Severity {
     /// work (item removed, signature changed, parameters reordered, enum
     /// discriminant changed).
     Breaking,
-}
-
-impl Default for Severity {
-    fn default() -> Self {
-        Severity::Additive
-    }
 }
 
 /// The difference between two parsed interfaces, oldest to newest.
@@ -268,7 +264,8 @@ fn diff_events(old: &ContractSpec, new: &ContractSpec) -> SectionDiff {
     // potentially-breaking rather than breaking.
     let mut still_changed = Vec::new();
     for item in diff.changed.drain(..) {
-        if let (Some(before), Some(after)) = (find_event(old, &item.name), find_event(new, &item.name))
+        if let (Some(before), Some(after)) =
+            (find_event(old, &item.name), find_event(new, &item.name))
         {
             if let Some(description) = map_event_added_fields(before, after) {
                 diff.potentially_breaking.push(PotentiallyBreakingItem {
@@ -287,10 +284,7 @@ fn diff_events(old: &ContractSpec, new: &ContractSpec) -> SectionDiff {
     diff
 }
 
-fn find_event<'a>(
-    spec: &'a ContractSpec,
-    name: &str,
-) -> Option<&'a crate::spec::EventSpec> {
+fn find_event<'a>(spec: &'a ContractSpec, name: &str) -> Option<&'a crate::spec::EventSpec> {
     spec.events.iter().find(|e| e.name == name)
 }
 
@@ -305,7 +299,7 @@ fn map_event_added_fields(
         return None;
     }
     // Only map-format events have named data fields that can be added safely.
-    if !format!("{}", new.data_format).eq_ignore_ascii_case("map") {
+    if !new.data_format.to_string().eq_ignore_ascii_case("map") {
         return None;
     }
     if new.params.len() <= old.params.len() {
@@ -321,7 +315,7 @@ fn map_event_added_fields(
     let added: Vec<&str> = new.params[old.params.len()..]
         .iter()
         .map(|p| {
-            if !format!("{}", p.location).eq_ignore_ascii_case("data") {
+            if !p.location.to_string().eq_ignore_ascii_case("data") {
                 return "";
             }
             p.name.as_str()
@@ -397,11 +391,7 @@ fn added_cases_only(old: &ContractSpec, new: &ContractSpec, name: &str) -> Optio
         new.enums.iter().find(|e| e.name == name),
     ) {
         if n.cases.len() > o.cases.len() {
-            let same_prefix = o
-                .cases
-                .iter()
-                .zip(n.cases.iter())
-                .all(|(a, b)| a == b);
+            let same_prefix = o.cases.iter().zip(n.cases.iter()).all(|(a, b)| a == b);
             if same_prefix {
                 let added: Vec<&str> = n.cases[o.cases.len()..]
                     .iter()
@@ -1053,7 +1043,9 @@ mod tests {
             "must appear in 'potentially_breaking'"
         );
         assert!(
-            d.types.potentially_breaking[0].description.contains("Pending"),
+            d.types.potentially_breaking[0]
+                .description
+                .contains("Pending"),
             "description should name the new case: {}",
             d.types.potentially_breaking[0].description
         );
@@ -1218,7 +1210,9 @@ mod tests {
         assert!(d.types.changed.is_empty(), "must not appear in 'changed'");
         assert_eq!(d.types.potentially_breaking.len(), 1);
         assert!(
-            d.types.potentially_breaking[0].description.contains("Pause"),
+            d.types.potentially_breaking[0]
+                .description
+                .contains("Pause"),
             "description should name the new case"
         );
     }

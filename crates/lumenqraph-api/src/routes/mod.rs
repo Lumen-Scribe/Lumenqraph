@@ -22,8 +22,8 @@ use axum::extract::{Request, State};
 use axum::http::{header, HeaderValue};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse};
+use axum::routing::{get, post};
 use axum::Json;
-use axum::routing::{delete, get, patch, post};
 use axum::{middleware, Extension, Router};
 use serde_json::json;
 use tower::Layer;
@@ -170,15 +170,23 @@ pub fn router(state: AppState) -> Router {
     // of REQUIRE_API_KEY (#420 — anonymous callers must not be able to list,
     // modify, or delete webhook subscriptions).
     let webhook_manage_routes = Router::new()
+        .route("/webhooks", get(webhooks::list_webhooks))
         .route(
-            "/webhooks",
-            get(webhooks::list_webhooks),
+            "/webhooks/:id",
+            get(webhooks::get_webhook)
+                .delete(webhooks::delete_webhook)
+                .patch(webhooks::update_webhook),
         )
-        .route("/webhooks/:id", get(webhooks::get_webhook).delete(webhooks::delete_webhook).patch(webhooks::update_webhook))
-        .route("/webhooks/:id/deliveries", get(webhooks::list_webhook_deliveries))
+        .route(
+            "/webhooks/:id/deliveries",
+            get(webhooks::list_webhook_deliveries),
+        )
         .route("/webhooks/:id/redrive", post(webhooks::redrive_webhook))
         .route("/webhooks/:id/reenable", post(webhooks::reenable_webhook))
-        .route("/webhooks/:id/rotate-secret", post(webhooks::rotate_webhook_secret))
+        .route(
+            "/webhooks/:id/rotate-secret",
+            post(webhooks::rotate_webhook_secret),
+        )
         .route("/webhooks/:id/test", post(webhooks::test_webhook))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -260,7 +268,7 @@ pub fn router(state: AppState) -> Router {
             HeaderValue::from_static("DENY"),
         );
         app.fallback_service(
-            no_frame.layer(nosniff.layer(csp.layer(revalidate.layer(ServeDir::new(explorer_dir)))))
+            no_frame.layer(nosniff.layer(csp.layer(revalidate.layer(ServeDir::new(explorer_dir))))),
         )
     } else {
         app

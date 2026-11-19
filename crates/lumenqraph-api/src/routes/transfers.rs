@@ -11,7 +11,7 @@ use axum::Json;
 use lumenqraph_core::TokenTransfer;
 use serde::Deserialize;
 
-use crate::error::{ApiError, ApiResult};
+use crate::error::ApiResult;
 use crate::extract::ValidContractId;
 use crate::pagination::{LedgerCursor, Page, PageRequest};
 use crate::state::AppState;
@@ -66,5 +66,7 @@ pub async fn list_transfers(
     .fetch_all(&state.pool)
     .await?;
 
-    Ok(page.finish(transfers, |t| LedgerCursor::new(t.ledger, &t.event_id)))
+    Ok(Json(page.finish(transfers, |t| {
+        LedgerCursor::new(t.ledger, &t.event_id)
+    })))
 }

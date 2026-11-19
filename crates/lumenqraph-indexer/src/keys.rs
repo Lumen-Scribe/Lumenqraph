@@ -38,26 +38,26 @@ impl KeyTemplate {
             Some(n) => n,
             None => return Vec::new(),
         };
-        
+
         if !self.event_names.iter().any(|en| en == event_name) {
             return Vec::new();
         }
 
         // Extract parameters at specified indices
         let mut params: Vec<Vec<String>> = vec![Vec::new()];
-        
+
         for &idx in &self.param_indices {
             if idx >= e.decoded_topics.len() {
                 return Vec::new();
             }
-            
+
             let topic = &e.decoded_topics[idx];
             let addresses = extract_addresses(topic);
-            
+
             if addresses.is_empty() {
                 return Vec::new();
             }
-            
+
             // Cartesian product for multi-param keys
             let mut next_params = Vec::new();
             for base in params {
@@ -69,7 +69,7 @@ impl KeyTemplate {
             }
             params = next_params;
         }
-        
+
         params
     }
 
@@ -79,14 +79,15 @@ impl KeyTemplate {
             anyhow::bail!("param count mismatch");
         }
 
-        let mut entries: Vec<ScVal> = vec![ScVal::Symbol(ScSymbol(self.symbol.as_str().try_into()?))];
-        
+        let mut entries: Vec<ScVal> =
+            vec![ScVal::Symbol(ScSymbol(self.symbol.as_str().try_into()?))];
+
         for param in params {
             let addr = ScAddress::from_str(param)
                 .map_err(|_| anyhow::anyhow!("invalid address strkey {param:?}"))?;
             entries.push(ScVal::Address(addr));
         }
-        
+
         Ok(ScVal::Vec(Some(ScVec(entries.try_into()?))))
     }
 }
@@ -95,9 +96,7 @@ impl KeyTemplate {
 fn extract_addresses(val: &serde_json::Value) -> Vec<String> {
     match val {
         serde_json::Value::String(s) if is_address(s) => vec![s.clone()],
-        serde_json::Value::Array(arr) => {
-            arr.iter().flat_map(extract_addresses).collect()
-        }
+        serde_json::Value::Array(arr) => arr.iter().flat_map(extract_addresses).collect(),
         _ => Vec::new(),
     }
 }
@@ -151,9 +150,7 @@ pub fn parse_durability(s: &str) -> anyhow::Result<ContractDataDurability> {
     match s.trim().to_ascii_lowercase().as_str() {
         "persistent" => Ok(ContractDataDurability::Persistent),
         "temporary" => Ok(ContractDataDurability::Temporary),
-        _ => anyhow::bail!(
-            "invalid durability {s:?}: expected \"persistent\" or \"temporary\""
-        ),
+        _ => anyhow::bail!("invalid durability {s:?}: expected \"persistent\" or \"temporary\""),
     }
 }
 
@@ -183,7 +180,7 @@ mod tests {
             contract_id: "C1".into(),
             ledger: 1,
             ledger_closed_at: chrono::Utc::now(),
-            event_type: "contract".into(),
+            event_type: lumenqraph_core::EventType::Contract,
             topics: vec![],
             decoded_topics: topics,
             event_name: name.map(String::from),

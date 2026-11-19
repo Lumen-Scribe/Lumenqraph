@@ -1,11 +1,16 @@
 //! OpenAPI 3.1 specification for the Lumenqraph REST API.
+
+// The documented handlers below exist to feed `#[utoipa::path]` and
+// `#[derive(OpenApi)]`, which reference them through generated items that
+// rustc does not count as uses.
+#![allow(dead_code)]
 //!
 //! This module generates and serves a machine-readable OpenAPI specification
 //! that describes all REST endpoints, parameters, and response schemas.
 
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, Modify, ToSchema};
 use utoipa::openapi::{InfoBuilder, OpenApiBuilder as UtoipaOpenApiBuilder};
+use utoipa::{OpenApi, ToSchema};
 
 /// Core data types used in OpenAPI responses
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
@@ -168,9 +173,7 @@ impl OpenApiBuilder {
             ))
             .build();
 
-        let mut api = UtoipaOpenApiBuilder::default()
-            .info(info)
-            .build();
+        let api = UtoipaOpenApiBuilder::default().info(info).build();
 
         // TODO: Add route-specific OpenAPI documentation via Modify trait
         // The routes will be documented using utoipa attributes on handler functions

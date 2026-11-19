@@ -56,12 +56,16 @@ const MAX_ENTRIES: usize = 256;
 /// callers that need the original bytes. `parsed` is `None` when the section
 /// doesn't parse — the read layer tolerates that, the diff endpoints don't.
 pub struct CachedSpec {
+    #[allow(dead_code)] // raw bytes for callers that re-parse; not read yet
     pub section: Vec<u8>,
     pub parsed: Option<ContractSpec>,
     /// Hash of the WASM this interface was parsed from. Part of the `/call`
     /// result-cache key, so an upgrade invalidates cached results.
     pub wasm_hash: String,
 }
+
+/// One `current` cache entry: (wasm_hash, fetched_at, parsed spec).
+type CurrentEntry = (String, DateTime<Utc>, Arc<CachedSpec>);
 
 #[derive(Default)]
 pub struct SpecCache {
@@ -70,7 +74,7 @@ pub struct SpecCache {
     /// signal (a real upgrade); `fetched_at` is compared alongside it so a write
     /// to the row is never missed even in the cases hash equality alone wouldn't
     /// cover.
-    current: RwLock<HashMap<String, (String, DateTime<Utc>, Arc<CachedSpec>)>>,
+    current: RwLock<HashMap<String, CurrentEntry>>,
     /// (contract_id, version) -> entry. Immutable once observed.
     versions: RwLock<HashMap<(String, i32), Arc<CachedSpec>>>,
 }
@@ -103,18 +107,17 @@ impl SpecCache {
             Some((hash, fetched_at)) => (hash, fetched_at),
             None => {
                 // Not in contract_specs; check if it's a SAC (has events but no WASM)
-                let has_events: Option<(i64,)> = sqlx::query_as(
-                    "SELECT 1 FROM events WHERE contract_id = $1 LIMIT 1"
-                )
-                .bind(contract_id)
-                .fetch_optional(pool)
-                .await?;
+                let has_events: Option<(i64,)> =
+                    sqlx::query_as("SELECT 1 FROM events WHERE contract_id = $1 LIMIT 1")
+                        .bind(contract_id)
+                        .fetch_optional(pool)
+                        .await?;
                 if has_events.is_some() {
                     return Err(ApiError::sac_not_supported(
                         "Stellar Asset Contract: no on-chain WASM interface. \
                          SACs publish only standard SEP-41 token conventions; \
                          use token metadata endpoints instead of /call or /simulate. \
-                         Retrying will not help."
+                         Retrying will not help.",
                     ));
                 }
                 return Err(not_indexed());
@@ -125,7 +128,8 @@ impl SpecCache {
         // compared alongside it so any write to this row — including one made
         // by a code path this cache doesn't specifically know about — is never
         // missed, with no reliance on a TTL.
-        if let Some((hash, cached_fetched_at, spec)) = self.current.read().unwrap().get(contract_id) {
+        if let Some((hash, cached_fetched_at, spec)) = self.current.read().unwrap().get(contract_id)
+        {
             if *hash == wasm_hash && *cached_fetched_at >= fetched_at {
                 return Ok(Arc::clone(spec));
             }
@@ -140,18 +144,23 @@ impl SpecCache {
         let hex_section = section
             .map(|r| r.0)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| ApiError::sac_not_supported(
-                "contract has no callable on-chain WASM interface (Stellar Asset Contract or \
+            .ok_or_else(|| {
+                ApiError::sac_not_supported(
+                    "contract has no callable on-chain WASM interface (Stellar Asset Contract or \
                  equivalent). Retrying will not help; use token metadata endpoints instead of \
-                 /call or /simulate."
-            ))?;
+                 /call or /simulate.",
+                )
+            })?;
         let entry = Arc::new(parse(&hex_section, &wasm_hash)?);
 
         let mut map = self.current.write().unwrap();
         if map.len() >= MAX_ENTRIES {
             map.clear();
         }
-        map.insert(contract_id.to_string(), (wasm_hash, fetched_at, Arc::clone(&entry)));
+        map.insert(
+            contract_id.to_string(),
+            (wasm_hash, fetched_at, Arc::clone(&entry)),
+        );
         Ok(entry)
     }
 

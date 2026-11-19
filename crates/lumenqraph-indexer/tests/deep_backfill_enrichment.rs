@@ -196,13 +196,12 @@ mod deep_backfill_enrichment_tests {
         cleanup_test_data(&pool, contract_id).await;
 
         // Test case: no persisted spec (would need RPC with --rpc flag)
-        let existing: Option<(String,)> = sqlx::query_as(
-            "SELECT contract_id FROM contract_specs WHERE contract_id = $1",
-        )
-        .bind(contract_id)
-        .fetch_optional(&pool)
-        .await
-        .expect("Failed to check spec");
+        let existing: Option<(String,)> =
+            sqlx::query_as("SELECT contract_id FROM contract_specs WHERE contract_id = $1")
+                .bind(contract_id)
+                .fetch_optional(&pool)
+                .await
+                .expect("Failed to check spec");
 
         assert!(existing.is_none(), "Contract should have no persisted spec");
 
@@ -286,13 +285,12 @@ mod deep_backfill_enrichment_tests {
         cleanup_test_data(&pool, contract_id).await;
 
         // Verify no spec exists
-        let spec_exists: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM contract_specs WHERE contract_id = $1",
-        )
-        .bind(contract_id)
-        .fetch_one(&pool)
-        .await
-        .expect("Failed to count specs");
+        let spec_exists: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM contract_specs WHERE contract_id = $1")
+                .bind(contract_id)
+                .fetch_one(&pool)
+                .await
+                .expect("Failed to count specs");
 
         assert_eq!(spec_exists.0, 0);
 

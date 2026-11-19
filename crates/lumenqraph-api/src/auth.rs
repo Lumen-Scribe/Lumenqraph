@@ -10,6 +10,7 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tokio::sync::mpsc;
@@ -75,7 +76,8 @@ pub struct IpConfig {
 /// Parse `TRUSTED_PROXY_HOPS`. Unset or unparseable values mean zero hops, so
 /// a directly exposed API never trusts a client-supplied `X-Forwarded-For`.
 fn parse_trusted_proxy_hops(raw: Option<&str>) -> usize {
-    raw.and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0)
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
 }
 
 impl IpConfig {
@@ -86,7 +88,11 @@ impl IpConfig {
 
         let platform_header = std::env::var("CLIENT_IP_HEADER").ok().and_then(|v| {
             let v = v.trim().to_lowercase();
-            if v.is_empty() { None } else { Some(v) }
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
         });
 
         tracing::info!(
@@ -147,7 +153,11 @@ fn parse_client_ip(raw: &str) -> Option<String> {
 /// A candidate from either header is used only if it parses as an IP address.
 /// Otherwise the next source is tried, so arbitrary strings never become
 /// rate-limit, concurrency or log keys.
-pub fn extract_client_ip(headers: &HeaderMap, socket_addr: Option<SocketAddr>, cfg: &IpConfig) -> String {
+pub fn extract_client_ip(
+    headers: &HeaderMap,
+    socket_addr: Option<SocketAddr>,
+    cfg: &IpConfig,
+) -> String {
     // 1. Platform-specific single-value header (Fly, Cloudflare, nginx real_ip…).
     if let Some(ref header_name) = cfg.platform_header {
         if let Some(ip) = headers
@@ -210,7 +220,11 @@ async fn authenticate(
     required: &str,
 ) -> Result<(String, i32, bool, Option<String>), ApiError> {
     let resolved = resolve_key(state, key, route, method).await?;
-    if !resolved.scopes.iter().any(|s| s == required || s == SCOPE_ADMIN) {
+    if !resolved
+        .scopes
+        .iter()
+        .any(|s| s == required || s == SCOPE_ADMIN)
+    {
         return Err(ApiError::insufficient_scope(required));
     }
     Ok((
@@ -236,22 +250,37 @@ async fn resolve_key(
     // --- Cache look-up (#430) ---
     if let Some(cached) = state.key_cache.get(&hash) {
         return match cached {
-            CachedKey::Valid { rate_limit_per_min, scopes, expires_at } => {
-                accept_key(state, hash, rate_limit_per_min, scopes, expires_at, route, method).await
+            CachedKey::Valid {
+                rate_limit_per_min,
+                scopes,
+                expires_at,
+            } => {
+                accept_key(
+                    state,
+                    hash,
+                    rate_limit_per_min,
+                    scopes,
+                    expires_at,
+                    route,
+                    method,
+                )
+                .await
             }
             CachedKey::Revoked => {
-                log_audit_event(&state, &hash, route, method, 401);
+                log_audit_event(state, &hash, route, method, 401);
                 Err(ApiError::unauthorized("API key revoked"))
             }
             CachedKey::NotFound => {
-                log_audit_event(&state, &hash, route, method, 401);
+                log_audit_event(state, &hash, route, method, 401);
                 Err(ApiError::unauthorized("invalid API key"))
             }
         };
     }
 
     // --- DB look-up on cache miss (#430) ---
-    let row: Option<(bool, i32, Vec<String>, Option<DateTime<Utc>>)> = sqlx::query_as(
+    // (revoked, rate_limit_per_min, scopes, expires_at)
+    type KeyRow = (bool, i32, Vec<String>, Option<DateTime<Utc>>);
+    let row: Option<KeyRow> = sqlx::query_as(
         "SELECT revoked, rate_limit_per_min, scopes, expires_at FROM api_keys WHERE key_hash = $1",
     )
     .bind(&hash)
@@ -260,17 +289,19 @@ async fn resolve_key(
 
     match row {
         Some((false, limit, scopes, expires_at)) => {
-            state.key_cache.insert_valid(&hash, limit, scopes.clone(), expires_at);
+            state
+                .key_cache
+                .insert_valid(&hash, limit, scopes.clone(), expires_at);
             accept_key(state, hash, limit, scopes, expires_at, route, method).await
         }
         Some((true, _, _, _)) => {
             state.key_cache.insert_revoked(&hash);
-            log_audit_event(&state, &hash, route, method, 401);
+            log_audit_event(state, &hash, route, method, 401);
             Err(ApiError::unauthorized("API key revoked"))
         }
         None => {
             state.key_cache.insert_not_found(&hash);
-            log_audit_event(&state, &hash, route, method, 401);
+            log_audit_event(state, &hash, route, method, 401);
             Err(ApiError::unauthorized("invalid API key"))
         }
     }
@@ -287,7 +318,7 @@ async fn accept_key(
     method: &str,
 ) -> Result<ResolvedKey, ApiError> {
     if expires_at.is_some_and(|at| at <= Utc::now()) {
-        log_audit_event(&state, &hash, route, method, 401);
+        log_audit_event(state, &hash, route, method, 401);
         return Err(ApiError::key_expired());
     }
     if state.key_cache.should_touch_last_used(&hash) {
@@ -398,7 +429,11 @@ async fn flush_audit_batch(pool: &PgPool, batch: &mut Vec<AuditEvent>) {
 ///
 /// This is the single shared helper for all three middlewares (#429), so the
 /// header set is consistent across every rate-limited path.
-fn rate_limited_response(limit: i32, retry_after_secs: Option<u64>, tokens_remaining: i32) -> Response {
+fn rate_limited_response(
+    limit: i32,
+    retry_after_secs: Option<u64>,
+    tokens_remaining: i32,
+) -> Response {
     let mut response = (
         StatusCode::TOO_MANY_REQUESTS,
         crate::error::rate_limit_error(),
@@ -452,7 +487,12 @@ pub async fn auth_and_rate_limit(
                 return Err(ApiError::unauthorized("missing API key"));
             }
             let client_ip = extract_client_ip(&headers, Some(socket_addr), &state.ip_config);
-            (format!("anon:{client_ip}"), state.anon_rate_limit, false, None)
+            (
+                format!("anon:{client_ip}"),
+                state.anon_rate_limit,
+                false,
+                None,
+            )
         }
     };
 
@@ -462,7 +502,11 @@ pub async fn auth_and_rate_limit(
             let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
             log_audit_event(&state, hash_prefix, &route, &method, 429);
         }
-        return Ok(rate_limited_response(limit, rl_status.retry_after_secs, rl_status.tokens_remaining));
+        return Ok(rate_limited_response(
+            limit,
+            rl_status.retry_after_secs,
+            rl_status.tokens_remaining,
+        ));
     }
 
     let response = next.run(req).await;
@@ -507,7 +551,12 @@ pub async fn rpc_auth_and_rate_limit(
             }
             // #429: key per-IP so each client has an independent budget.
             let client_ip = extract_client_ip(&headers, Some(socket_addr), &state.ip_config);
-            (format!("anon:{client_ip}"), state.rpc_anon_rate_limit, false, None)
+            (
+                format!("anon:{client_ip}"),
+                state.rpc_anon_rate_limit,
+                false,
+                None,
+            )
         }
     };
 
@@ -519,7 +568,11 @@ pub async fn rpc_auth_and_rate_limit(
         }
         // #429: use the shared helper so RPC-route 429s also carry Retry-After
         // and X-RateLimit-* headers.
-        return Ok(rate_limited_response(limit, rl_status.retry_after_secs, rl_status.tokens_remaining));
+        return Ok(rate_limited_response(
+            limit,
+            rl_status.retry_after_secs,
+            rl_status.tokens_remaining,
+        ));
     }
 
     let response = next.run(req).await;
@@ -559,7 +612,12 @@ pub async fn webhook_auth_and_rate_limit(
                 return Err(ApiError::unauthorized("missing API key"));
             }
             let client_ip = extract_client_ip(&headers, Some(socket_addr), &state.ip_config);
-            (format!("anon:{client_ip}"), state.webhook_anon_rate_limit, false, None)
+            (
+                format!("anon:{client_ip}"),
+                state.anon_rate_limit,
+                false,
+                None,
+            )
         }
     };
 
@@ -569,7 +627,11 @@ pub async fn webhook_auth_and_rate_limit(
             let hash_prefix = identity.split(':').nth(1).unwrap_or("unknown");
             log_audit_event(&state, hash_prefix, &route, &method, 429);
         }
-        return Ok(rate_limited_response(limit, rl_status.retry_after_secs, rl_status.tokens_remaining));
+        return Ok(rate_limited_response(
+            limit,
+            rl_status.retry_after_secs,
+            rl_status.tokens_remaining,
+        ));
     }
 
     // Inject the authenticated caller's key hash so create_webhook can set
@@ -619,24 +681,37 @@ pub async fn webhook_manage_auth_and_rate_limit(
     // Webhook management routes ALWAYS require a valid API key.
     // We intentionally do not check `state.require_auth` here — anonymous
     // callers cannot list or modify webhook subscriptions on any deployment.
-    let key = extract_key(&headers).ok_or_else(|| ApiError::unauthorized(
-        "webhook management routes require an API key regardless of REQUIRE_API_KEY"
-    ))?;
+    let key = extract_key(&headers).ok_or_else(|| {
+        ApiError::unauthorized(
+            "webhook management routes require an API key regardless of REQUIRE_API_KEY",
+        )
+    })?;
 
     // Resolve through the same path as every other route group, so the key
     // cache (#430) and revocation handling stay in one place (#560).
-    let required = if method == "GET" { SCOPE_READ } else { SCOPE_WEBHOOKS_WRITE };
+    let required = if method == "GET" {
+        SCOPE_READ
+    } else {
+        SCOPE_WEBHOOKS_WRITE
+    };
     let (identity, limit, _, _) = authenticate(&state, &key, &route, &method, required).await?;
     let hash = identity.trim_start_matches("key:").to_string();
 
     let identity = format!("key:{hash}");
     let rl_status = state.limiter.check(&identity, limit).await;
     if !rl_status.allowed {
-        let mut response = (StatusCode::TOO_MANY_REQUESTS, crate::error::rate_limit_error()).into_response();
+        let mut response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            crate::error::rate_limit_error(),
+        )
+            .into_response();
         if let Some(retry_after) = rl_status.retry_after_secs {
             response.headers_mut().insert(
                 "Retry-After",
-                retry_after.to_string().parse().unwrap_or_else(|_| "60".parse().unwrap()),
+                retry_after
+                    .to_string()
+                    .parse()
+                    .unwrap_or_else(|_| "60".parse().unwrap()),
             );
         }
         log_audit_event(&state, &hash, &route, &method, 429);
@@ -709,7 +784,11 @@ pub async fn proxy_rate_limit(
     let client_ip = extract_client_ip(&headers, Some(socket_addr), &state.ip_config);
     let rl_status = state
         .proxy_limiter
-        .check(&format!("proxy:{client_ip}"), state.config.proxy.rate_limit_per_min);
+        .check(
+            &format!("proxy:{client_ip}"),
+            state.config.proxy.rate_limit_per_min,
+        )
+        .await;
     if !rl_status.allowed {
         return Err(ApiError::too_many_requests(rl_status.retry_after_secs));
     }
@@ -842,7 +921,10 @@ mod tests {
         assert_eq!(parse_client_ip("1.2.3.4"), Some("1.2.3.4".into()));
         assert_eq!(parse_client_ip(" 1.2.3.4:5555 "), Some("1.2.3.4".into()));
         assert_eq!(parse_client_ip("2001:db8::1"), Some("2001:db8::1".into()));
-        assert_eq!(parse_client_ip("[2001:db8::1]:443"), Some("2001:db8::1".into()));
+        assert_eq!(
+            parse_client_ip("[2001:db8::1]:443"),
+            Some("2001:db8::1".into())
+        );
         assert_eq!(parse_client_ip("[2001:db8::1]"), Some("2001:db8::1".into()));
     }
 
@@ -903,13 +985,16 @@ mod tests {
         );
     }
 
-
     #[test]
     fn spoofed_leftmost_entries_do_not_change_bucket() {
         // An attacker sends many different leftmost entries.
         // With hops=1, the rightmost (proxy-appended) entry is always used.
         let cfg = cfg(1);
-        let addrs = ["10.0.0.1, 5.6.7.8", "10.0.0.2, 5.6.7.8", "10.0.0.3, 5.6.7.8"];
+        let addrs = [
+            "10.0.0.1, 5.6.7.8",
+            "10.0.0.2, 5.6.7.8",
+            "10.0.0.3, 5.6.7.8",
+        ];
         for xff in addrs {
             let h = make_headers("x-forwarded-for", xff);
             assert_eq!(
@@ -920,7 +1005,6 @@ mod tests {
         }
     }
 }
-
 
 // ---- HTTP-level integration tests ----------------------------------------
 //
@@ -955,8 +1039,7 @@ pub(crate) mod integration_tests {
     // ---- test fixtures ----
 
     pub(crate) async fn db_pool() -> PgPool {
-        let url =
-            std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL must be set");
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL must be set");
         let pool = PgPoolOptions::new()
             .max_connections(2)
             .connect(&url)
@@ -976,9 +1059,9 @@ pub(crate) mod integration_tests {
     }
 
     pub(crate) fn make_state(pool: PgPool, require_auth: bool, anon_rate: i32) -> AppState {
+        use crate::call_cache::CallCache;
         use crate::concurrency_limit::ConcurrencyLimiter;
         use crate::metrics_middleware::MetricsCollector;
-        use crate::call_cache::CallCache;
         use crate::read_cost_limit::ReadCostLimitConfig;
 
         AppState {
@@ -1012,8 +1095,15 @@ pub(crate) mod integration_tests {
             proxy_limiter: Arc::new(RateLimiter::memory()),
             webhook_limiter: Arc::new(RateLimiter::memory()),
             config: Arc::new(crate::config::ApiConfig::test_default()),
-            key_cache: Arc::new(KeyCache::new(256, std::time::Duration::from_secs(30), std::time::Duration::from_secs(5))),
-            ip_config: IpConfig { trusted_proxy_hops: 0, platform_header: None },
+            key_cache: Arc::new(KeyCache::new(
+                256,
+                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(5),
+            )),
+            ip_config: IpConfig {
+                trusted_proxy_hops: 0,
+                platform_header: None,
+            },
             audit_tx: None,
             audit_dropped: Arc::new(AtomicU64::new(0)),
             shutdown: tokio_util::sync::CancellationToken::new(),
@@ -1025,8 +1115,7 @@ pub(crate) mod integration_tests {
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("local_addr");
-        let app = routes::router(state)
-            .into_make_service_with_connect_info::<SocketAddr>();
+        let app = routes::router(state).into_make_service_with_connect_info::<SocketAddr>();
         tokio::spawn(async move {
             axum::serve(listener, app).await.ok();
         });
@@ -1252,7 +1341,11 @@ pub(crate) mod integration_tests {
         let base = spawn_server(make_state(pool, false, 1)).await;
         let client = reqwest::Client::new();
         // Exhaust the single token.
-        client.get(format!("{base}/contracts")).send().await.unwrap();
+        client
+            .get(format!("{base}/contracts"))
+            .send()
+            .await
+            .unwrap();
         let res = client
             .get(format!("{base}/contracts"))
             .send()
@@ -1328,7 +1421,11 @@ pub(crate) mod integration_tests {
         let base = spawn_server(make_state(pool, false, 1)).await;
         let client = reqwest::Client::new();
         // Exhaust the single token.
-        client.get(format!("{base}/contracts")).send().await.unwrap();
+        client
+            .get(format!("{base}/contracts"))
+            .send()
+            .await
+            .unwrap();
         let res = client
             .get(format!("{base}/contracts"))
             .send()

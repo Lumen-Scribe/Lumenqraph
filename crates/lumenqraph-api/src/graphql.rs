@@ -17,7 +17,7 @@ use sqlx::types::Json as SqlxJson;
 use sqlx::PgPool;
 
 use crate::config::GraphqlConfig;
-use crate::pagination::{self, decode_cursor};
+use crate::pagination::{self};
 
 pub type AppSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;
 
@@ -85,7 +85,7 @@ impl From<EventRow> for Event {
             contract_id: e.contract_id,
             ledger: e.ledger,
             ledger_closed_at: e.ledger_closed_at,
-            event_type: e.event_type,
+            event_type: e.event_type.as_str().to_string(),
             event_name: e.event_name,
             decoded_topics: GqlJson(e.decoded_topics.0),
             decoded_value: GqlJson(e.decoded_value.0),
@@ -146,10 +146,7 @@ impl Event {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("unknown")
                                 .to_string();
-                            let param_value = value
-                                .get("value")
-                                .cloned()
-                                .unwrap_or_else(|| Value::Null);
+                            let param_value = value.get("value").cloned().unwrap_or(Value::Null);
                             EnrichedParam {
                                 name: name.clone(),
                                 type_,
@@ -361,12 +358,11 @@ impl QueryRoot {
     ) -> Result<EventConnection> {
         let pool = ctx.data::<PgPool>()?;
         let limit = first.unwrap_or(20).clamp(1, 200) as i64;
-        let (after_ledger, after_id) = match pagination::decode_cursor(after.as_deref())
-            .map_err(async_graphql::Error::new)?
-        {
-            Some((l, id)) => (Some(l), Some(id)),
-            None => (None, None),
-        };
+        let (after_ledger, after_id) =
+            match pagination::decode_cursor(after.as_deref()).map_err(async_graphql::Error::new)? {
+                Some((l, id)) => (Some(l), Some(id)),
+                None => (None, None),
+            };
         // Fetch one extra row to determine hasNextPage.
         let rows: Vec<EventRow> = sqlx::query_as(
             "SELECT event_id, contract_id, ledger, ledger_closed_at, event_type,
@@ -397,21 +393,22 @@ impl QueryRoot {
         &self,
         ctx: &Context<'_>,
         contract_id: Option<String>,
-        #[graphql(desc = "Only transfers sent from this address (G… / C… strkey)")]
-        from: Option<String>,
-        #[graphql(desc = "Only transfers received by this address (G… / C… strkey)")]
-        to: Option<String>,
+        #[graphql(desc = "Only transfers sent from this address (G… / C… strkey)")] from: Option<
+            String,
+        >,
+        #[graphql(desc = "Only transfers received by this address (G… / C… strkey)")] to: Option<
+            String,
+        >,
         #[graphql(desc = "Page size (1-200, default 20)")] first: Option<i32>,
         after: Option<String>,
     ) -> Result<TransferConnection> {
         let pool = ctx.data::<PgPool>()?;
         let limit = first.unwrap_or(20).clamp(1, 200) as i64;
-        let (after_ledger, after_id) = match pagination::decode_cursor(after.as_deref())
-            .map_err(async_graphql::Error::new)?
-        {
-            Some((l, id)) => (Some(l), Some(id)),
-            None => (None, None),
-        };
+        let (after_ledger, after_id) =
+            match pagination::decode_cursor(after.as_deref()).map_err(async_graphql::Error::new)? {
+                Some((l, id)) => (Some(l), Some(id)),
+                None => (None, None),
+            };
         let rows: Vec<TokenTransfer> = sqlx::query_as(
             "SELECT event_id, contract_id, from_addr, to_addr, amount, ledger, ledger_closed_at
              FROM token_transfers
@@ -519,7 +516,9 @@ fn build_event_connection(mut rows: Vec<EventRow>, limit: i64) -> EventConnectio
     if has_next_page {
         rows.truncate(limit as usize);
     }
-    let end_cursor = rows.last().map(|e| pagination::encode_cursor(e.ledger, &e.event_id));
+    let end_cursor = rows
+        .last()
+        .map(|e| pagination::encode_cursor(e.ledger, &e.event_id));
     let edges = rows
         .into_iter()
         .map(|e| EventEdge {
@@ -541,7 +540,9 @@ fn build_transfer_connection(mut rows: Vec<TokenTransfer>, limit: i64) -> Transf
     if has_next_page {
         rows.truncate(limit as usize);
     }
-    let end_cursor = rows.last().map(|t| pagination::encode_cursor(t.ledger, &t.event_id));
+    let end_cursor = rows
+        .last()
+        .map(|t| pagination::encode_cursor(t.ledger, &t.event_id));
     let edges = rows
         .into_iter()
         .map(|t| TransferEdge {
@@ -561,6 +562,7 @@ fn build_transfer_connection(mut rows: Vec<TokenTransfer>, limit: i64) -> Transf
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pagination::decode_cursor;
     use base64::Engine as _;
 
     #[test]
@@ -578,12 +580,12 @@ mod tests {
     }
 
     #[test]
-    fn bad_cursor_decodes_to_none() {
-        assert_eq!(decode_cursor(None), None);
-        assert_eq!(decode_cursor(Some("!!!not-base64!!!")), None);
+    fn bad_cursor_is_rejected() {
+        assert_eq!(decode_cursor(None), Ok(None));
+        assert!(decode_cursor(Some("!!!not-base64!!!")).is_err());
         // Valid base64 but wrong shape (no `|` separator).
         let junk = base64::engine::general_purpose::STANDARD.encode("no-separator");
-        assert_eq!(decode_cursor(Some(&junk)), None);
+        assert!(decode_cursor(Some(&junk)).is_err());
     }
 
     #[test]

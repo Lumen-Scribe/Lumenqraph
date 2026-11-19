@@ -11,7 +11,7 @@ use axum::Json;
 use lumenqraph_core::AmmSwap;
 use serde::Deserialize;
 
-use crate::error::{ApiError, ApiResult};
+use crate::error::ApiResult;
 use crate::extract::ValidContractId;
 use crate::pagination::{LedgerCursor, Page, PageRequest};
 use crate::state::AppState;
@@ -70,5 +70,7 @@ pub async fn list_swaps(
     .fetch_all(&state.pool)
     .await?;
 
-    Ok(page.finish(rows, |r| LedgerCursor::new(r.ledger, &r.event_id)))
+    Ok(Json(page.finish(rows, |r| {
+        LedgerCursor::new(r.ledger, &r.event_id)
+    })))
 }

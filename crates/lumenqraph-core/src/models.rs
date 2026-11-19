@@ -19,6 +19,30 @@ pub enum EventType {
     Diagnostic,
 }
 
+impl EventType {
+    /// The lowercase value stored in `events.event_type`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventType::Contract => "contract",
+            EventType::System => "system",
+            EventType::Diagnostic => "diagnostic",
+        }
+    }
+}
+
+impl std::str::FromStr for EventType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "contract" => Ok(EventType::Contract),
+            "system" => Ok(EventType::System),
+            "diagnostic" => Ok(EventType::Diagnostic),
+            other => Err(format!("unknown event type {other:?}")),
+        }
+    }
+}
+
 /// The kind of a materialized NFT event, mirroring the `nft_events.event_kind`
 /// CHECK constraint ("mint" | "transfer" | "burn").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]

@@ -7,7 +7,6 @@
 use axum::extract::{Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::error::{ApiError, ApiResult};
 use crate::extract::ValidContractId;
@@ -120,7 +119,11 @@ fn validate_contract_id(contract_id: &str) -> Result<(), ApiError> {
 }
 
 /// Number of buckets a truncation granularity would produce over a range.
-fn trunc_bucket_count(trunc: &str, from: chrono::DateTime<chrono::Utc>, to: chrono::DateTime<chrono::Utc>) -> i64 {
+fn trunc_bucket_count(
+    trunc: &str,
+    from: chrono::DateTime<chrono::Utc>,
+    to: chrono::DateTime<chrono::Utc>,
+) -> i64 {
     let secs = (to - from).num_seconds().max(0);
     let unit_secs = match trunc {
         "minute" => 60,
@@ -210,7 +213,9 @@ pub async fn contract_stats(
     // Validate ledger range consistency
     if let (Some(from_ledger), Some(to_ledger)) = (q.from_ledger, q.to_ledger) {
         if from_ledger > to_ledger {
-            return Err(ApiError::bad_request("'from_ledger' must be <= 'to_ledger'"));
+            return Err(ApiError::bad_request(
+                "'from_ledger' must be <= 'to_ledger'",
+            ));
         }
     }
 
@@ -264,25 +269,28 @@ pub async fn contract_stats(
         Granularity::Trunc(trunc) => {
             if let Some(ref group_by) = q.group_by {
                 if group_by == "event_name" {
-                    query_stats_by_trunc_grouped(&state, &contract_id, trunc, from_datetime, to_datetime)
-                        .await?
+                    query_stats_by_trunc_grouped(
+                        &state,
+                        &contract_id,
+                        trunc,
+                        from_datetime,
+                        to_datetime,
+                    )
+                    .await?
                 } else {
-                    query_stats_by_trunc(&state, &contract_id, trunc, from_datetime, to_datetime).await?
+                    query_stats_by_trunc(&state, &contract_id, trunc, from_datetime, to_datetime)
+                        .await?
                 }
             } else {
-                query_stats_by_trunc(&state, &contract_id, trunc, from_datetime, to_datetime).await?
+                query_stats_by_trunc(&state, &contract_id, trunc, from_datetime, to_datetime)
+                    .await?
             }
         }
         Granularity::Ledger => {
             if let Some(ref group_by) = q.group_by {
                 if group_by == "event_name" {
-                    query_stats_by_ledger_grouped(
-                        &state,
-                        &contract_id,
-                        from_ledger,
-                        to_ledger,
-                    )
-                    .await?
+                    query_stats_by_ledger_grouped(&state, &contract_id, from_ledger, to_ledger)
+                        .await?
                 } else {
                     query_stats_by_ledger(&state, &contract_id, from_ledger, to_ledger).await?
                 }
@@ -356,11 +364,15 @@ async fn query_stats_by_trunc_grouped(
         .fetch_all(&state.pool)
         .await?;
 
-    let mut result: std::collections::HashMap<String, (i64, std::collections::HashMap<String, i64>)> =
-        std::collections::HashMap::new();
+    let mut result: std::collections::HashMap<
+        String,
+        (i64, std::collections::HashMap<String, i64>),
+    > = std::collections::HashMap::new();
 
     for (bucket, event_name, count) in rows {
-        let entry = result.entry(bucket).or_insert((0, std::collections::HashMap::new()));
+        let entry = result
+            .entry(bucket)
+            .or_insert((0, std::collections::HashMap::new()));
         entry.0 += count;
         if let Some(name) = event_name {
             *entry.1.entry(name).or_insert(0) += count;
@@ -433,8 +445,10 @@ async fn query_stats_by_ledger_grouped(
     .fetch_all(&state.pool)
     .await?;
 
-    let mut result: std::collections::HashMap<String, (i64, std::collections::HashMap<String, i64>)> =
-        std::collections::HashMap::new();
+    let mut result: std::collections::HashMap<
+        String,
+        (i64, std::collections::HashMap<String, i64>),
+    > = std::collections::HashMap::new();
 
     for (ledger, event_name, count) in rows {
         let bucket_key = ledger.to_string();

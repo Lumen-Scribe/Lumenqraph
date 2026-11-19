@@ -231,8 +231,7 @@ impl GalexieSource {
 
     /// Parse one line from the export file into zero or more [`HistoricalEvent`]s.
     pub fn parse_line(line: &str) -> anyhow::Result<Vec<HistoricalEvent>> {
-        let json: serde_json::Value =
-            serde_json::from_str(line).context("invalid JSON line")?;
+        let json: serde_json::Value = serde_json::from_str(line).context("invalid JSON line")?;
 
         // Is this a per-ledger envelope?
         if json.get("events").is_some() {
@@ -451,11 +450,7 @@ pub async fn run(
         if batch.len() >= batch_size {
             let n = flush_batch(&pool, &mut batch).await?;
             total_inserted += n;
-            debug!(
-                inserted = n,
-                lines_processed,
-                "flushed batch"
-            );
+            debug!(inserted = n, lines_processed, "flushed batch");
         }
     }
 
@@ -466,9 +461,7 @@ pub async fn run(
 
     info!(
         total_inserted,
-        total_skipped,
-        lines_processed,
-        "deep backfill complete"
+        total_skipped, lines_processed, "deep backfill complete"
     );
     Ok(())
 }
@@ -510,7 +503,12 @@ fn historical_to_new_event(
         contract_id: ev.contract_id,
         ledger: ev.ledger,
         ledger_closed_at: ev.ledger_closed_at,
-        event_type: ev.event_type,
+        // Unknown values fall back to `contract`, the same default used when the
+        // export omits the field.
+        event_type: ev
+            .event_type
+            .parse()
+            .unwrap_or(lumenqraph_core::EventType::Contract),
         topics: ev.topics,
         decoded_topics,
         event_name,

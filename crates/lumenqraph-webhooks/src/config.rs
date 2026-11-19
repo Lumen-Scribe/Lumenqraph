@@ -3,7 +3,9 @@
 use anyhow::Context;
 use std::time::Duration;
 
-pub fn redact_database_url(url: &str) -> String { lumenqraph_core::redact_url(url) }
+pub fn redact_database_url(url: &str) -> String {
+    lumenqraph_core::redact_url(url)
+}
 
 #[derive(Clone)]
 pub struct Config {
@@ -57,13 +59,14 @@ impl std::fmt::Debug for Config {
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        let encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY")
-            .map_err(|_| anyhow::anyhow!(
+        let encryption_key = std::env::var("WEBHOOK_ENCRYPTION_KEY").map_err(|_| {
+            anyhow::anyhow!(
                 "WEBHOOK_ENCRYPTION_KEY must be set \
                  (generate with: openssl rand -hex 32). \
                  The default test key provides no security and must not be \
                  used in production."
-            ))?;
+            )
+        })?;
         if encryption_key.trim().is_empty() {
             anyhow::bail!(
                 "WEBHOOK_ENCRYPTION_KEY is set but empty; \
@@ -84,7 +87,7 @@ impl Config {
             metrics_bind_addr: std::env::var("WEBHOOKS_METRICS_BIND_ADDR")
                 .ok()
                 .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| "127.0.0.1:9091".to_string()),
+                .unwrap_or_else(|| crate::metrics::DEFAULT_METRICS_BIND_ADDR.to_string()),
             db_max_connections: parse("DATABASE_MAX_CONNECTIONS", 5)?,
             db_min_connections: parse("DATABASE_MIN_CONNECTIONS", 1)?,
             db_acquire_timeout_secs: parse("DATABASE_ACQUIRE_TIMEOUT_SECS", 30)?,
@@ -96,6 +99,30 @@ impl Config {
                 crate::prune::DEFAULT_RETENTION_DAYS,
             )?,
         })
+    }
+
+    /// Config for unit and integration tests: short timeouts, a fixed test key.
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        Self {
+            database_url: String::new(),
+            tick_secs: 1,
+            batch_size: 100,
+            max_attempts: 5,
+            connect_timeout_secs: 2,
+            total_timeout_secs: 5,
+            max_concurrent_per_host: 4,
+            max_concurrent_deliveries: 8,
+            failure_threshold: 10,
+            metrics_bind_addr: "127.0.0.1:0".to_string(),
+            db_max_connections: 5,
+            db_min_connections: 0,
+            db_acquire_timeout_secs: 5,
+            db_idle_timeout_secs: 60,
+            db_connect_retries: 1,
+            encryption_key: "test-key".to_string(),
+            delivery_retention_days: 0,
+        }
     }
 
     pub fn connect_timeout(&self) -> Duration {
@@ -136,11 +163,15 @@ mod tests {
         let result = {
             // Temporarily remove the key from this process's env if it's set.
             let original = std::env::var("WEBHOOK_ENCRYPTION_KEY").ok();
-            unsafe { std::env::remove_var("WEBHOOK_ENCRYPTION_KEY"); }
+            unsafe {
+                std::env::remove_var("WEBHOOK_ENCRYPTION_KEY");
+            }
             let r = Config::from_env();
             // Restore.
             if let Some(val) = original {
-                unsafe { std::env::set_var("WEBHOOK_ENCRYPTION_KEY", val); }
+                unsafe {
+                    std::env::set_var("WEBHOOK_ENCRYPTION_KEY", val);
+                }
             }
             r
         };

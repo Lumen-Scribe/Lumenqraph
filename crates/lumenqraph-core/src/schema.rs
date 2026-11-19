@@ -65,11 +65,10 @@ pub async fn check(pool: &PgPool) -> Result<SchemaStatus, SchemaError> {
         return Err(SchemaError::Uninitialized);
     }
 
-    let applied: Vec<(i64, bool, Vec<u8>)> = sqlx::query_as(
-        "SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version",
-    )
-    .fetch_all(pool)
-    .await?;
+    let applied: Vec<(i64, bool, Vec<u8>)> =
+        sqlx::query_as("SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(pool)
+            .await?;
 
     if let Some((version, _, _)) = applied.iter().find(|(_, success, _)| !success) {
         return Err(SchemaError::Dirty { version: *version });

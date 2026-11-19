@@ -28,6 +28,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::{
@@ -64,6 +65,9 @@ where
         _ => Ok(default),
     }
 }
+
+/// Client key for stdio, which has one client and no session header.
+const STDIO_CLIENT_KEY: &str = "stdio";
 
 fn select_rpc_url(
     configured: Option<&str>,
@@ -153,14 +157,50 @@ impl State {
     }
 }
 
+/// Version, commit and build time shown by `--version` (clap prints the name).
+fn version_string() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        format!(
+            "{}\ncommit: {}\nbuilt: {}",
+            env!("CARGO_PKG_VERSION"),
+            option_env!("LUMENQRAPH_GIT_SHA").unwrap_or("unknown"),
+            option_env!("LUMENQRAPH_BUILD_TIME").unwrap_or("unknown"),
+        )
+    })
+}
+
+/// With no arguments the server speaks MCP over stdio, which is how clients
+/// launch it. The CLI is parsed first so `--help` and `--version` answer
+/// without touching the database or stdin (#651).
+#[derive(Parser)]
+#[command(
+    name = "lumenqraph-mcp",
+    about = "Lumenqraph MCP server: typed, self-describing Soroban contract access for AI agents over stdio"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Probe the /healthz endpoint of the streamable-HTTP transport and exit 0
+    /// or 1 (#469). Requires MCP_HTTP_BIND; a stdio server has no listener.
+    Healthcheck,
+}
+
+fn parse_cli() -> Cli {
+    let matches = Cli::command().version(version_string()).get_matches();
+    Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = parse_cli();
     let _ = dotenvy::dotenv();
 
-    // healthcheck: probe /healthz of the streamable-HTTP transport and exit
-    // 0/1 (#469). Only meaningful when MCP_HTTP_BIND is set; a stdio server
-    // has no listener to probe.
-    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+    if let Some(Command::Healthcheck) = cli.command {
         match std::env::var("MCP_HTTP_BIND") {
             Ok(bind) => lumenqraph_core::healthcheck::run_and_exit(&bind, "/healthz"),
             Err(_) => {
@@ -203,20 +243,39 @@ async fn main() -> anyhow::Result<()> {
 
     // Validate CONTRACT_IDS at startup so a misconfigured address is caught
     // immediately rather than silently ignored.
-    lumenqraph_core::parse_contract_ids(
-        &std::env::var("CONTRACT_IDS").unwrap_or_default(),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    lumenqraph_core::parse_contract_ids(&std::env::var("CONTRACT_IDS").unwrap_or_default())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let db = lumenqraph_core::db::DbConfig {
-        max_connections: db_setting("MCP_DATABASE_MAX_CONNECTIONS", "DATABASE_MAX_CONNECTIONS", 5u32)?,
-        min_connections: db_setting("MCP_DATABASE_MIN_CONNECTIONS", "DATABASE_MIN_CONNECTIONS", 0u32)?,
-        acquire_timeout_secs: db_setting("MCP_DATABASE_ACQUIRE_TIMEOUT_SECS", "DATABASE_ACQUIRE_TIMEOUT_SECS", 30u64)?,
-        idle_timeout_secs: db_setting("MCP_DATABASE_IDLE_TIMEOUT_SECS", "DATABASE_IDLE_TIMEOUT_SECS", 600u64)?,
-        connect_retries: db_setting("MCP_DATABASE_CONNECT_RETRIES", "DATABASE_CONNECT_RETRIES", 30u32)?,
+        max_connections: db_setting(
+            "MCP_DATABASE_MAX_CONNECTIONS",
+            "DATABASE_MAX_CONNECTIONS",
+            5u32,
+        )?,
+        min_connections: db_setting(
+            "MCP_DATABASE_MIN_CONNECTIONS",
+            "DATABASE_MIN_CONNECTIONS",
+            0u32,
+        )?,
+        acquire_timeout_secs: db_setting(
+            "MCP_DATABASE_ACQUIRE_TIMEOUT_SECS",
+            "DATABASE_ACQUIRE_TIMEOUT_SECS",
+            30u64,
+        )?,
+        idle_timeout_secs: db_setting(
+            "MCP_DATABASE_IDLE_TIMEOUT_SECS",
+            "DATABASE_IDLE_TIMEOUT_SECS",
+            600u64,
+        )?,
+        connect_retries: db_setting(
+            "MCP_DATABASE_CONNECT_RETRIES",
+            "DATABASE_CONNECT_RETRIES",
+            30u32,
+        )?,
     };
     let pool = lumenqraph_core::db::connect_with_retry(&database_url, &db).await?;
 
+    let rpc_url = resolve_rpc_url(&pool, std::env::var("RPC_URL").ok()).await?;
     let state = State {
         pool,
         rpc: RpcClient::new(rpc_url, rpc_timeout_secs),
@@ -389,7 +448,9 @@ async fn origin_guard(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if let Err(reason) = http_config.validate_origin(headers.get("origin").and_then(|v| v.to_str().ok())) {
+    if let Err(reason) =
+        http_config.validate_origin(headers.get("origin").and_then(|v| v.to_str().ok()))
+    {
         warn!(reason = %reason, "rejecting MCP request: Origin validation failed");
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -420,10 +481,7 @@ async fn handle_get_mcp() -> Response {
 /// `DELETE /mcp` — tear down an MCP session. Per spec, the server MAY respond
 /// with 405; we honour it so clients can clean up. Responds 404 if the session
 /// id is unknown, 200 if it was dropped, and 400 if the header is missing.
-async fn handle_delete_mcp(
-    AxumState(state): AxumState<State>,
-    headers: HeaderMap,
-) -> Response {
+async fn handle_delete_mcp(AxumState(state): AxumState<State>, headers: HeaderMap) -> Response {
     let Some(sessions) = &state.sessions else {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     };
@@ -433,16 +491,9 @@ async fn handle_delete_mcp(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "Mcp-Session-Id header required",
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, "Mcp-Session-Id header required").into_response();
     };
-    let dropped = sessions
-        .lock()
-        .expect("sessions mutex poisoned")
-        .remove(id);
+    let dropped = sessions.lock().expect("sessions mutex poisoned").remove(id);
     if dropped {
         StatusCode::OK.into_response()
     } else {
@@ -482,7 +533,7 @@ async fn handle_http_request(
         .and_then(|v| v.to_str().ok())
         .map(str::trim);
 
-    let authenticated = state.auth_token.as_ref().map_or(true, |token| {
+    let authenticated = state.auth_token.as_ref().is_none_or(|token| {
         msg.get("authorization")
             .and_then(Value::as_str)
             .map(|value| value.strip_prefix("Bearer ").unwrap_or(value).trim() == token)
@@ -538,7 +589,14 @@ async fn handle_http_request(
         }
     }
 
-    let (resp, _newly_auth) = match handle(&state, msg, authenticated).await {
+    let client_key = headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or("anonymous")
+        .to_string();
+    let (resp, _newly_auth) = match handle(&state, msg, authenticated, &client_key).await {
         Some((resp, newly_auth)) => (resp, newly_auth),
         None => return StatusCode::NO_CONTENT.into_response(),
     };
@@ -555,18 +613,14 @@ async fn handle_http_request(
     if successful_initialize {
         if let Some(version) = protocol_version {
             if let Ok(hv) = axum::http::HeaderValue::from_str(&version) {
-                response
-                    .headers_mut()
-                    .insert("mcp-protocol-version", hv);
+                response.headers_mut().insert("mcp-protocol-version", hv);
             }
         }
         if let Some(id) = state.issue_session() {
-            if let Ok(hv) =
-                axum::http::HeaderValue::from_str(&id).map_err(|e| warn!(error = %e, "session id not a valid header value"))
+            if let Ok(hv) = axum::http::HeaderValue::from_str(&id)
+                .map_err(|e| warn!(error = %e, "session id not a valid header value"))
             {
-                response
-                    .headers_mut()
-                    .insert("mcp-session-id", hv);
+                response.headers_mut().insert("mcp-session-id", hv);
             }
         }
     }
@@ -597,8 +651,8 @@ where
         let authenticated = state
             .auth_token
             .as_ref()
-            .map_or(true, |token| check_auth(&msg, token));
-        if let Some((response, _)) = handle(&state, msg, authenticated).await {
+            .is_none_or(|token| check_auth(&msg, token));
+        if let Some((response, _)) = handle(&state, msg, authenticated, STDIO_CLIENT_KEY).await {
             write_to(&mut out, &response).await?;
         }
     }
@@ -639,7 +693,12 @@ fn check_auth(msg: &Value, expected: &str) -> bool {
 }
 
 /// Dispatch one JSON-RPC message. Returns `(response, newly_authenticated)` where response is `None` for notifications (no id).
-async fn handle(state: &State, msg: Value, authenticated: bool) -> Option<(Value, bool)> {
+async fn handle(
+    state: &State,
+    msg: Value,
+    authenticated: bool,
+    client_key: &str,
+) -> Option<(Value, bool)> {
     let id = msg.get("id").cloned();
     let method = msg
         .get("method")
@@ -688,7 +747,7 @@ async fn handle(state: &State, msg: Value, authenticated: bool) -> Option<(Value
             id,
             json!({ "tools": tools::definitions() }),
         )),
-        "tools/call" => Some(handle_tools_call(state, id, &msg).await),
+        "tools/call" => Some(handle_tools_call(state, id, &msg, client_key).await),
         _ if is_request => Some(error_response(
             id.unwrap_or(Value::Null),
             -32601,
@@ -709,7 +768,10 @@ fn initialize_result(msg: &Value) -> Value {
     let protocol_version = if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) {
         requested
     } else {
-        SUPPORTED_PROTOCOL_VERSIONS.last().copied().unwrap_or(DEFAULT_PROTOCOL_VERSION)
+        SUPPORTED_PROTOCOL_VERSIONS
+            .last()
+            .copied()
+            .unwrap_or(DEFAULT_PROTOCOL_VERSION)
     };
     json!({
         "protocolVersion": protocol_version,
@@ -721,7 +783,12 @@ fn initialize_result(msg: &Value) -> Value {
     })
 }
 
-async fn handle_tools_call(state: &State, id: Option<Value>, msg: &Value) -> Value {
+async fn handle_tools_call(
+    state: &State,
+    id: Option<Value>,
+    msg: &Value,
+    client_key: &str,
+) -> Value {
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
     let name = params
         .get("name")
@@ -732,7 +799,7 @@ async fn handle_tools_call(state: &State, id: Option<Value>, msg: &Value) -> Val
 
     // MCP convention: tool failures are results with isError:true (so the agent
     // can read the message), not JSON-RPC protocol errors.
-    match tools::call(state, name, args).await {
+    match tools::call_for_client(state, name, args, client_key).await {
         Ok(payload) => result_response(id, tool_content(&payload, false)),
         Err(e) => result_response(id, tool_content(&json!({ "error": e.to_string() }), true)),
     }
@@ -765,10 +832,16 @@ mod tests {
     #[test]
     fn initialize_negotiates_supported_protocol_versions() {
         let supported = json!({ "params": { "protocolVersion": "2025-06-18" } });
-        assert_eq!(initialize_result(&supported)["protocolVersion"], "2025-06-18");
+        assert_eq!(
+            initialize_result(&supported)["protocolVersion"],
+            "2025-06-18"
+        );
 
         let unsupported = json!({ "params": { "protocolVersion": "2027-01-01" } });
-        assert_eq!(initialize_result(&unsupported)["protocolVersion"], "2025-06-18");
+        assert_eq!(
+            initialize_result(&unsupported)["protocolVersion"],
+            "2025-06-18"
+        );
 
         assert_eq!(
             initialize_result(&json!({}))["protocolVersion"],
@@ -864,8 +937,11 @@ mod tests {
             auth_token: None,
             sessions: None,
         };
-        let resp = handle(&state, msg, true).await;
-        assert!(resp.is_none(), "notifications should not produce a response");
+        let resp = handle(&state, msg, true, "test").await;
+        assert!(
+            resp.is_none(),
+            "notifications should not produce a response"
+        );
     }
 
     #[tokio::test]
@@ -881,9 +957,12 @@ mod tests {
             sessions: None,
         };
         let msg = json!({ "jsonrpc": "2.0", "id": 1, "method": "unknown/method" });
-        let (resp, _) = handle(&state, msg, true).await.unwrap();
+        let (resp, _) = handle(&state, msg, true, "test").await.unwrap();
         assert_eq!(resp["error"]["code"], -32601);
-        assert!(resp["error"]["message"].as_str().unwrap().contains("unknown/method"));
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown/method"));
     }
 
     #[tokio::test]
@@ -899,7 +978,7 @@ mod tests {
             sessions: None,
         };
         let msg = json!({ "jsonrpc": "2.0", "id": 42, "method": "ping" });
-        let (resp, _) = handle(&state, msg, true).await.unwrap();
+        let (resp, _) = handle(&state, msg, true, "test").await.unwrap();
         assert_eq!(resp["id"], 42);
         assert!(resp["result"].is_object());
     }
@@ -919,12 +998,12 @@ mod tests {
             sessions: None,
         };
         let msg = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} });
-        let (resp, is_auth) = handle(&state, msg, false).await.unwrap();
+        let (resp, is_auth) = handle(&state, msg, false, "test").await.unwrap();
         assert!(!is_auth);
         assert_eq!(resp["error"]["code"], -32001);
 
         let ping_msg = json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" });
-        let (ping_resp, _) = handle(&state, ping_msg, false).await.unwrap();
+        let (ping_resp, _) = handle(&state, ping_msg, false, "test").await.unwrap();
         assert_eq!(ping_resp["error"]["code"], -32001);
     }
 
@@ -944,7 +1023,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": { "authorization": "Bearer secret123" }
         });
-        let (resp, is_auth) = handle(&state, msg, false).await.unwrap();
+        let (resp, is_auth) = handle(&state, msg, false, "test").await.unwrap();
         assert!(is_auth);
         assert!(resp["result"]["capabilities"]["tools"].is_object());
     }
@@ -964,7 +1043,7 @@ mod tests {
             sessions: None,
         };
         let msg = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
-        let (resp, _) = handle(&state, msg, true).await.unwrap();
+        let (resp, _) = handle(&state, msg, true, "test").await.unwrap();
         assert_eq!(resp["id"], 2);
         let tools = resp["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 17, "all declared MCP tools must be present");
@@ -973,8 +1052,7 @@ mod tests {
             assert!(!tool["name"].as_str().unwrap_or("").is_empty());
             assert!(!tool["description"].as_str().unwrap_or("").is_empty());
             assert_eq!(
-                tool["inputSchema"]["type"],
-                "object",
+                tool["inputSchema"]["type"], "object",
                 "tool {:?} must declare an object inputSchema",
                 tool["name"]
             );
@@ -1001,7 +1079,7 @@ mod tests {
             "method": "tools/call",
             "params": { "name": tool_name, "arguments": args }
         });
-        let (resp, _) = handle(&state, msg, true).await.unwrap();
+        let (resp, _) = handle(&state, msg, true, "test").await.unwrap();
         // The result is always present (MCP errors are results with isError).
         let result = &resp["result"];
         assert_eq!(
@@ -1043,23 +1121,13 @@ mod tests {
     #[tokio::test]
     async fn call_contract_requires_contract_id_and_function() {
         assert_missing_arg_error("call_contract", json!({}), "contract_id").await;
-        assert_missing_arg_error(
-            "call_contract",
-            json!({ "contract_id": "C1" }),
-            "function",
-        )
-        .await;
+        assert_missing_arg_error("call_contract", json!({ "contract_id": "C1" }), "function").await;
     }
 
     #[tokio::test]
     async fn simulate_call_requires_contract_id_and_function() {
         assert_missing_arg_error("simulate_call", json!({}), "contract_id").await;
-        assert_missing_arg_error(
-            "simulate_call",
-            json!({ "contract_id": "C1" }),
-            "function",
-        )
-        .await;
+        assert_missing_arg_error("simulate_call", json!({ "contract_id": "C1" }), "function").await;
     }
 
     #[tokio::test]
@@ -1079,7 +1147,7 @@ mod tests {
             "method": "tools/call",
             "params": { "name": "no_such_tool", "arguments": {} }
         });
-        let (resp, _) = handle(&state, msg, true).await.unwrap();
+        let (resp, _) = handle(&state, msg, true, "test").await.unwrap();
         assert_eq!(resp["result"]["isError"], true);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
         assert!(
@@ -1297,7 +1365,10 @@ mod protocol_tests {
         // Build the input side: a DuplexStream where we write the test messages
         // then drop the write half to signal EOF.
         let (mut write_half, read_half) = tokio::io::duplex(64 * 1024);
-        write_half.write_all(input.as_bytes()).await.expect("write input");
+        write_half
+            .write_all(input.as_bytes())
+            .await
+            .expect("write input");
         drop(write_half); // EOF for the server reader
 
         // The output side: a DuplexStream where the server writes responses.
@@ -1310,15 +1381,19 @@ mod protocol_tests {
 
         // Read all bytes written by serve_io.
         let mut buf = Vec::new();
-        out_read_half.read_to_end(&mut buf).await.expect("read output");
+        out_read_half
+            .read_to_end(&mut buf)
+            .await
+            .expect("read output");
         let output = String::from_utf8(buf).expect("utf8 output");
 
         output
             .lines()
             .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| {
-                panic!("server produced invalid JSON: {e}\nline: {l}")
-            }))
+            .map(|l| {
+                serde_json::from_str(l)
+                    .unwrap_or_else(|e| panic!("server produced invalid JSON: {e}\nline: {l}"))
+            })
             .collect()
     }
 
@@ -1362,9 +1437,12 @@ mod protocol_tests {
         // Three messages: initialize, tools/list, and a tools/call that will
         // fail with isError (no DB) but still produce a well-formed response.
         let msgs = concat!(
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}"#, "\n",
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, "\n",
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_contracts","arguments":{}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_contracts","arguments":{}}}"#,
+            "\n",
         );
         let responses = run_rpc(msgs).await;
         assert_eq!(responses.len(), 3, "one response per request");
@@ -1378,7 +1456,10 @@ mod protocol_tests {
         assert_eq!(responses[2]["id"], 3, "tools/call id");
         // Either a real result or an isError — both are valid without a DB.
         let result = &responses[2]["result"];
-        assert!(result.is_object(), "tools/call always produces a result object");
+        assert!(
+            result.is_object(),
+            "tools/call always produces a result object"
+        );
     }
 
     // ── error cases ───────────────────────────────────────────────────────
@@ -1392,8 +1473,12 @@ mod protocol_tests {
         // id must be null/absent for a parse error (we can't know the request id).
         assert_eq!(r["error"]["code"], -32700);
         assert!(
-            r["error"]["message"].as_str().unwrap_or("").contains("parse error"),
-            "message should say parse error: {:?}", r["error"]["message"]
+            r["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("parse error"),
+            "message should say parse error: {:?}",
+            r["error"]["message"]
         );
     }
 
@@ -1407,8 +1492,12 @@ mod protocol_tests {
         assert_eq!(r["id"], 9);
         assert_eq!(r["error"]["code"], -32601);
         assert!(
-            r["error"]["message"].as_str().unwrap_or("").contains("no/such/method"),
-            "error should mention the method: {:?}", r["error"]["message"]
+            r["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no/such/method"),
+            "error should mention the method: {:?}",
+            r["error"]["message"]
         );
     }
 
@@ -1418,7 +1507,11 @@ mod protocol_tests {
         let msgs = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}
 "#;
         let responses = run_rpc(msgs).await;
-        assert_eq!(responses.len(), 0, "notifications must not produce a response");
+        assert_eq!(
+            responses.len(),
+            0,
+            "notifications must not produce a response"
+        );
     }
 
     #[tokio::test]
@@ -1479,8 +1572,10 @@ mod protocol_tests {
     async fn multiple_messages_get_independent_responses() {
         // Two well-formed requests: both must produce a response, in order.
         let msgs = concat!(
-            r#"{"jsonrpc":"2.0","id":10,"method":"ping"}"#, "\n",
-            r#"{"jsonrpc":"2.0","id":11,"method":"ping"}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":10,"method":"ping"}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":11,"method":"ping"}"#,
+            "\n",
         );
         let responses = run_rpc(msgs).await;
         assert_eq!(responses.len(), 2);
@@ -1527,8 +1622,11 @@ mod contract_ids_startup_validation {
     #[test]
     fn rejects_too_many_contract_ids() {
         // getEvents supports at most 25 IDs; the parser enforces this.
-        let single = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
-        let raw = std::iter::repeat(single).take(26).collect::<Vec<_>>().join(",");
+        // Distinct ids: duplicates are dropped before the count (#219).
+        let raw = (0..26u8)
+            .map(|i| stellar_strkey::Contract([i; 32]).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         let err = lumenqraph_core::parse_contract_ids(&raw).unwrap_err();
         assert!(
             err.contains("26"),
@@ -1644,11 +1742,8 @@ mod http_security_tests {
     fn origin_matching_is_exact_not_substring() {
         // Ensure "https://safe.example.com.evil.example.com" doesn't sneak past
         // by matching on a substring.
-        let config =
-            HttpConfig::for_testing(&["https://safe.example.com"], false);
-        let result = config.validate_origin(Some(
-            "https://safe.example.com.evil.example.com",
-        ));
+        let config = HttpConfig::for_testing(&["https://safe.example.com"], false);
+        let result = config.validate_origin(Some("https://safe.example.com.evil.example.com"));
         assert!(
             result.is_err(),
             "Origin matching must be exact, not a substring match"
@@ -1824,7 +1919,13 @@ mod http_e2e_tests {
         // 405. We do not implement server-initiated streaming → 405.
         let (app, _state) = test_router(HttpConfig::for_testing(&[], false));
         let resp = app
-            .oneshot(Request::builder().method("GET").uri("/mcp").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/mcp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .expect("router");
         assert_eq!(
