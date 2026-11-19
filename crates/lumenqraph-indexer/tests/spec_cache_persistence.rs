@@ -111,7 +111,7 @@ mod spec_cache_persistence_tests {
             row.get::<String, _>("spec_section"),
             spec_section
         );
-        assert_eq!(row.get::<bool, _>("has_events"), true);
+        assert!(row.get::<bool, _>("has_events"));
 
         cleanup_test_data(&pool, contract_id).await;
     }
@@ -125,7 +125,6 @@ mod spec_cache_persistence_tests {
         cleanup_test_data(&pool, contract_id).await;
 
         let hash_v1 = "hash_v1";
-        let hash_v2 = "hash_v2";
 
         // Insert v1
         sqlx::query(
@@ -186,7 +185,7 @@ mod spec_cache_persistence_tests {
         .await
         .expect("Failed to fetch");
 
-        assert_eq!(row.get::<bool, _>("has_events"), false);
+        assert!(!row.get::<bool, _>("has_events"));
         assert!(
             row.try_get::<Option<String>, _>("wasm_hash")
                 .unwrap()

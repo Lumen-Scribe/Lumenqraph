@@ -1,7 +1,6 @@
 //! Test custom HTTP headers support for authenticated RPC providers (Issue #397)
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use axum::extract::State;
 use axum::routing::post;
 use axum::Router;

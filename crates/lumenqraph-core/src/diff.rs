@@ -45,8 +45,10 @@ use crate::spec::ContractSpec;
 /// The ordering reflects impact: `Additive < PotentiallyBreaking < Breaking`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum Severity {
     /// Only new items were added; no existing consumer is affected.
+    #[default]
     Additive,
     /// Existing consumers *may* break depending on how they decode the type
     /// (e.g. exhaustive match on an enum whose case list grew).
@@ -57,11 +59,6 @@ pub enum Severity {
     Breaking,
 }
 
-impl Default for Severity {
-    fn default() -> Self {
-        Severity::Additive
-    }
-}
 
 /// The difference between two parsed interfaces, oldest to newest.
 #[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
@@ -305,7 +302,7 @@ fn map_event_added_fields(
         return None;
     }
     // Only map-format events have named data fields that can be added safely.
-    if !format!("{}", new.data_format).eq_ignore_ascii_case("map") {
+    if !new.data_format.to_string().eq_ignore_ascii_case("map") {
         return None;
     }
     if new.params.len() <= old.params.len() {
@@ -321,7 +318,7 @@ fn map_event_added_fields(
     let added: Vec<&str> = new.params[old.params.len()..]
         .iter()
         .map(|p| {
-            if !format!("{}", p.location).eq_ignore_ascii_case("data") {
+            if !p.location.to_string().eq_ignore_ascii_case("data") {
                 return "";
             }
             p.name.as_str()

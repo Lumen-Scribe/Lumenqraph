@@ -5,7 +5,7 @@
 #[cfg(test)]
 mod cursor_initialization_tests {
     use sqlx::postgres::PgPoolOptions;
-    use sqlx::{PgPool, Row};
+    use sqlx::PgPool;
 
     async fn setup_test_db() -> PgPool {
         let database_url = std::env::var("DATABASE_URL")

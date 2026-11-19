@@ -424,8 +424,9 @@ mod tests {
         assert_eq!(clamped, 0);
 
         // Zero and positive should pass through.
-        assert_eq!(if 0i64 < 0 { 0 } else { 0i64 }, 0);
-        assert_eq!(if 1000i64 < 0 { 0 } else { 1000i64 }, 1000);
+        let (zero, thousand) = (0i64, 1000i64);
+        assert_eq!(if zero < 0 { 0 } else { zero }, 0);
+        assert_eq!(if thousand < 0 { 0 } else { thousand }, 1000);
     }
 
     #[test]
@@ -436,8 +437,9 @@ mod tests {
         assert_eq!(clamped, 0);
 
         // Zero and positive should pass through.
-        assert_eq!(if 0i64 < 0 { 0 } else { 0i64 }, 0);
-        assert_eq!(if 100i64 < 0 { 0 } else { 100i64 }, 100);
+        let (zero, hundred) = (0i64, 100i64);
+        assert_eq!(if zero < 0 { 0 } else { zero }, 0);
+        assert_eq!(if hundred < 0 { 0 } else { hundred }, 100);
     }
 
     #[test]

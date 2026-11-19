@@ -77,41 +77,71 @@ use serde_json::{json, Map, Value};
 use stellar_strkey::ed25519::{MuxedAccount, PublicKey as Ed25519PublicKey};
 use stellar_strkey::{ClaimableBalance, Contract, LiquidityPool};
 
-// ScValType discriminants (stable wire tags).
+// ScValType discriminants (stable wire tags). The hand-rolled raw decoder that
+// uses these is not on the current decode path (which goes through stellar-xdr);
+// it is kept, not deleted, so its items are allowed to be unused.
+#[allow(dead_code)]
 const SCV_BOOL: u32 = 0;
+#[allow(dead_code)]
 const SCV_VOID: u32 = 1;
+#[allow(dead_code)]
 const SCV_ERROR: u32 = 2;
+#[allow(dead_code)]
 const SCV_U32: u32 = 3;
+#[allow(dead_code)]
 const SCV_I32: u32 = 4;
+#[allow(dead_code)]
 const SCV_U64: u32 = 5;
+#[allow(dead_code)]
 const SCV_I64: u32 = 6;
+#[allow(dead_code)]
 const SCV_TIMEPOINT: u32 = 7;
+#[allow(dead_code)]
 const SCV_DURATION: u32 = 8;
+#[allow(dead_code)]
 const SCV_U128: u32 = 9;
+#[allow(dead_code)]
 const SCV_I128: u32 = 10;
+#[allow(dead_code)]
 const SCV_U256: u32 = 11;
+#[allow(dead_code)]
 const SCV_I256: u32 = 12;
+#[allow(dead_code)]
 const SCV_BYTES: u32 = 13;
+#[allow(dead_code)]
 const SCV_STRING: u32 = 14;
+#[allow(dead_code)]
 const SCV_SYMBOL: u32 = 15;
+#[allow(dead_code)]
 const SCV_VEC: u32 = 16;
+#[allow(dead_code)]
 const SCV_MAP: u32 = 17;
+#[allow(dead_code)]
 const SCV_ADDRESS: u32 = 18;
 // Tags 19–21: present in instance-storage snapshots; payload must be consumed.
+#[allow(dead_code)]
 const SCV_CONTRACT_INSTANCE: u32 = 19;
+#[allow(dead_code)]
 const SCV_LEDGER_KEY_CONTRACT_INSTANCE: u32 = 20;
+#[allow(dead_code)]
 const SCV_LEDGER_KEY_NONCE: u32 = 21;
 
 // ScAddressType discriminants (Protocol 23+).
+#[allow(dead_code)]
 const SC_ADDRESS_ACCOUNT: u32 = 0;
+#[allow(dead_code)]
 const SC_ADDRESS_CONTRACT: u32 = 1;
+#[allow(dead_code)]
 const SC_ADDRESS_MUXED_ACCOUNT: u32 = 2;
+#[allow(dead_code)]
 const SC_ADDRESS_CLAIMABLE_BALANCE: u32 = 3;
+#[allow(dead_code)]
 const SC_ADDRESS_LIQUIDITY_POOL: u32 = 4;
 
 /// Maximum nesting depth for `ScVal` decoding. Values nested deeper than this
 /// cause the whole decode to return the `{"_xdr": …}` fallback rather than
 /// risk a stack overflow.
+#[allow(dead_code)]
 const MAX_DEPTH: u32 = 256;
 
 /// Decode a base64 `ScVal` into friendly JSON. Never panics.
@@ -257,7 +287,7 @@ fn u256_to_decimal(p: &stellar_xdr::curr::UInt256Parts) -> String {
 
 /// Render an `Int256Parts` as a decimal string (two's complement).
 fn i256_to_decimal(p: &stellar_xdr::curr::Int256Parts) -> String {
-    let negative = (p.hi_hi as i64) < 0;
+    let negative = p.hi_hi < 0;
     if !negative {
         let unsigned = stellar_xdr::curr::UInt256Parts {
             hi_hi: p.hi_hi as u64,
@@ -314,11 +344,13 @@ pub fn event_name_from_topic(topic_b64: &str) -> Option<String> {
 }
 
 /// A minimal big-endian XDR reader.
+#[allow(dead_code)]
 struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
+#[allow(dead_code)]
 impl<'a> Cursor<'a> {
     fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }

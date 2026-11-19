@@ -4,7 +4,7 @@
 //! RPC returns different content for a recently-passed ledger.
 //! Transfer events are additionally projected into the materialized `token_transfers` table.
 
-pub use lumenqraph_core::{EventType, NewEvent};
+pub use lumenqraph_core::NewEvent;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,6 +17,7 @@ static TRANSFER_PROJECTION_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Total number of transfer-like events skipped by the projection since process
 /// start. Exposed for the `lumenqraph_transfer_projection_skipped_total` metric.
+#[allow(dead_code)] // read by the metrics endpoint
 pub fn transfer_projection_skipped_total() -> u64 {
     TRANSFER_PROJECTION_SKIPPED.load(Ordering::Relaxed)
 }
@@ -39,6 +40,7 @@ pub enum ContractKind {
     /// A liquidity pool emitting `deposit`/`withdraw` events.
     LiquidityPool,
     /// Anything else, or unknown.
+    #[allow(dead_code)]
     Other,
 }
 
@@ -122,7 +124,7 @@ pub async fn insert_events_with_resolver(
         enriched_json.push(
             e.enriched
                 .as_ref()
-                .map(|v| serde_json::to_string(v))
+                .map(serde_json::to_string)
                 .transpose()?,
         );
         tx_hashes.push(e.tx_hash.clone());
@@ -425,7 +427,7 @@ pub async fn upsert_events(
         enriched_json.push(
             e.enriched
                 .as_ref()
-                .map(|v| serde_json::to_string(v))
+                .map(serde_json::to_string)
                 .transpose()?,
         );
         tx_hashes.push(e.tx_hash.clone());
@@ -624,10 +626,8 @@ fn as_i128_amount(v: &Value) -> Option<String> {
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Some(i.to_string())
-            } else if let Some(u) = n.as_u64() {
-                Some(u.to_string())
             } else {
-                None
+                n.as_u64().map(|u| u.to_string())
             }
         }
         _ => None,
@@ -828,6 +828,7 @@ fn extract_liquidity_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lumenqraph_core::EventType;
     use serde_json::json;
 
     /// Treat every contract as a SEP-41 token so transfer-shape parsing is

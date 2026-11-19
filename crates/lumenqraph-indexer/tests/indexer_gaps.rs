@@ -5,7 +5,7 @@
 #[cfg(test)]
 mod indexer_gaps_tests {
     use sqlx::postgres::PgPoolOptions;
-    use sqlx::{PgPool, Row};
+    use sqlx::PgPool;
 
     async fn setup_test_db() -> PgPool {
         let database_url = std::env::var("DATABASE_URL")
@@ -143,7 +143,7 @@ mod indexer_gaps_tests {
 
         let configured_start = 50_000i64;
         let oldest_available = 150_000i64;
-        let latest = 200_000i64;
+        let _latest = 200_000i64;
         let clamp_reason = "fresh-start ledger clamped to earliest servable ledger (RPC retention limit)";
 
         // Clamping scenario

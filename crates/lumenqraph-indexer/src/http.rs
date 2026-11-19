@@ -289,6 +289,7 @@ struct IndexerMetrics {
     unrecoverable_missed_ranges: i64,
 }
 
+#[allow(clippy::type_complexity)] // one row mirrors the indexer_cursor columns
 async fn gather_metrics(pool: &PgPool) -> anyhow::Result<IndexerMetrics> {
     let status: Option<(i64, i64, i64, i64, i64, i64, i64, i64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
         "SELECT last_processed_ledger, chain_tip_ledger, events_ingested_total, errors_total, events_enriched_total, events_not_enriched_total,

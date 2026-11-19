@@ -188,7 +188,7 @@ mod reenrich_tests {
             .bind(contract_id)
             .bind(last_ledger)
             .bind(&last_event_id)
-            .bind(batch_size as i32)
+            .bind(batch_size)
             .fetch_all(&pool)
             .await
             .expect("Failed to fetch batch");

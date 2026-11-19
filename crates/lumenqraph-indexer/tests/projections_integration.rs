@@ -16,7 +16,6 @@ mod projection_tests {
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
     use sqlx::Row;
-    use stellar_strkey::Strkey;
 
     /// Deterministic, valid contract strkey.
     fn contract_strkey(seed: u8) -> String {

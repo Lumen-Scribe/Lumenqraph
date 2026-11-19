@@ -58,7 +58,7 @@ pub async fn run_reenrich(
 
     loop {
         let rows = if let Some(contract) = options.contract.as_deref() {
-            let query = if let Some((ledger, event_id)) = cursor.as_ref() {
+            let query = if let Some((_ledger, _event_id)) = cursor.as_ref() {
                 format!(
                     "SELECT ledger, event_id, contract_id, decoded_topics, event_name, decoded_value
                      FROM events WHERE {filter} AND contract_id = $1 AND (ledger, event_id) > ($2, $3)
@@ -148,7 +148,7 @@ pub async fn run_reenrich(
             }
         }
 
-        if pages % PROGRESS_EVERY_PAGES == 0 {
+        if pages.is_multiple_of(PROGRESS_EVERY_PAGES) {
             let elapsed = start_time.elapsed();
             let since_last = processed - last_progress_count;
             let since_last_time = last_progress_time.elapsed().as_secs_f64();

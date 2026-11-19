@@ -7,8 +7,8 @@
 #[cfg(test)]
 mod retention_contract_summaries_tests {
     use sqlx::postgres::PgPoolOptions;
-    use sqlx::{PgPool, Row};
-    use std::path::Path;
+    use sqlx::PgPool;
+    
 
     /// Create an isolated test database schema with all migrations.
     async fn setup_test_db() -> PgPool {

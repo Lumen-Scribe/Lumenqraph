@@ -19,7 +19,7 @@
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
@@ -118,11 +118,20 @@ struct RpcError {
     message: String,
 }
 
+/// The chain tip and retention floor reported by one `getHealth` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TipSnapshot {
+    pub latest: i64,
+    pub oldest_available: Option<i64>,
+}
+
 /// The `getHealth` result. Soroban RPC reports the latest and oldest retained
 /// ledgers in one response, so a single call can supply both the tip and the
 /// retention floor (#718). Older providers may omit fields, hence the defaults.
 #[derive(Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
+// `status` and the retention window are part of the response but unused by the poller.
+#[allow(dead_code)]
 pub struct RpcHealth {
     #[serde(default)]
     pub status: String,
@@ -170,6 +179,7 @@ impl SorobanRpcErrorCode {
         }
     }
 
+    #[allow(dead_code)] // kept for logs and metrics labels
     pub fn code(&self) -> i64 {
         match self {
             Self::ParseError => -32700,
@@ -223,6 +233,19 @@ impl SorobanRpcError {
     pub fn is_permanent(&self) -> bool {
         self.error_code.is_permanent()
     }
+
+    /// `-32602` for a `startLedger` that has just fallen out of (or not yet
+    /// entered) the RPC's retention window. Soroban RPC reports it as invalid
+    /// params, but it is a timing race rather than a configuration error: the
+    /// retention window moves forward every ledger, so the next cycle that
+    /// re-reads `getHealth` will succeed (#716).
+    pub fn is_out_of_retention(&self) -> bool {
+        if self.code != -32602 {
+            return false;
+        }
+        let message = self.message.to_ascii_lowercase();
+        message.contains("startledger") || message.contains("start ledger")
+    }
 }
 
 impl std::fmt::Display for SorobanRpcError {
@@ -238,13 +261,34 @@ impl std::fmt::Display for SorobanRpcError {
 impl std::error::Error for SorobanRpcError {}
 
 /// Returns true if the given error contains a non-retryable Soroban RPC error.
+/// Out-of-retention `startLedger` errors are excluded: they are expected to
+/// clear on the next cycle, so they must not count towards the permanent-error
+/// budget that stops the poller (#716).
 pub fn is_non_retryable_rpc_error(err: &anyhow::Error) -> bool {
     for cause in err.chain() {
         if let Some(e) = cause.downcast_ref::<SorobanRpcError>() {
-            return e.is_permanent();
+            return e.is_permanent() && !e.is_out_of_retention();
         }
     }
     false
+}
+
+/// Returns true if the error is a `startLedger` that fell outside retention (#716).
+pub fn is_out_of_retention(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<SorobanRpcError>()
+            .is_some_and(|e| e.is_out_of_retention())
+    })
+}
+
+/// Returns true if the RPC reports the method as unsupported (`-32601`).
+pub fn is_method_not_found(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<SorobanRpcError>()
+            .is_some_and(|e| e.code == -32601)
+    })
 }
 
 // ---- getLatestLedger ----
@@ -268,6 +312,9 @@ struct NetworkResult {
 struct GetEventsParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     start_ledger: Option<i64>,
+    /// Exclusive upper bound. Only sent together with `start_ledger`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_ledger: Option<i64>,
     filters: Vec<EventFilter>,
     pagination: Pagination,
     xdr_format: &'static str,
@@ -358,6 +405,7 @@ pub struct EventInfo {
 }
 
 impl RpcClient {
+    #[allow(dead_code)] // single-endpoint convenience; the binary uses with_urls
     pub fn new(url: impl Into<String>, timeout_secs: u64) -> Self {
         Self::with_urls(vec![url.into()], timeout_secs)
     }
@@ -486,10 +534,7 @@ impl RpcClient {
             .json(&req_body)
             .send()
             .await;
-        let ok = match result {
-            Ok(r) if r.status().is_success() => true,
-            _ => false,
-        };
+        let ok = matches!(result, Ok(r) if r.status().is_success());
         if ok {
             let mut state = self.failover.lock().unwrap();
             if state.active_idx != 0 {
@@ -595,7 +640,7 @@ impl RpcClient {
                 let response = match response.error_for_status() {
                     Err(e) => {
                         let status = e.status();
-                        let is_retryable = status.map_or(false, |s| {
+                        let is_retryable = status.is_some_and(|s| {
                             s.is_server_error() || s.as_u16() == 429
                         });
                         let ctx_err =
@@ -668,6 +713,42 @@ impl RpcClient {
         self.call("getHealth", serde_json::json!({})).await
     }
 
+    /// The chain tip and the oldest retained ledger from a single `getHealth`
+    /// round-trip (#718). Falls back to `getLatestLedger` only when the provider
+    /// does not support `getHealth` (`-32601`) or omits the tip. `oldest_available`
+    /// is `None` when the provider does not report `oldestLedger`.
+    pub async fn get_tip_snapshot(&self) -> anyhow::Result<TipSnapshot> {
+        match self.get_health().await {
+            Ok(health) => {
+                let oldest_available = (health.oldest_ledger > 0).then_some(health.oldest_ledger);
+                let latest = if health.latest_ledger > 0 {
+                    health.latest_ledger
+                } else {
+                    self.get_latest_ledger().await?
+                };
+                Ok(TipSnapshot {
+                    latest,
+                    oldest_available,
+                })
+            }
+            Err(e) if is_method_not_found(&e) => Ok(TipSnapshot {
+                latest: self.get_latest_ledger().await?,
+                oldest_available: None,
+            }),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The oldest ledger the RPC still serves, or `None` when the provider does
+    /// not report it (or does not implement `getHealth`).
+    pub async fn oldest_available_ledger(&self) -> anyhow::Result<Option<i64>> {
+        match self.get_health().await {
+            Ok(health) => Ok((health.oldest_ledger > 0).then_some(health.oldest_ledger)),
+            Err(e) if is_method_not_found(&e) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Fetch a page of events. Pass `start_ledger` on the first page of a scan,
     /// or `cursor` to continue a previous page (never both).
     ///
@@ -680,8 +761,27 @@ impl RpcClient {
         cursor: Option<String>,
         limit: u32,
     ) -> anyhow::Result<GetEventsResult> {
+        self.get_events_bounded(start_ledger, None, contract_ids, cursor, limit)
+            .await
+    }
+
+    /// Like [`get_events`], but with an exclusive `end_ledger` so the RPC stops
+    /// at the tip instead of serving whatever is newest by the time the scan
+    /// reaches the end (#717). `end_ledger` is only sent on the first page,
+    /// where `start_ledger` is present; continuation pages rely on the caller
+    /// to stop at its own bound.
+    pub async fn get_events_bounded(
+        &self,
+        start_ledger: Option<i64>,
+        end_ledger: Option<i64>,
+        contract_ids: &[String],
+        cursor: Option<String>,
+        limit: u32,
+    ) -> anyhow::Result<GetEventsResult> {
+        let start_ledger = if cursor.is_some() { None } else { start_ledger };
         let params = GetEventsParams {
-            start_ledger: if cursor.is_some() { None } else { start_ledger },
+            end_ledger: if start_ledger.is_some() { end_ledger } else { None },
+            start_ledger,
             filters: event_filters(contract_ids)?,
             pagination: Pagination { limit, cursor },
             xdr_format: "base64",
@@ -1383,4 +1483,168 @@ mod tests {
         assert_eq!(host_of("https://rpc.example.com"), "rpc.example.com");
     }
 
+
+    // ── Method-routing mock (#715–#718) ───────────────────────────────────
+
+    type RequestLog = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+    type Responder = Arc<dyn Fn(&str, usize, &serde_json::Value) -> (u16, String) + Send + Sync + 'static>;
+
+    /// Mock RPC that routes on the JSON-RPC `method`. `respond` receives the
+    /// method, how many times it has been called before (0-based) and the whole
+    /// request, and returns `(http_status, body)`. Every request is logged.
+    async fn spawn_rpc_mock(respond: Responder) -> (String, RequestLog) {
+        #[derive(Clone)]
+        struct S {
+            respond: Responder,
+            log: RequestLog,
+            counts: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+        }
+        async fn handler(State(s): State<S>, body: axum::body::Bytes) -> axum::response::Response {
+            let req: serde_json::Value = serde_json::from_slice(&body).expect("json-rpc request");
+            let method = req["method"].as_str().unwrap_or_default().to_string();
+            let nth = {
+                let mut counts = s.counts.lock().unwrap();
+                let entry = counts.entry(method.clone()).or_insert(0);
+                let nth = *entry;
+                *entry += 1;
+                nth
+            };
+            s.log.lock().unwrap().push(req.clone());
+            let (status, text) = (s.respond)(&method, nth, &req);
+            axum::response::Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(text))
+                .unwrap()
+        }
+        let log: RequestLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = S {
+            respond,
+            log: log.clone(),
+            counts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        };
+        let app = Router::new().route("/", post(handler)).with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), log)
+    }
+
+    fn methods_called(log: &RequestLog) -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .map(|r| r["method"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    const HEALTH_2000_1500: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy","latestLedger":2000,"oldestLedger":1500,"ledgerRetentionWindow":500}}"#;
+    const HEALTH_NO_OLDEST: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy","latestLedger":1000}}"#;
+    const ERR_32601_HEALTH: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#;
+    const ERR_OUT_OF_RETENTION: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"startLedger must be between the oldest ledger: 1500 and the latest ledger: 2000"}}"#;
+    const EMPTY_EVENTS: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"latestLedger":2000,"events":[],"cursor":null}}"#;
+
+    // #718: one getHealth per cycle supplies both the tip and the retention floor.
+
+    #[tokio::test]
+    async fn tip_snapshot_uses_a_single_get_health_call() {
+        let (url, log) = spawn_rpc_mock(Arc::new(|method: &str, _n: usize, _r: &serde_json::Value| match method {
+            "getHealth" => (200, HEALTH_2000_1500.to_string()),
+            other => (500, format!("unexpected method {other}")),
+        }))
+        .await;
+
+        let client = RpcClient::new(&url, 5);
+        let snap = client.get_tip_snapshot().await.expect("snapshot");
+        assert_eq!(snap, TipSnapshot { latest: 2000, oldest_available: Some(1500) });
+        assert_eq!(methods_called(&log), vec!["getHealth"], "exactly one tip-related call per cycle");
+    }
+
+    #[tokio::test]
+    async fn tip_snapshot_falls_back_to_get_latest_ledger_when_health_is_unsupported() {
+        let (url, log) = spawn_rpc_mock(Arc::new(|method: &str, _n: usize, _r: &serde_json::Value| match method {
+            "getHealth" => (200, ERR_32601_HEALTH.to_string()),
+            "getLatestLedger" => (200, OK_SEQ_1000.to_string()),
+            other => (500, format!("unexpected method {other}")),
+        }))
+        .await;
+
+        let client = RpcClient::new(&url, 5);
+        let snap = client.get_tip_snapshot().await.expect("snapshot");
+        assert_eq!(snap, TipSnapshot { latest: 1000, oldest_available: None });
+        assert_eq!(methods_called(&log), vec!["getHealth", "getLatestLedger"]);
+    }
+
+    #[tokio::test]
+    async fn tip_snapshot_without_oldest_ledger_does_not_make_a_second_call() {
+        let (url, log) = spawn_rpc_mock(Arc::new(|method: &str, _n: usize, _r: &serde_json::Value| match method {
+            "getHealth" => (200, HEALTH_NO_OLDEST.to_string()),
+            other => (500, format!("unexpected method {other}")),
+        }))
+        .await;
+
+        let client = RpcClient::new(&url, 5);
+        let snap = client.get_tip_snapshot().await.expect("snapshot");
+        assert_eq!(snap, TipSnapshot { latest: 1000, oldest_available: None });
+        assert_eq!(methods_called(&log), vec!["getHealth"]);
+    }
+
+    // #716: an out-of-retention startLedger is a timing race, not a permanent error.
+
+    #[tokio::test]
+    async fn out_of_retention_start_ledger_is_not_treated_as_permanent() {
+        let (url, log) = spawn_rpc_mock(Arc::new(|_m: &str, _n: usize, _r: &serde_json::Value| {
+            (200, ERR_OUT_OF_RETENTION.to_string())
+        }))
+        .await;
+
+        let client = RpcClient::new(&url, 5);
+        let err = client
+            .get_events(Some(10), &[], None, 10)
+            .await
+            .expect_err("range error is surfaced to the caller");
+        assert!(is_out_of_retention(&err));
+        assert!(
+            !is_non_retryable_rpc_error(&err),
+            "must not count towards the permanent-error budget"
+        );
+        assert_eq!(methods_called(&log).len(), 1, "a range error is not retried on the same URL");
+    }
+
+    #[tokio::test]
+    async fn other_invalid_params_stay_permanent() {
+        let err_contract = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid contract id"}}"#;
+        let (url, _log) = spawn_rpc_mock(Arc::new(move |_m: &str, _n: usize, _r: &serde_json::Value| {
+            (200, err_contract.to_string())
+        }))
+        .await;
+
+        let client = RpcClient::new(&url, 5);
+        let err = client.get_events(Some(10), &[], None, 10).await.expect_err("bad contract id");
+        assert!(is_non_retryable_rpc_error(&err));
+        assert!(!is_out_of_retention(&err));
+    }
+
+    #[tokio::test]
+    async fn get_events_bounded_sends_end_ledger_only_with_start_ledger() {
+        let (url, log) = spawn_rpc_mock(Arc::new(|_m: &str, _n: usize, _r: &serde_json::Value| {
+            (200, EMPTY_EVENTS.to_string())
+        }))
+        .await;
+        let client = RpcClient::new(&url, 5);
+
+        client.get_events_bounded(Some(10), Some(21), &[], None, 10).await.unwrap();
+        client
+            .get_events_bounded(Some(10), Some(21), &[], Some("cursor-1".into()), 10)
+            .await
+            .unwrap();
+
+        let requests = log.lock().unwrap().clone();
+        let first = &requests[0]["params"];
+        assert_eq!(first["startLedger"], 10);
+        assert_eq!(first["endLedger"], 21, "first page is bounded at the tip");
+        let continuation = &requests[1]["params"];
+        assert!(continuation.get("startLedger").is_none(), "cursor pages carry no startLedger");
+        assert!(continuation.get("endLedger").is_none(), "endLedger is not sent with a cursor");
+    }
 }

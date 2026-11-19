@@ -67,6 +67,24 @@ pub async fn write_progress(
     Ok(())
 }
 
+/// Persist a mid-cycle checkpoint: every ledger up to and including
+/// `last_processed` is fully stored (#717). Only the cursor position moves.
+/// Ingest counters and the observed tip are still written once per cycle by
+/// [`write_progress`]. The cursor never moves backwards.
+pub async fn checkpoint_progress(pool: &PgPool, last_processed: i64) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO indexer_cursor (id, last_processed_ledger, updated_at)
+         VALUES (1, $1, now())
+         ON CONFLICT (id) DO UPDATE SET
+            last_processed_ledger = GREATEST(indexer_cursor.last_processed_ledger, EXCLUDED.last_processed_ledger),
+            updated_at            = now()",
+    )
+    .bind(last_processed)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Record that a poll cycle failed, for the error-rate metric.
 pub async fn incr_errors(pool: &PgPool) -> anyhow::Result<()> {
     sqlx::query(
@@ -103,6 +121,7 @@ pub async fn track_enrichment(
 }
 
 /// Track spec fetch failures.
+#[allow(dead_code)]
 pub async fn track_spec_fetch_failure(pool: &PgPool, count: u64) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO indexer_cursor (id, last_processed_ledger, spec_fetch_failures_total, updated_at)

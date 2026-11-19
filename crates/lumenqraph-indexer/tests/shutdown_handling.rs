@@ -8,7 +8,7 @@ mod shutdown_handling_tests {
     use sqlx::PgPool;
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::Notify;
+    
 
     async fn setup_test_db() -> PgPool {
         let database_url = std::env::var("DATABASE_URL")
@@ -191,7 +191,7 @@ mod shutdown_handling_tests {
             let mut pages_processed = 0;
 
             // Simulate fetching and processing pages
-            for page_num in 0..5 {
+            for _page_num in 0..5 {
                 // Simulate large page processing
                 tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -232,7 +232,7 @@ mod shutdown_handling_tests {
         let total_snapshots = 500;
 
         let cancellation_clone = cancellation.clone();
-        let pool_clone = pool.clone();
+        let _pool_clone = pool.clone();
         let task = tokio::spawn(async move {
             let mut written = 0;
 
@@ -240,7 +240,7 @@ mod shutdown_handling_tests {
                 // Simulate writing a batch of state snapshots
                 let batch_end = (batch_start + batch_size).min(total_snapshots);
 
-                for i in batch_start..batch_end {
+                for _i in batch_start..batch_end {
                     // Simulate snapshot write
                     written += 1;
                 }

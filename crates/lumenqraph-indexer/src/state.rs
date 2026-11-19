@@ -26,12 +26,14 @@ const MAX_BATCH_KEYS: usize = 100;
 
 /// Snapshot a contract's instance storage if it has changed since the last
 /// snapshot. Best-effort: errors are logged, never propagated to the poller.
+#[allow(dead_code)] // single-contract entry point; batch snapshots are used by the poller
 pub async fn snapshot(pool: &PgPool, rpc: &RpcClient, specs: &SpecCache, contract_id: &str) {
     if let Err(e) = try_snapshot(pool, rpc, specs, contract_id).await {
         warn!(contract_id, error = %e, "state snapshot failed");
     }
 }
 
+#[allow(dead_code)]
 async fn try_snapshot(
     pool: &PgPool,
     rpc: &RpcClient,

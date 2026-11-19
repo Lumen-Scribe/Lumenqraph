@@ -5,7 +5,7 @@
 #[cfg(test)]
 mod rpc_retention_window_tests {
     use sqlx::postgres::PgPoolOptions;
-    use sqlx::{PgPool, Row};
+    use sqlx::PgPool;
 
     async fn setup_test_db() -> PgPool {
         let database_url = std::env::var("DATABASE_URL")
@@ -145,7 +145,7 @@ mod rpc_retention_window_tests {
         .expect("insert rpc_health should succeed");
 
         // Get RPC-reported retention window (not hardcoded)
-        let (oldest, _latest, retention): (i64, i64, i64) = sqlx::query_as(
+        let (oldest, _latest, _retention): (i64, i64, i64) = sqlx::query_as(
             "SELECT oldest_ledger, latest_ledger, ledger_retention_window FROM rpc_health WHERE id = 1"
         )
         .fetch_one(&pool)
@@ -202,7 +202,7 @@ mod rpc_retention_window_tests {
             50_000i64
         };
 
-        let oldest_available = latest - retention_to_use;
+        let _oldest_available = latest - retention_to_use;
 
         // Verify fallback is more conservative than hardcoded 120_000 (when appropriate)
         // or uses the configured override
@@ -225,7 +225,7 @@ mod rpc_retention_window_tests {
         let latest = 1_000_000i64;
 
         // Hardcoded logic (current, broken):
-        let hardcoded_oldest = latest - MAX_LOOKBACK_LEDGERS;
+        let _hardcoded_oldest = latest - MAX_LOOKBACK_LEDGERS;
 
         // Should be replaced by:
         // let rpc_reported_oldest = rpc.get_health().oldest_ledger?;

@@ -245,7 +245,12 @@ async fn main() -> anyhow::Result<()> {
                 config.spec_cache_max_entries,
                 config.spec_fetch_concurrency,
             );
-            poller::recover_gaps(&pool, &rpc, &config, &specs).await
+            // SIGTERM/Ctrl-C stops the replay after the page in progress (#715).
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            tokio::spawn(poller::wait_for_shutdown(shutdown.clone()));
+            poller::recover_gaps(&pool, &rpc, &config, &specs, &shutdown)
+                .await
+                .map(|_summary| ())
         }
         Command::Reenrich { contract, force } => {
             reenrich::run_reenrich(pool, rpc, config, ReenrichOptions { contract, force }).await

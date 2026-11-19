@@ -380,7 +380,7 @@ fn bench_db_insert(c: &mut Criterion) {
                             let closed_ats: Vec<_> =
                                 events.iter().map(|e| e.ledger_closed_at).collect();
                             let event_types: Vec<_> =
-                                events.iter().map(|e| e.event_type.clone()).collect();
+                                events.iter().map(|e| e.event_type).collect();
                             let topics_json: Vec<String> = events
                                 .iter()
                                 .map(|e| serde_json::to_string(&e.topics).unwrap())
