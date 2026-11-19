@@ -192,7 +192,7 @@ pub fn decode_scval(sv: &stellar_xdr::curr::ScVal) -> Value {
 
 /// Render a `UInt256Parts` as a decimal string.
 fn u256_to_decimal(p: &stellar_xdr::curr::UInt256Parts) -> String {
-    let mut limbs: [u64; 4] = [p.hi_hi, p.hi_lo, p.lo_hi, p.lo_lo];
+    let mut limbs = [p.hi_hi as u64, p.hi_lo, p.lo_hi, p.lo_lo];
     // Repeated division by 10^19 (largest power of ten fitting in a u64).
     const CHUNK: u64 = 10_000_000_000_000_000_000;
     let mut chunks: Vec<u64> = Vec::new();

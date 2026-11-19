@@ -1,6 +1,4 @@
--- 0044_webhook_deliveries_restrict.sql
--- Renumbered from 0025 to resolve a duplicate version 0025 (see 0025_webhook_safe_decrypt.sql).
--- Idempotent (DROP IF EXISTS before ADD), so databases that already ran it under the old number are unaffected.
+-- 0025_webhook_deliveries_restrict.sql
 --
 -- Issue #601: Retention cascades into `webhook_deliveries`, silently deleting
 -- pending deliveries and delivery history.

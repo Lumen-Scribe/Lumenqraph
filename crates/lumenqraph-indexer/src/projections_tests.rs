@@ -1,3 +1,10 @@
+// Disabled until these projection tests are ported to the current API.
+// They import `lumenqraph_indexer::store`, which does not exist: the indexer is
+// a binary-only crate, so its modules cannot be reached from an integration
+// test. The file is kept as-is (all tests are `#[ignore]`d) so the work is not
+// lost. Remove this `cfg` gate once the tests are rewritten.
+#![cfg(any())]
+
 //! Integration tests for materialized view projections.
 //!
 //! These tests verify that:

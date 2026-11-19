@@ -230,7 +230,7 @@ mod tests {
         assert_eq!(inserted, 3, "all three events must be indexed");
 
         // Record the cursor (what backfill::run / poller::poll_once does).
-        cursor::write_progress(&pool, 1000, 1000, inserted)
+        cursor::write_progress_locked(&pool, 1000, 1000, inserted)
             .await
             .unwrap();
 

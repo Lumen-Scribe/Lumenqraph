@@ -38,6 +38,7 @@ lru.workspace = true
 axum.workspace = true
 
 [dev-dependencies]
+lumenqraph-core = { workspace = true, features = ["db-test"] }
 hmac.workspace = true
 stellar-strkey.workspace = true
 tower = { workspace = true, features = ["util"] }

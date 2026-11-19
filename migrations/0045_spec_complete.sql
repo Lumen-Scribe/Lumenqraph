@@ -1,5 +1,3 @@
--- Renumbered from 0042 to resolve a duplicate version 0042 (see 0042_webhook_secret_rotation.sql).
--- Idempotent (ADD COLUMN IF NOT EXISTS).
 -- #401: Track whether a contract's spec section was fully decoded.
 -- When false, interface diffs are suppressed to prevent false breaking-change
 -- alerts caused by partial parses truncating entries mid-section.

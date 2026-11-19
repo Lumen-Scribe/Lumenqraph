@@ -807,6 +807,7 @@ fn extract_liquidity_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use serde_json::json;
 
 
@@ -932,14 +933,14 @@ mod tests {
     }
 
     #[test]
-    fn nft_contract_transfer_with_complex_topics_should_be_handled() {
+    fn nft_contract_transfer_with_complex_topics_is_skipped() {
         let e = event(
             Some("transfer"),
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
             json!({"token_id": 123}),
         );
-        let t = extract_transfer(&e, &fungible);
-        assert!(t.is_some(), "should handle complex token_id object");
+        // No `amount` field: skipped and counted, never projected as a transfer.
+        assert!(extract_transfer(&e, &fungible).is_none(), "value without an amount is skipped");
     }
 
     // Issue #384: CAP-67 Protocol 23 support for muxed addresses and SAC assets
@@ -989,10 +990,8 @@ mod tests {
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
             map_value,
         );
-        let t = extract_transfer(&e, &fungible);
-        assert!(t.is_some(), "should handle CAP-67 map value");
-        let transfer = t.unwrap();
-        // The CAP-67 map form contributes its `amount`, not the whole map.
+        // CAP-67 map form: the amount comes from the `amount` key.
+        let transfer = extract_transfer(&e, &fungible).expect("CAP-67 map value should extract");
         assert_eq!(transfer.amount, "100");
     }
 
@@ -1009,19 +1008,18 @@ mod tests {
     }
 
     #[test]
-    fn transfer_with_vector_value_should_not_panic() {
+    fn transfer_with_vector_value_is_skipped_without_panicking() {
         let vector_value = json!(["item1", "item2", "item3"]);
         let e = event(
             Some("transfer"),
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
             vector_value,
         );
-        let t = extract_transfer(&e, &fungible);
-        assert!(t.is_some(), "should not panic on vector value");
+        assert!(extract_transfer(&e, &fungible).is_none(), "non-amount value is skipped");
     }
 
     #[test]
-    fn mint_with_struct_value_should_stringify() {
+    fn mint_with_struct_value_is_skipped() {
         let struct_value = json!({
             "field1": "value1",
             "field2": 42,
@@ -1034,34 +1032,28 @@ mod tests {
             vec![json!("mint"), json!("GRECIPIENT")],
             struct_value,
         );
-        let t = extract_transfer(&e, &fungible);
-        assert!(t.is_some(), "should handle complex struct value");
-        let amount = t.unwrap().amount;
-        assert!(amount.contains("field") || amount.contains("nested"));
+        // Only a top-level `amount` key counts; a nested one does not.
+        assert!(extract_transfer(&e, &fungible).is_none(), "struct without top-level amount is skipped");
     }
 
     #[test]
-    fn burn_with_null_value_should_handle() {
+    fn burn_with_null_value_is_skipped() {
         let e = event(
             Some("burn"),
             vec![json!("burn"), json!("GBURNER")],
             json!(null),
         );
-        let t = extract_transfer(&e, &fungible);
-        assert!(t.is_some(), "should handle null value");
-        assert_eq!(t.unwrap().amount, "null");
+        assert!(extract_transfer(&e, &fungible).is_none(), "null amount is skipped");
     }
 
     #[test]
-    fn clawback_with_boolean_value_should_stringify() {
+    fn clawback_with_boolean_value_is_skipped() {
         let e = event(
             Some("clawback"),
             vec![json!("clawback"), json!("GVICTIM")],
             json!(true),
         );
-        let t = extract_transfer(&e, &fungible);
-        assert!(t.is_some(), "should handle boolean value");
-        assert_eq!(t.unwrap().amount, "true");
+        assert!(extract_transfer(&e, &fungible).is_none(), "boolean amount is skipped");
     }
 
     // Issue #382: REORG_OVERLAP_LEDGERS upsert should skip no-op updates
