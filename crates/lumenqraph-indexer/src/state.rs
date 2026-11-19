@@ -11,11 +11,25 @@
 //! Reading the instance also gives us the contract's current WASM hash, which we
 //! feed back to the [`SpecCache`] so an upgraded contract's interface is
 //! refreshed.
+//!
+//! # Contract-data key hashes
+//!
+//! Each contract-data entry is identified by `ledger_key_hash`, the hex-encoded
+//! SHA-256 of the XDR-encoded `LedgerKey::ContractData { contract, key,
+//! durability }`. This is the standard Stellar ledger-key hash: it includes the
+//! durability, so persistent and temporary entries with an identical `ScVal` key
+//! are distinct entries, and clients can derive it from a key they already know.
+//!
+//! The legacy `key_hash` column (SHA-256 of the base64 key text, durability
+//! ignored) is still populated as a deprecated alias for one release.
 
 use lumenqraph_core::xdr;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use stellar_xdr::curr::{ContractDataDurability, Limits, ScVal, WriteXdr};
+use stellar_xdr::curr::{
+    ContractDataDurability, ContractId, Hash, LedgerKey, LedgerKeyContractData, Limits, ScAddress,
+    ScVal, WriteXdr,
+};
 use tracing::{debug, warn};
 
 use crate::rpc_client::{DataEntry, RpcClient};
@@ -266,7 +280,10 @@ async fn try_write_snapshot_data(
     entry: &DataEntry,
 ) -> anyhow::Result<()> {
     let key_xdr = key.to_xdr_base64(Limits::none())?;
+    // Deprecated alias: sha256 of the base64 key text (durability-blind).
     let key_hash = hex::encode(Sha256::digest(key_xdr.as_bytes()));
+    // Canonical identifier: sha256 of the XDR LedgerKey, which includes durability.
+    let ledger_key_hash = ledger_key_hash(contract_id, key, durability)?;
     let durability_str = match durability {
         ContractDataDurability::Persistent => "persistent",
         ContractDataDurability::Temporary => "temporary",
@@ -274,10 +291,10 @@ async fn try_write_snapshot_data(
 
     // Change detection: skip if we already have this key at this ledger.
     let latest: Option<i64> = sqlx::query_scalar(
-        "SELECT max(ledger) FROM contract_data WHERE contract_id = $1 AND key_hash = $2",
+        "SELECT max(ledger) FROM contract_data WHERE contract_id = $1 AND ledger_key_hash = $2",
     )
     .bind(contract_id)
-    .bind(&key_hash)
+    .bind(&ledger_key_hash)
     .fetch_one(pool)
     .await?;
     if latest == Some(entry.last_modified_ledger) {
@@ -286,12 +303,13 @@ async fn try_write_snapshot_data(
 
     sqlx::query(
         "INSERT INTO contract_data
-            (contract_id, key_hash, key, key_xdr, durability, ledger, value, label)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (contract_id, key_hash, ledger) DO NOTHING",
+            (contract_id, key_hash, ledger_key_hash, key, key_xdr, durability, ledger, value, label)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (contract_id, ledger_key_hash, ledger) DO NOTHING",
     )
     .bind(contract_id)
     .bind(&key_hash)
+    .bind(&ledger_key_hash)
     .bind(decode_scval(key))
     .bind(&key_xdr)
     .bind(durability_str)
@@ -307,6 +325,33 @@ async fn try_write_snapshot_data(
         "contract-data snapshot recorded"
     );
     Ok(())
+}
+
+/// Compute the canonical ledger-key hash for a contract-data entry:
+/// `hex(sha256(LedgerKey::ContractData { contract, key, durability }.to_xdr()))`.
+///
+/// This matches the identifier used by Stellar tooling and includes durability,
+/// so persistent and temporary entries with the same key never collide.
+pub fn ledger_key_hash(
+    contract_id: &str,
+    key: &ScVal,
+    durability: ContractDataDurability,
+) -> anyhow::Result<String> {
+    let contract = parse_contract_address(contract_id)?;
+    let ledger_key = LedgerKey::ContractData(LedgerKeyContractData {
+        contract,
+        key: key.clone(),
+        durability,
+    });
+    let xdr_bytes = ledger_key.to_xdr(Limits::none())?;
+    Ok(hex::encode(Sha256::digest(&xdr_bytes)))
+}
+
+/// Parse a contract ID string (`C…` StrKey) into an `ScAddress::Contract`.
+fn parse_contract_address(contract_id: &str) -> anyhow::Result<ScAddress> {
+    let contract = ContractId::from_str(contract_id)
+        .map_err(|e| anyhow::anyhow!("invalid contract id {contract_id}: {e}"))?;
+    Ok(ScAddress::Contract(contract))
 }
 
 /// Decode an instance-storage `ScVal` to friendly JSON directly, without any

@@ -587,9 +587,10 @@ fn default_data_limit() -> i64 {
     100
 }
 
-/// One `contract_data` row as selected below: (key_hash, key, durability,
-/// ledger, value, label, captured_at).
+/// One `contract_data` row as selected below: (ledger_key_hash, key_hash, key,
+/// durability, ledger, value, label, captured_at).
 type DataRow = (
+    String,
     String,
     SqlxJson<Value>,
     String,
@@ -608,15 +609,17 @@ pub async fn contract_data(
     Query(q): Query<DataQuery>,
 ) -> ApiResult<Json<Value>> {
     let limit = q.limit.clamp(1, 1000);
-    // DISTINCT ON gives the newest row per key_hash; the outer query orders and
-    // bounds the set of keys returned.
+    // DISTINCT ON gives the newest row per ledger_key_hash; the outer query
+    // orders and bounds the set of keys returned. `ledger_key_hash` includes
+    // the entry's durability, so persistent and temporary entries with the
+    // same key are distinct rows (#741).
     let rows: Vec<DataRow> = sqlx::query_as(
-        "SELECT key_hash, key, durability, ledger, value, label, captured_at FROM (
-                 SELECT DISTINCT ON (key_hash)
-                        key_hash, key, durability, ledger, value, label, captured_at
+        "SELECT ledger_key_hash, key_hash, key, durability, ledger, value, label, captured_at FROM (
+                 SELECT DISTINCT ON (ledger_key_hash)
+                        ledger_key_hash, key_hash, key, durability, ledger, value, label, captured_at
                  FROM contract_data
                  WHERE contract_id = $1 AND ($2::text IS NULL OR label = $2)
-                 ORDER BY key_hash, ledger DESC
+                 ORDER BY ledger_key_hash, ledger DESC
              ) latest
              ORDER BY ledger DESC
              LIMIT $3",
@@ -646,8 +649,10 @@ pub async fn contract_data(
     let keys: Vec<Value> = rows
         .into_iter()
         .map(
-            |(key_hash, key, durability, ledger, value, label, captured_at)| {
+            |(ledger_key_hash, key_hash, key, durability, ledger, value, label, captured_at)| {
                 json!({
+                    "ledger_key_hash": ledger_key_hash,
+                    // Deprecated alias, kept for one release (#741).
                     "key_hash": key_hash,
                     "key": key.0,
                     "durability": durability,
@@ -673,17 +678,24 @@ pub struct DataHistoryQuery {
     limit: i64,
 }
 
-/// `GET /contracts/:id/data/:key_hash` — the version history of a single
+/// `GET /contracts/:id/data/:ledger_key_hash` — the version history of a single
 /// per-key entry (e.g. one holder's balance over time), newest first.
+///
+/// The path parameter is the ledger-key hash: `hex(sha256(xdr(LedgerKey)))`,
+/// which includes the entry's durability. Persistent and temporary entries
+/// with the same key therefore have separate histories (#741). For one release
+/// the legacy `key_hash` value is also accepted and resolved to its entry.
 pub async fn contract_data_key(
     State(state): State<AppState>,
     ValidContractId(contract_id): ValidContractId,
-    Path((_, key_hash)): Path<(String, String)>,
+    Path((_, ledger_key_hash)): Path<(String, String)>,
     Query(q): Query<DataHistoryQuery>,
 ) -> ApiResult<Json<Value>> {
     let limit = q.limit.clamp(1, 500);
-    // (key, durability, ledger, value, label, captured_at)
+    // (ledger_key_hash, key_hash, key, durability, ledger, value, label, captured_at)
     type HistRow = (
+        String,
+        String,
         SqlxJson<Value>,
         String,
         i64,
@@ -691,34 +703,71 @@ pub async fn contract_data_key(
         Option<String>,
         DateTime<Utc>,
     );
+    // Match on the ledger-key hash. The legacy `key_hash` fallback is only
+    // consulted when no ledger-key hash matches, and is restricted to a single
+    // (key, durability) entry so it can never interleave two histories.
     let rows: Vec<HistRow> = sqlx::query_as(
-        "SELECT key, durability, ledger, value, label, captured_at
+        "SELECT ledger_key_hash, key_hash, key, durability, ledger, value, label, captured_at
              FROM contract_data
-             WHERE contract_id = $1 AND key_hash = $2
+             WHERE contract_id = $1
+               AND ledger_key_hash = (
+                     SELECT ledger_key_hash FROM contract_data
+                     WHERE contract_id = $1 AND ledger_key_hash = $2
+                     LIMIT 1
+                   )
              ORDER BY ledger DESC LIMIT $3",
     )
     .bind(&contract_id)
-    .bind(&key_hash)
+    .bind(&ledger_key_hash)
     .bind(limit)
     .fetch_all(&state.pool)
     .await?;
+
+    let rows = if rows.is_empty() {
+        // Deprecated alias: resolve a legacy `key_hash` to one entry. If the
+        // key exists under both durabilities the alias is ambiguous, so pick
+        // the persistent entry deterministically rather than mixing them.
+        sqlx::query_as(
+            "SELECT ledger_key_hash, key_hash, key, durability, ledger, value, label, captured_at
+                 FROM contract_data
+                 WHERE contract_id = $1
+                   AND ledger_key_hash = (
+                         SELECT ledger_key_hash FROM contract_data
+                         WHERE contract_id = $1 AND key_hash = $2
+                         ORDER BY (durability = 'persistent') DESC, ledger_key_hash
+                         LIMIT 1
+                       )
+                 ORDER BY ledger DESC LIMIT $3",
+        )
+        .bind(&contract_id)
+        .bind(&ledger_key_hash)
+        .bind(limit)
+        .fetch_all(&state.pool)
+        .await?
+    } else {
+        rows
+    };
 
     if rows.is_empty() {
         return Err(ApiError::not_found("no data snapshots for this key"));
     }
 
     // Key and durability are constant across a key's history; take them once.
-    let key = rows[0].0 .0.clone();
-    let durability = rows[0].1.clone();
-    let label = rows[0].4.clone();
+    let resolved_ledger_key_hash = rows[0].0.clone();
+    let key_hash = rows[0].1.clone();
+    let key = rows[0].2 .0.clone();
+    let durability = rows[0].3.clone();
+    let label = rows[0].6.clone();
     let versions: Vec<Value> = rows
         .into_iter()
-        .map(|(_, _, ledger, value, _, captured_at)| {
+        .map(|(_, _, _, _, ledger, value, _, captured_at)| {
             json!({ "ledger": ledger, "value": value.0, "captured_at": captured_at })
         })
         .collect();
     Ok(Json(json!({
         "contract_id": contract_id,
+        "ledger_key_hash": resolved_ledger_key_hash,
+        // Deprecated alias, kept for one release (#741).
         "key_hash": key_hash,
         "key": key,
         "durability": durability,

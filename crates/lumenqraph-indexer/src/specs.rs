@@ -176,18 +176,42 @@ impl SpecCache {
         ledger: i64,
     ) {
         // Only the check holds the lock; the reload below must not.
-        let is_stale = {
-            let mut map = self.inner.lock().unwrap();
-            match map.get(contract_id) {
-                Some(cached) if cached.wasm_hash.as_deref() != Some(current_hash) => {
-                    map.pop(contract_id);
-                    self.cache_size.store(map.len(), Ordering::Relaxed);
-                    true
+        let cached_hash = {
+            let map = self.inner.lock().unwrap();
+            map.get(contract_id).and_then(|c| c.wasm_hash.clone())
+        };
+        // #739: on a cache miss (never loaded since restart, or evicted under
+        // LRU pressure) the in-memory entry can't tell us anything. Fall back to
+        // the persisted current hash so upgrades of contracts that emit no
+        // events are still noticed eagerly.
+        let is_stale = match cached_hash {
+            Some(hash) => hash != current_hash,
+            None => {
+                let persisted: Option<Option<String>> = sqlx::query_scalar(
+                    "SELECT wasm_hash FROM contract_specs WHERE contract_id = $1",
+                )
+                .bind(contract_id)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(contract_id, error = %e, "failed to read persisted wasm hash");
+                    None
+                });
+                match persisted {
+                    // A persisted spec at a different hash: upgraded.
+                    Some(Some(hash)) => hash != current_hash,
+                    // No persisted spec at all: nothing to compare against, but
+                    // we still want to load and record the interface.
+                    Some(None) | None => true,
                 }
-                _ => false,
             }
         };
         if is_stale {
+            {
+                let mut map = self.inner.lock().unwrap();
+                map.pop(contract_id);
+                self.cache_size.store(map.len(), Ordering::Relaxed);
+            }
             info!(
                 contract_id,
                 wasm_hash = current_hash,

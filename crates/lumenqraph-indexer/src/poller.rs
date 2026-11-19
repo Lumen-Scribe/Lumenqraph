@@ -30,6 +30,10 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_LOOKBACK_LEDGERS: i64 = 120_000; // ~7 days at ~5s/ledger (SDF public RPC)
 static RPC_OLDEST_LEDGER: AtomicI64 = AtomicI64::new(0);
 
+/// Contracts per `getLedgerEntries` call when reading instance entries in
+/// batches. Matches the chunk size used by `state::snapshot_instances_batch`.
+const MAX_BATCH_INSTANCES: usize = 50;
+
 pub fn rpc_oldest_ledger() -> i64 {
     RPC_OLDEST_LEDGER.load(Ordering::Relaxed)
 }
@@ -597,10 +601,36 @@ async fn fetch_and_store_with_shutdown(
             // Also notes the executable hash, detecting upgrades for free.
             state::snapshot_instances_batch(pool, rpc, specs, &targets).await;
         } else {
-            // Upgrade watch in index-all mode: batch the instance reads,
-            // then check for upgrades.
-            for contract_id in &targets {
-                specs::check_for_upgrade(pool, rpc, specs, contract_id, tip).await;
+            // Upgrade watch in index-all mode: batch the instance reads, then
+            // note each executable hash. One getLedgerEntries per chunk instead
+            // of one per contract (#740).
+            for chunk in targets.chunks(MAX_BATCH_INSTANCES) {
+                let instances = match rpc.get_contract_instances_batch(chunk).await {
+                    Ok(instances) => instances,
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            contracts = chunk.len(),
+                            "batched instance read for upgrade watch failed; skipping chunk"
+                        );
+                        continue;
+                    }
+                };
+                for (contract_id, instance) in chunk.iter().zip(instances) {
+                    let Some(instance) = instance else { continue };
+                    let Some(wasm_hash) = instance.wasm_hash.as_deref() else {
+                        continue;
+                    };
+                    specs
+                        .note_wasm_hash(
+                            pool,
+                            rpc,
+                            contract_id,
+                            wasm_hash,
+                            instance.last_modified_ledger,
+                        )
+                        .await;
+                }
             }
         }
     }
