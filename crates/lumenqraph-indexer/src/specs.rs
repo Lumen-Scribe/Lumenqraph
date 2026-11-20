@@ -30,8 +30,7 @@
 //! when known, falling back to `observed_ledger` (an upper bound) otherwise
 //! (#737).
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -44,6 +43,37 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::rpc_client::RpcClient;
+
+/// Counters for `lumenqraph_spec_cache_loads_total{source}`: how many cache
+/// misses were satisfied from Postgres vs. from RPC (#735).
+#[derive(Default)]
+struct LoadCounters {
+    db: AtomicU64,
+    rpc: AtomicU64,
+}
+
+impl LoadCounters {
+    fn record(&self, source: LoadSource) {
+        match source {
+            LoadSource::Db => self.db.fetch_add(1, Ordering::Relaxed),
+            LoadSource::Rpc => self.rpc.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.db.load(Ordering::Relaxed),
+            self.rpc.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Where a cache miss was resolved from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoadSource {
+    Db,
+    Rpc,
+}
 
 #[derive(Clone)]
 enum CachedSpec {
@@ -112,9 +142,7 @@ pub struct SpecCache {
     inner: Mutex<LruCache<String, Cached>>,
     fetch_semaphore: Arc<Semaphore>,
     cache_size: AtomicUsize,
-    /// In-flight fetches keyed by contract id, so concurrent misses for one
-    /// contract coalesce into a single WASM fetch (#738).
-    inflight: Mutex<HashMap<String, BoxFuture<'static, ()>>>,
+    loads: LoadCounters,
 }
 
 impl SpecCache {
@@ -125,8 +153,15 @@ impl SpecCache {
             )),
             fetch_semaphore: Arc::new(Semaphore::new(concurrency)),
             cache_size: AtomicUsize::new(0),
-            inflight: Mutex::new(HashMap::new()),
+            loads: LoadCounters::default(),
         }
+    }
+
+    /// Return `(db, rpc)` counts of cache misses resolved from Postgres and
+    /// from RPC respectively. Used by `/metrics` to expose
+    /// `lumenqraph_spec_cache_loads_total{source}`.
+    pub fn load_counts(&self) -> (u64, u64) {
+        self.loads.snapshot()
     }
 
     /// Return the current number of entries in the spec cache. Used by the
@@ -276,14 +311,20 @@ impl SpecCache {
             .await
             .expect("semaphore acquire failed");
 
-        // Re-check after acquiring the permit: another leader may have finished
-        // while we waited.
-        if let Some(result) = self.try_cached(contract_id, ledger) {
-            return result;
-        }
-
-        let loaded = load(pool, rpc, contract_id, ledger).await;
-        let cached_spec = match &loaded.spec {
+        // #735: prefer the persisted spec. A restart (or an LRU eviction) must
+        // not cost a WASM download when we already have the interface in
+        // Postgres. RPC is only touched when no row exists.
+        let (spec, wasm_hash, is_permanent, source) =
+            match load_persisted(pool, contract_id).await {
+                Some((spec, wasm_hash)) => (Some(spec), wasm_hash, true, LoadSource::Db),
+                None => {
+                    let (spec, wasm_hash, is_permanent) =
+                        load(pool, rpc, contract_id, ledger).await;
+                    (spec, wasm_hash, is_permanent, LoadSource::Rpc)
+                }
+            };
+        self.loads.record(source);
+        let cached_spec = match spec {
             Some(s) => CachedSpec::Spec(s.clone()),
             None => {
                 if loaded.is_permanent {
@@ -338,34 +379,42 @@ impl SpecCache {
         ledger: i64,
     ) {
         // Only the check holds the lock; the reload below must not.
-        let is_stale = {
-            let mut map = self.inner.lock().unwrap();
-            match map.get_mut(contract_id) {
-                Some(cached) => match &cached.spec {
-                    CachedSpec::FetchError { .. } => {
-                        // Transient failure: keep the TTL, but remember the
-                        // observed hash so the retry can skip the instance hop.
-                        cached.wasm_hash = Some(current_hash.to_string());
-                        false
-                    }
-                    _ => {
-                        // Only treat as upgraded when we have a *known*
-                        // previous hash that differs.
-                        let upgraded = matches!(
-                            cached.wasm_hash.as_deref(),
-                            Some(prev) if prev != current_hash
-                        );
-                        if upgraded {
-                            map.pop(contract_id);
-                            self.cache_size.store(map.len(), Ordering::Relaxed);
-                        }
-                        upgraded
-                    }
-                },
-                None => false,
+        let cached_hash = {
+            let map = self.inner.lock().unwrap();
+            map.get(contract_id).and_then(|c| c.wasm_hash.clone())
+        };
+        // #739: on a cache miss (never loaded since restart, or evicted under
+        // LRU pressure) the in-memory entry can't tell us anything. Fall back to
+        // the persisted current hash so upgrades of contracts that emit no
+        // events are still noticed eagerly.
+        let is_stale = match cached_hash {
+            Some(hash) => hash != current_hash,
+            None => {
+                let persisted: Option<Option<String>> = sqlx::query_scalar(
+                    "SELECT wasm_hash FROM contract_specs WHERE contract_id = $1",
+                )
+                .bind(contract_id)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(contract_id, error = %e, "failed to read persisted wasm hash");
+                    None
+                });
+                match persisted {
+                    // A persisted spec at a different hash: upgraded.
+                    Some(Some(hash)) => hash != current_hash,
+                    // No persisted spec at all: nothing to compare against, but
+                    // we still want to load and record the interface.
+                    Some(None) | None => true,
+                }
             }
         };
         if is_stale {
+            {
+                let mut map = self.inner.lock().unwrap();
+                map.pop(contract_id);
+                self.cache_size.store(map.len(), Ordering::Relaxed);
+            }
             info!(
                 contract_id,
                 wasm_hash = current_hash,
@@ -405,20 +454,52 @@ pub async fn check_for_upgrade(
     }
 }
 
-/// Result of a spec load.
-struct Loaded {
-    spec: Option<Arc<ContractSpec>>,
-    wasm_hash: Option<String>,
-    is_permanent: bool,
-    /// Interface history for this contract, sorted ascending by
-    /// `effective_from_ledger`.
-    versions: Vec<SpecVersion>,
+/// Read a previously persisted interface from `contract_specs` (#735).
+///
+/// Returns `(spec, wasm_hash)` when a row exists and its `spec_section` parses.
+/// A row whose section is empty or unparseable yields `None`, so the caller
+/// falls back to RPC rather than caching a bogus interface.
+async fn load_persisted(
+    pool: &PgPool,
+    contract_id: &str,
+) -> Option<(Arc<ContractSpec>, Option<String>)> {
+    let row: Option<(String, String, bool)> = sqlx::query_as(
+        "SELECT wasm_hash, spec_section, spec_complete FROM contract_specs
+         WHERE contract_id = $1",
+    )
+    .bind(contract_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|e| {
+        // A DB hiccup must not be fatal: fall through to RPC.
+        warn!(contract_id, error = %e, "failed to read persisted contract spec");
+        None
+    });
+
+    let (wasm_hash, spec_section, complete) = row?;
+    let bytes = hex::decode(&spec_section).ok()?;
+    let parsed = ContractSpec::from_spec_xdr(&bytes)?;
+    if !complete {
+        debug!(
+            contract_id,
+            wasm_hash, "loaded partial contract spec from database"
+        );
+    } else {
+        debug!(contract_id, wasm_hash, "loaded contract spec from database");
+    }
+    Some((Arc::new(parsed.spec), Some(wasm_hash)))
 }
 
-/// Fetch, parse, persist, and record the contract's interface. Also loads the
-/// contract's version history from `contract_spec_versions` so `get` can answer
-/// version-at-ledger queries (#736).
-async fn load(pool: &PgPool, rpc: &RpcClient, contract_id: &str, ledger: i64) -> Loaded {
+/// Returns `(parsed spec, wasm hash, is_permanent_failure)`. The hash is present for any WASM contract
+/// (even if its spec fails to parse) and `None` for a Stellar Asset Contract.
+/// `is_permanent_failure` is true when the failure is not retryable (SAC, parse error),
+/// and false for transient failures (RPC error).
+async fn load(
+    pool: &PgPool,
+    rpc: &RpcClient,
+    contract_id: &str,
+    ledger: i64,
+) -> (Option<Arc<ContractSpec>>, Option<String>, bool) {
     let (wasm_hash, wasm) = match rpc.get_contract_wasm(contract_id).await {
         Ok(Some(w)) => w,
         Ok(None) => {
@@ -873,6 +954,59 @@ mod tests {
             diff["summary"],
             serde_json::json!([]),
             "an interface that didn't change should diff to no changes at all"
+        );
+    }
+
+    /// #735: with a `contract_specs` row present, `SpecCache::get` must serve
+    /// the persisted interface without touching RPC. The RPC client here points
+    /// at an unroutable address, so any `getLedgerEntries` call would fail (and
+    /// the test would observe a `FetchError` instead of the spec).
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn get_serves_persisted_spec_without_rpc() {
+        let pool = fixture().await;
+        let (section, spec) = spec_with(&["balance"]);
+        persist(&pool, "C1", "hash1", &section, &spec, true)
+            .await
+            .unwrap();
+
+        // A client that can never reach a node: any RPC call fails.
+        let rpc = RpcClient::new("http://127.0.0.1:1", Duration::from_millis(50));
+        let cache = SpecCache::new(16, 4);
+
+        let got = cache.get(&pool, &rpc, "C1", 100).await;
+        let got = got.expect("persisted spec should be returned");
+        assert_eq!(got.functions.len(), spec.functions.len());
+        assert_eq!(cache.load_counts(), (1, 0), "load must come from the db");
+    }
+
+    /// #735: after a restart with many known contracts, the first cycle must
+    /// make zero WASM fetches — every spec comes from `contract_specs`.
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn restart_with_known_contracts_makes_no_rpc_fetches() {
+        let pool = fixture().await;
+        let (section, spec) = spec_with(&["balance"]);
+        for i in 0..1_000 {
+            let id = format!("C{i}");
+            persist(&pool, &id, "hash1", &section, &spec, true)
+                .await
+                .unwrap();
+        }
+
+        let rpc = RpcClient::new("http://127.0.0.1:1", Duration::from_millis(50));
+        let cache = SpecCache::new(2_000, 8);
+        for i in 0..1_000 {
+            let id = format!("C{i}");
+            assert!(
+                cache.get(&pool, &rpc, &id, 100).await.is_some(),
+                "contract {id} should load from the database"
+            );
+        }
+        assert_eq!(
+            cache.load_counts(),
+            (1_000, 0),
+            "a warm restart must make zero RPC fetches"
         );
     }
 

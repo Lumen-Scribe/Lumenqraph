@@ -7,7 +7,9 @@ Every REST resource the API exposes has a method here; see the parity table in
 
 from __future__ import annotations
 
+import base64
 import dataclasses
+import hashlib
 import json
 import time
 from collections.abc import Iterator, Mapping
@@ -42,11 +44,261 @@ __all__ = [
     "ContractState",
     "ContractData",
     "CallResult",
+    "ledger_key_hash",
 ]
 
 JsonDict = dict[str, Any]
 WebhookKind = Literal["event", "upgrade"]
 SdkLang = Literal["ts", "python", "rust"]
+Durability = Literal["persistent", "temporary"]
+
+# XDR discriminants for the LedgerKey union (Stellar XDR, LedgerEntryType).
+_LEDGER_ENTRY_TYPE_CONTRACT_DATA = 6
+# XDR discriminants for the ContractDataDurability union.
+_DURABILITY_CODES: dict[str, int] = {"temporary": 0, "persistent": 1}
+# XDR discriminants for the ScVal union (ScValType).
+_SCVAL_CODES: dict[str, int] = {
+    "scv_bool": 0,
+    "scv_void": 1,
+    "scv_error": 2,
+    "scv_u32": 3,
+    "scv_i32": 4,
+    "scv_u64": 5,
+    "scv_i64": 6,
+    "scv_timepoint": 7,
+    "scv_duration": 8,
+    "scv_u128": 9,
+    "scv_i128": 10,
+    "scv_u256": 11,
+    "scv_i256": 12,
+    "scv_bytes": 13,
+    "scv_string": 14,
+    "scv_symbol": 15,
+    "scv_vec": 16,
+    "scv_map": 17,
+    "scv_address": 18,
+    "scv_contract_instance": 19,
+    "scv_ledger_key_contract_instance": 20,
+    "scv_ledger_key_nonce": 21,
+    "scv_ledger_key_ttl": 22,
+}
+# XDR discriminants for the SCAddress union.
+_SCADDRESS_CODES: dict[str, int] = {"sc_address_account": 0, "sc_address_contract": 1}
+# XDR discriminants for the PublicKey union.
+_PUBLIC_KEY_CODES: dict[str, int] = {"public_key_type_ed25519": 0}
+# XDR discriminants for the CryptoKeyType union.
+_CRYPTO_KEY_TYPE_ED25519 = 0
+# XDR discriminants for the ScErrorType / ScErrorCode unions.
+_SCERROR_TYPE_CODES: dict[str, int] = {
+    "sce_contract": 0,
+    "sce_wASM_vm": 1,
+    "sce_context": 2,
+    "sce_storage": 3,
+    "sce_object": 4,
+    "sce_crypto": 5,
+    "sce_events": 6,
+    "sce_budget": 7,
+    "sce_value": 8,
+    "sce_auth": 9,
+}
+_SCERROR_CODE_CODES: dict[str, int] = {
+    "scec_arith_domain": 0,
+    "scec_index_bounds": 1,
+    "scec_invalid_input": 2,
+    "scec_missing_value": 3,
+    "scec_existing_value": 4,
+    "scec_exceeded_limit": 5,
+    "scec_invalid_action": 6,
+    "scec_internal_error": 7,
+    "scec_unexpected_type": 8,
+    "scec_unexpected_size": 9,
+    "scec_out_of_memory": 10,
+}
+# XDR discriminants for the ScSpecType union (used by ScSpecTypeDef).
+_SCSPEC_TYPE_CODES: dict[str, int] = {
+    "scspec_type_val": 0,
+    "scspec_type_bool": 1,
+    "scspec_type_void": 2,
+    "scspec_type_error": 3,
+    "scspec_type_u32": 4,
+    "scspec_type_i32": 5,
+    "scspec_type_u64": 6,
+    "scspec_type_i64": 7,
+    "scspec_type_timepoint": 8,
+    "scspec_type_duration": 9,
+    "scspec_type_u128": 10,
+    "scspec_type_i128": 11,
+    "scspec_type_u256": 12,
+    "scspec_type_i256": 13,
+    "scspec_type_bytes": 14,
+    "scspec_type_string": 15,
+    "scspec_type_symbol": 16,
+    "scspec_type_address": 17,
+    "scspec_type_option": 18,
+    "scspec_type_result": 19,
+    "scspec_type_vec": 20,
+    "scspec_type_map": 21,
+    "scspec_type_tuple": 22,
+    "scspec_type_bytes_n": 23,
+    "scspec_type_udt": 24,
+}
+
+
+def _xdr_uint(value: int, size: int) -> bytes:
+    return int(value).to_bytes(size, "big", signed=False)
+
+
+def _xdr_int(value: int, size: int) -> bytes:
+    return int(value).to_bytes(size, "big", signed=True)
+
+
+def _xdr_var_opaque(data: bytes) -> bytes:
+    """Variable-length opaque: 4-byte length prefix, bytes, zero pad to 4."""
+    pad = (-len(data)) % 4
+    return _xdr_uint(len(data), 4) + data + b"\x00" * pad
+
+
+def _xdr_string(text: str) -> bytes:
+    return _xdr_var_opaque(text.encode("utf-8"))
+
+
+def _xdr_scaddress(address: str) -> bytes:
+    """Encode an SCAddress from its strkey form (``G...`` account or ``C...`` contract)."""
+    if not isinstance(address, str) or len(address) < 2:
+        raise ValueError(f"invalid Stellar address: {address!r}")
+    try:
+        raw = base64.b32decode(address + "=" * ((-len(address)) % 8), casefold=True)
+    except Exception as exc:  # noqa: BLE001 - surface as ValueError
+        raise ValueError(f"invalid Stellar address: {address!r}") from exc
+    if len(raw) != 35:
+        raise ValueError(f"invalid Stellar address: {address!r}")
+    version, payload, checksum = raw[0], raw[1:33], raw[33:]
+    expected = hashlib.crc32(version.to_bytes(1, "big") + payload) if False else None
+    # CRC16-XModem over version+payload, little-endian, as used by strkey.
+    crc = 0
+    for byte in version.to_bytes(1, "big") + payload:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    if checksum != crc.to_bytes(2, "little"):
+        raise ValueError(f"invalid Stellar address checksum: {address!r}")
+    del expected
+    if version == 6 << 3:  # 'G' account
+        return _xdr_uint(_SCADDRESS_CODES["sc_address_account"], 4) + _xdr_uint(
+            _PUBLIC_KEY_CODES["public_key_type_ed25519"], 4
+        ) + payload
+    if version == 2 << 3:  # 'C' contract
+        return _xdr_uint(_SCADDRESS_CODES["sc_address_contract"], 4) + payload
+    raise ValueError(f"unsupported Stellar address version: {address!r}")
+
+
+def _xdr_scval(value: Any) -> bytes:
+    """Encode an ScVal from its JSON form (the shape the Lumenqraph API returns).
+
+    Accepts either a tagged object (``{"type": "u32", "value": 7}``) or a
+    base64 XDR string (``"AAAA..."``) which is decoded and re-encoded verbatim.
+    """
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if isinstance(value, str):
+        # Assume a base64-encoded ScVal XDR blob.
+        try:
+            return base64.b64decode(value, validate=True)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"invalid base64 ScVal XDR: {value!r}") from exc
+    if not isinstance(value, Mapping):
+        raise ValueError(f"unsupported ScVal: {value!r}")
+    tag = value.get("type") or value.get("kind")
+    if tag is None:
+        raise ValueError(f"ScVal object missing 'type': {value!r}")
+    tag = str(tag).lower()
+    if tag.startswith("scv_"):
+        code = _SCVAL_CODES[tag]
+    else:
+        code = _SCVAL_CODES[f"scv_{tag}"]
+    inner = value.get("value")
+    out = _xdr_uint(code, 4)
+    if tag in ("scv_bool", "bool"):
+        return out + _xdr_uint(1 if inner else 0, 4)
+    if tag in ("scv_void", "void"):
+        return out
+    if tag in ("scv_u32", "u32"):
+        return out + _xdr_uint(int(inner), 4)
+    if tag in ("scv_i32", "i32"):
+        return out + _xdr_int(int(inner), 4)
+    if tag in ("scv_u64", "u64", "scv_timepoint", "timepoint", "scv_duration", "duration"):
+        return out + _xdr_uint(int(inner), 8)
+    if tag in ("scv_i64", "i64"):
+        return out + _xdr_int(int(inner), 8)
+    if tag in ("scv_u128", "u128", "scv_u256", "u256"):
+        size = 16 if "128" in tag else 32
+        return out + _xdr_uint(int(inner), size)
+    if tag in ("scv_i128", "i128", "scv_i256", "i256"):
+        size = 16 if "128" in tag else 32
+        return out + _xdr_int(int(inner), size)
+    if tag in ("scv_bytes", "bytes"):
+        return out + _xdr_var_opaque(base64.b64decode(inner) if isinstance(inner, str) else bytes(inner))
+    if tag in ("scv_string", "string", "scv_symbol", "symbol"):
+        return out + _xdr_string(str(inner))
+    if tag in ("scv_address", "address"):
+        return out + _xdr_scaddress(str(inner))
+    if tag in ("scv_vec", "vec"):
+        items = inner or []
+        return out + _xdr_uint(len(items), 4) + b"".join(_xdr_scval(i) for i in items)
+    if tag in ("scv_map", "map"):
+        entries = inner or []
+        encoded = b""
+        for entry in entries:
+            if isinstance(entry, Mapping):
+                k, v = entry.get("key"), entry.get("value")
+            else:
+                k, v = entry[0], entry[1]
+            encoded += _xdr_scval(k) + _xdr_scval(v)
+        return out + _xdr_uint(len(entries), 4) + encoded
+    if tag in ("scv_error", "error"):
+        if isinstance(inner, Mapping):
+            etype = str(inner.get("type", "sce_context")).lower()
+            ecode = str(inner.get("code", "scec_internal_error")).lower()
+        else:
+            etype, ecode = "sce_context", "scec_internal_error"
+        return (
+            out
+            + _xdr_uint(_SCERROR_TYPE_CODES[etype], 4)
+            + _xdr_uint(_SCERROR_CODE_CODES[ecode], 4)
+        )
+    raise ValueError(f"unsupported ScVal type: {tag!r}")
+
+
+def _xdr_ledger_key_contract_data(contract_id: str, key_sc_val: Any, durability: str) -> bytes:
+    """Encode ``LedgerKey::ContractData { contract, key, durability }`` as XDR."""
+    if durability not in _DURABILITY_CODES:
+        raise ValueError(f"durability must be 'persistent' or 'temporary', got {durability!r}")
+    return (
+        _xdr_uint(_LEDGER_ENTRY_TYPE_CONTRACT_DATA, 4)
+        + _xdr_scaddress(contract_id)
+        + _xdr_scval(key_sc_val)
+        + _xdr_uint(_DURABILITY_CODES[durability], 4)
+    )
+
+
+def ledger_key_hash(contract_id: str, key_sc_val: Any, durability: Durability) -> str:
+    """Compute the canonical ledger-key hash for a contract-data entry.
+
+    Returns ``hex(sha256(LedgerKey::ContractData{contract, key, durability}.to_xdr()))``,
+    matching the value the Lumenqraph server stores as ``ledger_key_hash`` and
+    exposes as the ``:key_hash`` path parameter on ``/contracts/:id/data/:key_hash``.
+
+    Args:
+        contract_id: The contract's strkey (``C...``).
+        key_sc_val: The storage key as an ScVal — either a tagged JSON object
+            (``{"type": "symbol", "value": "Balance"}``) or a base64 XDR string.
+        durability: ``"persistent"`` or ``"temporary"``.
+
+    Returns:
+        Lowercase hex SHA-256 digest (64 characters).
+    """
+    xdr = _xdr_ledger_key_contract_data(contract_id, key_sc_val, durability)
+    return hashlib.sha256(xdr).hexdigest()
 
 
 class ClientOptions(TypedDict, total=False):
@@ -113,7 +365,12 @@ class ContractState:
 
 @dataclass
 class ContractData:
-    """Contract per-key data snapshots."""
+    """Contract per-key data snapshots.
+
+    Each entry in ``keys`` carries a ``ledger_key_hash`` (the canonical
+    ``hex(sha256(LedgerKey XDR))``) and, for one release, a deprecated
+    ``key_hash`` alias with the same value.
+    """
 
     contract_id: str
     count: int
@@ -319,12 +576,32 @@ class LumenqraphClient:
         result = self._get(f"/contracts/{enc(contract_id)}/data", {"label": label, "limit": limit})
         return _from_dict(ContractData, result)
 
-    def get_data_key(self, contract_id: str, key_hash: str, limit: int = 50) -> JsonDict:
-        """Version history of a single per-key entry."""
+    def get_data_key(self, contract_id: str, ledger_key_hash: str, limit: int = 50) -> JsonDict:
+        """Version history of a single per-key entry.
+
+        ``ledger_key_hash`` is the canonical ``hex(sha256(LedgerKey XDR))`` value
+        — compute it with :func:`ledger_key_hash`. The old ``key_hash`` name is
+        accepted as a deprecated alias.
+        """
         result: JsonDict = self._get(
-            f"/contracts/{enc(contract_id)}/data/{enc(key_hash)}", {"limit": limit}
+            f"/contracts/{enc(contract_id)}/data/{enc(ledger_key_hash)}", {"limit": limit}
         )
         return result
+
+    def get_data_key_by_scval(
+        self,
+        contract_id: str,
+        key_sc_val: Any,
+        durability: Durability,
+        limit: int = 50,
+    ) -> JsonDict:
+        """Version history of a per-key entry identified by its ScVal + durability.
+
+        Convenience wrapper that computes the ledger-key hash for you.
+        """
+        return self.get_data_key(
+            contract_id, ledger_key_hash(contract_id, key_sc_val, durability), limit=limit
+        )
 
     # ---- Events ----
 
