@@ -272,6 +272,13 @@ REORG_OVERLAP_LEDGERS=0
 | **Services** | Indexer |
 | **Tradeoff** | **Historical Depth** vs **Database Size**: 0 = unbounded (disk is yours to manage). N > 0 = keep only last N ledgers, pruning older events and state snapshots (newest version per key always kept). Example: ~500 events/ledger at busy contracts, so 120960 ledgers ≈ 60M events ≈ ~50GB disk. Recommended: Tune to your database size cap; free-tier Postgres (~500MB) ≈ 0 ledgers or aggressive retention |
 
+**Webhook delivery interaction:** `webhook_deliveries.event_id` references `events` with `ON DELETE RESTRICT`, so an event cannot be deleted while any delivery row points at it. The pruner applies this policy:
+
+- **Events with only `delivered` or `failed` deliveries** are pruned together with those delivery rows, in the same transaction. The removed deliveries are counted by the `lumenqraph_webhook_deliveries_dropped_by_retention_total` metric, so delivery history for pruned events is shorter than `WEBHOOK_DELIVERY_RETENTION_DAYS` — retention wins over delivery history for out-of-window events.
+- **Events with a `pending` delivery** are retained (skipped) until the webhooks service delivers or fails them; they become prunable on a later pass. This keeps in-flight deliveries from being lost.
+
+Each table's pruning is independent: a failure pruning one table (for example `events`) is logged and does not prevent `contract_state`, `contract_data` or spec pruning from running in the same pass.
+
 ---
 
 ## API Configuration

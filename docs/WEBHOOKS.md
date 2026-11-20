@@ -376,15 +376,20 @@ delivery queue as follows:
   and deliveries for subscriptions that are down or auto-disabled). Those events stay in the
   database until the delivery is resolved, so at-least-once delivery is preserved even if a
   subscriber is unreachable for longer than the retention window.
+- **Delivered/failed history is pruned with the event.** Once a delivery is no longer pending
+  (`delivered` or `failed`), it no longer blocks pruning. For each batch of out-of-window
+  events, the pruner deletes the `delivered`/`failed` delivery rows for those events and then
+  deletes the events themselves, in the same transaction. The deleted delivery rows are counted
+  in the `lumenqraph_webhook_deliveries_dropped_by_retention_total` metric. If you need to audit
+  or redrive failed deliveries, do so before the event falls outside the retention window, or
+  increase `RETENTION_LEDGERS`.
 - **`ON DELETE RESTRICT` is a safety net.** Because `webhook_deliveries.event_id` is declared
   `ON DELETE RESTRICT`, any attempt to delete an event that still has a delivery row fails
   rather than cascading. This guarantees that a bug in the pruner cannot silently drop delivery
-  history.
-- **Delivered/failed history is pruned with the event.** Once a delivery is no longer pending
-  (`delivered` or `failed`), it no longer blocks pruning. When the event is eventually pruned,
-  the corresponding delivery rows are deleted along with it — the pruner removes them explicitly
-  (it does not rely on a cascade). If you need to audit or redrive failed deliveries, do so
-  before the event falls outside the retention window, or increase `RETENTION_LEDGERS`.
+  history: the pruner must remove the delivery rows explicitly before the event can be deleted.
+- **Each table's prune is independent.** A failure while pruning one table (for example
+  `events`) does not skip the others (`contract_state`, `contract_data`, spec versions) in the
+  same pass.
 
 > **Note:** Retention is opt-in. With `RETENTION_LEDGERS` unset, events and delivery history are
 > kept indefinitely.

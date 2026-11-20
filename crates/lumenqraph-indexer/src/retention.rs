@@ -12,25 +12,40 @@
 //! `token_transfers` cascades from `events` (FK `ON DELETE CASCADE`), so pruning
 //! events prunes the projection with it.
 //!
-//! `webhook_deliveries` also cascades from `events`, but webhooks promise
-//! at-least-once delivery with retries and redrive — so an event that still has
-//! a *pending* delivery is skipped by the pruner, however far outside the window
-//! it is. A subscriber that is down, auto-disabled, or backlogged therefore never
-//! silently loses events. If a delivery is dropped anyway (e.g. a non-pending
-//! delivery cascading away with its event), the count is reported in the
-//! `lumenqraph_webhook_deliveries_dropped_by_retention_total` counter and logged.
+//! `webhook_deliveries.event_id` references `events` with `ON DELETE RESTRICT`
+//! (migration 0025), so an event cannot be deleted while *any* delivery row
+//! points at it. Webhooks promise at-least-once delivery with retries and
+//! redrive, so the policy is:
+//!
+//! - An event that still has a *pending* delivery is skipped by the pruner,
+//!   however far outside the window it is. A subscriber that is down,
+//!   auto-disabled, or backlogged therefore never silently loses events.
+//! - An event whose deliveries are all *delivered* or *failed* is prunable: the
+//!   pruner deletes those delivery rows itself, in the same transaction as the
+//!   event, and counts them in the
+//!   `lumenqraph_webhook_deliveries_dropped_by_retention_total` counter (also
+//!   logged). The webhooks service would otherwise keep them until
+//!   `WEBHOOK_DELIVERY_RETENTION_DAYS`, which can be far longer than the event
+//!   window and would block event pruning entirely.
 //!
 //! The versioned tables (`contract_state`, `contract_data`) are per-key time
 //! series, so their *newest* row per key is current state, not history — it is
 //! kept however old it is, and only superseded versions are pruned. Otherwise a
 //! contract whose state last changed before the window would read as having no
 //! state at all.
+//!
+//! Each table is pruned independently: a failure on one (e.g. a lock timeout)
+//! is logged and the others still run. `prune` only returns `Err` if every
+//! table's pass failed.
+=======
 
 use sqlx::PgPool;
 use tracing::{info, warn};
 
-/// Cumulative count of `webhook_deliveries` rows removed as a side effect of
-/// retention pruning (via the `events` FK cascade). Exposed as the
+/// Cumulative count of `webhook_deliveries` rows removed by retention pruning:
+/// delivered/failed deliveries whose event fell outside the window, deleted
+/// explicitly by the pruner (the FK is `ON DELETE RESTRICT`, so they cannot
+/// cascade). Exposed as the
 /// `lumenqraph_webhook_deliveries_dropped_by_retention_total` metric.
 static WEBHOOK_DELIVERIES_DROPPED_BY_RETENTION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -63,40 +78,23 @@ pub async fn prune(pool: &PgPool, tip: i64, retention_ledgers: i64) -> anyhow::R
         return Ok(0);
     }
 
-    // Skip events that still have a pending webhook delivery: deleting them would
-    // cascade the delivery away and break the at-least-once promise. Such events
-    // stay until their delivery is delivered or dropped by the webhook layer.
-    let events = prune_batched(
-        pool,
-        "DELETE FROM events WHERE event_id IN (
-             SELECT e.event_id FROM events e
-              WHERE e.ledger < $1
-                AND NOT EXISTS (
-                    SELECT 1 FROM webhook_deliveries wd
-                     WHERE wd.event_id = e.event_id AND wd.status = 'pending'
-                )
-              ORDER BY e.ledger
-              LIMIT $2
-         )",
-        cutoff,
-    )
-    .await?;
+    // Each table is pruned independently: a failure on one is logged and the
+    // others still run, so e.g. a lock timeout on `events` cannot starve
+    // `contract_state` pruning.
+    let mut failures = 0usize;
 
-    // Count deliveries that were dropped anyway (non-pending deliveries whose
-    // event was pruned). Pending ones are protected above, so this is normally 0.
-    let dropped = count_dropped_deliveries(pool, cutoff).await?;
-    if dropped > 0 {
-        WEBHOOK_DELIVERIES_DROPPED_BY_RETENTION
-            .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
-        warn!(
-            cutoff_ledger = cutoff,
-            dropped, "retention dropped webhook deliveries (non-pending) with their events"
-        );
-    }
+    let events = match prune_events(pool, cutoff).await {
+        Ok(n) => n,
+        Err(err) => {
+            failures += 1;
+            warn!(cutoff_ledger = cutoff, error = %err, "retention: events prune failed");
+            0
+        }
+    };
 
     // `ledger < MAX(ledger) for this key` is what spares the current version:
     // the newest row can never satisfy it.
-    let state = prune_batched(
+    let state = match prune_batched(
         pool,
         "DELETE FROM contract_state WHERE ctid IN (
              SELECT cs.ctid FROM contract_state cs
@@ -109,9 +107,17 @@ pub async fn prune(pool: &PgPool, tip: i64, retention_ledgers: i64) -> anyhow::R
          )",
         cutoff,
     )
-    .await?;
+    .await
+    {
+        Ok(n) => n,
+        Err(err) => {
+            failures += 1;
+            warn!(cutoff_ledger = cutoff, error = %err, "retention: contract_state prune failed");
+            0
+        }
+    };
 
-    let data = prune_batched(
+    let data = match prune_batched(
         pool,
         "DELETE FROM contract_data WHERE ctid IN (
              SELECT cd.ctid FROM contract_data cd
@@ -125,9 +131,17 @@ pub async fn prune(pool: &PgPool, tip: i64, retention_ledgers: i64) -> anyhow::R
          )",
         cutoff,
     )
-    .await?;
+    .await
+    {
+        Ok(n) => n,
+        Err(err) => {
+            failures += 1;
+            warn!(cutoff_ledger = cutoff, error = %err, "retention: contract_data prune failed");
+            0
+        }
+    };
 
-    let specs = prune_batched(
+    let specs = match prune_batched(
         pool,
         "DELETE FROM contract_spec_versions WHERE ctid IN (
              SELECT csv.ctid FROM contract_spec_versions csv
@@ -145,7 +159,19 @@ pub async fn prune(pool: &PgPool, tip: i64, retention_ledgers: i64) -> anyhow::R
          )",
         cutoff,
     )
-    .await?;
+    .await
+    {
+        Ok(n) => n,
+        Err(err) => {
+            failures += 1;
+            warn!(cutoff_ledger = cutoff, error = %err, "retention: contract_spec_versions prune failed");
+            0
+        }
+    };
+
+    if failures == 4 {
+        anyhow::bail!("retention prune failed for every table (cutoff ledger {cutoff})");
+    }
 
     let total = events + state + data + specs;
     if total > 0 {
@@ -155,6 +181,76 @@ pub async fn prune(pool: &PgPool, tip: i64, retention_ledgers: i64) -> anyhow::R
         );
     }
     Ok(total)
+}
+
+/// Prune out-of-window events, deleting their delivered/failed webhook
+/// deliveries first (the FK is `ON DELETE RESTRICT`, so they cannot cascade).
+///
+/// Per batch, in one transaction: delete the non-pending deliveries whose event
+/// is outside the window, then delete the events that have no pending delivery.
+/// Events with a pending delivery are skipped and stay until the webhook layer
+/// delivers or drops them.
+async fn prune_events(pool: &PgPool, cutoff: i64) -> anyhow::Result<u64> {
+    let mut deleted = 0u64;
+    let mut dropped_deliveries = 0u64;
+    for _ in 0..MAX_BATCHES {
+        let mut tx = pool.begin().await?;
+
+        // Delivered/failed deliveries for out-of-window events are history too:
+        // remove them so the event itself can be deleted under RESTRICT.
+        let dropped = sqlx::query(
+            "DELETE FROM webhook_deliveries wd
+              WHERE wd.status <> 'pending'
+                AND wd.event_id IN (
+                    SELECT e.event_id FROM events e
+                     WHERE e.ledger < $1
+                     LIMIT $2
+                )",
+        )
+        .bind(cutoff)
+        .bind(BATCH)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        let n = sqlx::query(
+            "DELETE FROM events WHERE event_id IN (
+                 SELECT e.event_id FROM events e
+                  WHERE e.ledger < $1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM webhook_deliveries wd
+                         WHERE wd.event_id = e.event_id AND wd.status = 'pending'
+                    )
+                  ORDER BY e.ledger
+                  LIMIT $2
+             )",
+        )
+        .bind(cutoff)
+        .bind(BATCH)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        tx.commit().await?;
+
+        dropped_deliveries += dropped;
+        deleted += n;
+        if n < BATCH as u64 && dropped < BATCH as u64 {
+            break;
+        }
+    }
+
+    if dropped_deliveries > 0 {
+        WEBHOOK_DELIVERIES_DROPPED_BY_RETENTION
+            .fetch_add(dropped_deliveries, std::sync::atomic::Ordering::Relaxed);
+        warn!(
+            cutoff_ledger = cutoff,
+            dropped = dropped_deliveries,
+            "retention dropped delivered/failed webhook deliveries for out-of-window events"
+        );
+    }
+
+    Ok(deleted)
 }
 
 /// Delete old contract spec versions, respecting both the retention window and the
@@ -251,24 +347,6 @@ pub async fn prune_spec_versions(
         );
     }
     Ok(deleted)
-}
-
-/// Count `webhook_deliveries` rows that retention is about to drop: deliveries
-/// whose event is outside the window and which are not pending (pending ones are
-/// skipped by the event pruner). Must run *before* the events DELETE.
-async fn count_dropped_deliveries(pool: &PgPool, cutoff: i64) -> anyhow::Result<u64> {
-    let row: (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM webhook_deliveries wd
-          WHERE wd.status <> 'pending'
-            AND EXISTS (
-                SELECT 1 FROM events e
-                 WHERE e.event_id = wd.event_id AND e.ledger < $1
-            )",
-    )
-    .bind(cutoff)
-    .fetch_one(pool)
-    .await?;
-    Ok(row.0 as u64)
 }
 
 /// Run `sql` (bound: $1 = cutoff ledger, $2 = batch size) until it stops
@@ -571,6 +649,103 @@ mod tests {
             .await,
             1,
             "the surviving delivery must still be pending"
+        );
+    }
+
+    /// Issue #749: under `ON DELETE RESTRICT`, an out-of-window event with a
+    /// delivered (or failed) delivery must be pruned — the pruner deletes the
+    /// delivery row itself — and `prune` must return `Ok`.
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn pruning_drops_delivered_deliveries_with_their_events() {
+        let pool = fixture().await;
+        insert_event(&pool, "delivered_evt", 100).await;
+        insert_event(&pool, "failed_evt", 120).await;
+        insert_event(&pool, "pending_evt", 150).await;
+        insert_delivery(&pool, "d1", "delivered_evt", "delivered").await;
+        insert_delivery(&pool, "d2", "failed_evt", "failed").await;
+        insert_delivery(&pool, "d3", "pending_evt", "pending").await;
+
+        // tip 1000, keep 500 => cutoff 500; all events are outside the window.
+        let deleted = prune(&pool, 1000, 500).await.expect("prune must not fail");
+
+        assert_eq!(deleted, 2, "the delivered and failed events should be pruned");
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM events WHERE event_id = 'pending_evt'"
+            )
+            .await,
+            1,
+            "an event with a pending delivery must survive retention"
+        );
+        assert_eq!(
+            count(&pool, "SELECT count(*) FROM webhook_deliveries").await,
+            1,
+            "only the pending delivery should remain"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM webhook_deliveries WHERE status = 'pending'"
+            )
+            .await,
+            1,
+            "the surviving delivery must still be pending"
+        );
+    }
+
+    /// Issue #749: a failure on the events pass must not skip `contract_state`
+    /// pruning. Simulated by making the events DELETE fail (a trigger that
+    /// raises), then checking state rows were still pruned.
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn state_pruning_runs_when_events_prune_fails() {
+        let pool = fixture().await;
+        insert_event(&pool, "old", 100).await;
+        for ledger in [10i64, 20] {
+            sqlx::query(
+                "INSERT INTO contract_state (contract_id, ledger, storage) VALUES ('C1',$1,'{}')",
+            )
+            .bind(ledger)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "CREATE FUNCTION fail_event_delete() RETURNS trigger AS $$
+             BEGIN RAISE EXCEPTION 'simulated events prune failure'; END;
+             $$ LANGUAGE plpgsql",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_event_delete BEFORE DELETE ON events
+             FOR EACH ROW EXECUTE FUNCTION fail_event_delete()",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // tip 1000, keep 500 => cutoff 500.
+        let deleted = prune(&pool, 1000, 500)
+            .await
+            .expect("prune must not fail when only one table fails");
+
+        assert_eq!(
+            deleted, 1,
+            "the superseded contract_state row should still be pruned"
+        );
+        assert_eq!(
+            count(&pool, "SELECT count(*) FROM events").await,
+            1,
+            "the events pass failed, so the event survives"
+        );
+        assert_eq!(
+            count(&pool, "SELECT count(*) FROM contract_state").await,
+            1,
+            "superseded state versions are pruned despite the events failure"
         );
     }
 

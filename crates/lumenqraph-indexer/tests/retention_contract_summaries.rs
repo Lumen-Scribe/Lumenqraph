@@ -146,6 +146,66 @@ mod retention_contract_summaries_tests {
         result.rows_affected()
     }
 
+    /// Insert a webhook_deliveries row for an event with the given status.
+    async fn insert_delivery(pool: &PgPool, delivery_id: &str, event_id: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO webhook_deliveries
+                 (delivery_id, subscription_id, event_id, status, attempts, created_at)
+             VALUES ($1, 'sub-1', $2, $3, 0, now())",
+        )
+        .bind(delivery_id)
+        .bind(event_id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("Failed to insert webhook delivery");
+    }
+
+    /// Count webhook_deliveries rows for an event.
+    async fn count_deliveries(pool: &PgPool, event_id: &str) -> i64 {
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM webhook_deliveries WHERE event_id = $1")
+                .bind(event_id)
+                .fetch_one(pool)
+                .await
+                .expect("Failed to count deliveries");
+        row.0
+    }
+
+    /// Insert a contract_state row for a contract at a given ledger.
+    async fn insert_contract_state(pool: &PgPool, contract_id: &str, ledger: i64) {
+        sqlx::query(
+            "INSERT INTO contract_state (contract_id, key, ledger, durability, value)
+             VALUES ($1, 'k', $2, 'persistent', 'v')",
+        )
+        .bind(contract_id)
+        .bind(ledger)
+        .execute(pool)
+        .await
+        .expect("Failed to insert contract_state");
+    }
+
+    /// Count contract_state rows for a contract.
+    async fn count_contract_state(pool: &PgPool, contract_id: &str) -> i64 {
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM contract_state WHERE contract_id = $1")
+                .bind(contract_id)
+                .fetch_one(pool)
+                .await
+                .expect("Failed to count contract_state");
+        row.0
+    }
+
+    /// Run the real retention pruner from the indexer crate.
+    async fn run_pruner(
+        pool: &PgPool,
+        tip: i64,
+        retention_ledgers: i64,
+    ) -> Result<lumenqraph_indexer::retention::PruneStats, sqlx::Error> {
+        lumenqraph_indexer::retention::prune(pool, tip, retention_ledgers, retention_ledgers)
+            .await
+    }
+
     #[tokio::test]
     #[ignore] // Requires TEST_DATABASE_URL
     async fn test_contract_summaries_decrements_on_pruning() {
@@ -347,5 +407,135 @@ mod retention_contract_summaries_tests {
             get_summary_event_count(&pool, contract_id).await.is_none(),
             "After final prune, summary row should be deleted"
         );
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires TEST_DATABASE_URL
+    async fn test_prune_ok_with_delivered_delivery() {
+        let pool = setup_test_db().await;
+        let contract_id = "CBDQ5K7FVPZ2YWXDNZ7Q6RTCZE2ZSSX3VW5J5K5Q7KXNZG5Q5Q5";
+
+        // Out-of-window event with a delivered delivery row.
+        insert_event(&pool, "old-delivered", contract_id, 100).await;
+        insert_delivery(&pool, "d-delivered", "old-delivered", "delivered").await;
+
+        // In-window event that must survive.
+        insert_event(&pool, "new-event", contract_id, 900).await;
+
+        // tip=1000, retention=500 → cutoff=500; only the ledger=100 event is out of window.
+        let stats = run_pruner(&pool, 1000, 500)
+            .await
+            .expect("prune must return Ok even with a delivered delivery row");
+
+        assert_eq!(stats.events_deleted, 1, "the out-of-window event is pruned");
+        assert_eq!(
+            count_events(&pool, contract_id).await,
+            1,
+            "only the in-window event survives"
+        );
+        assert_eq!(
+            count_deliveries(&pool, "old-delivered").await,
+            0,
+            "the delivered delivery row is removed with its event"
+        );
+        assert_eq!(
+            count_deliveries(&pool, "new-event").await,
+            0,
+            "the surviving event has no deliveries"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires TEST_DATABASE_URL
+    async fn test_prune_skips_event_with_pending_delivery() {
+        let pool = setup_test_db().await;
+        let contract_id = "CBDQ5K7FVPZ2YWXDNZ7Q6RTCZE2ZSSX3VW5J5K5Q7KXNZG5Q5Q5";
+
+        // Out-of-window event with a pending delivery row: must be retained.
+        insert_event(&pool, "old-pending", contract_id, 100).await;
+        insert_delivery(&pool, "d-pending", "old-pending", "pending").await;
+
+        // Out-of-window event with no deliveries: must be pruned.
+        insert_event(&pool, "old-plain", contract_id, 150).await;
+
+        let stats = run_pruner(&pool, 1000, 500)
+            .await
+            .expect("prune must return Ok");
+
+        assert_eq!(
+            stats.events_deleted, 1,
+            "only the event without a pending delivery is pruned"
+        );
+        assert_eq!(
+            count_events(&pool, contract_id).await,
+            1,
+            "the event with a pending delivery survives"
+        );
+        assert_eq!(
+            count_deliveries(&pool, "old-pending").await,
+            1,
+            "the pending delivery row is retained"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires TEST_DATABASE_URL
+    async fn test_contract_state_pruned_when_events_pass_fails() {
+        let pool = setup_test_db().await;
+        let contract_id = "CBDQ5K7FVPZ2YWXDNZ7Q6RTCZE2ZSSX3VW5J5K5Q7KXNZG5Q5Q5";
+
+        // Out-of-window contract_state row that should be pruned independently.
+        insert_contract_state(&pool, contract_id, 100).await;
+
+        // Force the events pass to fail: a delivery row referencing a non-existent
+        // event violates the FK, so the events DELETE (which touches the referenced
+        // event) cannot succeed. We instead break the events DELETE by making the
+        // events table temporarily un-deletable via a trigger that raises.
+        sqlx::query(
+            "CREATE OR REPLACE FUNCTION test_block_event_delete() RETURNS trigger AS $$
+             BEGIN
+                 RAISE EXCEPTION 'blocked for test';
+             END;
+             $$ LANGUAGE plpgsql",
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create blocking function");
+
+        sqlx::query(
+            "CREATE TRIGGER test_block_event_delete_trg
+             BEFORE DELETE ON events
+             FOR EACH ROW EXECUTE FUNCTION test_block_event_delete()",
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create blocking trigger");
+
+        // Insert an out-of-window event so the events pass actually attempts a delete.
+        insert_event(&pool, "old-event", contract_id, 100).await;
+
+        // prune should not return Err for the events pass; contract_state must still run.
+        let result = run_pruner(&pool, 1000, 500).await;
+
+        // The events pass may report an error internally, but contract_state pruning
+        // must still have executed. Assert contract_state was pruned.
+        assert_eq!(
+            count_contract_state(&pool, contract_id).await,
+            0,
+            "contract_state pruning must run even when the events pass fails"
+        );
+
+        // Clean up the trigger so the pool can be reused/closed cleanly.
+        sqlx::query("DROP TRIGGER IF EXISTS test_block_event_delete_trg ON events")
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DROP FUNCTION IF EXISTS test_block_event_delete()")
+            .execute(&pool)
+            .await
+            .ok();
+
+        // The overall result should be Ok per the independent-table policy.
+        result.expect("prune must return Ok even when the events pass fails");
     }
 }
