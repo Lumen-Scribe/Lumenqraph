@@ -1,13 +1,57 @@
-//! Test for issue #392: SpecCache loads persisted specs from database.
+//! Test for issue #392 / #735: SpecCache loads persisted specs from database.
 //!
-//! This test verifies that after a restart, the SpecCache reads persisted specs
-//! from the contract_specs table instead of making new RPC calls. This prevents
-//! expensive re-downloads of WASM files and avoids throttling on restart.
+//! These tests verify that on a cache miss the SpecCache reads persisted specs
+//! from the `contract_specs` table instead of making new RPC calls. This
+//! prevents expensive re-downloads of WASM files and avoids throttling on
+//! restart. The RPC mock panics on any `getLedgerEntries` call, so any RPC
+//! access fails the test loudly.
 
 #[cfg(test)]
 mod spec_cache_persistence_tests {
+    use lumenqraph_indexer::specs::SpecCache;
+    use lumenqraph_indexer::rpc::SorobanRpc;
     use sqlx::postgres::PgPoolOptions;
     use sqlx::{PgPool, Row};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// RPC mock that panics on any ledger-entry fetch. Used to prove that the
+    /// cache never falls back to RPC when a persisted spec row exists.
+    struct PanickingRpc {
+        get_ledger_entries_calls: Arc<AtomicUsize>,
+    }
+
+    impl PanickingRpc {
+        fn new() -> Self {
+            Self {
+                get_ledger_entries_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.get_ledger_entries_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SorobanRpc for PanickingRpc {
+        async fn get_ledger_entries(
+            &self,
+            _keys: &[String],
+        ) -> anyhow::Result<Vec<serde_json::Value>> {
+            self.get_ledger_entries_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("getLedgerEntries must not be called when a persisted spec exists");
+        }
+
+        async fn get_contract_wasm(
+            &self,
+            _contract_id: &str,
+            _ledger: Option<u32>,
+        ) -> anyhow::Result<Vec<u8>> {
+            self.get_ledger_entries_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("get_contract_wasm must not be called when a persisted spec exists");
+        }
+    }
 
     async fn setup_test_db() -> PgPool {
         let database_url = std::env::var("DATABASE_URL")
@@ -110,6 +154,97 @@ mod spec_cache_persistence_tests {
         cleanup_test_data(&pool, contract_id).await;
     }
 
+    /// Issue #735: with a `contract_specs` row present, `SpecCache::get` must
+    /// return the persisted spec without touching RPC at all.
+    #[tokio::test]
+    #[ignore]
+    async fn test_spec_cache_get_reads_persisted_spec_without_rpc() {
+        let pool = setup_test_db().await;
+        let contract_id = "CBDQ5K7FVPZ2YWXDNZ7Q6RTCZE2ZSSX3VW5J5K5Q7KXNZG5Q5Q5";
+
+        cleanup_test_data(&pool, contract_id).await;
+
+        let spec_section = "0123456789abcdef";
+        let interface = r#"{"events":[{"name":"transfer"}]}"#;
+
+        sqlx::query(
+            "INSERT INTO contract_specs (contract_id, wasm_hash, interface, spec_section, has_events)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(contract_id)
+        .bind("hash1")
+        .bind(interface)
+        .bind(spec_section)
+        .bind(true)
+        .execute(&pool)
+        .await
+        .expect("Failed to insert spec");
+
+        let rpc = PanickingRpc::new();
+        let cache = SpecCache::new(pool.clone(), Arc::new(rpc));
+
+        let spec = cache
+            .get(contract_id, None)
+            .await
+            .expect("SpecCache::get should succeed from persisted row");
+
+        assert_eq!(
+            spec.spec_section.as_deref(),
+            Some(spec_section),
+            "persisted spec_section should be returned"
+        );
+
+        cleanup_test_data(&pool, contract_id).await;
+    }
+
+    /// Issue #735: after a restart with 1,000 known contracts, the first cycle
+    /// must make zero WASM fetches because every spec is read from Postgres.
+    #[tokio::test]
+    #[ignore]
+    async fn test_restart_with_1000_known_contracts_makes_zero_wasm_fetches() {
+        let pool = setup_test_db().await;
+
+        let contract_ids: Vec<String> = (0..1000)
+            .map(|i| format!("C{:055}", i))
+            .collect();
+
+        for contract_id in &contract_ids {
+            cleanup_test_data(&pool, contract_id).await;
+            sqlx::query(
+                "INSERT INTO contract_specs (contract_id, wasm_hash, interface, spec_section, has_events)
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(contract_id)
+            .bind(format!("hash_{}", contract_id))
+            .bind(r#"{"events":[]}"#)
+            .bind("0123456789abcdef")
+            .bind(true)
+            .execute(&pool)
+            .await
+            .expect("Failed to insert spec");
+        }
+
+        let rpc = PanickingRpc::new();
+        let cache = SpecCache::new(pool.clone(), Arc::new(rpc));
+
+        for contract_id in &contract_ids {
+            cache
+                .get(contract_id, None)
+                .await
+                .expect("SpecCache::get should succeed from persisted row");
+        }
+
+        assert_eq!(
+            rpc.calls(),
+            0,
+            "first cycle after restart must make zero WASM fetches"
+        );
+
+        for contract_id in &contract_ids {
+            cleanup_test_data(&pool, contract_id).await;
+        }
+    }
+
     #[tokio::test]
     #[ignore]
     async fn test_upgrade_detection_via_hash() {
@@ -185,6 +320,16 @@ mod spec_cache_persistence_tests {
                 .is_none(),
             "SAC should have no wasm_hash"
         );
+
+        // A no-spec marker must also be served from Postgres without RPC.
+        let rpc = PanickingRpc::new();
+        let cache = SpecCache::new(pool.clone(), Arc::new(rpc));
+        let spec = cache
+            .get(contract_id, None)
+            .await
+            .expect("SpecCache::get should succeed for a no-spec marker");
+        assert!(spec.spec_section.is_none());
+        assert_eq!(rpc.calls(), 0);
 
         cleanup_test_data(&pool, contract_id).await;
     }
