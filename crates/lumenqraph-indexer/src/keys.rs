@@ -30,7 +30,66 @@ pub struct KeyTemplate {
 /// Token events that name a holder address in their topics.
 const HOLDER_EVENTS: [&str; 4] = ["transfer", "mint", "burn", "clawback"];
 
+/// Upper bound on the number of topic segments a Soroban event can carry. A
+/// `param_indices` entry at or beyond this can never address a real topic, so
+/// it is rejected at config load rather than silently matching nothing.
+const MAX_TOPIC_SEGMENTS: usize = 4;
+
 impl KeyTemplate {
+    /// Validate this template at config load. Every mistake that would
+    /// otherwise fail silently per event at runtime (an unparseable symbol, an
+    /// empty event list, an empty or nonsensical index list, an index that can
+    /// never address a topic) is surfaced here as a startup error naming the
+    /// `KEY_TEMPLATES` variable and the offending template.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let ident = self.identifier();
+
+        if ScSymbol::try_from(self.symbol.as_str()).is_err() {
+            anyhow::bail!(
+                "KEY_TEMPLATES: template {ident:?} has invalid symbol {:?}: \
+                 must be 1-32 characters from the ScSymbol charset",
+                self.symbol
+            );
+        }
+
+        if self.event_names.is_empty() {
+            anyhow::bail!(
+                "KEY_TEMPLATES: template {ident:?} has an empty event_names list; \
+                 it would never match any event"
+            );
+        }
+
+        if self.param_indices.is_empty() {
+            anyhow::bail!(
+                "KEY_TEMPLATES: template {ident:?} has an empty param_indices list; \
+                 specify at least one topic index"
+            );
+        }
+
+        for &idx in &self.param_indices {
+            if idx == 0 {
+                anyhow::bail!(
+                    "KEY_TEMPLATES: template {ident:?} uses param index 0, which is the \
+                     event-name topic; use indices >= 1"
+                );
+            }
+            if idx >= MAX_TOPIC_SEGMENTS {
+                anyhow::bail!(
+                    "KEY_TEMPLATES: template {ident:?} uses param index {idx}, which is \
+                     out of range (topics have at most {MAX_TOPIC_SEGMENTS} segments)"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// A human-readable identifier for this template in error messages: the
+    /// label when set, otherwise the symbol.
+    fn identifier(&self) -> String {
+        self.label.clone().unwrap_or_else(|| self.symbol.clone())
+    }
+
     /// Extract keys from an event according to this template.
     pub fn keys_from_event(&self, e: &NewEvent) -> Vec<Vec<String>> {
         // Check if event name matches
@@ -254,6 +313,84 @@ mod tests {
             assert!(msg.contains("persistent"), "message: {msg}");
             assert!(msg.contains("temporary"), "message: {msg}");
         }
+    }
+
+    fn valid_template() -> KeyTemplate {
+        KeyTemplate {
+            symbol: "Balance".into(),
+            event_names: vec!["transfer".into()],
+            param_indices: vec![1],
+            durability: ContractDataDurability::Persistent,
+            label: Some("balance".into()),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_valid_template() {
+        valid_template().validate().expect("valid template");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_symbol() {
+        // Too long for an ScSymbol (max 32 chars).
+        let mut t = valid_template();
+        t.symbol = "X".repeat(33);
+        let msg = t.validate().expect_err("should reject").to_string();
+        assert!(msg.contains("KEY_TEMPLATES"), "message: {msg}");
+        assert!(msg.contains("balance"), "message: {msg}");
+
+        // Invalid character for an ScSymbol.
+        let mut t = valid_template();
+        t.symbol = "Bad Symbol!".into();
+        let msg = t.validate().expect_err("should reject").to_string();
+        assert!(msg.contains("KEY_TEMPLATES"), "message: {msg}");
+        assert!(msg.contains("balance"), "message: {msg}");
+    }
+
+    #[test]
+    fn validate_rejects_empty_event_names() {
+        let mut t = valid_template();
+        t.event_names.clear();
+        let msg = t.validate().expect_err("should reject").to_string();
+        assert!(msg.contains("KEY_TEMPLATES"), "message: {msg}");
+        assert!(msg.contains("balance"), "message: {msg}");
+    }
+
+    #[test]
+    fn validate_rejects_empty_param_indices() {
+        let mut t = valid_template();
+        t.param_indices.clear();
+        let msg = t.validate().expect_err("should reject").to_string();
+        assert!(msg.contains("KEY_TEMPLATES"), "message: {msg}");
+        assert!(msg.contains("balance"), "message: {msg}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_param_index() {
+        let mut t = valid_template();
+        t.param_indices = vec![0];
+        let msg = t.validate().expect_err("should reject").to_string();
+        assert!(msg.contains("KEY_TEMPLATES"), "message: {msg}");
+        assert!(msg.contains("balance"), "message: {msg}");
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_param_index() {
+        let mut t = valid_template();
+        t.param_indices = vec![MAX_TOPIC_SEGMENTS];
+        let msg = t.validate().expect_err("should reject").to_string();
+        assert!(msg.contains("KEY_TEMPLATES"), "message: {msg}");
+        assert!(msg.contains("balance"), "message: {msg}");
+    }
+
+    #[test]
+    fn validate_error_names_template_by_symbol_without_label() {
+        let mut t = valid_template();
+        t.label = None;
+        t.event_names.clear();
+        let msg = t.validate().expect_err("should reject").to_string();
+        assert!(msg.contains("KEY_TEMPLATES"), "message: {msg}");
+        assert!(msg.contains("Balance"), "message: {msg}");
     }
 
     #[test]

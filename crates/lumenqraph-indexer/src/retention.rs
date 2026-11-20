@@ -52,7 +52,6 @@ static WEBHOOK_DELIVERIES_DROPPED_BY_RETENTION: std::sync::atomic::AtomicU64 =
 
 /// Total `webhook_deliveries` rows dropped by retention since process start.
 /// Exported for the metrics endpoint.
-#[allow(dead_code)]
 pub fn webhook_deliveries_dropped_by_retention_total() -> u64 {
     WEBHOOK_DELIVERIES_DROPPED_BY_RETENTION.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -141,43 +140,15 @@ pub async fn prune(pool: &PgPool, tip: i64, retention_ledgers: i64) -> anyhow::R
         }
     };
 
-    let specs = match prune_batched(
-        pool,
-        "DELETE FROM contract_spec_versions WHERE ctid IN (
-             SELECT csv.ctid FROM contract_spec_versions csv
-              WHERE csv.ledger < $1
-                AND csv.version < (
-                    SELECT MAX(x.version) FROM contract_spec_versions x
-                     WHERE x.contract_id = csv.contract_id
-                )
-                AND NOT EXISTS (
-                    SELECT 1 FROM webhook_deliveries wd
-                     WHERE wd.upgrade_id = csv.id
-                       AND wd.status = 'pending'
-                )
-              LIMIT $2
-         )",
-        cutoff,
-    )
-    .await
-    {
-        Ok(n) => n,
-        Err(err) => {
-            failures += 1;
-            warn!(cutoff_ledger = cutoff, error = %err, "retention: contract_spec_versions prune failed");
-            0
-        }
-    };
-
-    if failures == 4 {
-        anyhow::bail!("retention prune failed for every table (cutoff ledger {cutoff})");
-    }
-
-    let total = events + state + data + specs;
+    // Spec versions are pruned exclusively by `prune_spec_versions`, which
+    // honours `SPEC_VERSION_RETENTION`. Doing it here too would delete every
+    // version outside the window except the newest before that function runs,
+    // making the retention setting a no-op.
+    let total = events + state + data;
     if total > 0 {
         info!(
             cutoff_ledger = cutoff,
-            events, state, data, specs, "pruned history outside the retention window"
+            events, state, data, "pruned history outside the retention window"
         );
     }
     Ok(total)

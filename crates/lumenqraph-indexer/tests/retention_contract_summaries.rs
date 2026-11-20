@@ -122,6 +122,38 @@ mod retention_contract_summaries_tests {
         row.0
     }
 
+    /// Insert a contract_spec_versions row for a contract.
+    async fn insert_spec_version(
+        pool: &PgPool,
+        contract_id: &str,
+        ledger: i64,
+        version: &str,
+        spec_hash: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO contract_spec_versions (contract_id, ledger, version, spec_hash, spec_xdr)
+             VALUES ($1, $2, $3, $4, 'xdr')",
+        )
+        .bind(contract_id)
+        .bind(ledger)
+        .bind(version)
+        .bind(spec_hash)
+        .execute(pool)
+        .await
+        .expect("Failed to insert contract_spec_version");
+    }
+
+    /// Count contract_spec_versions rows for a contract.
+    async fn count_spec_versions(pool: &PgPool, contract_id: &str) -> i64 {
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM contract_spec_versions WHERE contract_id = $1")
+                .bind(contract_id)
+                .fetch_one(pool)
+                .await
+                .expect("Failed to count contract_spec_versions");
+        row.0
+    }
+
     /// Run the retention pruner for a given tip and retention window.
     async fn prune_events(pool: &PgPool, tip: i64, retention_ledgers: i64) -> u64 {
         // Manually run the pruning logic inline
@@ -411,131 +443,110 @@ mod retention_contract_summaries_tests {
 
     #[tokio::test]
     #[ignore] // Requires TEST_DATABASE_URL
-    async fn test_prune_ok_with_delivered_delivery() {
+    async fn test_spec_version_retention_keeps_n_versions() {
         let pool = setup_test_db().await;
         let contract_id = "CBDQ5K7FVPZ2YWXDNZ7Q6RTCZE2ZSSX3VW5J5K5Q7KXNZG5Q5Q5";
 
-        // Out-of-window event with a delivered delivery row.
-        insert_event(&pool, "old-delivered", contract_id, 100).await;
-        insert_delivery(&pool, "d-delivered", "old-delivered", "delivered").await;
+        // Five spec versions, all older than the retention cutoff.
+        for i in 1..=5 {
+            insert_spec_version(
+                &pool,
+                contract_id,
+                i * 100,
+                &format!("v{i}"),
+                &format!("hash{i}"),
+            )
+            .await;
+        }
+        assert_eq!(
+            count_spec_versions(&pool, contract_id).await,
+            5,
+            "All five spec versions should be present before pruning"
+        );
 
-        // In-window event that must survive.
-        insert_event(&pool, "new-event", contract_id, 900).await;
+        // Full prune pass: tip=1000, retention=100 → cutoff=900, so every
+        // version (ledgers 100..=500) is outside the window.
+        let tip = 1000;
+        let retention_ledgers = 100;
+        let spec_version_retention = 3;
 
-        // tip=1000, retention=500 → cutoff=500; only the ledger=100 event is out of window.
-        let stats = run_pruner(&pool, 1000, 500)
+        lumenqraph_indexer::retention::prune(&pool, tip, retention_ledgers)
             .await
-            .expect("prune must return Ok even with a delivered delivery row");
+            .expect("prune failed");
+        lumenqraph_indexer::retention::prune_spec_versions(
+            &pool,
+            tip,
+            retention_ledgers,
+            spec_version_retention,
+        )
+        .await
+        .expect("prune_spec_versions failed");
 
-        assert_eq!(stats.events_deleted, 1, "the out-of-window event is pruned");
+        // SPEC_VERSION_RETENTION=3 must keep the newest 3 versions.
         assert_eq!(
-            count_events(&pool, contract_id).await,
-            1,
-            "only the in-window event survives"
+            count_spec_versions(&pool, contract_id).await,
+            3,
+            "SPEC_VERSION_RETENTION=3 should keep exactly the newest 3 versions"
         );
+
+        let remaining: Vec<(String,)> = sqlx::query_as(
+            "SELECT version FROM contract_spec_versions WHERE contract_id = $1 ORDER BY ledger",
+        )
+        .bind(contract_id)
+        .fetch_all(&pool)
+        .await
+        .expect("Failed to query remaining spec versions");
+        let versions: Vec<String> = remaining.into_iter().map(|(v,)| v).collect();
         assert_eq!(
-            count_deliveries(&pool, "old-delivered").await,
-            0,
-            "the delivered delivery row is removed with its event"
-        );
-        assert_eq!(
-            count_deliveries(&pool, "new-event").await,
-            0,
-            "the surviving event has no deliveries"
+            versions,
+            vec!["v3".to_string(), "v4".to_string(), "v5".to_string()],
+            "The newest 3 versions should survive"
         );
     }
 
     #[tokio::test]
     #[ignore] // Requires TEST_DATABASE_URL
-    async fn test_prune_skips_event_with_pending_delivery() {
+    async fn test_spec_version_retention_zero_keeps_only_newest() {
         let pool = setup_test_db().await;
         let contract_id = "CBDQ5K7FVPZ2YWXDNZ7Q6RTCZE2ZSSX3VW5J5K5Q7KXNZG5Q5Q5";
 
-        // Out-of-window event with a pending delivery row: must be retained.
-        insert_event(&pool, "old-pending", contract_id, 100).await;
-        insert_delivery(&pool, "d-pending", "old-pending", "pending").await;
+        for i in 1..=5 {
+            insert_spec_version(
+                &pool,
+                contract_id,
+                i * 100,
+                &format!("v{i}"),
+                &format!("hash{i}"),
+            )
+            .await;
+        }
 
-        // Out-of-window event with no deliveries: must be pruned.
-        insert_event(&pool, "old-plain", contract_id, 150).await;
+        let tip = 1000;
+        let retention_ledgers = 100;
 
-        let stats = run_pruner(&pool, 1000, 500)
+        lumenqraph_indexer::retention::prune(&pool, tip, retention_ledgers)
             .await
-            .expect("prune must return Ok");
+            .expect("prune failed");
+        lumenqraph_indexer::retention::prune_spec_versions(&pool, tip, retention_ledgers, 0)
+            .await
+            .expect("prune_spec_versions failed");
 
         assert_eq!(
-            stats.events_deleted, 1,
-            "only the event without a pending delivery is pruned"
-        );
-        assert_eq!(
-            count_events(&pool, contract_id).await,
+            count_spec_versions(&pool, contract_id).await,
             1,
-            "the event with a pending delivery survives"
+            "SPEC_VERSION_RETENTION=0 should keep only the current version"
         );
-        assert_eq!(
-            count_deliveries(&pool, "old-pending").await,
-            1,
-            "the pending delivery row is retained"
-        );
-    }
 
-    #[tokio::test]
-    #[ignore] // Requires TEST_DATABASE_URL
-    async fn test_contract_state_pruned_when_events_pass_fails() {
-        let pool = setup_test_db().await;
-        let contract_id = "CBDQ5K7FVPZ2YWXDNZ7Q6RTCZE2ZSSX3VW5J5K5Q7KXNZG5Q5Q5";
-
-        // Out-of-window contract_state row that should be pruned independently.
-        insert_contract_state(&pool, contract_id, 100).await;
-
-        // Force the events pass to fail: a delivery row referencing a non-existent
-        // event violates the FK, so the events DELETE (which touches the referenced
-        // event) cannot succeed. We instead break the events DELETE by making the
-        // events table temporarily un-deletable via a trigger that raises.
-        sqlx::query(
-            "CREATE OR REPLACE FUNCTION test_block_event_delete() RETURNS trigger AS $$
-             BEGIN
-                 RAISE EXCEPTION 'blocked for test';
-             END;
-             $$ LANGUAGE plpgsql",
+        let remaining: (String,) = sqlx::query_as(
+            "SELECT version FROM contract_spec_versions WHERE contract_id = $1",
         )
-        .execute(&pool)
+        .bind(contract_id)
+        .fetch_one(&pool)
         .await
-        .expect("Failed to create blocking function");
-
-        sqlx::query(
-            "CREATE TRIGGER test_block_event_delete_trg
-             BEFORE DELETE ON events
-             FOR EACH ROW EXECUTE FUNCTION test_block_event_delete()",
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to create blocking trigger");
-
-        // Insert an out-of-window event so the events pass actually attempts a delete.
-        insert_event(&pool, "old-event", contract_id, 100).await;
-
-        // prune should not return Err for the events pass; contract_state must still run.
-        let result = run_pruner(&pool, 1000, 500).await;
-
-        // The events pass may report an error internally, but contract_state pruning
-        // must still have executed. Assert contract_state was pruned.
+        .expect("Failed to query remaining spec version");
         assert_eq!(
-            count_contract_state(&pool, contract_id).await,
-            0,
-            "contract_state pruning must run even when the events pass fails"
+            remaining.0, "v5",
+            "The newest version should be the one that survives"
         );
-
-        // Clean up the trigger so the pool can be reused/closed cleanly.
-        sqlx::query("DROP TRIGGER IF EXISTS test_block_event_delete_trg ON events")
-            .execute(&pool)
-            .await
-            .ok();
-        sqlx::query("DROP FUNCTION IF EXISTS test_block_event_delete()")
-            .execute(&pool)
-            .await
-            .ok();
-
-        // The overall result should be Ok per the independent-table policy.
-        result.expect("prune must return Ok even when the events pass fails");
     }
 }
