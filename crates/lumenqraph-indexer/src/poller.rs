@@ -3,8 +3,9 @@
 //! retried with exponential backoff so a flaky RPC never kills the process.
 //! Responds to Ctrl-C / SIGTERM for a clean shutdown.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lumenqraph_core::NewEvent;
@@ -53,6 +54,83 @@ pub fn max_lookback() -> i64 {
     MAX_LOOKBACK_LEDGERS
 }
 
+/// Number of poll cycles after which a template that has never matched is
+/// reported with a WARN, so a misconfigured template is noticed at default log
+/// levels instead of silently indexing nothing (#747).
+pub const TEMPLATE_UNMATCHED_WARN_CYCLES: u64 = 10;
+
+/// Per-template match bookkeeping across poll cycles (#747).
+///
+/// `matches` counts how many template keys have been built for each template
+/// label, and `cycles` counts completed poll cycles. A template whose count is
+/// still zero after `TEMPLATE_UNMATCHED_WARN_CYCLES` cycles is reported once.
+#[derive(Debug, Default)]
+pub struct TemplateMatchTracker {
+    matches: Mutex<HashMap<String, u64>>,
+    cycles: Mutex<u64>,
+    warned: Mutex<std::collections::HashSet<String>>,
+}
+
+impl TemplateMatchTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record `count` built keys for `label`.
+    pub fn record(&self, label: &str, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let mut matches = self.matches.lock().unwrap();
+        *matches.entry(label.to_string()).or_insert(0) += count;
+    }
+
+    /// Total keys built for `label` so far.
+    pub fn matches_for(&self, label: &str) -> u64 {
+        self.matches
+            .lock()
+            .unwrap()
+            .get(label)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Advance the cycle counter and return the labels that have never matched
+    /// and have not been warned about yet. Each label is returned at most once.
+    pub fn finish_cycle(&self, labels: &[String]) -> Vec<String> {
+        let mut cycles = self.cycles.lock().unwrap();
+        *cycles += 1;
+        let cycle = *cycles;
+        if cycle < TEMPLATE_UNMATCHED_WARN_CYCLES {
+            return Vec::new();
+        }
+        let matches = self.matches.lock().unwrap();
+        let mut warned = self.warned.lock().unwrap();
+        labels
+            .iter()
+            .filter(|label| matches.get(*label).copied().unwrap_or(0) == 0)
+            .filter(|label| warned.insert((*label).clone()))
+            .cloned()
+            .collect()
+    }
+}
+
+/// The process-wide template match tracker, shared by the poller and the
+/// metrics exporter.
+pub fn template_match_tracker() -> &'static TemplateMatchTracker {
+    static TRACKER: std::sync::OnceLock<TemplateMatchTracker> = std::sync::OnceLock::new();
+    TRACKER.get_or_init(TemplateMatchTracker::new)
+}
+
+/// The label used for a template in logs and metrics: its `label` when set,
+/// otherwise its `symbol`.
+pub fn template_metric_label(template: &crate::config::KeyTemplate) -> String {
+    template
+        .label
+        .clone()
+        .unwrap_or_else(|| template.symbol.clone())
+}
+
 pub async fn run(
     pool: PgPool,
     rpc: RpcClient,
@@ -74,11 +152,24 @@ pub async fn run(
     let mut consecutive_permanent: u32 = 0;
     let shutdown = CancellationToken::new();
     tokio::spawn(wait_for_shutdown(shutdown.clone()));
+    let template_labels: Vec<String> = config
+        .key_templates
+        .iter()
+        .map(template_metric_label)
+        .collect();
 
     loop {
         let sleep_for = match poll_once(&pool, &rpc, &config, &specs, &shutdown).await {
             Ok(processed_to) => {
                 consecutive_permanent = 0;
+                // Report templates that have never matched after enough cycles (#747).
+                for label in template_match_tracker().finish_cycle(&template_labels) {
+                    warn!(
+                        template = %label,
+                        cycles = TEMPLATE_UNMATCHED_WARN_CYCLES,
+                        "key template has not matched any event; check its symbol, event_names and param_indices"
+                    );
+                }
                 // Success: reset both the backoff and the circuit-breaker counter.
                 if consecutive_errors > 0 {
                     info!(
@@ -553,11 +644,16 @@ async fn fetch_and_store_with_shutdown(
             }
             // Discover keys from custom templates.
             for (idx, template) in config.key_templates.iter().enumerate() {
+                let mut built = 0u64;
                 for params in template.keys_from_event(&new_event) {
+                    built += 1;
                     template_keys_by_contract
                         .entry(new_event.contract_id.clone())
                         .or_default()
                         .insert((idx, params));
+                }
+                if built > 0 {
+                    template_match_tracker().record(&template_metric_label(template), built);
                 }
             }
             batch.push(new_event);
@@ -1199,6 +1295,25 @@ mod tests {
         let keys = template_keys_by_contract.get(&contract).unwrap();
         assert_eq!(keys.len(), 1, "duplicate template keys must collapse to one");
         assert!(keys.contains(&(0usize, params)));
+    }
+
+    #[test]
+    fn template_match_tracker_warns_after_unmatched_cycles() {
+        let tracker = TemplateMatchTracker::new();
+        let labels = vec!["matched".to_string(), "never".to_string()];
+        tracker.record("matched", 3);
+
+        // No warning before the threshold.
+        for _ in 0..TEMPLATE_UNMATCHED_WARN_CYCLES - 1 {
+            assert!(tracker.finish_cycle(&labels).is_empty());
+        }
+        // At the threshold, only the never-matched template is reported.
+        let warned = tracker.finish_cycle(&labels);
+        assert_eq!(warned, vec!["never".to_string()]);
+        // Reported at most once.
+        assert!(tracker.finish_cycle(&labels).is_empty());
+        assert_eq!(tracker.matches_for("matched"), 3);
+        assert_eq!(tracker.matches_for("never"), 0);
     }
 
     #[test]

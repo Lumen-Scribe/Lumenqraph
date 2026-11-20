@@ -228,7 +228,7 @@ REORG_OVERLAP_LEDGERS=0
 |----------|-------|
 | **Default** | `[]` (empty array) |
 | **Example** | `[{"symbol":"Balance","events":["transfer","mint"],"params":[1,2],"durability":"persistent","label":"balance"}]` |
-| **Valid Range** | JSON array of key template objects |
+| **Valid Range** | JSON array of key template objects. Every template is validated at startup (see below); an invalid template fails config load with an error naming the template and the offending field. |
 | **Services** | Indexer |
 | **Tradeoff** | **Custom State Indexing** vs **RPC Cost**: Each template triggers state fetching for matching events. Advanced feature for custom data models (allowances, liquidity positions, etc.). Cost: ~1 RPC call per template per active key per cycle. Recommended: Use sparingly; reserved for specialized use cases |
 
@@ -237,11 +237,36 @@ REORG_OVERLAP_LEDGERS=0
 {
   "symbol": "string (storage key variant)",
   "events": ["string (event names triggering this key)"],
-  "params": [0, 1],  // topic indices to extract addresses from
+  "params": [1, 2],  // topic indices to extract addresses from
   "durability": "persistent | temporary",
   "label": "string (optional, for grouping)"
 }
 ```
+
+**Validation (strict, at startup):**
+
+Templates are validated when the indexer loads its configuration. A template that fails any of the checks below stops the indexer with an error that names the template (by `label`, or by its position in the array when no label is set) and the offending field — nothing is deferred to runtime:
+
+- `symbol` must be a valid Soroban symbol: 1–32 characters, using only `a–z`, `A–Z`, `0–9` and `_`. Anything longer or containing other characters is rejected.
+- `events` must be non-empty. A template with no event names would never match anything.
+- `params` must be non-empty and must not contain `0`. Topic `0` is the event-name topic, not a data topic, so extracting an address from it is always a mistake. Use `1` for the first data topic, `2` for the second, and so on.
+- Each index in `params` must be within the topic range of the events the template matches. An index beyond every matching event's topic count would never match.
+
+Example errors:
+
+```
+❌ KEY_TEMPLATES[0] (label "balance"): symbol "BalanceV2KeyThatIsWayTooLongForASymbol" is not a valid Soroban symbol (max 32 chars, [A-Za-z0-9_])
+❌ KEY_TEMPLATES[1]: events must not be empty
+❌ KEY_TEMPLATES[2] (label "allowance"): params must not be empty
+❌ KEY_TEMPLATES[3] (label "allowance"): params must not contain 0 (topic 0 is the event name)
+❌ KEY_TEMPLATES[4] (label "position"): param index 3 is out of range for events ["transfer"] (max topic index 2)
+```
+
+**Monitoring:**
+
+- `lumenqraph_key_template_matches_total{label}` counts, per template label, how many events matched the template and produced a key. A template whose counter stays at zero is not doing anything.
+- Templates that have never matched after N indexing cycles are logged at `WARN` level, so a misconfigured template is visible at default log levels instead of failing silently.
+=======
 
 #### `BALANCE_KEY_SYMBOL`
 | Property | Value |

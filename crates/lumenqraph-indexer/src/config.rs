@@ -331,6 +331,19 @@ impl Config {
             .transpose()?
             .unwrap_or_default();
 
+        // Validate every key template eagerly (#747). Invalid symbols, empty
+        // event/param lists and out-of-range indices would otherwise only fail
+        // per event at DEBUG level, silently disabling per-key indexing.
+        for (i, template) in key_templates.iter().enumerate() {
+            template.validate().map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid KEY_TEMPLATES entry {i} (symbol {:?}, label {:?}): {e}",
+                    template.symbol,
+                    template.label
+                )
+            })?;
+        }
+
         let max_consecutive_errors = env_parse("MAX_CONSECUTIVE_ERRORS", 20u32)?;
         let degraded_poll_interval_secs = env_parse("DEGRADED_POLL_INTERVAL_SECS", 300u64)?;
 
@@ -863,5 +876,119 @@ mod tests {
                 None => std::env::remove_var(&key),
             }
         }
+    }
+
+    /// Run `Config::from_env` with a minimal valid environment plus the given
+    /// `KEY_TEMPLATES` JSON, returning the result. Restores env afterwards.
+    fn load_config_with_key_templates(templates: &str) -> anyhow::Result<Config> {
+        let saved: Vec<(String, Option<String>)> = [
+            "DATABASE_URL",
+            "RPC_URL",
+            "RPC_URLS",
+            "CONTRACT_IDS",
+            "EVENT_TOPIC_FILTERS",
+            "KEY_TEMPLATES",
+            "BALANCE_KEY_DURABILITY",
+        ]
+        .iter()
+        .map(|k| ((*k).to_string(), std::env::var(k).ok()))
+        .collect();
+
+        std::env::set_var("DATABASE_URL", "postgres://localhost/test");
+        std::env::set_var("RPC_URL", "https://example.com");
+        std::env::remove_var("RPC_URLS");
+        std::env::remove_var("CONTRACT_IDS");
+        std::env::remove_var("EVENT_TOPIC_FILTERS");
+        std::env::remove_var("BALANCE_KEY_DURABILITY");
+        std::env::set_var("KEY_TEMPLATES", templates);
+
+        let result = Config::from_env();
+
+        for (key, value) in saved {
+            match value {
+                Some(v) => std::env::set_var(&key, v),
+                None => std::env::remove_var(&key),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn valid_key_template_loads() {
+        let _guard = env_lock();
+        let cfg = load_config_with_key_templates(
+            r#"[{"symbol":"Balance","event_names":["transfer"],"param_indices":[1],"label":"bal"}]"#,
+        )
+        .expect("valid KEY_TEMPLATES should load");
+        assert_eq!(cfg.key_templates.len(), 1);
+        assert_eq!(cfg.key_templates[0].label.as_deref(), Some("bal"));
+    }
+
+    #[test]
+    fn key_template_invalid_symbol_fails_config_load() {
+        let _guard = env_lock();
+        // 33 characters exceeds the ScSymbol limit.
+        let long_symbol = "A".repeat(33);
+        let json = format!(
+            r#"[{{"symbol":"{long_symbol}","event_names":["transfer"],"param_indices":[1],"label":"bad-sym"}}]"#
+        );
+        let err = load_config_with_key_templates(&json)
+            .expect_err("invalid symbol must fail")
+            .to_string();
+        assert!(err.contains("KEY_TEMPLATES"), "{err}");
+        assert!(err.contains("bad-sym"), "error should name the template: {err}");
+        assert!(err.contains("symbol"), "{err}");
+    }
+
+    #[test]
+    fn key_template_empty_event_names_fails_config_load() {
+        let _guard = env_lock();
+        let err = load_config_with_key_templates(
+            r#"[{"symbol":"Balance","event_names":[],"param_indices":[1],"label":"no-events"}]"#,
+        )
+        .expect_err("empty event_names must fail")
+        .to_string();
+        assert!(err.contains("KEY_TEMPLATES"), "{err}");
+        assert!(err.contains("no-events"), "error should name the template: {err}");
+        assert!(err.contains("event_names"), "{err}");
+    }
+
+    #[test]
+    fn key_template_empty_param_indices_fails_config_load() {
+        let _guard = env_lock();
+        let err = load_config_with_key_templates(
+            r#"[{"symbol":"Balance","event_names":["transfer"],"param_indices":[],"label":"no-params"}]"#,
+        )
+        .expect_err("empty param_indices must fail")
+        .to_string();
+        assert!(err.contains("KEY_TEMPLATES"), "{err}");
+        assert!(err.contains("no-params"), "error should name the template: {err}");
+        assert!(err.contains("param_indices"), "{err}");
+    }
+
+    #[test]
+    fn key_template_zero_param_index_fails_config_load() {
+        let _guard = env_lock();
+        let err = load_config_with_key_templates(
+            r#"[{"symbol":"Balance","event_names":["transfer"],"param_indices":[0],"label":"zero-param"}]"#,
+        )
+        .expect_err("param index 0 must fail")
+        .to_string();
+        assert!(err.contains("KEY_TEMPLATES"), "{err}");
+        assert!(err.contains("zero-param"), "error should name the template: {err}");
+        assert!(err.contains("param_indices"), "{err}");
+    }
+
+    #[test]
+    fn key_template_out_of_range_param_index_fails_config_load() {
+        let _guard = env_lock();
+        let err = load_config_with_key_templates(
+            r#"[{"symbol":"Balance","event_names":["transfer"],"param_indices":[9],"label":"oob-param"}]"#,
+        )
+        .expect_err("out-of-range param index must fail")
+        .to_string();
+        assert!(err.contains("KEY_TEMPLATES"), "{err}");
+        assert!(err.contains("oob-param"), "error should name the template: {err}");
+        assert!(err.contains("param_indices"), "{err}");
     }
 }
