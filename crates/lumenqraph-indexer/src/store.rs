@@ -15,6 +15,22 @@ use tracing::debug;
 /// (issue #600).
 static TRANSFER_PROJECTION_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Counts vertical projection failures (swaps, NFT events, liquidity events)
+/// that were rolled back to a savepoint so the raw events could still commit
+/// (issue #730).
+static VERTICAL_PROJECTION_FAILED: AtomicU64 = AtomicU64::new(0);
+
+/// Total number of vertical projection failures since process start. Exposed
+/// for the `lumenqraph_vertical_projection_failed_total` metric.
+#[allow(dead_code)] // read by the metrics endpoint
+pub fn vertical_projection_failed_total() -> u64 {
+    VERTICAL_PROJECTION_FAILED.load(Ordering::Relaxed)
+}
+
+fn record_vertical_projection_failed() {
+    VERTICAL_PROJECTION_FAILED.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Total number of transfer-like events skipped by the projection since process
 /// start. Exposed for the `lumenqraph_transfer_projection_skipped_total` metric.
 #[allow(dead_code)] // read by the metrics endpoint
@@ -195,7 +211,7 @@ pub async fn insert_events_with_resolver(
 
     let inserted_count = inserted_rows.len() as u64;
 
-    // Project token_transfers only for events that were newly inserted.
+    // Project token_transfers and verticals only for events that were newly inserted.
     if inserted_count > 0 {
         let inserted_ids: std::collections::HashSet<String> = inserted_rows
             .iter()
@@ -207,150 +223,222 @@ pub async fn insert_events_with_resolver(
             .filter(|e| inserted_ids.contains(&e.event_id))
             .collect();
 
-        let transfers: Vec<Transfer> = new_events
-            .iter()
-            .filter_map(|e| extract_transfer(e, resolve))
-            .collect();
-
-        if !transfers.is_empty() {
-            let t_event_ids: Vec<String> = transfers.iter().map(|t| t.event_id.clone()).collect();
-            let t_contract_ids: Vec<String> =
-                transfers.iter().map(|t| t.contract_id.clone()).collect();
-            let t_from_addrs: Vec<Option<String>> =
-                transfers.iter().map(|t| t.from_addr.clone()).collect();
-            let t_to_addrs: Vec<Option<String>> =
-                transfers.iter().map(|t| t.to_addr.clone()).collect();
-            let t_amounts: Vec<String> = transfers.iter().map(|t| t.amount.clone()).collect();
-            let t_kinds: Vec<String> = transfers.iter().map(|t| t.kind.clone()).collect();
-            let t_amounts_numeric: Vec<Option<String>> =
-                transfers.iter().map(|t| Some(t.amount.clone())).collect();
-            let t_ledgers: Vec<i64> = transfers.iter().map(|t| t.ledger).collect();
-            let t_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
-                transfers.iter().map(|t| t.ledger_closed_at).collect();
-
-            sqlx::query(
-                "INSERT INTO token_transfers
-                    (event_id, contract_id, from_addr, to_addr, amount, kind, amount_numeric, ledger, ledger_closed_at)
-                 SELECT * FROM UNNEST(
-                    $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::numeric[], $8::bigint[], $9::timestamptz[]
-                 ) AS t(event_id, contract_id, from_addr, to_addr, amount, kind, amount_numeric, ledger, ledger_closed_at)
-                 ON CONFLICT (event_id) DO NOTHING",
-            )
-            .bind(&t_event_ids)
-            .bind(&t_contract_ids)
-            .bind(&t_from_addrs)
-            .bind(&t_to_addrs)
-            .bind(&t_amounts)
-            .bind(&t_kinds)
-            .bind(&t_amounts_numeric)
-            .bind(&t_ledgers)
-            .bind(&t_closed_ats)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        // Vertical projections (#599): swaps, NFT events and liquidity events.
-        // Written in the same transaction as the events insert.
-        project_verticals(&mut tx, &new_events, resolve).await?;
+        project_derived(&mut tx, &new_events, resolve).await?;
     }
 
     // Wake the API's SSE fan-out. Postgres delivers NOTIFY only on commit, so
     // it is sent in the same transaction as the rows it announces (#569).
-    sqlx::query("SELECT pg_notify('lumenqraph_events', '')")
-        .execute(&mut *tx)
-        .await?;
+    // Only notify when rows were actually inserted, and carry the new max seq
+    // so listeners can skip the catch-up query when already past it (#732).
+    if inserted_count > 0 {
+        let max_seq: Option<i64> = sqlx::query_scalar("SELECT MAX(seq) FROM events")
+            .fetch_one(&mut *tx)
+            .await?;
+        sqlx::query("SELECT pg_notify('lumenqraph_events', $1)")
+            .bind(max_seq.unwrap_or(0).to_string())
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
     Ok(inserted_count)
 }
 
+/// Project the derived rows (`token_transfers`, `amm_swaps`, `nft_events`,
+/// `liquidity_events`) for the given events. Shared by the insert and upsert
+/// paths so their projection logic cannot drift (#733).
+async fn project_derived(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    events: &[&NewEvent],
+    resolve: &ContractKindResolver<'_>,
+) -> anyhow::Result<()> {
+    let transfers: Vec<Transfer> = events
+        .iter()
+        .filter_map(|e| extract_transfer(e, resolve))
+        .collect();
+
+    if !transfers.is_empty() {
+        let t_event_ids: Vec<String> = transfers.iter().map(|t| t.event_id.clone()).collect();
+        let t_contract_ids: Vec<String> = transfers.iter().map(|t| t.contract_id.clone()).collect();
+        let t_from_addrs: Vec<Option<String>> =
+            transfers.iter().map(|t| t.from_addr.clone()).collect();
+        let t_to_addrs: Vec<Option<String>> = transfers.iter().map(|t| t.to_addr.clone()).collect();
+        let t_amounts: Vec<String> = transfers.iter().map(|t| t.amount.clone()).collect();
+        let t_kinds: Vec<String> = transfers.iter().map(|t| t.kind.clone()).collect();
+        let t_amounts_numeric: Vec<Option<String>> =
+            transfers.iter().map(|t| Some(t.amount.clone())).collect();
+        let t_ledgers: Vec<i64> = transfers.iter().map(|t| t.ledger).collect();
+        let t_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
+            transfers.iter().map(|t| t.ledger_closed_at).collect();
+
+        sqlx::query(
+            "INSERT INTO token_transfers
+                (event_id, contract_id, from_addr, to_addr, amount, kind, amount_numeric, ledger, ledger_closed_at)
+             SELECT * FROM UNNEST(
+                $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::numeric[], $8::bigint[], $9::timestamptz[]
+             ) AS t(event_id, contract_id, from_addr, to_addr, amount, kind, amount_numeric, ledger, ledger_closed_at)
+             ON CONFLICT (event_id) DO NOTHING",
+        )
+        .bind(&t_event_ids)
+        .bind(&t_contract_ids)
+        .bind(&t_from_addrs)
+        .bind(&t_to_addrs)
+        .bind(&t_amounts)
+        .bind(&t_kinds)
+        .bind(&t_amounts_numeric)
+        .bind(&t_ledgers)
+        .bind(&t_closed_ats)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    // Vertical projections (#599): swaps, NFT events and liquidity events.
+    // Written in the same transaction as the events insert.
+    project_verticals(tx, events, resolve).await?;
+
+    Ok(())
+}
+
+/// Delete the derived rows for the given event ids so they can be re-projected
+/// after an event's content changed during a reorg re-scan (#733).
+async fn delete_derived(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    event_ids: &[String],
+) -> anyhow::Result<()> {
+    if event_ids.is_empty() {
+        return Ok(());
+    }
+    for table in [
+        "token_transfers",
+        "amm_swaps",
+        "nft_events",
+        "liquidity_events",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE event_id = ANY($1::text[])"))
+            .bind(event_ids)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Write `amm_swaps`, `nft_events` and `liquidity_events` rows for the given
-/// newly-inserted events, gated on the resolved contract kind.
+/// newly-inserted events, gated on the resolved contract kind. Column names and
+/// value vocabularies match migrations 0012/0013/0014 (issue #730).
 async fn project_verticals(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     events: &[&NewEvent],
     resolve: &ContractKindResolver<'_>,
 ) -> anyhow::Result<()> {
+    // amm_swaps: sell_* / buy_* columns, sell_amount and buy_amount NOT NULL.
     let swaps: Vec<Swap> = events
         .iter()
         .filter_map(|e| extract_swap(e, resolve))
+        .filter(|s| {
+            let ok = s.sell_amount.is_some() && s.buy_amount.is_some();
+            if !ok {
+                record_vertical_projection_failed();
+            }
+            ok
+        })
         .collect();
     if !swaps.is_empty() {
         let s_event_ids: Vec<String> = swaps.iter().map(|s| s.event_id.clone()).collect();
         let s_contract_ids: Vec<String> = swaps.iter().map(|s| s.contract_id.clone()).collect();
         let s_senders: Vec<Option<String>> = swaps.iter().map(|s| s.sender.clone()).collect();
-        let s_recipients: Vec<Option<String>> = swaps.iter().map(|s| s.recipient.clone()).collect();
-        let s_token_ins: Vec<Option<String>> = swaps.iter().map(|s| s.token_in.clone()).collect();
-        let s_token_outs: Vec<Option<String>> = swaps.iter().map(|s| s.token_out.clone()).collect();
-        let s_amount_ins: Vec<Option<String>> = swaps.iter().map(|s| s.amount_in.clone()).collect();
-        let s_amount_outs: Vec<Option<String>> =
-            swaps.iter().map(|s| s.amount_out.clone()).collect();
+        let s_sell_tokens: Vec<Option<String>> =
+            swaps.iter().map(|s| s.sell_token.clone()).collect();
+        let s_buy_tokens: Vec<Option<String>> = swaps.iter().map(|s| s.buy_token.clone()).collect();
+        let s_sell_amounts: Vec<String> = swaps
+            .iter()
+            .map(|s| s.sell_amount.clone().unwrap_or_default())
+            .collect();
+        let s_buy_amounts: Vec<String> = swaps
+            .iter()
+            .map(|s| s.buy_amount.clone().unwrap_or_default())
+            .collect();
+        let s_raw_event_names: Vec<String> =
+            swaps.iter().map(|s| s.raw_event_name.clone()).collect();
         let s_ledgers: Vec<i64> = swaps.iter().map(|s| s.ledger).collect();
         let s_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
             swaps.iter().map(|s| s.ledger_closed_at).collect();
 
         sqlx::query(
             "INSERT INTO amm_swaps
-                (event_id, contract_id, sender, recipient, token_in, token_out,
-                 amount_in, amount_out, ledger, ledger_closed_at)
+                (event_id, contract_id, sender, sell_token, buy_token,
+                 sell_amount, buy_amount, raw_event_name, ledger, ledger_closed_at)
              SELECT * FROM UNNEST(
-                $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
-                $7::numeric[], $8::numeric[], $9::bigint[], $10::timestamptz[]
-             ) AS t(event_id, contract_id, sender, recipient, token_in, token_out,
-                    amount_in, amount_out, ledger, ledger_closed_at)
+                $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
+                $6::numeric[], $7::numeric[], $8::text[], $9::bigint[], $10::timestamptz[]
+             ) AS t(event_id, contract_id, sender, sell_token, buy_token,
+                    sell_amount, buy_amount, raw_event_name, ledger, ledger_closed_at)
              ON CONFLICT (event_id) DO NOTHING",
         )
         .bind(&s_event_ids)
         .bind(&s_contract_ids)
         .bind(&s_senders)
-        .bind(&s_recipients)
-        .bind(&s_token_ins)
-        .bind(&s_token_outs)
-        .bind(&s_amount_ins)
-        .bind(&s_amount_outs)
+        .bind(&s_sell_tokens)
+        .bind(&s_buy_tokens)
+        .bind(&s_sell_amounts)
+        .bind(&s_buy_amounts)
+        .bind(&s_raw_event_names)
         .bind(&s_ledgers)
         .bind(&s_closed_ats)
         .execute(&mut **tx)
         .await?;
     }
 
+    // nft_events: event_kind column, token_id NOT NULL. Skip (and count) rows
+    // without a token id rather than violating the constraint.
     let nfts: Vec<NftEvent> = events
         .iter()
         .filter_map(|e| extract_nft_event(e, resolve))
+        .filter(|n| {
+            let ok = n.token_id.is_some();
+            if !ok {
+                record_vertical_projection_failed();
+            }
+            ok
+        })
         .collect();
     if !nfts.is_empty() {
         let n_event_ids: Vec<String> = nfts.iter().map(|n| n.event_id.clone()).collect();
         let n_contract_ids: Vec<String> = nfts.iter().map(|n| n.contract_id.clone()).collect();
         let n_kinds: Vec<String> = nfts.iter().map(|n| n.kind.clone()).collect();
-        let n_token_ids: Vec<Option<String>> = nfts.iter().map(|n| n.token_id.clone()).collect();
         let n_froms: Vec<Option<String>> = nfts.iter().map(|n| n.from_addr.clone()).collect();
         let n_tos: Vec<Option<String>> = nfts.iter().map(|n| n.to_addr.clone()).collect();
+        let n_token_ids: Vec<String> = nfts
+            .iter()
+            .map(|n| n.token_id.clone().unwrap_or_default())
+            .collect();
         let n_ledgers: Vec<i64> = nfts.iter().map(|n| n.ledger).collect();
         let n_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
             nfts.iter().map(|n| n.ledger_closed_at).collect();
 
         sqlx::query(
             "INSERT INTO nft_events
-                (event_id, contract_id, kind, token_id, from_addr, to_addr,
+                (event_id, contract_id, event_kind, from_addr, to_addr, token_id,
                  ledger, ledger_closed_at)
              SELECT * FROM UNNEST(
                 $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
                 $7::bigint[], $8::timestamptz[]
-             ) AS t(event_id, contract_id, kind, token_id, from_addr, to_addr,
+             ) AS t(event_id, contract_id, event_kind, from_addr, to_addr, token_id,
                     ledger, ledger_closed_at)
              ON CONFLICT (event_id) DO NOTHING",
         )
         .bind(&n_event_ids)
         .bind(&n_contract_ids)
         .bind(&n_kinds)
-        .bind(&n_token_ids)
         .bind(&n_froms)
         .bind(&n_tos)
+        .bind(&n_token_ids)
         .bind(&n_ledgers)
         .bind(&n_closed_ats)
         .execute(&mut **tx)
         .await?;
     }
 
+    // liquidity_events: event_kind add/remove, shares, raw_event_name,
+    // extra_amounts JSONB; no token_a/token_b columns.
     let liqs: Vec<LiquidityEvent> = events
         .iter()
         .filter_map(|e| extract_liquidity_event(e, resolve))
@@ -360,33 +448,39 @@ async fn project_verticals(
         let l_contract_ids: Vec<String> = liqs.iter().map(|l| l.contract_id.clone()).collect();
         let l_kinds: Vec<String> = liqs.iter().map(|l| l.kind.clone()).collect();
         let l_providers: Vec<Option<String>> = liqs.iter().map(|l| l.provider.clone()).collect();
-        let l_token_as: Vec<Option<String>> = liqs.iter().map(|l| l.token_a.clone()).collect();
-        let l_token_bs: Vec<Option<String>> = liqs.iter().map(|l| l.token_b.clone()).collect();
         let l_amount_as: Vec<Option<String>> = liqs.iter().map(|l| l.amount_a.clone()).collect();
         let l_amount_bs: Vec<Option<String>> = liqs.iter().map(|l| l.amount_b.clone()).collect();
+        let l_shares: Vec<Option<String>> = liqs.iter().map(|l| l.shares.clone()).collect();
+        let l_raw_event_names: Vec<String> =
+            liqs.iter().map(|l| l.raw_event_name.clone()).collect();
+        let l_extra_amounts: Vec<Option<String>> = liqs
+            .iter()
+            .map(|l| serde_json::to_string(&l.extra_amounts).ok())
+            .collect();
         let l_ledgers: Vec<i64> = liqs.iter().map(|l| l.ledger).collect();
         let l_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
             liqs.iter().map(|l| l.ledger_closed_at).collect();
 
         sqlx::query(
             "INSERT INTO liquidity_events
-                (event_id, contract_id, kind, provider, token_a, token_b,
-                 amount_a, amount_b, ledger, ledger_closed_at)
+                (event_id, contract_id, event_kind, provider, amount_a, amount_b,
+                 shares, raw_event_name, extra_amounts, ledger, ledger_closed_at)
              SELECT * FROM UNNEST(
-                $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
-                $7::numeric[], $8::numeric[], $9::bigint[], $10::timestamptz[]
-             ) AS t(event_id, contract_id, kind, provider, token_a, token_b,
-                    amount_a, amount_b, ledger, ledger_closed_at)
+                $1::text[], $2::text[], $3::text[], $4::text[], $5::numeric[], $6::numeric[],
+                $7::numeric[], $8::text[], $9::jsonb[], $10::bigint[], $11::timestamptz[]
+             ) AS t(event_id, contract_id, event_kind, provider, amount_a, amount_b,
+                    shares, raw_event_name, extra_amounts, ledger, ledger_closed_at)
              ON CONFLICT (event_id) DO NOTHING",
         )
         .bind(&l_event_ids)
         .bind(&l_contract_ids)
         .bind(&l_kinds)
         .bind(&l_providers)
-        .bind(&l_token_as)
-        .bind(&l_token_bs)
         .bind(&l_amount_as)
         .bind(&l_amount_bs)
+        .bind(&l_shares)
+        .bind(&l_raw_event_names)
+        .bind(&l_extra_amounts)
         .bind(&l_ledgers)
         .bind(&l_closed_ats)
         .execute(&mut **tx)
@@ -397,10 +491,22 @@ async fn project_verticals(
 }
 
 /// Insert a batch of events with upsert semantics for reorg handling.
-/// If an event already exists (same event_id), update mutable fields (decoded values, enrichment)
-/// in case the RPC returned different content for a recently-passed ledger (shallow reorg).
+/// If an event already exists (same event_id) with *different* content, every
+/// content column (raw and decoded) is replaced and its derived rows are
+/// re-projected, in case the RPC returned different content for a
+/// recently-passed ledger (shallow reorg). Identical rows are left untouched.
 /// Returns (inserted, updated) counts.
 pub async fn upsert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result<(u64, u64)> {
+    upsert_events_with_resolver(pool, events, &default_contract_kind).await
+}
+
+/// Like [`upsert_events`] but with an explicit contract-kind resolver, so the
+/// caller can pass the `SpecCache`-backed lookup.
+pub async fn upsert_events_with_resolver(
+    pool: &PgPool,
+    events: &[NewEvent],
+    resolve: &ContractKindResolver<'_>,
+) -> anyhow::Result<(u64, u64)> {
     if events.is_empty() {
         return Ok((0, 0));
     }
@@ -461,9 +567,16 @@ pub async fn upsert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result
             enriched, tx_hash, in_successful_call, paging_token
          )
          ON CONFLICT (event_id) DO UPDATE SET
+            topics = EXCLUDED.topics,
+            value = EXCLUDED.value,
             decoded_topics = EXCLUDED.decoded_topics,
             decoded_value = EXCLUDED.decoded_value,
-            enriched = EXCLUDED.enriched
+            enriched = EXCLUDED.enriched,
+            tx_hash = EXCLUDED.tx_hash,
+            in_successful_call = EXCLUDED.in_successful_call,
+            ledger_closed_at = EXCLUDED.ledger_closed_at
+         WHERE (events.topics, events.value, events.tx_hash, events.in_successful_call)
+               IS DISTINCT FROM (EXCLUDED.topics, EXCLUDED.value, EXCLUDED.tx_hash, EXCLUDED.in_successful_call)
          RETURNING event_id, (xmax = 0) AS inserted",
     )
     .bind(&event_ids)
@@ -486,6 +599,7 @@ pub async fn upsert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result
     let mut inserted = 0u64;
     let mut updated = 0u64;
     let mut inserted_ids = std::collections::HashSet::new();
+    let mut updated_ids: Vec<String> = Vec::new();
 
     for row in rows {
         let event_id: String = row.try_get("event_id")?;
@@ -495,6 +609,7 @@ pub async fn upsert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result
             inserted_ids.insert(event_id);
         } else {
             updated += 1;
+            updated_ids.push(event_id);
         }
     }
 
@@ -502,59 +617,40 @@ pub async fn upsert_events(pool: &PgPool, events: &[NewEvent]) -> anyhow::Result
         debug!(count = updated, "events updated due to shallow reorg");
     }
 
-    // Project token_transfers only for newly inserted events. The default
-    // resolver cannot confirm any contract kind, so nothing is projected here;
-    // callers with a spec cache should use `insert_events_with_resolver`.
+    // Re-project derived rows for updated events: drop the stale projections
+    // and re-insert them from the new content, using the same resolver as the
+    // insert path (#733).
+    if !updated_ids.is_empty() {
+        delete_derived(&mut tx, &updated_ids).await?;
+        let updated_set: std::collections::HashSet<&String> = updated_ids.iter().collect();
+        let changed_events: Vec<&NewEvent> = events
+            .iter()
+            .filter(|e| updated_set.contains(&e.event_id))
+            .collect();
+        project_derived(&mut tx, &changed_events, resolve).await?;
+    }
+
+    // Project derived rows for newly inserted events.
     if inserted > 0 {
-        let transfers: Vec<Transfer> = events
+        let new_events: Vec<&NewEvent> = events
             .iter()
             .filter(|e| inserted_ids.contains(&e.event_id))
-            .filter_map(|e| extract_transfer(e, &default_contract_kind))
             .collect();
-
-        if !transfers.is_empty() {
-            let t_event_ids: Vec<String> = transfers.iter().map(|t| t.event_id.clone()).collect();
-            let t_contract_ids: Vec<String> =
-                transfers.iter().map(|t| t.contract_id.clone()).collect();
-            let t_from_addrs: Vec<Option<String>> =
-                transfers.iter().map(|t| t.from_addr.clone()).collect();
-            let t_to_addrs: Vec<Option<String>> =
-                transfers.iter().map(|t| t.to_addr.clone()).collect();
-            let t_amounts: Vec<String> = transfers.iter().map(|t| t.amount.clone()).collect();
-            let t_kinds: Vec<String> = transfers.iter().map(|t| t.kind.clone()).collect();
-            let t_amounts_numeric: Vec<Option<String>> =
-                transfers.iter().map(|t| Some(t.amount.clone())).collect();
-            let t_ledgers: Vec<i64> = transfers.iter().map(|t| t.ledger).collect();
-            let t_closed_ats: Vec<chrono::DateTime<chrono::Utc>> =
-                transfers.iter().map(|t| t.ledger_closed_at).collect();
-
-            sqlx::query(
-                "INSERT INTO token_transfers
-                    (event_id, contract_id, from_addr, to_addr, amount, kind, amount_numeric, ledger, ledger_closed_at)
-                 SELECT * FROM UNNEST(
-                    $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::numeric[], $8::bigint[], $9::timestamptz[]
-                 ) AS t(event_id, contract_id, from_addr, to_addr, amount, kind, amount_numeric, ledger, ledger_closed_at)
-                 ON CONFLICT (event_id) DO NOTHING",
-            )
-            .bind(&t_event_ids)
-            .bind(&t_contract_ids)
-            .bind(&t_from_addrs)
-            .bind(&t_to_addrs)
-            .bind(&t_amounts)
-            .bind(&t_kinds)
-            .bind(&t_amounts_numeric)
-            .bind(&t_ledgers)
-            .bind(&t_closed_ats)
-            .execute(&mut *tx)
-            .await?;
-        }
+        project_derived(&mut tx, &new_events, resolve).await?;
     }
 
     // Wake the API's SSE fan-out. Postgres delivers NOTIFY only on commit, so
     // it is sent in the same transaction as the rows it announces (#569).
-    sqlx::query("SELECT pg_notify('lumenqraph_events', '')")
-        .execute(&mut *tx)
-        .await?;
+    // Updates don't change `seq`, so only notify when rows were inserted (#732).
+    if inserted > 0 {
+        let max_seq: Option<i64> = sqlx::query_scalar("SELECT MAX(seq) FROM events")
+            .fetch_one(&mut *tx)
+            .await?;
+        sqlx::query("SELECT pg_notify('lumenqraph_events', $1)")
+            .bind(max_seq.unwrap_or(0).to_string())
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
     Ok((inserted, updated))
 }
@@ -574,11 +670,11 @@ struct Swap {
     event_id: String,
     contract_id: String,
     sender: Option<String>,
-    recipient: Option<String>,
-    token_in: Option<String>,
-    token_out: Option<String>,
-    amount_in: Option<String>,
-    amount_out: Option<String>,
+    sell_token: Option<String>,
+    buy_token: Option<String>,
+    sell_amount: Option<String>,
+    buy_amount: Option<String>,
+    raw_event_name: String,
     ledger: i64,
     ledger_closed_at: chrono::DateTime<chrono::Utc>,
 }
@@ -599,10 +695,11 @@ struct LiquidityEvent {
     contract_id: String,
     kind: String,
     provider: Option<String>,
-    token_a: Option<String>,
-    token_b: Option<String>,
     amount_a: Option<String>,
     amount_b: Option<String>,
+    shares: Option<String>,
+    raw_event_name: String,
+    extra_amounts: Value,
     ledger: i64,
     ledger_closed_at: chrono::DateTime<chrono::Utc>,
 }
@@ -612,6 +709,15 @@ fn as_addr(v: Option<&Value>) -> Option<String> {
         Some(Value::String(s)) => Some(s.clone()),
         _ => None,
     }
+}
+
+/// Look up a spec-declared event parameter by name in the enrichment payload
+/// (`enriched.params.<name>.value`). Returns `None` when enrichment is absent
+/// or the parameter is not present.
+fn enriched_param(e: &NewEvent, name: &str) -> Option<String> {
+    let enriched = e.enriched.as_ref()?;
+    let params = enriched.get("params")?;
+    as_addr(params.get(name).and_then(|p| p.get("value")))
 }
 
 /// Extract a decimal amount from a decoded value. Accepts a JSON string or a
@@ -639,11 +745,17 @@ fn as_i128_amount(v: &Value) -> Option<String> {
 /// SEP-41 tokens (or SACs), and for values that are not a valid amount.
 ///
 /// transfer: Topics: [symbol "transfer", from Address, to Address]
-/// mint: Topics: [symbol "mint", to Address]
+/// mint: Topics: [symbol "mint", to Address] (CAP-67 SAC / custom SEP-41) or
+///       [symbol "mint", admin Address, to Address, asset] (legacy pre-CAP-67 SAC)
 /// burn: Topics: [symbol "burn", from Address]
-/// clawback: Topics: [symbol "clawback", from Address]
+/// clawback: Topics: [symbol "clawback", from Address] (CAP-67 SAC / custom SEP-41)
+///       or [symbol "clawback", admin Address, from Address, asset] (legacy SAC)
 /// All have Value: i128 amount (decoded as a decimal string) or, under CAP-67,
 /// a map `{amount, to_muxed_id}`.
+///
+/// For `mint`/`clawback` the address is taken from the spec-declared parameter
+/// names when enrichment is available, otherwise from the topic count so the
+/// legacy SAC layouts (which carry the admin at index 1) are handled (#734).
 fn extract_transfer(e: &NewEvent, resolve: &ContractKindResolver<'_>) -> Option<Transfer> {
     let event_name = e.event_name.as_deref()?;
     let kind = match event_name {
@@ -686,8 +798,31 @@ fn extract_transfer(e: &NewEvent, resolve: &ContractKindResolver<'_>) -> Option<
             as_addr(e.decoded_topics.get(1)),
             as_addr(e.decoded_topics.get(2)),
         ),
-        "mint" => (None, as_addr(e.decoded_topics.get(1))),
-        "burn" | "clawback" => (as_addr(e.decoded_topics.get(1)), None),
+        "mint" => {
+            let to = enriched_param(e, "to").or_else(|| {
+                // Legacy SAC: [mint, admin, to, asset]; CAP-67 SAC (3 topics)
+                // and custom SEP-41 (2 topics): [mint, to].
+                if e.decoded_topics.len() >= 4 {
+                    as_addr(e.decoded_topics.get(2))
+                } else {
+                    as_addr(e.decoded_topics.get(1))
+                }
+            });
+            (None, to)
+        }
+        "burn" => (as_addr(e.decoded_topics.get(1)), None),
+        "clawback" => {
+            let from = enriched_param(e, "from").or_else(|| {
+                // Legacy SAC: [clawback, admin, from, asset]; otherwise
+                // [clawback, from].
+                if e.decoded_topics.len() >= 4 {
+                    as_addr(e.decoded_topics.get(2))
+                } else {
+                    as_addr(e.decoded_topics.get(1))
+                }
+            });
+            (from, None)
+        }
         _ => return None,
     };
 
@@ -731,11 +866,11 @@ fn extract_swap(e: &NewEvent, resolve: &ContractKindResolver<'_>) -> Option<Swap
         event_id: e.event_id.clone(),
         contract_id: e.contract_id.clone(),
         sender: as_addr(e.decoded_topics.get(1)),
-        recipient: as_addr(e.decoded_topics.get(2)),
-        token_in: as_addr(e.decoded_topics.get(3)),
-        token_out: as_addr(e.decoded_topics.get(4)),
-        amount_in,
-        amount_out,
+        sell_token: as_addr(e.decoded_topics.get(3)),
+        buy_token: as_addr(e.decoded_topics.get(4)),
+        sell_amount: amount_in,
+        buy_amount: amount_out,
+        raw_event_name: e.event_name.clone().unwrap_or_default(),
         ledger: e.ledger,
         ledger_closed_at: e.ledger_closed_at,
     })
@@ -796,9 +931,10 @@ fn extract_liquidity_event(
     e: &NewEvent,
     resolve: &ContractKindResolver<'_>,
 ) -> Option<LiquidityEvent> {
+    // Migration 0014 uses `add`/`remove` as the event_kind vocabulary.
     let kind = match e.event_name.as_deref()? {
-        "deposit" => "deposit",
-        "withdraw" => "withdraw",
+        "deposit" => "add",
+        "withdraw" => "remove",
         _ => return None,
     };
     if resolve(&e.contract_id) != Some(ContractKind::LiquidityPool) {
@@ -817,15 +953,29 @@ fn extract_liquidity_event(
         _ => (None, None),
     };
 
+    let shares = match &e.decoded_value {
+        Value::Object(map) => map.get("shares").and_then(as_i128_amount),
+        _ => None,
+    };
+
+    let extra_amounts = match &e.decoded_value {
+        Value::Object(map) => map
+            .get("extra_amounts")
+            .cloned()
+            .unwrap_or(Value::Null),
+        _ => Value::Null,
+    };
+
     Some(LiquidityEvent {
         event_id: e.event_id.clone(),
         contract_id: e.contract_id.clone(),
         kind: kind.to_string(),
         provider: as_addr(e.decoded_topics.get(1)),
-        token_a: as_addr(e.decoded_topics.get(2)),
-        token_b: as_addr(e.decoded_topics.get(3)),
         amount_a,
         amount_b,
+        shares,
+        raw_event_name: e.event_name.clone().unwrap_or_default(),
+        extra_amounts,
         ledger: e.ledger,
         ledger_closed_at: e.ledger_closed_at,
     })
@@ -917,6 +1067,69 @@ mod tests {
         assert_eq!(t.to_addr, None);
         assert_eq!(t.amount, "750");
         assert_eq!(t.kind, "clawback");
+    }
+
+    // Issue #734: legacy (pre-CAP-67) SAC mint/clawback carry the admin at index 1.
+    #[test]
+    fn extracts_legacy_sac_mint_recipient_not_admin() {
+        let e = event(
+            Some("mint"),
+            vec![json!("mint"), json!("GADMIN"), json!("GRECIPIENT"), json!("native")],
+            json!("1000"),
+        );
+        let t = extract_transfer(&e, &fungible).expect("legacy mint should be recognised");
+        assert_eq!(t.from_addr, None);
+        assert_eq!(t.to_addr.as_deref(), Some("GRECIPIENT"));
+        assert_eq!(t.kind, "mint");
+    }
+
+    #[test]
+    fn extracts_cap67_sac_mint_recipient() {
+        let e = event(
+            Some("mint"),
+            vec![json!("mint"), json!("GRECIPIENT"), json!("native")],
+            json!("1000"),
+        );
+        let t = extract_transfer(&e, &fungible).expect("CAP-67 mint should be recognised");
+        assert_eq!(t.to_addr.as_deref(), Some("GRECIPIENT"));
+    }
+
+    #[test]
+    fn extracts_legacy_sac_clawback_victim_not_admin() {
+        let e = event(
+            Some("clawback"),
+            vec![json!("clawback"), json!("GADMIN"), json!("GVICTIM"), json!("native")],
+            json!("750"),
+        );
+        let t = extract_transfer(&e, &fungible).expect("legacy clawback should be recognised");
+        assert_eq!(t.from_addr.as_deref(), Some("GVICTIM"));
+        assert_eq!(t.to_addr, None);
+        assert_eq!(t.kind, "clawback");
+    }
+
+    #[test]
+    fn extracts_cap67_sac_clawback_victim() {
+        let e = event(
+            Some("clawback"),
+            vec![json!("clawback"), json!("GVICTIM"), json!("native")],
+            json!("750"),
+        );
+        let t = extract_transfer(&e, &fungible).expect("CAP-67 clawback should be recognised");
+        assert_eq!(t.from_addr.as_deref(), Some("GVICTIM"));
+    }
+
+    #[test]
+    fn enriched_params_take_precedence_for_mint() {
+        let mut e = event(
+            Some("mint"),
+            vec![json!("mint"), json!("GADMIN"), json!("GWRONG"), json!("native")],
+            json!("1000"),
+        );
+        e.enriched = Some(json!({
+            "params": { "to": { "value": "GRECIPIENT" } }
+        }));
+        let t = extract_transfer(&e, &fungible).expect("mint should be recognised");
+        assert_eq!(t.to_addr.as_deref(), Some("GRECIPIENT"));
     }
 
     #[test]

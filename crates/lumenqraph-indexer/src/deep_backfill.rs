@@ -434,7 +434,11 @@ pub async fn run(
 
     for ev in staging {
         lines_processed += 1;
-        let spec = specs.get_cached(&ev.contract_id);
+        // Enrich with the spec version in force at the event's ledger, not the
+        // contract's current spec: deep-backfilled events predate upgrades.
+        let spec = specs
+            .get(&pool, &config.soroban_rpc_url, &ev.contract_id, ev.ledger)
+            .await;
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             historical_to_new_event(ev, spec.as_deref())
         })) {
@@ -452,14 +456,14 @@ pub async fn run(
         }
 
         if batch.len() >= batch_size {
-            let n = flush_batch(&pool, &mut batch).await?;
+            let n = flush_batch(&pool, &specs, &mut batch).await?;
             total_inserted += n;
             debug!(inserted = n, lines_processed, "flushed batch");
         }
     }
 
     if !batch.is_empty() {
-        let n = flush_batch(&pool, &mut batch).await?;
+        let n = flush_batch(&pool, &specs, &mut batch).await?;
         total_inserted += n;
     }
 
@@ -470,8 +474,13 @@ pub async fn run(
     Ok(())
 }
 
-async fn flush_batch(pool: &PgPool, batch: &mut Vec<NewEvent>) -> anyhow::Result<u64> {
-    let inserted = store::insert_events(pool, batch).await?;
+async fn flush_batch(
+    pool: &PgPool,
+    specs: &SpecCache,
+    batch: &mut Vec<NewEvent>,
+) -> anyhow::Result<u64> {
+    let inserted =
+        store::insert_events_with_resolver(pool, batch, &|cid| specs.kind(cid)).await?;
     batch.clear();
     Ok(inserted)
 }

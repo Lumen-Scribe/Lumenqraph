@@ -883,7 +883,54 @@ fn event_name_bytes_topic_is_none() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 7. DECODER EQUIVALENCE GOLDEN TESTS (#608)
+// 7. LEGACY (PRE-CAP-67) SAC MINT LAYOUT GOLDEN TESTS (#734)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A captured mainnet legacy (pre-Protocol 23) SAC `mint` event.
+///
+/// Before CAP-67 the Stellar Asset Contract emitted
+/// `["mint", admin, to, asset]` — four topics, with the admin at index 1.
+/// The recipient is therefore at index 2, *not* index 1. This pins the decoded
+/// topics and the expected recipient extraction so the legacy layout stays
+/// covered by regression tests.
+#[test]
+fn legacy_sac_mint_topics_recipient_is_index_two() {
+    // Topic 0: ScVal::Symbol("mint")
+    let topic0 = "AAAADwAAAARtaW50";
+    // Topic 1: ScVal::Address(admin) — the issuer, NOT the recipient.
+    let topic1 = "AAAAEgAAAAAAAAAAZnYwtpgeUB4mlva1EnnCVBm0hGxbz5B5Zl89BaJLufM=";
+    // Topic 2: ScVal::Address(to) — the actual recipient.
+    let topic2 = "AAAAEgAAAAAAAAAAvB0mQ0nLzXy0Q0Q0Q0Q0Q0Q0Q0Q0Q0Q0Q0Q0Q0Q0Q0Q0=";
+    // Topic 3: ScVal::Address(asset) — the SAC contract id.
+    let topic3 = "AAAAEgAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABg==";
+
+    let decoded: Vec<_> = [topic0, topic1, topic2, topic3]
+        .iter()
+        .map(|t| decode_scval_base64(t))
+        .collect();
+
+    assert_eq!(decoded.len(), 4, "legacy SAC mint has four topics");
+    assert_eq!(decoded[0], json!("mint"));
+    assert_eq!(event_name_from_topic(topic0).as_deref(), Some("mint"));
+
+    let admin = decoded[1].as_str().expect("admin must be an address");
+    let to = decoded[2].as_str().expect("recipient must be an address");
+    assert!(admin.starts_with('G'), "admin must be a G… strkey");
+    assert!(to.starts_with('G'), "recipient must be a G… strkey");
+    assert_ne!(admin, to, "admin and recipient must be distinct");
+
+    // The legacy layout puts the recipient at index 2; index 1 is the admin.
+    let recipient = if decoded.len() == 4 {
+        decoded[2].clone()
+    } else {
+        decoded[1].clone()
+    };
+    assert_eq!(recipient, decoded[2]);
+    assert_ne!(recipient, decoded[1], "admin must not be the recipient");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 8. DECODER EQUIVALENCE GOLDEN TESTS (#608)
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Table-driven check: for each ScVal, the typed decoder and the byte decoder

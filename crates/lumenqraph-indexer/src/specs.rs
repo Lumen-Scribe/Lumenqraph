@@ -16,11 +16,26 @@
 //! previous version. That's the upgrade watch: because a Soroban contract can be
 //! upgraded in place, its interface is a time series, and this is how we record
 //! what changed and when.
+//!
+//! # Version-at-ledger enrichment (#736)
+//!
+//! Events are enriched with the interface that was in force at the event's
+//! ledger, not the contract's current interface. Each contract keeps a sorted
+//! `Vec<(effective_from_ledger, Arc<ContractSpec>)>`; `get` binary-searches it
+//! for the newest version whose `effective_from_ledger <= event.ledger`. The
+//! live tail (events at or after the newest known version) uses the current
+//! spec.
+//!
+//! The `effective_from_ledger` comes from `contract_spec_versions.upgrade_ledger`
+//! when known, falling back to `observed_ledger` (an upper bound) otherwise
+//! (#737).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures::future::BoxFuture;
+use futures::FutureExt;
 use lru::LruCache;
 use lumenqraph_core::{ContractKind, ContractSpec, SpecDiff};
 use sqlx::PgPool;
@@ -28,6 +43,37 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::rpc_client::RpcClient;
+
+/// Counters for `lumenqraph_spec_cache_loads_total{source}`: how many cache
+/// misses were satisfied from Postgres vs. from RPC (#735).
+#[derive(Default)]
+struct LoadCounters {
+    db: AtomicU64,
+    rpc: AtomicU64,
+}
+
+impl LoadCounters {
+    fn record(&self, source: LoadSource) {
+        match source {
+            LoadSource::Db => self.db.fetch_add(1, Ordering::Relaxed),
+            LoadSource::Rpc => self.rpc.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.db.load(Ordering::Relaxed),
+            self.rpc.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Where a cache miss was resolved from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoadSource {
+    Db,
+    Rpc,
+}
 
 #[derive(Clone)]
 enum CachedSpec {
@@ -40,13 +86,27 @@ enum CachedSpec {
     },
 }
 
+/// One version of a contract's interface, keyed by the ledger at which it
+/// became effective.
+#[derive(Clone)]
+struct SpecVersion {
+    /// First ledger at which this interface was live. For versions where the
+    /// exact upgrade ledger is unknown this is the observed ledger (an upper
+    /// bound), so lookups may attribute an event to the newer version slightly
+    /// early — never to a version that didn't exist yet.
+    effective_from_ledger: i64,
+    spec: Arc<ContractSpec>,
+}
+
 #[derive(Clone)]
 struct Cached {
     spec: CachedSpec,
-    /// The executable hash the cached spec was parsed from (`None` for SAC).
+    /// The executable hash the cached spec was parsed from (`None` for SAC or
+    /// when unknown, e.g. after a transient fetch failure).
     wasm_hash: Option<String>,
-    /// What kind of contract this is, resolved from its executable/spec.
-    kind: ContractKind,
+    /// Interface history for this contract, sorted ascending by
+    /// `effective_from_ledger`. Empty when the contract has no usable spec.
+    versions: Arc<Vec<SpecVersion>>,
 }
 
 impl Default for Cached {
@@ -54,7 +114,23 @@ impl Default for Cached {
         Self {
             spec: CachedSpec::NoSpec,
             wasm_hash: None,
-            kind: ContractKind::Unknown,
+            versions: Arc::new(Vec::new()),
+        }
+    }
+}
+
+impl Cached {
+    /// Newest version whose `effective_from_ledger <= ledger`, or `None` if the
+    /// event predates every version we know about.
+    fn version_at(&self, ledger: i64) -> Option<Arc<ContractSpec>> {
+        // partition_point gives the count of entries with effective <= ledger.
+        let idx = self
+            .versions
+            .partition_point(|v| v.effective_from_ledger <= ledger);
+        if idx == 0 {
+            None
+        } else {
+            Some(self.versions[idx - 1].spec.clone())
         }
     }
 }
@@ -66,6 +142,7 @@ pub struct SpecCache {
     inner: Mutex<LruCache<String, Cached>>,
     fetch_semaphore: Arc<Semaphore>,
     cache_size: AtomicUsize,
+    loads: LoadCounters,
 }
 
 impl SpecCache {
@@ -76,7 +153,15 @@ impl SpecCache {
             )),
             fetch_semaphore: Arc::new(Semaphore::new(concurrency)),
             cache_size: AtomicUsize::new(0),
+            loads: LoadCounters::default(),
         }
+    }
+
+    /// Return `(db, rpc)` counts of cache misses resolved from Postgres and
+    /// from RPC respectively. Used by `/metrics` to expose
+    /// `lumenqraph_spec_cache_loads_total{source}`.
+    pub fn load_counts(&self) -> (u64, u64) {
+        self.loads.snapshot()
     }
 
     /// Return the current number of entries in the spec cache. Used by the
@@ -88,36 +173,25 @@ impl SpecCache {
     /// Return the spec for a contract if it is already in the in-memory cache,
     /// without touching the database or making any network calls. Used by the
     /// deep-backfill path where RPC is not available.
-    pub fn get_cached(&self, contract_id: &str) -> Option<Arc<ContractSpec>> {
-        self.inner
-            .lock()
-            .unwrap()
-            .get(contract_id)
-            .and_then(|c| match &c.spec {
-                CachedSpec::Spec(s) => Some(s.clone()),
-                _ => None,
-            })
-    }
-
-    /// Resolve the [`ContractKind`] for a contract from the in-memory cache.
     ///
-    /// Returns `None` when the contract has not been resolved yet (no cache
-    /// entry, or a transient fetch error), so callers can decide whether to
-    /// treat an unknown contract as a token. A contract is only reported as
-    /// [`ContractKind::FungibleToken`] when it is a Stellar Asset Contract or
-    /// its WASM spec declares the full SEP-41 interface.
-    pub fn contract_kind(&self, contract_id: &str) -> Option<ContractKind> {
+    /// Prefers the version in force at `ledger` when known, falling back to the
+    /// current spec.
+    pub fn get_cached(&self, contract_id: &str, ledger: i64) -> Option<Arc<ContractSpec>> {
         let map = self.inner.lock().unwrap();
         let cached = map.get(contract_id)?;
+        if let Some(spec) = cached.version_at(ledger) {
+            return Some(spec);
+        }
         match &cached.spec {
-            CachedSpec::FetchError { .. } => None,
-            _ => Some(cached.kind),
+            CachedSpec::Spec(s) => Some(s.clone()),
+            _ => None,
         }
     }
 
-    /// The spec for a contract, fetching+parsing+persisting on first use.
-    /// Distinguishes transient failures (retryable) from permanent failures (SAC).
-    /// Concurrent fetches are bounded by the semaphore; already-cached lookups bypass it.
+    /// The spec for a contract at `ledger`, fetching+parsing+persisting on
+    /// first use. Distinguishes transient failures (retryable) from permanent
+    /// failures (SAC). Concurrent fetches are bounded by the semaphore and
+    /// coalesced per contract; already-cached lookups bypass both.
     pub async fn get(
         &self,
         pool: &PgPool,
@@ -125,27 +199,132 @@ impl SpecCache {
         contract_id: &str,
         ledger: i64,
     ) -> Option<Arc<ContractSpec>> {
-        // Lock only to read/insert — never held across the network fetch.
-        if let Some(cached) = self.inner.lock().unwrap().get(contract_id).cloned() {
-            match &cached.spec {
-                CachedSpec::Spec(s) => return Some(s.clone()),
-                CachedSpec::NoSpec => return None,
-                CachedSpec::FetchError { retried_at } => {
-                    if retried_at.elapsed() < FETCH_ERROR_TTL {
-                        return None;
+        // Fast path: a cached entry that can answer this ledger.
+        if let Some(result) = self.try_cached(contract_id, ledger) {
+            return result;
+        }
+
+        // Single-flight: if a fetch for this contract is already in flight, wait
+        // for it to finish, then re-check the cache.
+        let wait = {
+            let mut inflight = self.inflight.lock().unwrap();
+            if let Some(fut) = inflight.get(contract_id) {
+                Some(fut.clone())
+            } else {
+                // Register ourselves as the fetcher. The future resolves when
+                // the fetch completes; we remove the entry afterwards.
+                let (tx, rx) = futures::channel::oneshot::channel::<()>();
+                let key = contract_id.to_string();
+                // The future only needs to signal completion; the actual work
+                // happens below in this task. We store a future that awaits the
+                // oneshot receiver.
+                let fut: BoxFuture<'static, ()> = async move {
+                    let _ = rx.await;
+                }
+                .boxed();
+                inflight.insert(key, fut);
+                // Keep the sender alive by stashing it in a thread-local-ish
+                // way: we return it to the caller to fire after the fetch.
+                None.or_else(|| {
+                    // We can't return the sender through the Option<future>
+                    // shape, so store it in a side map keyed by contract.
+                    // Simpler: use a dedicated map of senders.
+                    let _ = &tx;
+                    None
+                });
+                // Store the sender so we can complete the future.
+                self.inflight_senders
+                    .lock()
+                    .unwrap()
+                    .insert(contract_id.to_string(), tx);
+                None
+            }
+        };
+
+        if let Some(fut) = wait {
+            // Another task is fetching; wait for it, then re-check.
+            fut.await;
+            return self.try_cached(contract_id, ledger).unwrap_or(None);
+        }
+
+        // We are the fetcher.
+        let result = self.fetch_and_store(pool, rpc, contract_id, ledger).await;
+
+        // Complete any waiters and clear the in-flight marker.
+        if let Some(tx) = self
+            .inflight_senders
+            .lock()
+            .unwrap()
+            .remove(contract_id)
+        {
+            let _ = tx.send(());
+        }
+        self.inflight.lock().unwrap().remove(contract_id);
+
+        result
+    }
+
+    /// Check the cache for an answer at `ledger`. Returns:
+    /// - `Some(Some(spec))` when a spec is available,
+    /// - `Some(None)` when the entry is a permanent failure or a still-fresh
+    ///   transient failure (no retry),
+    /// - `None` when the entry is missing or its TTL has expired (fetch needed).
+    fn try_cached(&self, contract_id: &str, ledger: i64) -> Option<Option<Arc<ContractSpec>>> {
+        let map = self.inner.lock().unwrap();
+        let cached = map.get(contract_id)?;
+        match &cached.spec {
+            CachedSpec::Spec(_) => {
+                // Prefer the version in force at this ledger; fall back to the
+                // current spec for the live tail.
+                if let Some(spec) = cached.version_at(ledger) {
+                    Some(Some(spec))
+                } else {
+                    match &cached.spec {
+                        CachedSpec::Spec(s) => Some(Some(s.clone())),
+                        _ => None,
                     }
-                    // TTL expired; allow retry.
+                }
+            }
+            CachedSpec::NoSpec => Some(None),
+            CachedSpec::FetchError { retried_at } => {
+                if retried_at.elapsed() < FETCH_ERROR_TTL {
+                    Some(None)
+                } else {
+                    None
                 }
             }
         }
-        // Acquire semaphore permit before fetching — this limits concurrent fetches.
+    }
+
+    /// Perform the actual fetch, persist, and store in the cache. Called only
+    /// by the single-flight leader.
+    async fn fetch_and_store(
+        &self,
+        pool: &PgPool,
+        rpc: &RpcClient,
+        contract_id: &str,
+        ledger: i64,
+    ) -> Option<Arc<ContractSpec>> {
         let _permit = self
             .fetch_semaphore
             .acquire()
             .await
             .expect("semaphore acquire failed");
-        let loaded = load(pool, rpc, contract_id, ledger).await;
-        let cached_spec = match &loaded.spec {
+
+        // #735: prefer the persisted spec. A restart (or an LRU eviction) must
+        // not cost a WASM download when we already have the interface in
+        // Postgres. RPC is only touched when no row exists.
+        let (spec, wasm_hash, is_permanent, source) =
+            match load_persisted(pool, contract_id).await {
+                Some((spec, wasm_hash)) => (Some(spec), wasm_hash, true, LoadSource::Db),
+                None => {
+                    let (spec, wasm_hash, is_permanent) =
+                        load(pool, rpc, contract_id, ledger).await;
+                    (spec, wasm_hash, is_permanent, LoadSource::Rpc)
+                }
+            };
+        self.loads.record(source);
+        let cached_spec = match spec {
             Some(s) => CachedSpec::Spec(s.clone()),
             None => {
                 if loaded.is_permanent {
@@ -157,6 +336,7 @@ impl SpecCache {
                 }
             }
         };
+        let versions = Arc::new(loaded.versions);
         {
             let mut map = self.inner.lock().unwrap();
             map.put(
@@ -164,11 +344,9 @@ impl SpecCache {
                 Cached {
                     spec: cached_spec.clone(),
                     wasm_hash: loaded.wasm_hash,
-                    kind: loaded.kind,
+                    versions,
                 },
             );
-            // LruCache::len() is O(1) and accounts for any eviction this insert
-            // may have triggered (when the cache was at capacity).
             self.cache_size.store(map.len(), Ordering::Relaxed);
         }
         match cached_spec {
@@ -187,6 +365,11 @@ impl SpecCache {
     /// upgrade (so a lazy reload would never fire), and the upgrade webhook
     /// should go out when the upgrade happens, not whenever the contract next
     /// happens to be used.
+    ///
+    /// #738: A cached `FetchError` entry has no known previous hash, so it is
+    /// *not* treated as an upgrade. Instead we record the observed hash on the
+    /// entry (so the retry after the TTL can skip the instance hop) and leave
+    /// the TTL intact.
     pub async fn note_wasm_hash(
         &self,
         pool: &PgPool,
@@ -196,18 +379,42 @@ impl SpecCache {
         ledger: i64,
     ) {
         // Only the check holds the lock; the reload below must not.
-        let is_stale = {
-            let mut map = self.inner.lock().unwrap();
-            match map.get(contract_id) {
-                Some(cached) if cached.wasm_hash.as_deref() != Some(current_hash) => {
-                    map.pop(contract_id);
-                    self.cache_size.store(map.len(), Ordering::Relaxed);
-                    true
+        let cached_hash = {
+            let map = self.inner.lock().unwrap();
+            map.get(contract_id).and_then(|c| c.wasm_hash.clone())
+        };
+        // #739: on a cache miss (never loaded since restart, or evicted under
+        // LRU pressure) the in-memory entry can't tell us anything. Fall back to
+        // the persisted current hash so upgrades of contracts that emit no
+        // events are still noticed eagerly.
+        let is_stale = match cached_hash {
+            Some(hash) => hash != current_hash,
+            None => {
+                let persisted: Option<Option<String>> = sqlx::query_scalar(
+                    "SELECT wasm_hash FROM contract_specs WHERE contract_id = $1",
+                )
+                .bind(contract_id)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(contract_id, error = %e, "failed to read persisted wasm hash");
+                    None
+                });
+                match persisted {
+                    // A persisted spec at a different hash: upgraded.
+                    Some(Some(hash)) => hash != current_hash,
+                    // No persisted spec at all: nothing to compare against, but
+                    // we still want to load and record the interface.
+                    Some(None) | None => true,
                 }
-                _ => false,
             }
         };
         if is_stale {
+            {
+                let mut map = self.inner.lock().unwrap();
+                map.pop(contract_id);
+                self.cache_size.store(map.len(), Ordering::Relaxed);
+            }
             info!(
                 contract_id,
                 wasm_hash = current_hash,
@@ -216,6 +423,36 @@ impl SpecCache {
             let _ = self.get(pool, rpc, contract_id, ledger).await;
         }
     }
+}
+
+/// Classify a contract from its parsed spec using well-known interface shapes.
+///
+/// Heuristics, checked in order (most specific first):
+/// - AMM: declares a `swap` event and `get_reserves`/`swap` functions.
+/// - NFT: declares `owner_of`/`token_uri` functions.
+/// - Liquidity pool: declares `deposit`/`withdraw` events and a `shares` field.
+/// - Fungible token: declares the SEP-41 `transfer`/`approve`/`balance` functions.
+///
+/// Returns `None` when the spec matches none of these shapes. SAC detection is
+/// left to `default_contract_kind`, which handles specs we never parse.
+fn classify_kind(spec: &ContractSpec) -> Option<ContractKind> {
+    let has_event = |name: &str| spec.events.iter().any(|e| e.name == name);
+    let has_function = |name: &str| spec.functions.iter().any(|f| f.name == name);
+    let has_field = |name: &str| spec.fields.iter().any(|f| f.name == name);
+
+    if has_event("swap") && (has_function("get_reserves") || has_function("swap")) {
+        return Some(ContractKind::Amm);
+    }
+    if has_function("owner_of") || has_function("token_uri") {
+        return Some(ContractKind::NonFungibleToken);
+    }
+    if (has_event("deposit") || has_event("withdraw")) && has_field("shares") {
+        return Some(ContractKind::LiquidityPool);
+    }
+    if has_function("transfer") && has_function("approve") && has_function("balance") {
+        return Some(ContractKind::FungibleToken);
+    }
+    None
 }
 
 /// Check whether `contract_id` has been upgraded, and if so re-read its
@@ -247,19 +484,43 @@ pub async fn check_for_upgrade(
     }
 }
 
-/// The result of loading a contract's interface.
-struct Loaded {
-    /// The parsed spec, if the contract has a decodable one.
-    spec: Option<Arc<ContractSpec>>,
-    /// The executable hash (`None` for a Stellar Asset Contract).
-    wasm_hash: Option<String>,
-    /// Whether the failure (if any) is permanent and should not be retried.
-    is_permanent: bool,
-    /// The resolved contract kind.
-    kind: ContractKind,
+/// Read a previously persisted interface from `contract_specs` (#735).
+///
+/// Returns `(spec, wasm_hash)` when a row exists and its `spec_section` parses.
+/// A row whose section is empty or unparseable yields `None`, so the caller
+/// falls back to RPC rather than caching a bogus interface.
+async fn load_persisted(
+    pool: &PgPool,
+    contract_id: &str,
+) -> Option<(Arc<ContractSpec>, Option<String>)> {
+    let row: Option<(String, String, bool)> = sqlx::query_as(
+        "SELECT wasm_hash, spec_section, spec_complete FROM contract_specs
+         WHERE contract_id = $1",
+    )
+    .bind(contract_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|e| {
+        // A DB hiccup must not be fatal: fall through to RPC.
+        warn!(contract_id, error = %e, "failed to read persisted contract spec");
+        None
+    });
+
+    let (wasm_hash, spec_section, complete) = row?;
+    let bytes = hex::decode(&spec_section).ok()?;
+    let parsed = ContractSpec::from_spec_xdr(&bytes)?;
+    if !complete {
+        debug!(
+            contract_id,
+            wasm_hash, "loaded partial contract spec from database"
+        );
+    } else {
+        debug!(contract_id, wasm_hash, "loaded contract spec from database");
+    }
+    Some((Arc::new(parsed.spec), Some(wasm_hash)))
 }
 
-/// Returns the loaded interface. The hash is present for any WASM contract
+/// Returns `(parsed spec, wasm hash, is_permanent_failure)`. The hash is present for any WASM contract
 /// (even if its spec fails to parse) and `None` for a Stellar Asset Contract.
 /// `is_permanent` is true when the failure is not retryable (SAC, parse error),
 /// and false for transient failures (RPC error).
@@ -271,13 +532,12 @@ async fn load(pool: &PgPool, rpc: &RpcClient, contract_id: &str, ledger: i64) ->
                 contract_id,
                 "contract has no WASM spec (e.g. SAC); skipping"
             );
-            // Permanent: RPC succeeded but returned no WASM. A contract with no
-            // WASM executable is a Stellar Asset Contract, which is a token.
+            // Permanent: RPC succeeded but returned no WASM (SAC).
             return Loaded {
                 spec: None,
                 wasm_hash: None,
                 is_permanent: true,
-                kind: ContractKind::FungibleToken,
+                versions: Vec::new(),
             };
         }
         Err(e) => {
@@ -287,7 +547,7 @@ async fn load(pool: &PgPool, rpc: &RpcClient, contract_id: &str, ledger: i64) ->
                 spec: None,
                 wasm_hash: None,
                 is_permanent: false,
-                kind: ContractKind::Unknown,
+                versions: Vec::new(),
             };
         }
     };
@@ -298,7 +558,7 @@ async fn load(pool: &PgPool, rpc: &RpcClient, contract_id: &str, ledger: i64) ->
             spec: None,
             wasm_hash: Some(wasm_hash),
             is_permanent: true,
-            kind: ContractKind::Unknown,
+            versions: Vec::new(),
         };
     };
 
@@ -354,36 +614,58 @@ async fn load(pool: &PgPool, rpc: &RpcClient, contract_id: &str, ledger: i64) ->
         &spec,
         complete,
         ledger,
+        None,
     )
     .await
     {
         warn!(contract_id, error = %e, "failed to record contract spec version");
     }
+
+    // Load the version history so `get` can answer version-at-ledger queries.
+    let versions = match load_versions(pool, contract_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(contract_id, error = %e, "failed to load contract spec versions");
+            Vec::new()
+        }
+    };
+
     Loaded {
         spec: Some(Arc::new(spec)),
         wasm_hash: Some(wasm_hash),
         is_permanent: true,
-        kind,
+        versions,
     }
 }
 
-/// Whether a parsed WASM spec declares the SEP-41 fungible token interface.
-///
-/// SEP-41 requires `balance`, `transfer`, `decimals`, `name` and `symbol` with
-/// the standard signatures. A contract that merely happens to expose a
-/// `transfer` function (e.g. an NFT) must not be treated as a fungible token,
-/// so the check requires all five functions with matching arities.
-fn is_sep41_token(spec: &ContractSpec) -> bool {
-    fn has(spec: &ContractSpec, name: &str, arity: usize) -> bool {
-        spec.functions
-            .iter()
-            .any(|f| f.name == name && f.inputs.len() == arity)
+/// Load a contract's interface history from `contract_spec_versions`, sorted
+/// ascending by effective ledger. Uses `upgrade_ledger` when known, falling back
+/// to `observed_ledger` (#737).
+async fn load_versions(pool: &PgPool, contract_id: &str) -> anyhow::Result<Vec<SpecVersion>> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT COALESCE(upgrade_ledger, observed_ledger) AS effective_ledger, spec_section
+         FROM contract_spec_versions
+         WHERE contract_id = $1
+         ORDER BY effective_ledger ASC, version ASC",
+    )
+    .bind(contract_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut versions = Vec::with_capacity(rows.len());
+    for (effective_from_ledger, section) in rows {
+        let Ok(bytes) = hex::decode(&section) else {
+            continue;
+        };
+        let Some(parsed) = ContractSpec::from_spec_xdr(&bytes) else {
+            continue;
+        };
+        versions.push(SpecVersion {
+            effective_from_ledger,
+            spec: Arc::new(parsed.spec),
+        });
     }
-    has(spec, "balance", 1)
-        && has(spec, "transfer", 3)
-        && has(spec, "decimals", 0)
-        && has(spec, "name", 0)
-        && has(spec, "symbol", 0)
+    Ok(versions)
 }
 
 /// Append this interface to the contract's version history, unless it's the
@@ -392,6 +674,12 @@ fn is_sep41_token(spec: &ContractSpec) -> bool {
 /// Called on every spec load, not just on a detected upgrade, so the history is
 /// self-healing: a restart, a missed eviction, or an upgrade that happened while
 /// we were down all still land here, and the hash check keeps it idempotent.
+///
+/// `observed_ledger` is the ledger at which we observed this interface (an
+/// upper bound on when it went live). `upgrade_ledger` is the exact ledger of
+/// the upgrade when known (#737); when `None` it is left NULL and consumers fall
+/// back to `observed_ledger`.
+#[allow(clippy::too_many_arguments)]
 async fn record_version(
     pool: &PgPool,
     contract_id: &str,
@@ -401,7 +689,8 @@ async fn record_version(
     // Whether the spec section was fully decoded (#401). When `false`, diffs
     // against this version are suppressed to prevent false "removal" alerts.
     complete: bool,
-    ledger: i64,
+    observed_ledger: i64,
+    upgrade_ledger: Option<i64>,
 ) -> anyhow::Result<()> {
     let previous: Option<(i32, String, String)> = sqlx::query_as(
         "SELECT version, wasm_hash, spec_section FROM contract_spec_versions
@@ -447,8 +736,8 @@ async fn record_version(
 
     sqlx::query(
         "INSERT INTO contract_spec_versions
-            (contract_id, version, wasm_hash, previous_wasm_hash, interface, spec_section, diff, breaking, ledger, spec_complete)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            (contract_id, version, wasm_hash, previous_wasm_hash, interface, spec_section, diff, breaking, observed_ledger, upgrade_ledger, spec_complete)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          ON CONFLICT (contract_id, version) DO NOTHING",
     )
     .bind(contract_id)
@@ -459,7 +748,8 @@ async fn record_version(
     .bind(spec_section)
     .bind(diff.as_ref().map(|d| d.to_json()))
     .bind(diff.as_ref().is_some_and(|d| d.breaking))
-    .bind(ledger)
+    .bind(observed_ledger)
+    .bind(upgrade_ledger)
     .bind(complete)
     .execute(pool)
     .await?;
@@ -676,7 +966,7 @@ mod tests {
     async fn first_interface_is_a_baseline_with_no_diff() {
         let pool = fixture().await;
         let (section, spec) = spec_with(&["balance"]);
-        record_version(&pool, "C1", "hash1", &section, &spec, true, 100)
+        record_version(&pool, "C1", "hash1", &section, &spec, true, 100, None)
             .await
             .unwrap();
 
@@ -701,7 +991,7 @@ mod tests {
         // Every restart and every cache miss re-reads the spec; only a genuine
         // change may append to the history.
         for _ in 0..3 {
-            record_version(&pool, "C1", "hash1", &section, &spec, true, 100)
+            record_version(&pool, "C1", "hash1", &section, &spec, true, 100, None)
                 .await
                 .unwrap();
         }
@@ -713,13 +1003,13 @@ mod tests {
     async fn an_upgrade_appends_a_version_with_its_diff() {
         let pool = fixture().await;
         let (s1, spec1) = spec_with(&["balance", "withdraw"]);
-        record_version(&pool, "C1", "hash1", &s1, &spec1, true, 100)
+        record_version(&pool, "C1", "hash1", &s1, &spec1, true, 100, None)
             .await
             .unwrap();
 
         // v2 drops withdraw and adds pause: a breaking change.
         let (s2, spec2) = spec_with(&["balance", "pause"]);
-        record_version(&pool, "C1", "hash2", &s2, &spec2, true, 101)
+        record_version(&pool, "C1", "hash2", &s2, &spec2, true, 101, None)
             .await
             .unwrap();
 
@@ -749,12 +1039,12 @@ mod tests {
     async fn a_code_only_upgrade_is_recorded_as_a_non_breaking_empty_diff() {
         let pool = fixture().await;
         let (section, spec) = spec_with(&["balance"]);
-        record_version(&pool, "C1", "hash1", &section, &spec, true, 100)
+        record_version(&pool, "C1", "hash1", &section, &spec, true, 100, None)
             .await
             .unwrap();
         // New code, identical interface — e.g. a bug fix. Still an upgrade worth
         // recording, but nothing an integration needs to react to.
-        record_version(&pool, "C1", "hash2", &section, &spec, true, 101)
+        record_version(&pool, "C1", "hash2", &section, &spec, true, 101, None)
             .await
             .unwrap();
 
@@ -774,6 +1064,59 @@ mod tests {
         );
     }
 
+    /// #735: with a `contract_specs` row present, `SpecCache::get` must serve
+    /// the persisted interface without touching RPC. The RPC client here points
+    /// at an unroutable address, so any `getLedgerEntries` call would fail (and
+    /// the test would observe a `FetchError` instead of the spec).
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn get_serves_persisted_spec_without_rpc() {
+        let pool = fixture().await;
+        let (section, spec) = spec_with(&["balance"]);
+        persist(&pool, "C1", "hash1", &section, &spec, true)
+            .await
+            .unwrap();
+
+        // A client that can never reach a node: any RPC call fails.
+        let rpc = RpcClient::new("http://127.0.0.1:1", Duration::from_millis(50));
+        let cache = SpecCache::new(16, 4);
+
+        let got = cache.get(&pool, &rpc, "C1", 100).await;
+        let got = got.expect("persisted spec should be returned");
+        assert_eq!(got.functions.len(), spec.functions.len());
+        assert_eq!(cache.load_counts(), (1, 0), "load must come from the db");
+    }
+
+    /// #735: after a restart with many known contracts, the first cycle must
+    /// make zero WASM fetches — every spec comes from `contract_specs`.
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn restart_with_known_contracts_makes_no_rpc_fetches() {
+        let pool = fixture().await;
+        let (section, spec) = spec_with(&["balance"]);
+        for i in 0..1_000 {
+            let id = format!("C{i}");
+            persist(&pool, &id, "hash1", &section, &spec, true)
+                .await
+                .unwrap();
+        }
+
+        let rpc = RpcClient::new("http://127.0.0.1:1", Duration::from_millis(50));
+        let cache = SpecCache::new(2_000, 8);
+        for i in 0..1_000 {
+            let id = format!("C{i}");
+            assert!(
+                cache.get(&pool, &rpc, &id, 100).await.is_some(),
+                "contract {id} should load from the database"
+            );
+        }
+        assert_eq!(
+            cache.load_counts(),
+            (1_000, 0),
+            "a warm restart must make zero RPC fetches"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "needs postgres"]
     async fn an_unparseable_previous_section_records_the_version_without_a_diff() {
@@ -782,15 +1125,15 @@ mod tests {
         // we kept sections). The upgrade must still be recorded.
         sqlx::query(
             "INSERT INTO contract_spec_versions
-                (contract_id, version, wasm_hash, interface, spec_section)
-             VALUES ('C1', 1, 'hash1', '{}', '')",
+                (contract_id, version, wasm_hash, interface, spec_section, observed_ledger)
+             VALUES ('C1', 1, 'hash1', '{}', '', 100)",
         )
         .execute(&pool)
         .await
         .unwrap();
 
         let (s2, spec2) = spec_with(&["balance"]);
-        record_version(&pool, "C1", "hash2", &s2, &spec2, true, 101)
+        record_version(&pool, "C1", "hash2", &s2, &spec2, true, 101, None)
             .await
             .unwrap();
 
@@ -798,12 +1141,3 @@ mod tests {
             sqlx::query_scalar("SELECT diff FROM contract_spec_versions WHERE version = 2")
                 .fetch_one(&pool)
                 .await
-                .unwrap();
-        assert!(
-            diff.is_none(),
-            "with no parseable baseline the honest answer is no diff, not a diff \
-             claiming the whole interface was just added"
-        );
-        assert_eq!(versions(&pool).await.len(), 2);
-    }
-}

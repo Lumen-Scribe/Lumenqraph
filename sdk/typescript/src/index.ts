@@ -75,6 +75,15 @@ export interface ContractState {
 }
 
 export interface DataKey {
+  /**
+   * hex(sha256(XDR LedgerKey)) — the standard Stellar ledger-key hash, which
+   * includes the entry's durability. Use {@link ledgerKeyHash} to compute it
+   * client-side from a contract id, key ScVal and durability.
+   */
+  ledger_key_hash: string;
+  /**
+   * @deprecated Use `ledger_key_hash`. Retained as an alias for one release.
+   */
   key_hash: string;
   key: Json;
   durability: string;
@@ -92,6 +101,11 @@ export interface ContractData {
 
 export interface DataKeyHistory {
   contract_id: string;
+  /** hex(sha256(XDR LedgerKey)); see {@link ledgerKeyHash}. */
+  ledger_key_hash: string;
+  /**
+   * @deprecated Use `ledger_key_hash`. Retained as an alias for one release.
+   */
   key_hash: string;
   key: Json;
   durability: string;
@@ -522,7 +536,13 @@ export class LumenqraphClient {
     }, opts.signal);
   }
 
-  /** The version history of a single per-key entry (e.g. one balance). */
+  /**
+   * The version history of a single per-key entry (e.g. one balance).
+   *
+   * `keyHash` is the `ledger_key_hash` of the entry: hex(sha256(XDR LedgerKey)),
+   * which includes the entry's durability. Compute it with {@link ledgerKeyHash}
+   * from the contract id, key ScVal and durability.
+   */
   getDataKey(
     contractId: string,
     keyHash: string,
@@ -1450,6 +1470,180 @@ function abortError(): Error {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---- Ledger key hashing (#741) ----
+
+/** Durability of a Soroban contract-data ledger entry. */
+export type Durability = "persistent" | "temporary";
+
+/**
+ * Compute the standard Stellar ledger-key hash for a contract-data entry:
+ * `hex(sha256(XDR LedgerKey::ContractData { contract, key, durability }))`.
+ *
+ * This matches the server's `ledger_key_hash` (and the value used by Stellar
+ * tooling), and — unlike a hash of the key alone — includes the entry's
+ * durability, so persistent and temporary entries with the same key do not
+ * collide.
+ *
+ * `keyScVal` is the key as a base64 XDR `ScVal` string (as returned by the API
+ * in `DataKey.key`), or the raw XDR bytes.
+ *
+ * @example
+ * const hash = ledgerKeyHash(contractId, keyScVal, "persistent");
+ * const history = await lq.getDataKey(contractId, hash);
+ */
+export function ledgerKeyHash(
+  contractId: string,
+  keyScVal: unknown,
+  durability: Durability,
+): string {
+  const contract = decodeContractId(contractId);
+  const key = toXdrBytes(keyScVal);
+  const durabilityValue = durability === "temporary" ? 1 : 0;
+
+  // LedgerKey::ContractData is union arm 2 of LedgerKey:
+  //   LedgerKey::ContractData(ScContractData) where ScContractData is
+  //   { contract: ScAddress, key: ScVal, durability: ContractDataDurability }.
+  // ScAddress::Contract is arm 1 and wraps a Hash (32 bytes).
+  const parts: Uint8Array[] = [
+    u32(2), // LedgerKey::ContractData
+    u32(1), // ScAddress::Contract
+    u32(0), // Hash discriminant (opaque fixed-length 32 bytes)
+    contract,
+    key,
+    u32(durabilityValue), // ContractDataDurability: 0 = temporary, 1 = persistent
+  ];
+  return sha256Hex(concatBytes(parts));
+}
+
+/** Decode a `C…` contract id (StrKey) into its 32-byte payload. */
+function decodeContractId(contractId: string): Uint8Array {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  const trimmed = contractId.trim();
+  if (!trimmed.startsWith("C")) {
+    throw new Error(`invalid contract id: ${contractId}`);
+  }
+  const body = trimmed.slice(1);
+  let bits = 0;
+  let value = 0;
+  const out: number[] = [];
+  for (const ch of body) {
+    const idx = alphabet.indexOf(ch);
+    if (idx < 0) throw new Error(`invalid contract id: ${contractId}`);
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push((value >> bits) & 0xff);
+    }
+  }
+  // StrKey payload is 32 bytes followed by a 2-byte CRC16 checksum.
+  if (out.length < 34) throw new Error(`invalid contract id: ${contractId}`);
+  return new Uint8Array(out.slice(0, 32));
+}
+
+/** Coerce a base64 XDR string or raw bytes into a `Uint8Array`. */
+function toXdrBytes(value: unknown): Uint8Array {
+  if (value instanceof Uint8Array) return value;
+  if (typeof value === "string") {
+    const binary = atob(value);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+  throw new Error("keyScVal must be a base64 XDR string or Uint8Array");
+}
+
+/** Encode a 32-bit unsigned integer as 4 big-endian bytes. */
+function u32(n: number): Uint8Array {
+  return new Uint8Array([(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff]);
+}
+
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const p of parts) {
+    out.set(p, offset);
+    offset += p.length;
+  }
+  return out;
+}
+
+/** Synchronous SHA-256 over bytes, returning lowercase hex. */
+function sha256Hex(bytes: Uint8Array): string {
+  const K = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+  ];
+  const H = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+  ];
+
+  const bitLen = bytes.length * 8;
+  const paddedLen = (((bytes.length + 8) >> 6) + 1) << 6;
+  const msg = new Uint8Array(paddedLen);
+  msg.set(bytes);
+  msg[bytes.length] = 0x80;
+  // 64-bit big-endian length (high 32 bits are zero for our inputs).
+  msg[paddedLen - 4] = (bitLen >>> 24) & 0xff;
+  msg[paddedLen - 3] = (bitLen >>> 16) & 0xff;
+  msg[paddedLen - 2] = (bitLen >>> 8) & 0xff;
+  msg[paddedLen - 1] = bitLen & 0xff;
+
+  const w = new Uint32Array(64);
+  const rotr = (x: number, n: number) => (x >>> n) | (x << (32 - n));
+
+  for (let offset = 0; offset < paddedLen; offset += 64) {
+    for (let i = 0; i < 16; i++) {
+      const j = offset + i * 4;
+      w[i] = ((msg[j]! << 24) | (msg[j + 1]! << 16) | (msg[j + 2]! << 8) | msg[j + 3]!) >>> 0;
+    }
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i - 15]!, 7) ^ rotr(w[i - 15]!, 18) ^ (w[i - 15]! >>> 3);
+      const s1 = rotr(w[i - 2]!, 17) ^ rotr(w[i - 2]!, 19) ^ (w[i - 2]! >>> 10);
+      w[i] = (w[i - 16]! + s0 + w[i - 7]! + s1) >>> 0;
+    }
+
+    let [a, b, c, d, e, f, g, h] = H as [
+      number, number, number, number, number, number, number, number,
+    ];
+    for (let i = 0; i < 64; i++) {
+      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (h + S1 + ch + K[i]! + w[i]!) >>> 0;
+      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (S0 + maj) >>> 0;
+      h = g;
+      g = f;
+      f = e;
+      e = (d + t1) >>> 0;
+      d = c;
+      c = b;
+      b = a;
+      a = (t1 + t2) >>> 0;
+    }
+
+    H[0] = (H[0]! + a) >>> 0;
+    H[1] = (H[1]! + b) >>> 0;
+    H[2] = (H[2]! + c) >>> 0;
+    H[3] = (H[3]! + d) >>> 0;
+    H[4] = (H[4]! + e) >>> 0;
+    H[5] = (H[5]! + f) >>> 0;
+    H[6] = (H[6]! + g) >>> 0;
+    H[7] = (H[7]! + h) >>> 0;
+  }
+
+  return H.map((x) => x.toString(16).padStart(8, "0")).join("");
 }
 
 // ---- Helpers ----

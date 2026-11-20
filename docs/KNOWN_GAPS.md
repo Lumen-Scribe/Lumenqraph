@@ -6,7 +6,7 @@ If you fix one of these, update this table in the same PR, and include the behav
 
 | Closed issue | What's on `main` | Open tracking issue |
 | --- | --- | --- |
-| #86, #87, #88: swap, NFT and liquidity verticals | Tables and endpoints exist; the indexer now writes to them for the well-known event shapes (Soroswap/Aquarius `swap`, SEP-50 NFT `mint`/`transfer`/`burn`, `deposit`/`withdraw`), but coverage is narrow and the endpoints remain experimental | [#599](https://github.com/Lumen-Scribe/Lumenqraph/issues/599) |
+| #86, #87, #88: swap, NFT and liquidity verticals | Tables and endpoints exist, but the indexer only writes to them once the poller passes the `SpecCache`-backed resolver ([#731](https://github.com/Lumen-Scribe/Lumenqraph/issues/731)) and the projection INSERTs match the migrations ([#730](https://github.com/Lumen-Scribe/Lumenqraph/issues/730)); coverage is narrow and the endpoints remain experimental | [#599](https://github.com/Lumen-Scribe/Lumenqraph/issues/599) |
 | #91: admin API for API keys | No key-management routes exist; keys are still minted with `scripts/gen_api_key.sh` | [#431](https://github.com/Lumen-Scribe/Lumenqraph/issues/431) |
 | #116: backfill a new webhook subscription | `since` is stored but never read by the enqueuer | None yet: [#116](https://github.com/Lumen-Scribe/Lumenqraph/issues/116) should be reopened |
 | #117: prune `webhook_deliveries` | The prune function exists but is never spawned | [#567](https://github.com/Lumen-Scribe/Lumenqraph/issues/567), [#568](https://github.com/Lumen-Scribe/Lumenqraph/issues/568) |

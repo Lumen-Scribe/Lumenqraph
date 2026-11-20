@@ -74,7 +74,10 @@ pub async fn run(
             .max()
             .unwrap_or(last_page_ledger);
 
-        // Build and store this page's events.
+        // Build and store this page's events.  Each event is enriched with the
+        // spec version that was in force at its own ledger, not the contract's
+        // current spec: a page can straddle an upgrade, and backfilled events
+        // are often older than the newest version.
         let mut batch = Vec::with_capacity(page_len);
         for ev in &page.events {
             let spec = specs.get(&pool, &rpc, &ev.contract_id, ev.ledger).await;

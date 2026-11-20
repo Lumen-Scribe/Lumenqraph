@@ -112,12 +112,15 @@ CREATE TABLE contract_spec_versions (
     breaking            BOOLEAN NOT NULL,           -- Whether diff breaks consumers
     diff                JSONB NOT NULL,             -- Semantic diff vs previous version
     observed_at         TIMESTAMPTZ NOT NULL,       -- When we detected this version
+    observed_ledger     BIGINT,                     -- Ledger of the event/entry that first revealed this version
+    upgrade_ledger      BIGINT,                     -- First ledger at which the new executable was live (NULL = unknown)
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (contract_id, version)
 );
 
 CREATE INDEX idx_spec_versions_contract ON contract_spec_versions (contract_id, version DESC);
 CREATE INDEX idx_spec_versions_timestamp ON contract_spec_versions (observed_at DESC);
+CREATE INDEX idx_spec_versions_upgrade_ledger ON contract_spec_versions (contract_id, upgrade_ledger DESC) WHERE upgrade_ledger IS NOT NULL;
 ```
 
 **Key Points:**
@@ -125,6 +128,26 @@ CREATE INDEX idx_spec_versions_timestamp ON contract_spec_versions (observed_at 
 - `diff` includes `breaking: boolean` and `summary: string[]` of changes
 - Used by webhook subscribers watching `kind = 'upgrade'`
 - Only versions >= 2 trigger upgrade webhooks
+
+**Ledger precision (`observed_ledger` vs `upgrade_ledger`):**
+
+These two columns answer different questions and must not be conflated:
+
+- `observed_ledger` — the ledger of the event or ledger entry that first revealed the new version to the indexer. It is an **upper bound** on when the upgrade happened, never an exact upgrade ledger. Sources:
+  - `SpecCache::get` — the ledger of the event that missed the cache. This can be days after the upgrade (e.g. the first event after a restart) or before it (a backfill).
+  - `note_wasm_hash` — `instance.last_modified_ledger`. The instance entry changes on **every** instance-storage write, not just on executable updates, so this is "the last time anything in instance storage changed", not the upgrade ledger.
+- `upgrade_ledger` — the first ledger at which the new executable was live, or `NULL` when it cannot be determined. Populated from an exact source when available:
+  - the executable-update system event or diagnostic,
+  - the transaction that called `update_current_contract_wasm` (seen via `getTransactions`),
+  - binary search with `getLedgerEntries` at historical ledgers when an archive RPC is configured.
+
+**Precision semantics for consumers:**
+
+- `upgrade_ledger IS NOT NULL` → exact: the new executable was live at that ledger.
+- `upgrade_ledger IS NULL` → unknown; `observed_ledger` is the best available value and is an upper bound ("first observed at"). API responses expose which ledger value is returned and whether it is exact or an upper bound.
+- A version recorded from `note_wasm_hash` after an instance-storage-only change is **not** attributed to that change: `observed_ledger` may reflect it, but `upgrade_ledger` is only set from an exact source.
+
+**Retention:** pruning uses `COALESCE(upgrade_ledger, observed_ledger)` against the cutoff, so rows are never pruned based on a meaningless value. Rows with an exact `upgrade_ledger` are retained until that ledger falls outside the window; rows with only `observed_ledger` are retained until the observation falls outside the window.
 
 ## Per-Key Storage Tables
 
@@ -515,6 +538,29 @@ SELECT interface FROM contract_spec_versions
 WHERE contract_id = 'CADQZ...' 
   AND observed_at <= '2025-01-15'::timestamp
 ORDER BY version DESC 
+LIMIT 1;
+```
+
+### Contract Interface at a Ledger (exact upgrades only)
+
+```sql
+SELECT interface, upgrade_ledger FROM contract_spec_versions 
+WHERE contract_id = 'CADQZ...' 
+  AND upgrade_ledger IS NOT NULL
+  AND upgrade_ledger <= 12345678
+ORDER BY upgrade_ledger DESC 
+LIMIT 1;
+```
+
+When no exact `upgrade_ledger` is known, fall back to `observed_ledger` and treat the result as an upper bound:
+
+```sql
+SELECT interface, COALESCE(upgrade_ledger, observed_ledger) AS ledger,
+       upgrade_ledger IS NOT NULL AS exact
+FROM contract_spec_versions 
+WHERE contract_id = 'CADQZ...' 
+  AND COALESCE(upgrade_ledger, observed_ledger) <= 12345678
+ORDER BY COALESCE(upgrade_ledger, observed_ledger) DESC 
 LIMIT 1;
 ```
 
