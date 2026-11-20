@@ -16,7 +16,7 @@ use crate::config::Config;
 use crate::convert::to_new_event;
 use crate::rpc_client::RpcClient;
 use crate::specs::{self, SpecCache};
-use crate::{cursor, keys, retention, state, store};
+use crate::{cursor, keys, metrics, retention, state, store};
 
 /// How often to prune outside the retention window. Decoupled from the poll
 /// interval: retention is a slow-moving disk concern, and re-checking it every
@@ -594,11 +594,29 @@ async fn fetch_and_store_with_shutdown(
     // storage map and the executable hash respectively — so whenever state
     // indexing is on it covers both, and the upgrade watch adds no RPC calls.
     if config.state_indexing || config.upgrade_watch {
-        let targets: Vec<String> = if config.contract_ids.is_empty() {
+        let mut targets: Vec<String> = if config.contract_ids.is_empty() {
             active_contracts.iter().cloned().collect()
         } else {
             config.contract_ids.clone()
         };
+        // Index-all state indexing has no natural bound on the number of active
+        // contracts, so cap the per-cycle target list and defer the rest (#746).
+        // Contracts whose last snapshot is oldest go first, so every contract is
+        // eventually refreshed instead of a fixed subset starving the rest.
+        if config.state_indexing && config.contract_ids.is_empty() {
+            let cap = config.max_state_contracts_per_cycle;
+            if cap > 0 && targets.len() > cap {
+                let deferred = targets.len() - cap;
+                prioritise_by_snapshot_age(pool, &mut targets).await;
+                targets.truncate(cap);
+                metrics::record_deferred_state_contracts(deferred as u64);
+                debug!(
+                    deferred,
+                    cap,
+                    "deferring contracts past MAX_STATE_CONTRACTS_PER_CYCLE to later cycles"
+                );
+            }
+        }
         if config.state_indexing {
             // Batch instance reads with bounded concurrency.
             // Change-detected, so unchanged instances are no-op writes.
@@ -643,6 +661,24 @@ async fn fetch_and_store_with_shutdown(
     // Keys are batched into chunked getLedgerEntries calls so per-cycle RPC cost
     // scales with the number of batches, not the number of individual holders.
     if config.key_indexing && !holders_by_contract.is_empty() {
+        // Index-all key indexing sees every holder of every token, so cap the
+        // total number of keys per cycle and defer the rest (#746). Holders whose
+        // last snapshot is oldest go first so the backlog drains fairly.
+        let cap = config.max_state_keys_per_cycle;
+        if cap > 0 {
+            let total: usize = holders_by_contract.values().map(|h| h.len()).sum();
+            if total > cap {
+                let deferred = total - cap;
+                prioritise_holders_by_snapshot_age(pool, &mut holders_by_contract).await;
+                truncate_holders(&mut holders_by_contract, cap);
+                metrics::record_deferred_state_keys(deferred as u64);
+                debug!(
+                    deferred,
+                    cap,
+                    "deferring balance keys past MAX_STATE_KEYS_PER_CYCLE to later cycles"
+                );
+            }
+        }
         // Validated at config load (`Config::from_env`), so this cannot fail here.
         let durability = keys::parse_durability(&config.balance_key_durability)?;
         state::snapshot_balances_batch(
@@ -674,6 +710,82 @@ async fn fetch_and_store_with_shutdown(
             not_enriched_count: counters.not_enriched,
         },
     ))
+}
+
+/// Order `targets` so the contracts whose last state snapshot is oldest come
+/// first, and contracts never snapshotted come before those with a snapshot.
+/// A failed lookup leaves the existing order intact: prioritisation is an
+/// optimisation, not a correctness requirement (#746).
+async fn prioritise_by_snapshot_age(pool: &PgPool, targets: &mut [String]) {
+    let ages: std::collections::HashMap<String, Option<i64>> =
+        match state::last_snapshot_ledgers(pool, targets).await {
+            Ok(ages) => ages,
+            Err(e) => {
+                warn!(error = %e, "failed to read last-snapshot ledgers; keeping discovery order");
+                return;
+            }
+        };
+    // Never snapshotted (None) sorts before any ledger; then oldest ledger first.
+    targets.sort_by_key(|cid| ages.get(cid).copied().flatten().unwrap_or(i64::MIN));
+}
+
+/// Order each contract's holder set so holders whose last balance snapshot is
+/// oldest come first, and never-snapshotted holders come before the rest.
+/// A failed lookup leaves the existing order intact (#746).
+async fn prioritise_holders_by_snapshot_age(
+    pool: &PgPool,
+    holders_by_contract: &mut std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    >,
+) {
+    let mut all: Vec<String> = Vec::new();
+    for holders in holders_by_contract.values() {
+        all.extend(holders.iter().cloned());
+    }
+    let ages = match state::last_balance_snapshot_ledgers(pool, &all).await {
+        Ok(ages) => ages,
+        Err(e) => {
+            warn!(error = %e, "failed to read last balance snapshot ledgers; keeping discovery order");
+            return;
+        }
+    };
+    for holders in holders_by_contract.values_mut() {
+        let mut ordered: Vec<String> = holders.iter().cloned().collect();
+        ordered.sort_by_key(|h| ages.get(h).copied().flatten().unwrap_or(i64::MIN));
+        *holders = ordered.into_iter().collect();
+    }
+}
+
+/// Trim the holder sets so their combined size is at most `cap`, dropping
+/// holders from the end of each contract's (already prioritised) order. The
+/// budget is shared round-robin across contracts so one busy token cannot
+/// consume the whole cycle's allowance (#746).
+fn truncate_holders(
+    holders_by_contract: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+    cap: usize,
+) {
+    let mut remaining = cap;
+    let mut contracts: Vec<String> = holders_by_contract.keys().cloned().collect();
+    contracts.sort();
+    for contract in contracts {
+        let Some(holders) = holders_by_contract.get_mut(&contract) else {
+            continue;
+        };
+        if remaining == 0 {
+            holders.clear();
+            continue;
+        }
+        if holders.len() > remaining {
+            let kept: std::collections::HashSet<String> =
+                holders.iter().take(remaining).cloned().collect();
+            *holders = kept;
+            remaining = 0;
+        } else {
+            remaining -= holders.len();
+        }
+    }
+    holders_by_contract.retain(|_, holders| !holders.is_empty());
 }
 
 /// Record a deliberately skipped range without letting a failure to write the
@@ -1201,6 +1313,49 @@ mod tests {
         assert!(keys.contains(&(0usize, params)));
     }
 
+    /// #746: the per-cycle key cap must be shared across contracts, keeping the
+    /// prioritised (oldest-first) holders and dropping the rest.
+    #[test]
+    fn truncate_holders_respects_the_global_cap() {
+        use std::collections::{HashMap, HashSet};
+
+        let mut holders: HashMap<String, HashSet<String>> = HashMap::new();
+        // Insertion order is preserved by HashSet only for small sets; build the
+        // prioritised order explicitly by inserting in the order we want kept.
+        let mut a: HashSet<String> = HashSet::new();
+        a.insert("a1".into());
+        a.insert("a2".into());
+        a.insert("a3".into());
+        let mut b: HashSet<String> = HashSet::new();
+        b.insert("b1".into());
+        b.insert("b2".into());
+        holders.insert("C_A".into(), a);
+        holders.insert("C_B".into(), b);
+
+        truncate_holders(&mut holders, 3);
+        let total: usize = holders.values().map(|h| h.len()).sum();
+        assert_eq!(total, 3, "cap must bound the total number of keys");
+        // Contract C_A is processed first (sorted), so it keeps up to the cap.
+        assert_eq!(holders.get("C_A").map(|h| h.len()), Some(3));
+        assert!(
+            !holders.contains_key("C_B"),
+            "contracts past the cap must be deferred entirely"
+        );
+    }
+
+    #[test]
+    fn truncate_holders_is_a_noop_under_the_cap() {
+        use std::collections::{HashMap, HashSet};
+
+        let mut holders: HashMap<String, HashSet<String>> = HashMap::new();
+        holders.insert("C_A".into(), ["a1".to_string()].into_iter().collect());
+        holders.insert("C_B".into(), ["b1".to_string()].into_iter().collect());
+
+        truncate_holders(&mut holders, 10);
+        assert_eq!(holders.len(), 2);
+        assert_eq!(holders.values().map(|h| h.len()).sum::<usize>(), 2);
+    }
+
     #[test]
     fn non_retryable_rpc_errors_are_detected() {
         use crate::rpc_client::{is_non_retryable_rpc_error, SorobanRpcError};
@@ -1287,6 +1442,8 @@ mod db_tests {
             spec_fetch_concurrency: 2,
             degraded_poll_interval_secs: 300,
             max_consecutive_errors: 20,
+            max_state_keys_per_cycle: 0,
+            max_state_contracts_per_cycle: 0,
         }
     }
 

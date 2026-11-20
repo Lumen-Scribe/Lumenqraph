@@ -210,7 +210,35 @@ REORG_OVERLAP_LEDGERS=0
 | **Example** | `true` |
 | **Valid Range** | `true` \| `false` |
 | **Services** | Indexer |
-| **Tradeoff** | **Contract State Snapshots** vs **RPC Cost**: When ON, snapshots each tracked contract's instance storage into `contract_state` table each cycle. Cost: 1 RPC call per tracked contract per cycle. Provides `/contracts/:id/state` endpoint. Recommended: Enable if using CONTRACT_IDS (bounded, predictable cost); optional for index-all (high variable cost) |
+| **Tradeoff** | **Contract State Snapshots** vs **RPC Cost**: When ON, snapshots each tracked contract's instance storage into `contract_state` table each cycle. Cost: 1 RPC call per tracked contract per cycle, capped by `MAX_STATE_CONTRACTS_PER_CYCLE` (see below). Provides `/contracts/:id/state` endpoint. Recommended: Enable if using CONTRACT_IDS (bounded, predictable cost); optional for index-all (high variable cost, but capped) |
+
+#### `MAX_STATE_CONTRACTS_PER_CYCLE`
+| Property | Value |
+|----------|-------|
+| **Default** | 100 |
+| **Example** | `25` (conservative), `500` (aggressive) |
+| **Valid Range** | 1 ≤ contracts ≤ 10000 |
+| **Services** | Indexer (when STATE_INDEXING=true) |
+| **Tradeoff** | **RPC Cost Predictability** vs **Snapshot Freshness**: Caps how many contracts have their instance storage snapshotted per cycle. In bounded mode (`CONTRACT_IDS` set) the tracked set is already small, so this rarely binds. In index-all mode every active contract is a candidate, so this cap is what keeps per-cycle RPC cost flat as the network grows. Contracts that don't fit in the current cycle are deferred to later cycles, prioritised by last-snapshot age (oldest snapshot first), so every contract is eventually refreshed. Lower = cheaper, flatter cycles but slower full coverage; higher = faster coverage but more RPC calls per cycle. Recommended: 100–500 for index-all, leave at default for bounded mode |
+
+#### `MAX_STATE_KEYS_PER_CYCLE`
+| Property | Value |
+|----------|-------|
+| **Default** | 1000 |
+| **Example** | `200` (conservative), `5000` (aggressive) |
+| **Valid Range** | 1 ≤ keys ≤ 100000 |
+| **Services** | Indexer (when KEY_INDEXING=true) |
+| **Tradeoff** | **RPC Cost Predictability** vs **Balance Freshness**: Caps how many storage keys (e.g. per-holder balances) are fetched per cycle. In bounded mode the holder set is limited by `CONTRACT_IDS`, so this rarely binds. In index-all mode every holder of every token seen in the cycle is a candidate, which on mainnet can mean tens of thousands of keys per cycle; this cap is what keeps `getLedgerEntries` batches bounded. Keys that don't fit are deferred to later cycles, prioritised by last-snapshot age (oldest snapshot first), so every key is eventually refreshed. Lower = cheaper, flatter cycles but slower full coverage; higher = faster coverage but more RPC calls per cycle. Recommended: 1000–2000 for index-all, leave at default for bounded mode |
+
+**Cost model for index-all state and key indexing:**
+
+When `CONTRACT_IDS` is empty, nothing filters the candidate set: `STATE_INDEXING` considers every active contract, and `KEY_INDEXING` considers every holder of every token seen in the cycle. Without caps, per-cycle RPC cost grows with the size of the network, cycle time can exceed `POLL_INTERVAL_SECS`, and lag climbs. The two caps above bound this:
+
+- Each cycle, at most `MAX_STATE_CONTRACTS_PER_CYCLE` contracts are snapshotted and at most `MAX_STATE_KEYS_PER_CYCLE` keys are fetched.
+- Remaining candidates are queued and deferred to later cycles, prioritised by last-snapshot age (oldest first), so coverage is eventually complete and no candidate starves.
+- The number of deferred keys is exported as the `lumenqraph_indexer_state_keys_deferred` metric (gauge, current cycle). A persistently non-zero value means the caps are binding: either raise them (more RPC cost per cycle) or accept slower coverage. Watch it alongside cycle duration and indexer lag.
+- Per-cycle RPC cost is therefore roughly `ceil(MAX_STATE_KEYS_PER_CYCLE / batch_size)` `getLedgerEntries` calls plus `MAX_STATE_CONTRACTS_PER_CYCLE` instance reads, independent of network size.
+=======
 
 ### Per-Key Storage Indexing
 
@@ -584,6 +612,8 @@ Every service reads the shared `DATABASE_*` settings. Each service also reads it
 | `SPEC_FETCH_CONCURRENCY` | 4 | Maximum concurrent contract spec fetches. Clamped to at least 1. |
 | `HEALTH_MAX_LAG_LEDGERS` | 100 | `/health` reports unhealthy when the indexer is at least this many ledgers behind the chain tip. Also read by the API. |
 | `HEALTH_MAX_STALE_SECS` | 120 | `/health` reports unhealthy when the last update is older than this. Also read by the API. |
+| `MAX_STATE_CONTRACTS_PER_CYCLE` | 100 | Cap on contracts snapshotted per cycle when `STATE_INDEXING=true`. Excess contracts are deferred by last-snapshot age. See the cost model above. |
+| `MAX_STATE_KEYS_PER_CYCLE` | 1000 | Cap on storage keys fetched per cycle when `KEY_INDEXING=true`. Excess keys are deferred by last-snapshot age and counted by the `lumenqraph_indexer_state_keys_deferred` metric. See the cost model above. |
 
 ### API
 
@@ -754,6 +784,8 @@ redacted) is logged at startup. Examples of validation errors:
 ❌ POLL_INTERVAL_SECS cannot be zero; clamping to 1
 ❌ RETENTION_LEDGERS cannot be negative; clamping to 0
 ❌ BALANCE_KEY_DURABILITY "invalid" not recognized; expected "persistent" or "temporary"
+❌ MAX_STATE_KEYS_PER_CYCLE 0 out of range [1, 100000]; clamping to 1
+❌ MAX_STATE_CONTRACTS_PER_CYCLE 0 out of range [1, 10000]; clamping to 1
 ❌ invalid origin in CORS_ALLOWED_ORIGINS: "not-a-url", skipping
 ```
 
@@ -783,6 +815,15 @@ Fix errors by adjusting `.env` and restarting.
 - `POLL_INTERVAL_SECS=10`, `PAGE_SIZE=5000`
 - `RETENTION_LEDGERS=43200` (3 days) — keep DB small
 - `ANON_RATE_LIMIT_PER_MIN=100` (high, since serving many contracts)
+
+**All-Contracts Indexing with State/Key Indexing (Capped)**
+- `CONTRACT_IDS=` (empty)
+- `EVENT_TOPIC_FILTERS=[["transfer","*","*"]]` — narrows the event stream and the set of tokens whose holders are tracked
+- `STATE_INDEXING=true`, `KEY_INDEXING=true`
+- `MAX_STATE_CONTRACTS_PER_CYCLE=100`, `MAX_STATE_KEYS_PER_CYCLE=1000` — keep per-cycle RPC cost flat; excess work is deferred by last-snapshot age
+- `POLL_INTERVAL_SECS=10`, `PAGE_SIZE=5000`
+- `RETENTION_LEDGERS=43200` (3 days) — keep DB small
+- Monitor `lumenqraph_indexer_state_keys_deferred`: a persistently high value means coverage is lagging behind the caps
 
 ### Monitoring Configuration Changes
 

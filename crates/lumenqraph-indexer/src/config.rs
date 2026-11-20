@@ -60,6 +60,16 @@ pub struct Config {
     /// Sleep interval (seconds) used while the circuit breaker is open (i.e.
     /// the poller is in degraded state). Default: 300 (5 minutes).
     pub degraded_poll_interval_secs: u64,
+    /// Maximum number of state keys snapshotted per cycle when `KEY_INDEXING`
+    /// is enabled (#746). Remaining keys are deferred to later cycles,
+    /// prioritised by last-snapshot age. Env `MAX_STATE_KEYS_PER_CYCLE`,
+    /// default 500, clamped to >= 1.
+    pub max_state_keys_per_cycle: usize,
+    /// Maximum number of contracts snapshotted per cycle when `STATE_INDEXING`
+    /// is enabled (#746). Remaining contracts are deferred to later cycles,
+    /// prioritised by last-snapshot age. Env `MAX_STATE_CONTRACTS_PER_CYCLE`,
+    /// default 50, clamped to >= 1.
+    pub max_state_contracts_per_cycle: usize,
 }
 
 impl std::fmt::Debug for Config {
@@ -102,6 +112,11 @@ impl std::fmt::Debug for Config {
             )
             .field("enrichment_warn_threshold", &self.enrichment_warn_threshold)
             .field("spec_cache_max_entries", &self.spec_cache_max_entries)
+            .field("max_state_keys_per_cycle", &self.max_state_keys_per_cycle)
+            .field(
+                "max_state_contracts_per_cycle",
+                &self.max_state_contracts_per_cycle,
+            )
             .finish()
     }
 }
@@ -334,6 +349,37 @@ impl Config {
         let max_consecutive_errors = env_parse("MAX_CONSECUTIVE_ERRORS", 20u32)?;
         let degraded_poll_interval_secs = env_parse("DEGRADED_POLL_INTERVAL_SECS", 300u64)?;
 
+        // Per-cycle caps on state snapshots (#746). Without these, index-all
+        // mode reads every holder / active contract every cycle, so RPC cost
+        // grows with network size. Clamp to >= 1 so a cycle always progresses.
+        let max_state_keys_per_cycle = clamp_with_warning(
+            "MAX_STATE_KEYS_PER_CYCLE",
+            env_parse("MAX_STATE_KEYS_PER_CYCLE", DEFAULT_MAX_STATE_KEYS_PER_CYCLE)?,
+            1,
+            usize::MAX,
+        );
+        let max_state_contracts_per_cycle = clamp_with_warning(
+            "MAX_STATE_CONTRACTS_PER_CYCLE",
+            env_parse(
+                "MAX_STATE_CONTRACTS_PER_CYCLE",
+                DEFAULT_MAX_STATE_CONTRACTS_PER_CYCLE,
+            )?,
+            1,
+            usize::MAX,
+        );
+
+        let state_indexing = env_bool("STATE_INDEXING", false);
+        let key_indexing = env_bool("KEY_INDEXING", false);
+        // Refuse the unsupported index-all + state/key indexing combination
+        // unless the operator explicitly set the per-cycle caps (#746).
+        validate_index_all_state_caps(
+            &contract_ids,
+            state_indexing,
+            key_indexing,
+            std::env::var("MAX_STATE_KEYS_PER_CYCLE").ok(),
+            std::env::var("MAX_STATE_CONTRACTS_PER_CYCLE").ok(),
+        )?;
+
         // Build the ordered endpoint list: RPC_URLS (comma-separated, priority
         // order) takes precedence; RPC_URL is the single-endpoint fallback for
         // backward compatibility. At least one URL must be present.
@@ -365,8 +411,8 @@ impl Config {
             page_size,
             start_ledger: env_parse("START_LEDGER", 0)?,
             max_catchup_ledgers,
-            state_indexing: env_bool("STATE_INDEXING", false),
-            key_indexing: env_bool("KEY_INDEXING", false),
+            state_indexing,
+            key_indexing,
             upgrade_watch: env_bool("UPGRADE_WATCH", !contract_ids.is_empty()),
             contract_ids,
             event_topic_filters,
@@ -387,8 +433,68 @@ impl Config {
             spec_fetch_concurrency,
             max_consecutive_errors,
             degraded_poll_interval_secs,
+            max_state_keys_per_cycle,
+            max_state_contracts_per_cycle,
         })
     }
+}
+
+/// Default per-cycle cap on state keys snapshotted when `KEY_INDEXING` is on.
+pub const DEFAULT_MAX_STATE_KEYS_PER_CYCLE: usize = 500;
+/// Default per-cycle cap on contracts snapshotted when `STATE_INDEXING` is on.
+pub const DEFAULT_MAX_STATE_CONTRACTS_PER_CYCLE: usize = 50;
+
+/// Refuse the unsupported "index-all + state/key indexing" combination (#746).
+///
+/// When `CONTRACT_IDS` is empty the poller snapshots every holder of every
+/// token (`KEY_INDEXING`) and every active contract (`STATE_INDEXING`) each
+/// cycle, so RPC cost grows with the network. The per-cycle caps bound that
+/// cost, but only if the operator has consciously set them. This validation
+/// fails startup when index-all state indexing is requested without an
+/// explicit cap, with a message that names the variables to set.
+///
+/// `keys_env` / `contracts_env` are the raw env values (if any) so that an
+/// explicit setting — even one equal to the default — counts as opt-in.
+pub fn validate_index_all_state_caps(
+    contract_ids: &[String],
+    state_indexing: bool,
+    key_indexing: bool,
+    keys_env: Option<String>,
+    contracts_env: Option<String>,
+) -> anyhow::Result<()> {
+    if !contract_ids.is_empty() || (!state_indexing && !key_indexing) {
+        return Ok(());
+    }
+
+    let keys_set = keys_env.is_some_and(|v| !v.trim().is_empty());
+    let contracts_set = contracts_env.is_some_and(|v| !v.trim().is_empty());
+
+    let mut missing: Vec<&str> = Vec::new();
+    if key_indexing && !keys_set {
+        missing.push("MAX_STATE_KEYS_PER_CYCLE");
+    }
+    if state_indexing && !contracts_set {
+        missing.push("MAX_STATE_CONTRACTS_PER_CYCLE");
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    Err(anyhow::anyhow!(
+        "CONTRACT_IDS is empty (index-all mode) with {} enabled, which snapshots every holder/contract each cycle; \
+         set {} to bound per-cycle RPC cost (defaults: MAX_STATE_KEYS_PER_CYCLE={}, MAX_STATE_CONTRACTS_PER_CYCLE={}), \
+         or set CONTRACT_IDS to restrict indexing",
+        if key_indexing && state_indexing {
+            "KEY_INDEXING and STATE_INDEXING"
+        } else if key_indexing {
+            "KEY_INDEXING"
+        } else {
+            "STATE_INDEXING"
+        },
+        missing.join(" and "),
+        DEFAULT_MAX_STATE_KEYS_PER_CYCLE,
+        DEFAULT_MAX_STATE_CONTRACTS_PER_CYCLE,
+    ))
 }
 
 /// Maximum number of filter slots Soroban RPC accepts in one `getEvents` call.
@@ -793,6 +899,166 @@ mod tests {
         // Invalid JSON fails fast.
         std::env::set_var("EVENT_TOPIC_FILTERS", "not json");
         assert!(Config::from_env().is_err());
+
+        for (key, value) in saved {
+            match value {
+                Some(v) => std::env::set_var(&key, v),
+                None => std::env::remove_var(&key),
+            }
+        }
+    }
+
+    #[test]
+    fn state_caps_parse_and_clamp() {
+        let _guard = env_lock();
+        let saved: Vec<(String, Option<String>)> = [
+            "DATABASE_URL",
+            "RPC_URL",
+            "RPC_URLS",
+            "CONTRACT_IDS",
+            "STATE_INDEXING",
+            "KEY_INDEXING",
+            "MAX_STATE_KEYS_PER_CYCLE",
+            "MAX_STATE_CONTRACTS_PER_CYCLE",
+        ]
+        .iter()
+        .map(|k| ((*k).to_string(), std::env::var(k).ok()))
+        .collect();
+
+        std::env::set_var("DATABASE_URL", "postgres://localhost/test");
+        std::env::set_var("RPC_URL", "https://example.com");
+        std::env::remove_var("RPC_URLS");
+        std::env::remove_var("CONTRACT_IDS");
+        std::env::remove_var("STATE_INDEXING");
+        std::env::remove_var("KEY_INDEXING");
+
+        // Defaults apply when unset.
+        std::env::remove_var("MAX_STATE_KEYS_PER_CYCLE");
+        std::env::remove_var("MAX_STATE_CONTRACTS_PER_CYCLE");
+        let cfg = Config::from_env().expect("config should load");
+        assert_eq!(cfg.max_state_keys_per_cycle, DEFAULT_MAX_STATE_KEYS_PER_CYCLE);
+        assert_eq!(
+            cfg.max_state_contracts_per_cycle,
+            DEFAULT_MAX_STATE_CONTRACTS_PER_CYCLE
+        );
+
+        // Explicit values are honoured.
+        std::env::set_var("MAX_STATE_KEYS_PER_CYCLE", "1234");
+        std::env::set_var("MAX_STATE_CONTRACTS_PER_CYCLE", "7");
+        let cfg = Config::from_env().expect("config should load");
+        assert_eq!(cfg.max_state_keys_per_cycle, 1234);
+        assert_eq!(cfg.max_state_contracts_per_cycle, 7);
+        assert!(format!("{cfg:?}").contains("max_state_keys_per_cycle"));
+
+        // Zero is clamped up to 1.
+        std::env::set_var("MAX_STATE_KEYS_PER_CYCLE", "0");
+        std::env::set_var("MAX_STATE_CONTRACTS_PER_CYCLE", "0");
+        let cfg = Config::from_env().expect("config should load");
+        assert_eq!(cfg.max_state_keys_per_cycle, 1);
+        assert_eq!(cfg.max_state_contracts_per_cycle, 1);
+
+        // Non-numeric values fail fast.
+        std::env::set_var("MAX_STATE_KEYS_PER_CYCLE", "lots");
+        assert!(Config::from_env().is_err());
+
+        for (key, value) in saved {
+            match value {
+                Some(v) => std::env::set_var(&key, v),
+                None => std::env::remove_var(&key),
+            }
+        }
+    }
+
+    #[test]
+    fn index_all_state_indexing_requires_explicit_caps() {
+        // No contracts, no state indexing: fine.
+        assert!(validate_index_all_state_caps(&[], false, false, None, None).is_ok());
+        // Restricted contracts: caps not required.
+        let contracts = vec!["C1".to_string()];
+        assert!(validate_index_all_state_caps(&contracts, true, true, None, None).is_ok());
+
+        // Index-all + KEY_INDEXING without a cap is refused.
+        let err = validate_index_all_state_caps(&[], false, true, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("MAX_STATE_KEYS_PER_CYCLE"), "{err}");
+        assert!(err.contains("CONTRACT_IDS"), "{err}");
+
+        // Index-all + STATE_INDEXING without a cap is refused.
+        let err = validate_index_all_state_caps(&[], true, false, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("MAX_STATE_CONTRACTS_PER_CYCLE"), "{err}");
+
+        // Both enabled: both caps named.
+        let err = validate_index_all_state_caps(&[], true, true, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("MAX_STATE_KEYS_PER_CYCLE"), "{err}");
+        assert!(err.contains("MAX_STATE_CONTRACTS_PER_CYCLE"), "{err}");
+
+        // Explicit caps (even equal to defaults) opt in.
+        assert!(validate_index_all_state_caps(
+            &[],
+            true,
+            true,
+            Some("500".to_string()),
+            Some("50".to_string())
+        )
+        .is_ok());
+        // Only the relevant cap is required per feature.
+        assert!(validate_index_all_state_caps(
+            &[],
+            false,
+            true,
+            Some("500".to_string()),
+            None
+        )
+        .is_ok());
+        // Empty env values do not count as explicit.
+        assert!(validate_index_all_state_caps(
+            &[],
+            false,
+            true,
+            Some("  ".to_string()),
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn index_all_key_indexing_fails_config_load_without_cap() {
+        let _guard = env_lock();
+        let saved: Vec<(String, Option<String>)> = [
+            "DATABASE_URL",
+            "RPC_URL",
+            "RPC_URLS",
+            "CONTRACT_IDS",
+            "STATE_INDEXING",
+            "KEY_INDEXING",
+            "MAX_STATE_KEYS_PER_CYCLE",
+            "MAX_STATE_CONTRACTS_PER_CYCLE",
+        ]
+        .iter()
+        .map(|k| ((*k).to_string(), std::env::var(k).ok()))
+        .collect();
+
+        std::env::set_var("DATABASE_URL", "postgres://localhost/test");
+        std::env::set_var("RPC_URL", "https://example.com");
+        std::env::remove_var("RPC_URLS");
+        std::env::remove_var("CONTRACT_IDS");
+        std::env::remove_var("STATE_INDEXING");
+        std::env::set_var("KEY_INDEXING", "true");
+        std::env::remove_var("MAX_STATE_KEYS_PER_CYCLE");
+        std::env::remove_var("MAX_STATE_CONTRACTS_PER_CYCLE");
+
+        let err = Config::from_env().expect_err("index-all KEY_INDEXING must be refused");
+        assert!(err.to_string().contains("MAX_STATE_KEYS_PER_CYCLE"), "{err}");
+
+        // Setting the cap makes it load.
+        std::env::set_var("MAX_STATE_KEYS_PER_CYCLE", "250");
+        let cfg = Config::from_env().expect("config should load with explicit cap");
+        assert_eq!(cfg.max_state_keys_per_cycle, 250);
 
         for (key, value) in saved {
             match value {
