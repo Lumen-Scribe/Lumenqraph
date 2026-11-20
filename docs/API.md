@@ -404,7 +404,8 @@ snapshot). Query: `label` (e.g. `balance`), `limit` (1–1000, default 100).
 Requires the indexer's `KEY_INDEXING`.
 ```json
 { "contract_id": "CB...", "count": 2, "keys": [
-  { "key_hash": "9f2c…", "key": ["Balance", "G..."], "durability": "persistent",
+  { "ledger_key_hash": "9f2c…", "key_hash": "9f2c…",
+    "key": ["Balance", "G..."], "durability": "persistent",
     "ledger": 3550881, "value": "500", "label": "balance",
     "captured_at": "2026-07-15T..." }] }
 ```
@@ -412,14 +413,101 @@ Requires the indexer's `KEY_INDEXING`.
 ### `GET /contracts/:id/data/:key_hash`
 The version history of a single per-key entry (one holder's balance over time),
 newest first. Query: `limit` (1–500, default 1).
+
+The path parameter is the entry's `ledger_key_hash` (see below). `key_hash` is
+accepted as a deprecated alias for one release.
 ```json
-{ "contract_id": "CB...", "key_hash": "9f2c…",
+{ "contract_id": "CB...", "ledger_key_hash": "9f2c…", "key_hash": "9f2c…",
   "key": ["Balance", "G..."], "durability": "persistent", "label": "balance",
   "count": 3, "versions": [
     { "ledger": 3550881, "value": "500", "captured_at": "2026-07-15T..." },
     { "ledger": 3550870, "value": "450", "captured_at": "2026-07-15T..." },
     { "ledger": 3550850, "value": "400", "captured_at": "2026-07-15T..." }
   ] }
+```
+
+#### Contract-data identifier (`ledger_key_hash`)
+
+A contract-data entry is identified by the SHA-256 of its XDR `LedgerKey`:
+
+```
+ledger_key_hash = hex(sha256(LedgerKey::ContractData {
+    contract: <contract strkey>,
+    key:      <ScVal>,
+    durability: persistent | temporary,
+}.to_xdr()))
+```
+
+This is the standard Stellar ledger-key hash, so clients can derive it for a
+key they already know without reading Lumenqraph's source. Because the
+**durability is part of the hash**, a persistent and a temporary entry with an
+identical `ScVal` key are two distinct entries: they get separate rows, separate
+change-detection series, and separate histories from
+`/contracts/:id/data/:key_hash`.
+
+`key_hash` is a **deprecated alias** for `ledger_key_hash` and will be removed
+after one release. It is still returned in responses and accepted in the
+`/contracts/:id/data/:key_hash` path, but it no longer hashes the base64 text of
+the key alone — it carries the same value as `ledger_key_hash`.
+
+TypeScript:
+
+```ts
+import { Address, Keypair, nativeToScVal, xdr } from "@stellar/stellar-sdk";
+import { createHash } from "node:crypto";
+
+function ledgerKeyHash(
+  contractId: string,
+  key: xdr.ScVal,
+  durability: "persistent" | "temporary",
+): string {
+  const ledgerKey = xdr.LedgerKey.contractData(
+    new xdr.LedgerKeyContractData({
+      contract: Address.fromString(contractId).toScAddress(),
+      key,
+      durability:
+        durability === "persistent"
+          ? xdr.ContractDataDurability.persistent()
+          : xdr.ContractDataDurability.temporary(),
+    }),
+  );
+  return createHash("sha256").update(ledgerKey.toXDR()).digest("hex");
+}
+
+// e.g. Balance(G...) in persistent storage
+const hash = ledgerKeyHash(
+  "CB...",
+  xdr.ScVal.scvVec([nativeToScVal("Balance", { type: "symbol" }), nativeToScVal("G...", { type: "address" })]),
+  "persistent",
+);
+```
+
+Python:
+
+```python
+import hashlib
+from stellar_sdk import Address
+from stellar_sdk.xdr import (
+    ContractDataDurability,
+    LedgerKey,
+    LedgerKeyContractData,
+    ScVal,
+)
+
+def ledger_key_hash(contract_id: str, key: ScVal, durability: str) -> str:
+    ledger_key = LedgerKey(
+        type=LedgerKey.LedgerKeyType.CONTRACT_DATA,
+        contract_data=LedgerKeyContractData(
+            contract=Address(contract_id).to_xdr_sc_address(),
+            key=key,
+            durability=(
+                ContractDataDurability.PERSISTENT
+                if durability == "persistent"
+                else ContractDataDurability.TEMPORARY
+            ),
+        ),
+    )
+    return hashlib.sha256(ledger_key.to_xdr_bytes()).hexdigest()
 ```
 
 ## Read layer (authenticated)

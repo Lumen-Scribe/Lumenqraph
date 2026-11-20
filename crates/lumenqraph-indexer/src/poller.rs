@@ -30,6 +30,10 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_LOOKBACK_LEDGERS: i64 = 120_000; // ~7 days at ~5s/ledger (SDF public RPC)
 static RPC_OLDEST_LEDGER: AtomicI64 = AtomicI64::new(0);
 
+/// Contracts per `getLedgerEntries` call when reading instance entries in
+/// batches. Matches the chunk size used by `state::snapshot_instances_batch`.
+const MAX_BATCH_INSTANCES: usize = 50;
+
 pub fn rpc_oldest_ledger() -> i64 {
     RPC_OLDEST_LEDGER.load(Ordering::Relaxed)
 }
@@ -461,9 +465,12 @@ async fn fetch_and_store_with_shutdown(
         std::collections::HashSet<String>,
     > = std::collections::HashMap::new();
     // contract -> (template_index, key_params) for per-key template snapshots.
+    // A set, not a list: a popular holder can appear in hundreds of events in
+    // one cycle, and each duplicate would otherwise fill the getLedgerEntries
+    // batch budget and trigger a redundant change-detection query (#744).
     let mut template_keys_by_contract: std::collections::HashMap<
         String,
-        Vec<(usize, Vec<String>)>,
+        std::collections::HashSet<(usize, Vec<String>)>,
     > = std::collections::HashMap::new();
     loop {
         if shutdown.is_cancelled() {
@@ -550,7 +557,7 @@ async fn fetch_and_store_with_shutdown(
                     template_keys_by_contract
                         .entry(new_event.contract_id.clone())
                         .or_default()
-                        .push((idx, params));
+                        .insert((idx, params));
                 }
             }
             batch.push(new_event);
@@ -598,10 +605,36 @@ async fn fetch_and_store_with_shutdown(
             // Also notes the executable hash, detecting upgrades for free.
             state::snapshot_instances_batch(pool, rpc, specs, &targets).await;
         } else {
-            // Upgrade watch in index-all mode: batch the instance reads,
-            // then check for upgrades.
-            for contract_id in &targets {
-                specs::check_for_upgrade(pool, rpc, specs, contract_id, tip).await;
+            // Upgrade watch in index-all mode: batch the instance reads, then
+            // note each executable hash. One getLedgerEntries per chunk instead
+            // of one per contract (#740).
+            for chunk in targets.chunks(MAX_BATCH_INSTANCES) {
+                let instances = match rpc.get_contract_instances_batch(chunk).await {
+                    Ok(instances) => instances,
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            contracts = chunk.len(),
+                            "batched instance read for upgrade watch failed; skipping chunk"
+                        );
+                        continue;
+                    }
+                };
+                for (contract_id, instance) in chunk.iter().zip(instances) {
+                    let Some(instance) = instance else { continue };
+                    let Some(wasm_hash) = instance.wasm_hash.as_deref() else {
+                        continue;
+                    };
+                    specs
+                        .note_wasm_hash(
+                            pool,
+                            rpc,
+                            contract_id,
+                            wasm_hash,
+                            instance.last_modified_ledger,
+                        )
+                        .await;
+                }
             }
         }
     }
@@ -622,7 +655,8 @@ async fn fetch_and_store_with_shutdown(
         )
         .await;
     }
-    // Snapshot per-key entries from custom templates.
+    // Snapshot per-key entries from custom templates. The per-contract sets are
+    // already deduplicated, so each distinct key is requested once (#744).
     if !template_keys_by_contract.is_empty() {
         state::snapshot_template_keys_batch(
             pool,
@@ -1139,6 +1173,30 @@ mod tests {
             sleep, degraded,
             "degraded interval should be used when circuit is open"
         );
+    }
+
+    /// #744: the same template params discovered from many events in one cycle
+    /// must collapse to a single key before batching.
+    #[test]
+    fn template_keys_are_deduplicated_per_contract() {
+        use std::collections::{HashMap, HashSet};
+
+        let mut template_keys_by_contract: HashMap<String, HashSet<(usize, Vec<String>)>> =
+            HashMap::new();
+        let contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM".to_string();
+        let params = vec!["holder".to_string(), "0".to_string()];
+
+        // 50 events, same template params each time.
+        for _ in 0..50 {
+            template_keys_by_contract
+                .entry(contract.clone())
+                .or_default()
+                .insert((0usize, params.clone()));
+        }
+
+        let keys = template_keys_by_contract.get(&contract).unwrap();
+        assert_eq!(keys.len(), 1, "duplicate template keys must collapse to one");
+        assert!(keys.contains(&(0usize, params)));
     }
 
     #[test]
