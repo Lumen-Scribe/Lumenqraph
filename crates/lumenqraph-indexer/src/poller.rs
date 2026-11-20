@@ -102,18 +102,17 @@ pub async fn run(
                         {
                             warn!(error = %e, "retention prune failed");
                         }
-                        // Prune old spec versions (if enabled)
-                        if config.spec_version_retention > 0 {
-                            if let Err(e) = retention::prune_spec_versions(
-                                &pool,
-                                ledger,
-                                config.retention_ledgers,
-                                config.spec_version_retention,
-                            )
-                            .await
-                            {
-                                warn!(error = %e, "spec version retention prune failed");
-                            }
+                        // Spec versions are pruned only here, so SPEC_VERSION_RETENTION
+                        // (0 = keep only the current version) is always honoured (#748).
+                        if let Err(e) = retention::prune_spec_versions(
+                            &pool,
+                            ledger,
+                            config.retention_ledgers,
+                            config.spec_version_retention,
+                        )
+                        .await
+                        {
+                            warn!(error = %e, "spec version retention prune failed");
                         }
                         last_prune = Some(Instant::now());
                     }

@@ -127,31 +127,15 @@ pub async fn prune(pool: &PgPool, tip: i64, retention_ledgers: i64) -> anyhow::R
     )
     .await?;
 
-    let specs = prune_batched(
-        pool,
-        "DELETE FROM contract_spec_versions WHERE ctid IN (
-             SELECT csv.ctid FROM contract_spec_versions csv
-              WHERE csv.ledger < $1
-                AND csv.version < (
-                    SELECT MAX(x.version) FROM contract_spec_versions x
-                     WHERE x.contract_id = csv.contract_id
-                )
-                AND NOT EXISTS (
-                    SELECT 1 FROM webhook_deliveries wd
-                     WHERE wd.upgrade_id = csv.id
-                       AND wd.status = 'pending'
-                )
-              LIMIT $2
-         )",
-        cutoff,
-    )
-    .await?;
-
-    let total = events + state + data + specs;
+    // Spec versions are pruned exclusively by `prune_spec_versions`, which
+    // honours `SPEC_VERSION_RETENTION`. Doing it here too would delete every
+    // version outside the window except the newest before that function runs,
+    // making the retention setting a no-op.
+    let total = events + state + data;
     if total > 0 {
         info!(
             cutoff_ledger = cutoff,
-            events, state, data, specs, "pruned history outside the retention window"
+            events, state, data, "pruned history outside the retention window"
         );
     }
     Ok(total)
