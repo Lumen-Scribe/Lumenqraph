@@ -336,6 +336,22 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env().context("failed to load config")?;
 
+    // Refuse (or warn about) index-all combined with state/key indexing before
+    // any RPC work starts: with an empty CONTRACT_IDS filter every holder and
+    // every active contract would be snapshotted each cycle (#746).
+    config
+        .validate_state_indexing()
+        .context("unsupported state indexing configuration")?;
+    if config.contract_ids.is_empty()
+        && (config.key_indexing || config.state_indexing)
+    {
+        info!(
+            max_state_keys_per_cycle = config.max_state_keys_per_cycle,
+            max_state_contracts_per_cycle = config.max_state_contracts_per_cycle,
+            "index-all state indexing is capped per cycle; remaining keys are deferred to later cycles"
+        );
+    }
+
     let db = Config::db_config()?;
     let pool = lumenqraph_core::db::connect_with_retry(&config.database_url, &db).await?;
 

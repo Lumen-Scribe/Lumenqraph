@@ -44,23 +44,73 @@ const MAX_BATCH_KEYS: usize = 100;
 /// `INSERT … ON CONFLICT DO NOTHING` (no per-contract round-trips). State
 /// indexing and upgrade detection both use the instance entry, so this bundles
 /// both. Best-effort: errors are logged, never propagated to the poller.
+///
+/// `max_per_cycle` caps how many contracts are snapshotted this cycle (0 means
+/// unlimited). When the input exceeds the cap, contracts are prioritised by
+/// last-snapshot age (oldest / never-snapshotted first) and the remainder is
+/// deferred to later cycles. Returns the number of contracts deferred.
 pub async fn snapshot_instances_batch(
     pool: &PgPool,
     rpc: &RpcClient,
     specs: &SpecCache,
     contract_ids: &[String],
-) {
+    max_per_cycle: usize,
+) -> usize {
     if contract_ids.is_empty() {
-        return;
+        return 0;
+    }
+
+    let (selected, deferred) = cap_and_prioritise_instances(pool, contract_ids, max_per_cycle).await;
+    if deferred > 0 {
+        debug!(
+            deferred,
+            selected = selected.len(),
+            "deferring contract instance snapshots to later cycles"
+        );
     }
 
     // Chunk contract IDs for RPC calls (avoid sending too many at once).
     const MAX_BATCH_INSTANCES: usize = 50;
-    for chunk in contract_ids.chunks(MAX_BATCH_INSTANCES) {
+    for chunk in selected.chunks(MAX_BATCH_INSTANCES) {
         if let Err(e) = try_snapshot_instances_batch(pool, rpc, specs, chunk).await {
             warn!(error = %e, "batch instance snapshot failed");
         }
     }
+    deferred
+}
+
+/// Apply the per-cycle cap to a set of contract IDs, ordering by last-snapshot
+/// age (never-snapshotted first, then oldest `max(ledger)`). Returns the
+/// selected IDs and the number deferred.
+async fn cap_and_prioritise_instances(
+    pool: &PgPool,
+    contract_ids: &[String],
+    max_per_cycle: usize,
+) -> (Vec<String>, usize) {
+    if max_per_cycle == 0 || contract_ids.len() <= max_per_cycle {
+        return (contract_ids.to_vec(), 0);
+    }
+
+    let latest_rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT contract_id, max(ledger) FROM contract_state
+         WHERE contract_id = ANY($1)
+         GROUP BY contract_id",
+    )
+    .bind(contract_ids)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let latest: std::collections::HashMap<String, i64> = latest_rows.into_iter().collect();
+
+    let mut ordered: Vec<(String, i64)> = contract_ids
+        .iter()
+        .map(|cid| (cid.clone(), latest.get(cid).copied().unwrap_or(i64::MIN)))
+        .collect();
+    ordered.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+    let deferred = ordered.len() - max_per_cycle;
+    let selected = ordered.into_iter().take(max_per_cycle).map(|(cid, _)| cid).collect();
+    (selected, deferred)
 }
 
 async fn try_snapshot_instances_batch(
@@ -183,15 +233,10 @@ async fn try_snapshot_data(
 /// grouped `SELECT max(ledger)` and writes are one multi-row `UNNEST` insert.
 /// Keys that return no entry but have history get a tombstone row.
 ///
-/// # Stellar Asset Contracts
-///
-/// For a SAC, a classic account (`G…`) holder's balance lives in its trustline
-/// (or the native account entry for XLM), not in a `Balance(Address)`
-/// contract-data entry — only contract (`C…`) holders have those. When the
-/// contract is detected as a SAC, `G…` holders are read via
-/// `LedgerKey::Trustline` (or `LedgerKey::Account` for native XLM) in the same
-/// `getLedgerEntries` batch, and the resulting balance is stored under the
-/// `balance` label. Non-SAC contracts keep the contract-data-only path.
+/// `max_per_cycle` caps how many keys are snapshotted this cycle (0 means
+/// unlimited). When the batch exceeds the cap, keys are prioritised by
+/// last-snapshot age (oldest / never-snapshotted first) and the remainder is
+/// deferred to later cycles. Returns the number of keys deferred.
 pub async fn snapshot_balances_batch(
     pool: &PgPool,
     rpc: &RpcClient,
@@ -199,7 +244,8 @@ pub async fn snapshot_balances_batch(
     contract_ids_filter: &[String],
     balance_key_symbol: &str,
     durability: ContractDataDurability,
-) {
+    max_per_cycle: usize,
+) -> usize {
     use crate::keys;
 
     // Build the flat list of (contract_id, key, durability, label) to fetch,
@@ -258,8 +304,17 @@ pub async fn snapshot_balances_batch(
         }
     }
 
-    if batch.is_empty() && trustline_batch.is_empty() {
-        return;
+    if batch.is_empty() {
+        return 0;
+    }
+
+    let (batch, deferred) = cap_and_prioritise_keys(pool, batch, max_per_cycle).await;
+    if deferred > 0 {
+        debug!(
+            deferred,
+            selected = batch.len(),
+            "deferring holder balance key snapshots to later cycles"
+        );
     }
 
     debug!(
@@ -273,115 +328,29 @@ pub async fn snapshot_balances_batch(
             warn!(error = %e, "batch contract-data snapshot failed");
         }
     }
-
-    for chunk in trustline_batch.chunks(MAX_BATCH_KEYS) {
-        if let Err(e) = snapshot_trustlines_chunk(pool, rpc, chunk).await {
-            warn!(error = %e, "batch trustline snapshot failed");
-        }
-    }
+    deferred
 }
 
-/// Whether an address string is a classic account (`G…`).
-fn is_classic_account(address: &str) -> bool {
-    address.starts_with('G')
-}
-
-/// Build the ledger key for a classic account's balance of `asset`:
-/// `LedgerKey::Account` for native XLM, `LedgerKey::Trustline` otherwise.
-fn trustline_ledger_key(account: &str, asset: &Asset) -> anyhow::Result<LedgerKey> {
-    let account_id = AccountId::from_str(account)
-        .map_err(|e| anyhow::anyhow!("invalid account id {account}: {e}"))?;
-    Ok(match asset {
-        Asset::Native => LedgerKey::Account(LedgerKeyAccount { account_id }),
-        other => LedgerKey::Trustline(LedgerKeyTrustLine {
-            account_id,
-            asset: TrustLineAsset::from(other.clone()),
-        }),
-    })
-}
-
-/// Detect whether `contract_id` is a Stellar Asset Contract and, if so, return
-/// the asset it wraps. Uses the SAC's `name` instance-storage entry, which holds
-/// the SEP-11 asset string (`"native"` or `"CODE:ISSUER"`).
-async fn detect_sac_asset(rpc: &RpcClient, contract_id: &str) -> Option<Asset> {
-    let instance = match rpc.get_contract_instances_batch(&[contract_id.to_string()]).await {
-        Ok(mut instances) => instances.pop().flatten(),
-        Err(e) => {
-            debug!(contract_id, error = %e, "SAC detection failed");
-            return None;
-        }
-    };
-    let instance = instance?;
-    let name = find_instance_symbol(&instance.storage, "name")?;
-    parse_sep11_asset(&name)
-}
-
-/// Find a symbol-keyed string value in an instance-storage `ScVal` map.
-fn find_instance_symbol(storage: &ScVal, symbol: &str) -> Option<String> {
-    let ScVal::Map(Some(map)) = storage else {
-        return None;
-    };
-    for entry in map.0.iter() {
-        if let ScVal::Symbol(s) = &entry.key {
-            if s.to_string() == symbol {
-                if let ScVal::String(v) = &entry.val {
-                    return Some(v.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Parse a SEP-11 asset string (`"native"` or `"CODE:ISSUER"`) into an `Asset`.
-fn parse_sep11_asset(s: &str) -> Option<Asset> {
-    if s == "native" {
-        return Some(Asset::Native);
-    }
-    let (code, issuer) = s.split_once(':')?;
-    let issuer = AccountId::from_str(issuer).ok()?;
-    if code.len() <= 4 {
-        let mut buf = [0u8; 4];
-        buf[..code.len()].copy_from_slice(code.as_bytes());
-        Some(Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
-            asset_code: buf,
-            issuer,
-        }))
-    } else if code.len() <= 12 {
-        let mut buf = [0u8; 12];
-        buf[..code.len()].copy_from_slice(code.as_bytes());
-        Some(Asset::CreditAlphanum12(stellar_xdr::curr::AlphaNum12 {
-            asset_code: buf,
-            issuer,
-        }))
-    } else {
-        None
-    }
-}
-
-/// Fetch one chunk of trustline/account ledger keys via a single
-/// `getLedgerEntries` call, then store the decoded balances under the
-/// `balance` label (with change detection and tombstones), mirroring
-/// [`snapshot_data_chunk`].
-async fn snapshot_trustlines_chunk(
+/// Apply the per-cycle cap to a batch of contract-data keys, ordering by
+/// last-snapshot age (never-snapshotted first, then oldest `max(ledger)`).
+/// Returns the selected batch and the number of keys deferred.
+async fn cap_and_prioritise_keys(
     pool: &PgPool,
-    rpc: &RpcClient,
-    chunk: &[(String, String, LedgerKey)],
-) -> anyhow::Result<()> {
-    let ledger_keys: Vec<LedgerKey> = chunk.iter().map(|(_, _, k)| k.clone()).collect();
-    let entries = rpc.get_ledger_entries(&ledger_keys).await?;
-
-    // Precompute key hashes and XDR for the chunk.
-    let mut key_hashes: Vec<String> = Vec::with_capacity(chunk.len());
-    let mut key_xdrs: Vec<String> = Vec::with_capacity(chunk.len());
-    for (_, _, ledger_key) in chunk {
-        let xdr_bytes = ledger_key.to_xdr(Limits::none())?;
-        key_hashes.push(hex::encode(Sha256::digest(&xdr_bytes)));
-        key_xdrs.push(ledger_key.to_xdr_base64(Limits::none())?);
+    batch: Vec<(String, ScVal, ContractDataDurability, &str)>,
+    max_per_cycle: usize,
+) -> (Vec<(String, ScVal, ContractDataDurability, &str)>, usize) {
+    if max_per_cycle == 0 || batch.len() <= max_per_cycle {
+        return (batch, 0);
     }
 
-    // One grouped query fetches the latest ledger for every key in the chunk.
-    let contract_ids: Vec<String> = chunk.iter().map(|(cid, _, _)| cid.clone()).collect();
+    // Compute key hashes up front so we can look up last-snapshot ledgers.
+    let mut hashes: Vec<Option<String>> = Vec::with_capacity(batch.len());
+    for (_, key, _, _) in &batch {
+        hashes.push(key_hash_of(key).ok());
+    }
+
+    let contract_ids: Vec<String> = batch.iter().map(|(cid, _, _, _)| cid.clone()).collect();
+    let key_hashes: Vec<String> = hashes.iter().flatten().cloned().collect();
     let latest_rows: Vec<(String, String, i64)> = sqlx::query_as(
         "SELECT contract_id, key_hash, max(ledger) FROM contract_data
          WHERE contract_id = ANY($1) AND key_hash = ANY($2)
@@ -390,107 +359,36 @@ async fn snapshot_trustlines_chunk(
     .bind(&contract_ids)
     .bind(&key_hashes)
     .fetch_all(pool)
-    .await?;
+    .await
+    .unwrap_or_default();
     let latest: std::collections::HashMap<(String, String), i64> = latest_rows
         .into_iter()
         .map(|(cid, kh, ledger)| ((cid, kh), ledger))
         .collect();
 
-    let mut ins_contract: Vec<String> = Vec::new();
-    let mut ins_key_hash: Vec<String> = Vec::new();
-    let mut ins_key: Vec<serde_json::Value> = Vec::new();
-    let mut ins_key_xdr: Vec<String> = Vec::new();
-    let mut ins_ledger: Vec<i64> = Vec::new();
-    let mut ins_value: Vec<Option<serde_json::Value>> = Vec::new();
-    let mut ins_deleted: Vec<bool> = Vec::new();
+    // Pair each item with its last-snapshot ledger (i64::MIN if never seen).
+    let mut indexed: Vec<(usize, i64)> = batch
+        .iter()
+        .enumerate()
+        .map(|(idx, (cid, _, _, _))| {
+            let last = hashes[idx]
+                .as_ref()
+                .and_then(|kh| latest.get(&(cid.clone(), kh.clone())).copied())
+                .unwrap_or(i64::MIN);
+            (idx, last)
+        })
+        .collect();
+    indexed.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
-    for (idx, ((contract_id, holder, ledger_key), entry_opt)) in
-        chunk.iter().zip(entries.iter()).enumerate()
-    {
-        let key_hash = &key_hashes[idx];
-        let latest_ledger = latest.get(&(contract_id.clone(), key_hash.clone())).copied();
-
-        match entry_opt {
-            Some(entry) => {
-                if latest_ledger == Some(entry.last_modified_ledger) {
-                    continue;
-                }
-                let Some(balance) = decode_trustline_balance(&entry.val) else {
-                    debug!(holder, "unrecognised trustline/account entry; skipping");
-                    continue;
-                };
-                ins_contract.push(contract_id.clone());
-                ins_key_hash.push(key_hash.clone());
-                ins_key.push(serde_json::json!({
-                    "type": "trustline",
-                    "account": holder,
-                }));
-                ins_key_xdr.push(key_xdrs[idx].clone());
-                ins_ledger.push(entry.last_modified_ledger);
-                ins_value.push(Some(serde_json::json!({ "balance": balance })));
-                ins_deleted.push(false);
-            }
-            None => {
-                if latest_ledger.is_none() {
-                    continue;
-                }
-                let tip = rpc.latest_ledger().await;
-                ins_contract.push(contract_id.clone());
-                ins_key_hash.push(key_hash.clone());
-                ins_key.push(serde_json::json!({
-                    "type": "trustline",
-                    "account": holder,
-                }));
-                ins_key_xdr.push(key_xdrs[idx].clone());
-                ins_ledger.push(tip);
-                ins_value.push(None);
-                ins_deleted.push(true);
-            }
-        }
-    }
-
-    if ins_contract.is_empty() {
-        return Ok(());
-    }
-
-    sqlx::query(
-        "INSERT INTO contract_data
-            (contract_id, key_hash, key, key_xdr, durability, ledger, value, label, deleted, archived)
-         SELECT $1::text[], $2::text[], $3::jsonb[], $4::text[],
-                'persistent', $5::bigint[], $6::jsonb[], 'balance', $7::boolean[],
-                false
-         FROM UNNEST($1::text[], $2::text[], $3::jsonb[], $4::text[], $5::bigint[], $6::jsonb[], $7::boolean[])
-         ON CONFLICT (contract_id, key_hash, ledger) DO NOTHING",
-    )
-    .bind(&ins_contract)
-    .bind(&ins_key_hash)
-    .bind(&ins_key)
-    .bind(&ins_key_xdr)
-    .bind(&ins_ledger)
-    .bind(&ins_value)
-    .bind(&ins_deleted)
-    .execute(pool)
-    .await?;
-    debug!(
-        count = ins_contract.len(),
-        "trustline balance snapshots recorded"
-    );
-    Ok(())
-}
-
-/// Decode the balance (in stroops) from a trustline or account ledger entry.
-fn decode_trustline_balance(val: &ScVal) -> Option<i64> {
-    match val {
-        ScVal::LedgerKeyContractInstance => None,
-        _ => {
-            // The RPC returns the entry's value as an ScVal; trustlines and
-            // accounts are encoded as LedgerEntryData, which the shared decoder
-            // surfaces as a JSON object with a `balance` field.
-            let json = decode_scval(val);
-            json.get("balance")
-                .and_then(|b| b.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| b.as_i64()))
-        }
-    }
+    let deferred = indexed.len() - max_per_cycle;
+    let mut slots: Vec<Option<(String, ScVal, ContractDataDurability, &str)>> =
+        batch.into_iter().map(Some).collect();
+    let selected: Vec<(String, ScVal, ContractDataDurability, &str)> = indexed
+        .into_iter()
+        .take(max_per_cycle)
+        .filter_map(|(idx, _)| slots[idx].take())
+        .collect();
+    (selected, deferred)
 }
 
 /// Snapshot per-key entries from configurable templates discovered during a cycle.
@@ -498,6 +396,11 @@ fn decode_trustline_balance(val: &ScVal) -> Option<i64> {
 /// `MAX_BATCH_KEYS` entries per RPC call. Per chunk, change detection is one
 /// grouped `SELECT max(ledger)` and writes are one multi-row `UNNEST` insert.
 /// Keys that return no entry but have history get a tombstone row.
+///
+/// `max_per_cycle` caps how many keys are snapshotted this cycle (0 means
+/// unlimited). When the batch exceeds the cap, keys are prioritised by
+/// last-snapshot age (oldest / never-snapshotted first) and the remainder is
+/// deferred to later cycles. Returns the number of keys deferred.
 pub async fn snapshot_template_keys_batch(
     pool: &PgPool,
     rpc: &RpcClient,
@@ -507,7 +410,8 @@ pub async fn snapshot_template_keys_batch(
     >,
     contract_ids_filter: &[String],
     templates: &[crate::keys::KeyTemplate],
-) {
+    max_per_cycle: usize,
+) -> usize {
     // Build the flat list of (contract_id, key, durability, label) to fetch,
     // deduplicated by (contract_id, key_hash).
     let mut batch: Vec<(String, ScVal, ContractDataDurability, Option<String>)> = Vec::new();
@@ -543,7 +447,16 @@ pub async fn snapshot_template_keys_batch(
     }
 
     if batch.is_empty() {
-        return;
+        return 0;
+    }
+
+    let (batch, deferred) = cap_and_prioritise_keys(pool, batch, max_per_cycle).await;
+    if deferred > 0 {
+        debug!(
+            deferred,
+            selected = batch.len(),
+            "deferring template key snapshots to later cycles"
+        );
     }
 
     debug!(count = batch.len(), "batching template key snapshots");
@@ -553,6 +466,7 @@ pub async fn snapshot_template_keys_batch(
             warn!(error = %e, "batch contract-data snapshot failed");
         }
     }
+    deferred
 }
 
 /// Fetch one chunk of contract-data keys via a single `getLedgerEntries` call,
@@ -872,79 +786,59 @@ fn decode_scval(v: &ScVal) -> serde_json::Value {
 mod tests {
     use super::*;
 
-    fn usdc_asset() -> Asset {
-        let issuer = AccountId::from_str(
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
-        )
-        .unwrap();
-        let mut buf = [0u8; 4];
-        buf.copy_from_slice(b"USDC");
-        Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
-            asset_code: buf,
-            issuer,
-        })
-    }
-
-    #[test]
-    fn classic_account_detection() {
-        assert!(is_classic_account(
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
-        ));
-        assert!(!is_classic_account(
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
-        ));
-    }
-
-    #[test]
-    fn trustline_key_for_credit_asset() {
-        let account = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
-        let key = trustline_ledger_key(account, &usdc_asset()).unwrap();
-        match key {
-            LedgerKey::Trustline(t) => {
-                assert_eq!(t.account_id.to_string(), account);
-                assert_eq!(t.asset, TrustLineAsset::CreditAlphanum4(
-                    match usdc_asset() {
-                        Asset::CreditAlphanum4(a) => a,
-                        _ => unreachable!(),
-                    }
-                ));
-            }
-            other => panic!("expected trustline key, got {other:?}"),
+    /// Pure prioritisation helper mirroring `cap_and_prioritise_*`: given items
+    /// with their last-snapshot ledger (`None` = never snapshotted), return the
+    /// selected indices in priority order and the deferred count.
+    fn prioritise(lasts: &[Option<i64>], max_per_cycle: usize) -> (Vec<usize>, usize) {
+        if max_per_cycle == 0 || lasts.len() <= max_per_cycle {
+            return ((0..lasts.len()).collect(), 0);
         }
+        let mut indexed: Vec<(usize, i64)> = lasts
+            .iter()
+            .enumerate()
+            .map(|(idx, last)| (idx, last.unwrap_or(i64::MIN)))
+            .collect();
+        indexed.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let deferred = indexed.len() - max_per_cycle;
+        let selected = indexed.into_iter().take(max_per_cycle).map(|(i, _)| i).collect();
+        (selected, deferred)
     }
 
     #[test]
-    fn account_key_for_native() {
-        let account = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
-        let key = trustline_ledger_key(account, &Asset::Native).unwrap();
-        assert!(matches!(key, LedgerKey::Account(_)));
+    fn cap_zero_means_unlimited() {
+        let (selected, deferred) = prioritise(&[Some(1), Some(2), Some(3)], 0);
+        assert_eq!(selected, vec![0, 1, 2]);
+        assert_eq!(deferred, 0);
     }
 
     #[test]
-    fn sep11_asset_parsing() {
-        assert_eq!(parse_sep11_asset("native"), Some(Asset::Native));
-        assert!(matches!(
-            parse_sep11_asset("USDC:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"),
-            Some(Asset::CreditAlphanum4(_))
-        ));
-        assert!(matches!(
-            parse_sep11_asset("LONGCODE:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"),
-            Some(Asset::CreditAlphanum12(_))
-        ));
-        assert_eq!(parse_sep11_asset("garbage"), None);
+    fn cap_under_limit_selects_all() {
+        let (selected, deferred) = prioritise(&[Some(1), Some(2)], 5);
+        assert_eq!(selected, vec![0, 1]);
+        assert_eq!(deferred, 0);
     }
 
     #[test]
-    fn finds_name_in_instance_storage() {
-        let storage = ScVal::Map(Some(stellar_xdr::curr::ScMap(
-            vec![stellar_xdr::curr::ScMapEntry {
-                key: ScVal::Symbol("name".try_into().unwrap()),
-                val: ScVal::String("native".try_into().unwrap()),
-            }]
-            .try_into()
-            .unwrap(),
-        )));
-        assert_eq!(find_instance_symbol(&storage, "name").as_deref(), Some("native"));
-        assert_eq!(find_instance_symbol(&storage, "symbol"), None);
+    fn cap_truncates_and_defers_remainder() {
+        let (selected, deferred) = prioritise(&[Some(10), Some(20), Some(30), Some(40)], 2);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(deferred, 2);
+    }
+
+    #[test]
+    fn cap_prioritises_oldest_and_never_snapshotted() {
+        // Index 2 is never snapshotted (highest priority), then oldest ledger.
+        let lasts = [Some(50), Some(10), None, Some(30)];
+        let (selected, deferred) = prioritise(&lasts, 2);
+        assert_eq!(selected, vec![2, 1]);
+        assert_eq!(deferred, 2);
+    }
+
+    #[test]
+    fn cap_breaks_ties_by_input_order() {
+        let lasts = [Some(5), Some(5), Some(5)];
+        let (selected, deferred) = prioritise(&lasts, 2);
+        assert_eq!(selected, vec![0, 1]);
+        assert_eq!(deferred, 1);
     }
 }

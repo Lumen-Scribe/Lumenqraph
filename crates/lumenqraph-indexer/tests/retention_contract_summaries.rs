@@ -122,6 +122,38 @@ mod retention_contract_summaries_tests {
         row.0
     }
 
+    /// Insert a contract_spec_versions row for a contract.
+    async fn insert_spec_version(
+        pool: &PgPool,
+        contract_id: &str,
+        ledger: i64,
+        version: &str,
+        spec_hash: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO contract_spec_versions (contract_id, ledger, version, spec_hash, spec_xdr)
+             VALUES ($1, $2, $3, $4, 'xdr')",
+        )
+        .bind(contract_id)
+        .bind(ledger)
+        .bind(version)
+        .bind(spec_hash)
+        .execute(pool)
+        .await
+        .expect("Failed to insert contract_spec_version");
+    }
+
+    /// Count contract_spec_versions rows for a contract.
+    async fn count_spec_versions(pool: &PgPool, contract_id: &str) -> i64 {
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM contract_spec_versions WHERE contract_id = $1")
+                .bind(contract_id)
+                .fetch_one(pool)
+                .await
+                .expect("Failed to count contract_spec_versions");
+        row.0
+    }
+
     /// Run the retention pruner for a given tip and retention window.
     async fn prune_events(pool: &PgPool, tip: i64, retention_ledgers: i64) -> u64 {
         // Manually run the pruning logic inline
@@ -144,6 +176,66 @@ mod retention_contract_summaries_tests {
         .expect("Failed to prune events");
 
         result.rows_affected()
+    }
+
+    /// Insert a webhook_deliveries row for an event with the given status.
+    async fn insert_delivery(pool: &PgPool, delivery_id: &str, event_id: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO webhook_deliveries
+                 (delivery_id, subscription_id, event_id, status, attempts, created_at)
+             VALUES ($1, 'sub-1', $2, $3, 0, now())",
+        )
+        .bind(delivery_id)
+        .bind(event_id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("Failed to insert webhook delivery");
+    }
+
+    /// Count webhook_deliveries rows for an event.
+    async fn count_deliveries(pool: &PgPool, event_id: &str) -> i64 {
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM webhook_deliveries WHERE event_id = $1")
+                .bind(event_id)
+                .fetch_one(pool)
+                .await
+                .expect("Failed to count deliveries");
+        row.0
+    }
+
+    /// Insert a contract_state row for a contract at a given ledger.
+    async fn insert_contract_state(pool: &PgPool, contract_id: &str, ledger: i64) {
+        sqlx::query(
+            "INSERT INTO contract_state (contract_id, key, ledger, durability, value)
+             VALUES ($1, 'k', $2, 'persistent', 'v')",
+        )
+        .bind(contract_id)
+        .bind(ledger)
+        .execute(pool)
+        .await
+        .expect("Failed to insert contract_state");
+    }
+
+    /// Count contract_state rows for a contract.
+    async fn count_contract_state(pool: &PgPool, contract_id: &str) -> i64 {
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM contract_state WHERE contract_id = $1")
+                .bind(contract_id)
+                .fetch_one(pool)
+                .await
+                .expect("Failed to count contract_state");
+        row.0
+    }
+
+    /// Run the real retention pruner from the indexer crate.
+    async fn run_pruner(
+        pool: &PgPool,
+        tip: i64,
+        retention_ledgers: i64,
+    ) -> Result<lumenqraph_indexer::retention::PruneStats, sqlx::Error> {
+        lumenqraph_indexer::retention::prune(pool, tip, retention_ledgers, retention_ledgers)
+            .await
     }
 
     #[tokio::test]
@@ -346,6 +438,115 @@ mod retention_contract_summaries_tests {
         assert!(
             get_summary_event_count(&pool, contract_id).await.is_none(),
             "After final prune, summary row should be deleted"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires TEST_DATABASE_URL
+    async fn test_spec_version_retention_keeps_n_versions() {
+        let pool = setup_test_db().await;
+        let contract_id = "CBDQ5K7FVPZ2YWXDNZ7Q6RTCZE2ZSSX3VW5J5K5Q7KXNZG5Q5Q5";
+
+        // Five spec versions, all older than the retention cutoff.
+        for i in 1..=5 {
+            insert_spec_version(
+                &pool,
+                contract_id,
+                i * 100,
+                &format!("v{i}"),
+                &format!("hash{i}"),
+            )
+            .await;
+        }
+        assert_eq!(
+            count_spec_versions(&pool, contract_id).await,
+            5,
+            "All five spec versions should be present before pruning"
+        );
+
+        // Full prune pass: tip=1000, retention=100 → cutoff=900, so every
+        // version (ledgers 100..=500) is outside the window.
+        let tip = 1000;
+        let retention_ledgers = 100;
+        let spec_version_retention = 3;
+
+        lumenqraph_indexer::retention::prune(&pool, tip, retention_ledgers)
+            .await
+            .expect("prune failed");
+        lumenqraph_indexer::retention::prune_spec_versions(
+            &pool,
+            tip,
+            retention_ledgers,
+            spec_version_retention,
+        )
+        .await
+        .expect("prune_spec_versions failed");
+
+        // SPEC_VERSION_RETENTION=3 must keep the newest 3 versions.
+        assert_eq!(
+            count_spec_versions(&pool, contract_id).await,
+            3,
+            "SPEC_VERSION_RETENTION=3 should keep exactly the newest 3 versions"
+        );
+
+        let remaining: Vec<(String,)> = sqlx::query_as(
+            "SELECT version FROM contract_spec_versions WHERE contract_id = $1 ORDER BY ledger",
+        )
+        .bind(contract_id)
+        .fetch_all(&pool)
+        .await
+        .expect("Failed to query remaining spec versions");
+        let versions: Vec<String> = remaining.into_iter().map(|(v,)| v).collect();
+        assert_eq!(
+            versions,
+            vec!["v3".to_string(), "v4".to_string(), "v5".to_string()],
+            "The newest 3 versions should survive"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires TEST_DATABASE_URL
+    async fn test_spec_version_retention_zero_keeps_only_newest() {
+        let pool = setup_test_db().await;
+        let contract_id = "CBDQ5K7FVPZ2YWXDNZ7Q6RTCZE2ZSSX3VW5J5K5Q7KXNZG5Q5Q5";
+
+        for i in 1..=5 {
+            insert_spec_version(
+                &pool,
+                contract_id,
+                i * 100,
+                &format!("v{i}"),
+                &format!("hash{i}"),
+            )
+            .await;
+        }
+
+        let tip = 1000;
+        let retention_ledgers = 100;
+
+        lumenqraph_indexer::retention::prune(&pool, tip, retention_ledgers)
+            .await
+            .expect("prune failed");
+        lumenqraph_indexer::retention::prune_spec_versions(&pool, tip, retention_ledgers, 0)
+            .await
+            .expect("prune_spec_versions failed");
+
+        assert_eq!(
+            count_spec_versions(&pool, contract_id).await,
+            1,
+            "SPEC_VERSION_RETENTION=0 should keep only the current version"
+        );
+
+        let remaining: (String,) = sqlx::query_as(
+            "SELECT version FROM contract_spec_versions WHERE contract_id = $1",
+        )
+        .bind(contract_id)
+        .fetch_one(&pool)
+        .await
+        .expect("Failed to query remaining spec version");
+        assert_eq!(
+            remaining.0, "v5",
+            "The newest version should be the one that survives"
         );
     }
 }
