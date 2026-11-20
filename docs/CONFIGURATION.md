@@ -223,6 +223,16 @@ REORG_OVERLAP_LEDGERS=0
 | **Services** | Indexer |
 | **Tradeoff** | **Per-Holder Balances** vs **RPC Cost**: When ON, snapshots per-holder balances into `contract_data` for each holder mentioned in events. Cost: ~1 RPC call per *newly-active* holder per cycle (variable, can be high for popular tokens). Enables balance queries. Recommended: Pair with CONTRACT_IDS to bound the holder set; use sparingly for high-volume tokens |
 
+**How balances are read:**
+
+- **Stellar Asset Contracts (SACs)** — the contract that wraps a classic asset such as USDC or XLM. A classic account (`G…`) does not hold a `Balance` contract-data entry; its balance lives in a **trustline** (or in the native account entry for XLM). For SACs the indexer therefore:
+  - reads `G…` holders via `LedgerKey::Trustline { account_id, asset }`, or `LedgerKey::Account` for the native asset (XLM). The asset is derived from the SAC itself (the `name` instance storage, or the SEP-11 asset string in CAP-67 topics);
+  - reads `C…` (contract) holders via the usual `Balance` contract-data key;
+  - stores both in the same `getLedgerEntries` batch, with the trustline/account balances written under the `balance` label.
+- **Non-SAC contracts** — unchanged: every holder is read via the `Balance` contract-data key.
+
+Balances indexed this way are readable via `GET /data?label=balance`. If you enable `KEY_INDEXING` for a SAC and see no balances, check that the contract is recognised as a SAC and that the asset can be derived from its instance storage.
+
 #### `KEY_TEMPLATES`
 | Property | Value |
 |----------|-------|

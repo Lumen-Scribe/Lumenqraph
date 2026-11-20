@@ -655,6 +655,70 @@ pub async fn upsert_events_with_resolver(
     Ok((inserted, updated))
 }
 
+/// A single balance snapshot to persist. `label` distinguishes the source of
+/// the balance: `balance` for SAC classic-account trustline/account balances
+/// (issue #745) as well as contract-data `Balance` entries, and other labels
+/// for non-SAC contract data.
+#[derive(Debug, Clone)]
+pub struct BalanceSnapshot {
+    /// Contract (SAC or other) the balance belongs to.
+    pub contract_id: String,
+    /// Holder address (`G…` for trustlines/accounts, `C…` for contract data).
+    pub holder: String,
+    /// Label under which the balance is exposed (`balance`, ...).
+    pub label: String,
+    /// Raw balance value as a decimal string.
+    pub value: String,
+    /// Ledger at which the snapshot was taken.
+    pub ledger: i64,
+    /// Durability of the underlying ledger entry (`persistent`, `temporary`,
+    /// `instance`, or `trustline`/`account` for classic entries).
+    pub durability: String,
+}
+
+/// Persist a batch of balance snapshots. Rows are keyed by
+/// `(contract_id, holder, label)` and replaced on conflict so the latest
+/// snapshot wins. This is used by `snapshot_balances_batch` for both
+/// contract-data `Balance` entries and, for SACs, classic-account trustline /
+/// account balances (issue #745). Non-SAC behaviour is unchanged: callers
+/// simply pass the contract-data snapshots as before.
+pub async fn upsert_balance_snapshots(
+    pool: &PgPool,
+    snapshots: &[BalanceSnapshot],
+) -> anyhow::Result<u64> {
+    if snapshots.is_empty() {
+        return Ok(0);
+    }
+
+    let contract_ids: Vec<String> = snapshots.iter().map(|s| s.contract_id.clone()).collect();
+    let holders: Vec<String> = snapshots.iter().map(|s| s.holder.clone()).collect();
+    let labels: Vec<String> = snapshots.iter().map(|s| s.label.clone()).collect();
+    let values: Vec<String> = snapshots.iter().map(|s| s.value.clone()).collect();
+    let ledgers: Vec<i64> = snapshots.iter().map(|s| s.ledger).collect();
+    let durabilities: Vec<String> = snapshots.iter().map(|s| s.durability.clone()).collect();
+
+    let result = sqlx::query(
+        "INSERT INTO balance_snapshots
+            (contract_id, holder, label, value, ledger, durability)
+         SELECT * FROM UNNEST(
+            $1::text[], $2::text[], $3::text[], $4::text[], $5::bigint[], $6::text[]
+         ) AS t(contract_id, holder, label, value, ledger, durability)
+         ON CONFLICT (contract_id, holder, label) DO UPDATE SET
+            value = EXCLUDED.value,
+            ledger = EXCLUDED.ledger,
+            durability = EXCLUDED.durability",
+    )
+    .bind(&contract_ids)
+    .bind(&holders)
+    .bind(&labels)
+    .bind(&values)
+    .bind(&ledgers)
+    .bind(&durabilities)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 struct Transfer {
     event_id: String,
     contract_id: String,

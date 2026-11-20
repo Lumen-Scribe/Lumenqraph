@@ -288,6 +288,182 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+// ---- Stellar Asset Contract (SAC) balance helpers ------------------------
+//
+// #745: For a SAC, the balance of a classic account (`G…`) lives in its
+// trustline (or the native account entry for XLM), not in a `Balance`
+// contract-data entry. These helpers let the indexer derive the asset a SAC
+// wraps, build the right `LedgerKey` for a holder, and decode the resulting
+// balance into the same JSON shape used for contract-data balances.
+
+/// A classic Stellar asset, as wrapped by a Stellar Asset Contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SacAsset {
+    /// The native asset (XLM).
+    Native,
+    /// A credit asset identified by its 4- or 12-character code and issuer.
+    Credit { code: String, issuer: String },
+}
+
+impl SacAsset {
+    /// Parse a SEP-11 asset string (`native`, `CODE:ISSUER`, or
+    /// `CODE:ISSUER:CONTRACT_ID`).
+    ///
+    /// The optional contract-ID suffix (used in CAP-67 `transfer` topics) is
+    /// ignored. Returns `None` for malformed input.
+    pub fn from_sep11(s: &str) -> Option<SacAsset> {
+        if s == "native" {
+            return Some(SacAsset::Native);
+        }
+        let mut parts = s.split(':');
+        let code = parts.next()?;
+        let issuer = parts.next()?;
+        if code.is_empty() || issuer.is_empty() {
+            return None;
+        }
+        // A third component (contract ID) is permitted and ignored.
+        Some(SacAsset::Credit {
+            code: code.to_string(),
+            issuer: issuer.to_string(),
+        })
+    }
+
+    /// Render as a SEP-11 asset string (`native` or `CODE:ISSUER`).
+    pub fn to_sep11(&self) -> String {
+        match self {
+            SacAsset::Native => "native".to_string(),
+            SacAsset::Credit { code, issuer } => format!("{code}:{issuer}"),
+        }
+    }
+}
+
+/// Derive the classic asset wrapped by a SAC from its instance storage.
+///
+/// A SAC's instance storage holds a `name` entry whose value is the SEP-11
+/// asset string (e.g. `"native"` or `"USDC:G…"`). `entries` is the decoded
+/// `ScVal::Map` of the contract instance storage (as returned by
+/// [`decode_scval`] on the instance's `ScVal::ContractInstance`).
+///
+/// Returns `None` when no usable `name` entry is present.
+pub fn sac_asset_from_instance_storage(instance: &Value) -> Option<SacAsset> {
+    let storage = instance.get("storage")?.as_array()?;
+    for entry in storage {
+        let key = entry.get("key")?;
+        let is_name = key
+            .as_str()
+            .map(|s| s == "name")
+            .or_else(|| key.get("symbol").and_then(|s| s.as_str()).map(|s| s == "name"))
+            .unwrap_or(false);
+        if !is_name {
+            continue;
+        }
+        let val = entry.get("val")?;
+        if let Some(s) = val.as_str() {
+            return SacAsset::from_sep11(s);
+        }
+    }
+    None
+}
+
+/// Derive the classic asset wrapped by a SAC from a CAP-67 event topic.
+///
+/// CAP-67 `transfer`/`mint`/`burn`/`clawback` events carry the SEP-11 asset
+/// string as a topic (either a plain string or a `String`/`Symbol` decoded to
+/// a JSON string). Returns `None` when no topic parses as an asset string.
+pub fn sac_asset_from_topics(topics: &[Value]) -> Option<SacAsset> {
+    topics
+        .iter()
+        .filter_map(|t| t.as_str())
+        .find_map(SacAsset::from_sep11)
+}
+
+/// Build the `LedgerKey` for a holder's balance of `asset`.
+///
+/// * `G…` holders use `LedgerKey::Trustline` for credit assets and
+///   `LedgerKey::Account` for the native asset.
+/// * `C…` holders use the `Balance` contract-data key of the SAC.
+///
+/// Returns `None` if `holder` is not a valid `G…`/`C…` strkey.
+pub fn balance_ledger_key(
+    holder: &str,
+    asset: &SacAsset,
+    sac_contract: &str,
+) -> Option<stellar_xdr::curr::LedgerKey> {
+    use stellar_xdr::curr::{
+        AccountId, AlphaNum12, AlphaNum4, Asset, AssetCode12, AssetCode4, ContractDataDurability,
+        ContractId, Hash, LedgerKey, PublicKey, ScAddress, ScVal, Uint256,
+    };
+
+    if holder.starts_with('C') {
+        let contract = stellar_strkey::Contract::from_string(holder).ok()?;
+        let sac = stellar_strkey::Contract::from_string(sac_contract).ok()?;
+        let key = ScVal::Vec(Some(stellar_xdr::curr::ScVec(
+            vec![
+                ScVal::Symbol(stellar_xdr::curr::ScSymbol(
+                    b"Balance".to_vec().try_into().ok()?,
+                )),
+                ScVal::Address(ScAddress::Contract(ContractId(Hash(contract.0)))),
+            ]
+            .try_into()
+            .ok()?,
+        )));
+        return Some(LedgerKey::ContractData(stellar_xdr::curr::LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash(sac.0))),
+            key,
+            durability: ContractDataDurability::Persistent,
+        }));
+    }
+
+    let account = stellar_strkey::ed25519::PublicKey::from_string(holder).ok()?;
+    let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account.0)));
+
+    let asset = match asset {
+        SacAsset::Native => return Some(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id,
+        })),
+        SacAsset::Credit { code, issuer } => {
+            let issuer = stellar_strkey::ed25519::PublicKey::from_string(issuer).ok()?;
+            let issuer_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(issuer.0)));
+            let code_bytes = code.as_bytes();
+            if code_bytes.len() <= 4 {
+                let mut buf = [0u8; 4];
+                buf[..code_bytes.len()].copy_from_slice(code_bytes);
+                Asset::CreditAlphanum4(AlphaNum4 {
+                    asset_code: AssetCode4(buf),
+                    issuer: issuer_id,
+                })
+            } else if code_bytes.len() <= 12 {
+                let mut buf = [0u8; 12];
+                buf[..code_bytes.len()].copy_from_slice(code_bytes);
+                Asset::CreditAlphanum12(AlphaNum12 {
+                    asset_code: AssetCode12(buf),
+                    issuer: issuer_id,
+                })
+            } else {
+                return None;
+            }
+        }
+    };
+
+    Some(LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
+        account_id,
+        asset,
+    }))
+}
+
+/// Decode a trustline or account ledger entry into the same JSON shape used
+/// for contract-data balances: `{"amount": "<i128 decimal>"}`.
+///
+/// Returns `None` for any other entry type.
+pub fn decode_balance_entry(entry: &stellar_xdr::curr::LedgerEntryData) -> Option<Value> {
+    use stellar_xdr::curr::LedgerEntryData;
+    match entry {
+        LedgerEntryData::Trustline(tl) => Some(json!({ "amount": tl.balance.to_string() })),
+        LedgerEntryData::Account(acct) => Some(json!({ "amount": acct.balance.to_string() })),
+        _ => None,
+    }
+}
+
 // ---- Strkey validation (thin wrapper around stellar-strkey) --------------
 //
 // #413: All base32/CRC16 hand-rolled code has been removed. The canonical

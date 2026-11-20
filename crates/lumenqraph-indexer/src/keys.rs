@@ -10,7 +10,9 @@
 use std::str::FromStr;
 
 use lumenqraph_core::NewEvent;
-use stellar_xdr::curr::{ContractDataDurability, ScAddress, ScSymbol, ScVal, ScVec};
+use stellar_xdr::curr::{
+    AccountId, Asset, ContractDataDurability, LedgerKey, ScAddress, ScSymbol, ScVal, ScVec,
+};
 
 /// A configurable template for building storage keys from event parameters.
 #[derive(Debug, Clone)]
@@ -141,6 +143,139 @@ fn is_address(s: &str) -> bool {
     (s.starts_with('G') || s.starts_with('C')) && ScAddress::from_str(s).is_ok()
 }
 
+/// Whether a strkey names a classic account (`G…`) rather than a contract (`C…`).
+pub fn is_account_address(s: &str) -> bool {
+    s.starts_with('G') && ScAddress::from_str(s).is_ok()
+}
+
+/// Whether a strkey names a contract (`C…`).
+pub fn is_contract_address(s: &str) -> bool {
+    s.starts_with('C') && ScAddress::from_str(s).is_ok()
+}
+
+/// Whether a contract is a Stellar Asset Contract (SAC).
+///
+/// A SAC's contract id is derived deterministically from the asset it wraps, so
+/// the reliable test is to derive the SAC id for each candidate asset and
+/// compare. `asset` is the asset derived from the contract's `name` instance
+/// storage (or a SEP-11 asset string seen in CAP-67 topics); when it is `None`
+/// we cannot confirm SAC-ness and report `false`.
+pub fn is_sac_contract(contract_id: &str, asset: Option<&Asset>) -> bool {
+    let Some(asset) = asset else {
+        return false;
+    };
+    match ScAddress::from_str(contract_id) {
+        Ok(ScAddress::Contract(contract)) => {
+            let derived = stellar_xdr::curr::ContractId::from(asset.clone());
+            derived == contract
+        }
+        _ => false,
+    }
+}
+
+/// Parse a SEP-11 asset string (`native`, `CODE:ISSUER`, or `CODE:ISSUER:CONTRACT`)
+/// into an [`Asset`]. Returns `None` for anything that isn't a valid asset.
+pub fn asset_from_sep11(s: &str) -> Option<Asset> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("native") || s.eq_ignore_ascii_case("xlm") {
+        return Some(Asset::Native);
+    }
+    let mut parts = s.split(':');
+    let code = parts.next()?;
+    let issuer = parts.next()?;
+    // A third component (the SAC contract id) is allowed and ignored here.
+    let _ = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    let issuer = AccountId::from_str(issuer).ok()?;
+    if code.len() <= 4 {
+        let code: [u8; 4] = {
+            let mut buf = [0u8; 4];
+            let bytes = code.as_bytes();
+            buf[..bytes.len()].copy_from_slice(bytes);
+            buf
+        };
+        Some(Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
+            asset_code: stellar_xdr::curr::AssetCode4(code),
+            issuer,
+        }))
+    } else if code.len() <= 12 {
+        let code: [u8; 12] = {
+            let mut buf = [0u8; 12];
+            let bytes = code.as_bytes();
+            buf[..bytes.len()].copy_from_slice(bytes);
+            buf
+        };
+        Some(Asset::CreditAlphanum12(stellar_xdr::curr::AlphaNum12 {
+            asset_code: stellar_xdr::curr::AssetCode12(code),
+            issuer,
+        }))
+    } else {
+        None
+    }
+}
+
+/// Derive the wrapped [`Asset`] from a SAC's `name` instance-storage value.
+///
+/// The SAC stores its asset name as a string: `"native"` for XLM, or the
+/// SEP-11 `CODE:ISSUER` form for issued assets. Returns `None` if the value is
+/// not a string or does not parse as an asset.
+pub fn asset_from_sac_name(name: &ScVal) -> Option<Asset> {
+    match name {
+        ScVal::String(s) => {
+            let text = s.to_utf8_string().ok()?;
+            asset_from_sep11(&text)
+        }
+        _ => None,
+    }
+}
+
+/// The ledger key to read for a holder's balance.
+///
+/// For a SAC, a classic account (`G…`) holds its balance in a trustline (or the
+/// native account entry for XLM), not in contract data — so we build the
+/// matching [`LedgerKey`]. For contract holders (`C…`) and for non-SAC
+/// contracts, balances live in contract data under `Vec[Symbol(symbol), Address]`.
+///
+/// `asset` is the asset derived from the SAC (see [`asset_from_sac_name`] /
+/// [`asset_from_sep11`]); it is only consulted when `is_sac` is true and the
+/// holder is a `G…` account.
+pub fn balance_ledger_key(
+    is_sac: bool,
+    asset: Option<&Asset>,
+    holder: &str,
+    symbol: &str,
+) -> anyhow::Result<LedgerKey> {
+    if is_sac && is_account_address(holder) {
+        let asset = asset.ok_or_else(|| {
+            anyhow::anyhow!("SAC account holder {holder:?} requires a derived asset")
+        })?;
+        let account_id = AccountId::from_str(holder)
+            .map_err(|_| anyhow::anyhow!("invalid account strkey {holder:?}"))?;
+        return Ok(match asset {
+            Asset::Native => LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                account_id,
+            }),
+            other => LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
+                account_id,
+                asset: other.clone(),
+            }),
+        });
+    }
+
+    // Contract holder, or non-SAC contract: contract-data Balance key.
+    let contract = ScAddress::from_str(holder)
+        .map_err(|_| anyhow::anyhow!("invalid address strkey {holder:?}"))?;
+    Ok(LedgerKey::ContractData(
+        stellar_xdr::curr::LedgerKeyContractData {
+            contract,
+            key: balance_key(symbol, holder)?,
+            durability: ContractDataDurability::Persistent,
+        },
+    ))
+}
+
 /// Parse a durability config string strictly. Only `persistent` or `temporary`
 /// (case-insensitive, surrounding whitespace ignored) are accepted; anything
 /// else — including typos like `instance` or `temp` — is an error, so a
@@ -254,6 +389,76 @@ mod tests {
             assert!(msg.contains("persistent"), "message: {msg}");
             assert!(msg.contains("temporary"), "message: {msg}");
         }
+    }
+
+    #[test]
+    fn sac_account_holder_produces_trustline_key() {
+        // USDC-like issued asset wrapped by a SAC.
+        let issuer = AccountId::from_str(&account_strkey(9)).expect("valid issuer");
+        let asset = Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
+            asset_code: stellar_xdr::curr::AssetCode4(*b"USDC"),
+            issuer: issuer.clone(),
+        });
+        let sac_id = ScAddress::Contract(stellar_xdr::curr::ContractId::from(asset.clone()))
+            .to_string();
+        assert!(is_sac_contract(&sac_id, Some(&asset)));
+
+        let holder = account_strkey(1);
+        let key = balance_ledger_key(true, Some(&asset), &holder, "Balance").expect("key");
+        match key {
+            LedgerKey::Trustline(tl) => {
+                assert_eq!(tl.account_id, AccountId::from_str(&holder).unwrap());
+                assert_eq!(tl.asset, asset);
+            }
+            other => panic!("expected trustline key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sac_native_account_holder_produces_account_key() {
+        let sac_id =
+            ScAddress::Contract(stellar_xdr::curr::ContractId::from(Asset::Native)).to_string();
+        assert!(is_sac_contract(&sac_id, Some(&Asset::Native)));
+        let key = balance_ledger_key(true, Some(&Asset::Native), &account_strkey(2), "Balance")
+            .expect("key");
+        assert!(matches!(key, LedgerKey::Account(_)));
+    }
+
+    #[test]
+    fn sac_contract_holder_produces_contract_data_key() {
+        let asset = Asset::Native;
+        let holder = contract_strkey(3);
+        let key = balance_ledger_key(true, Some(&asset), &holder, "Balance").expect("key");
+        match key {
+            LedgerKey::ContractData(cd) => {
+                assert_eq!(cd.contract, ScAddress::from_str(&holder).unwrap());
+                assert!(matches!(cd.key, ScVal::Vec(Some(_))));
+            }
+            other => panic!("expected contract-data key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_sac_account_holder_uses_contract_data_key() {
+        // Non-SAC contract: even a G… holder is read from contract data.
+        let holder = account_strkey(4);
+        let key = balance_ledger_key(false, None, &holder, "Balance").expect("key");
+        assert!(matches!(key, LedgerKey::ContractData(_)));
+    }
+
+    #[test]
+    fn asset_from_sep11_parses_forms() {
+        assert_eq!(asset_from_sep11("native"), Some(Asset::Native));
+        let issuer = account_strkey(7);
+        assert!(matches!(
+            asset_from_sep11(&format!("USDC:{issuer}")),
+            Some(Asset::CreditAlphanum4(_))
+        ));
+        assert!(matches!(
+            asset_from_sep11(&format!("LONGCODE:{issuer}")),
+            Some(Asset::CreditAlphanum12(_))
+        ));
+        assert!(asset_from_sep11("not-an-asset").is_none());
     }
 
     #[test]

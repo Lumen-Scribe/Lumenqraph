@@ -27,8 +27,8 @@ use lumenqraph_core::xdr;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use stellar_xdr::curr::{
-    ContractDataDurability, ContractId, Hash, LedgerKey, LedgerKeyContractData, Limits, ScAddress,
-    ScVal, WriteXdr,
+    AccountId, Asset, ContractDataDurability, ContractId, Hash, LedgerKey, LedgerKeyAccount,
+    LedgerKeyContractData, LedgerKeyTrustLine, Limits, ScAddress, ScVal, TrustLineAsset, WriteXdr,
 };
 use tracing::{debug, warn};
 
@@ -182,6 +182,16 @@ async fn try_snapshot_data(
 /// `MAX_BATCH_KEYS` entries per RPC call. Per chunk, change detection is one
 /// grouped `SELECT max(ledger)` and writes are one multi-row `UNNEST` insert.
 /// Keys that return no entry but have history get a tombstone row.
+///
+/// # Stellar Asset Contracts
+///
+/// For a SAC, a classic account (`G…`) holder's balance lives in its trustline
+/// (or the native account entry for XLM), not in a `Balance(Address)`
+/// contract-data entry — only contract (`C…`) holders have those. When the
+/// contract is detected as a SAC, `G…` holders are read via
+/// `LedgerKey::Trustline` (or `LedgerKey::Account` for native XLM) in the same
+/// `getLedgerEntries` batch, and the resulting balance is stored under the
+/// `balance` label. Non-SAC contracts keep the contract-data-only path.
 pub async fn snapshot_balances_batch(
     pool: &PgPool,
     rpc: &RpcClient,
@@ -196,11 +206,40 @@ pub async fn snapshot_balances_batch(
     // deduplicated by (contract_id, key_hash).
     let mut batch: Vec<(String, ScVal, ContractDataDurability, &str)> = Vec::new();
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    // Classic-account holders of SACs: (contract_id, holder, ledger key).
+    let mut trustline_batch: Vec<(String, String, LedgerKey)> = Vec::new();
+    let mut trustline_seen: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     for (contract_id, holders) in holders_by_contract {
         if !contract_ids_filter.is_empty() && !contract_ids_filter.contains(contract_id) {
             continue;
         }
+        // Detect SACs once per contract; non-SACs keep the contract-data path.
+        let sac_asset = if holders.iter().any(|h| is_classic_account(h)) {
+            detect_sac_asset(rpc, contract_id).await
+        } else {
+            None
+        };
         for holder in holders {
+            if let Some(asset) = &sac_asset {
+                if is_classic_account(holder) {
+                    match trustline_ledger_key(holder, asset) {
+                        Ok(ledger_key) => {
+                            if trustline_seen.insert((contract_id.clone(), holder.clone())) {
+                                trustline_batch.push((
+                                    contract_id.clone(),
+                                    holder.clone(),
+                                    ledger_key,
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            debug!(holder, error = %e, "skipping unbuildable trustline key")
+                        }
+                    }
+                    continue;
+                }
+            }
             match keys::balance_key(balance_key_symbol, holder) {
                 Ok(key) => {
                     let key_hash = match key_hash_of(&key) {
@@ -219,15 +258,237 @@ pub async fn snapshot_balances_batch(
         }
     }
 
-    if batch.is_empty() {
+    if batch.is_empty() && trustline_batch.is_empty() {
         return;
     }
 
-    debug!(count = batch.len(), "batching holder balance key snapshots");
+    debug!(
+        contract_data = batch.len(),
+        trustlines = trustline_batch.len(),
+        "batching holder balance key snapshots"
+    );
 
     for chunk in batch.chunks(MAX_BATCH_KEYS) {
         if let Err(e) = snapshot_data_chunk(pool, rpc, chunk).await {
             warn!(error = %e, "batch contract-data snapshot failed");
+        }
+    }
+
+    for chunk in trustline_batch.chunks(MAX_BATCH_KEYS) {
+        if let Err(e) = snapshot_trustlines_chunk(pool, rpc, chunk).await {
+            warn!(error = %e, "batch trustline snapshot failed");
+        }
+    }
+}
+
+/// Whether an address string is a classic account (`G…`).
+fn is_classic_account(address: &str) -> bool {
+    address.starts_with('G')
+}
+
+/// Build the ledger key for a classic account's balance of `asset`:
+/// `LedgerKey::Account` for native XLM, `LedgerKey::Trustline` otherwise.
+fn trustline_ledger_key(account: &str, asset: &Asset) -> anyhow::Result<LedgerKey> {
+    let account_id = AccountId::from_str(account)
+        .map_err(|e| anyhow::anyhow!("invalid account id {account}: {e}"))?;
+    Ok(match asset {
+        Asset::Native => LedgerKey::Account(LedgerKeyAccount { account_id }),
+        other => LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id,
+            asset: TrustLineAsset::from(other.clone()),
+        }),
+    })
+}
+
+/// Detect whether `contract_id` is a Stellar Asset Contract and, if so, return
+/// the asset it wraps. Uses the SAC's `name` instance-storage entry, which holds
+/// the SEP-11 asset string (`"native"` or `"CODE:ISSUER"`).
+async fn detect_sac_asset(rpc: &RpcClient, contract_id: &str) -> Option<Asset> {
+    let instance = match rpc.get_contract_instances_batch(&[contract_id.to_string()]).await {
+        Ok(mut instances) => instances.pop().flatten(),
+        Err(e) => {
+            debug!(contract_id, error = %e, "SAC detection failed");
+            return None;
+        }
+    };
+    let instance = instance?;
+    let name = find_instance_symbol(&instance.storage, "name")?;
+    parse_sep11_asset(&name)
+}
+
+/// Find a symbol-keyed string value in an instance-storage `ScVal` map.
+fn find_instance_symbol(storage: &ScVal, symbol: &str) -> Option<String> {
+    let ScVal::Map(Some(map)) = storage else {
+        return None;
+    };
+    for entry in map.0.iter() {
+        if let ScVal::Symbol(s) = &entry.key {
+            if s.to_string() == symbol {
+                if let ScVal::String(v) = &entry.val {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse a SEP-11 asset string (`"native"` or `"CODE:ISSUER"`) into an `Asset`.
+fn parse_sep11_asset(s: &str) -> Option<Asset> {
+    if s == "native" {
+        return Some(Asset::Native);
+    }
+    let (code, issuer) = s.split_once(':')?;
+    let issuer = AccountId::from_str(issuer).ok()?;
+    if code.len() <= 4 {
+        let mut buf = [0u8; 4];
+        buf[..code.len()].copy_from_slice(code.as_bytes());
+        Some(Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
+            asset_code: buf,
+            issuer,
+        }))
+    } else if code.len() <= 12 {
+        let mut buf = [0u8; 12];
+        buf[..code.len()].copy_from_slice(code.as_bytes());
+        Some(Asset::CreditAlphanum12(stellar_xdr::curr::AlphaNum12 {
+            asset_code: buf,
+            issuer,
+        }))
+    } else {
+        None
+    }
+}
+
+/// Fetch one chunk of trustline/account ledger keys via a single
+/// `getLedgerEntries` call, then store the decoded balances under the
+/// `balance` label (with change detection and tombstones), mirroring
+/// [`snapshot_data_chunk`].
+async fn snapshot_trustlines_chunk(
+    pool: &PgPool,
+    rpc: &RpcClient,
+    chunk: &[(String, String, LedgerKey)],
+) -> anyhow::Result<()> {
+    let ledger_keys: Vec<LedgerKey> = chunk.iter().map(|(_, _, k)| k.clone()).collect();
+    let entries = rpc.get_ledger_entries(&ledger_keys).await?;
+
+    // Precompute key hashes and XDR for the chunk.
+    let mut key_hashes: Vec<String> = Vec::with_capacity(chunk.len());
+    let mut key_xdrs: Vec<String> = Vec::with_capacity(chunk.len());
+    for (_, _, ledger_key) in chunk {
+        let xdr_bytes = ledger_key.to_xdr(Limits::none())?;
+        key_hashes.push(hex::encode(Sha256::digest(&xdr_bytes)));
+        key_xdrs.push(ledger_key.to_xdr_base64(Limits::none())?);
+    }
+
+    // One grouped query fetches the latest ledger for every key in the chunk.
+    let contract_ids: Vec<String> = chunk.iter().map(|(cid, _, _)| cid.clone()).collect();
+    let latest_rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT contract_id, key_hash, max(ledger) FROM contract_data
+         WHERE contract_id = ANY($1) AND key_hash = ANY($2)
+         GROUP BY contract_id, key_hash",
+    )
+    .bind(&contract_ids)
+    .bind(&key_hashes)
+    .fetch_all(pool)
+    .await?;
+    let latest: std::collections::HashMap<(String, String), i64> = latest_rows
+        .into_iter()
+        .map(|(cid, kh, ledger)| ((cid, kh), ledger))
+        .collect();
+
+    let mut ins_contract: Vec<String> = Vec::new();
+    let mut ins_key_hash: Vec<String> = Vec::new();
+    let mut ins_key: Vec<serde_json::Value> = Vec::new();
+    let mut ins_key_xdr: Vec<String> = Vec::new();
+    let mut ins_ledger: Vec<i64> = Vec::new();
+    let mut ins_value: Vec<Option<serde_json::Value>> = Vec::new();
+    let mut ins_deleted: Vec<bool> = Vec::new();
+
+    for (idx, ((contract_id, holder, ledger_key), entry_opt)) in
+        chunk.iter().zip(entries.iter()).enumerate()
+    {
+        let key_hash = &key_hashes[idx];
+        let latest_ledger = latest.get(&(contract_id.clone(), key_hash.clone())).copied();
+
+        match entry_opt {
+            Some(entry) => {
+                if latest_ledger == Some(entry.last_modified_ledger) {
+                    continue;
+                }
+                let Some(balance) = decode_trustline_balance(&entry.val) else {
+                    debug!(holder, "unrecognised trustline/account entry; skipping");
+                    continue;
+                };
+                ins_contract.push(contract_id.clone());
+                ins_key_hash.push(key_hash.clone());
+                ins_key.push(serde_json::json!({
+                    "type": "trustline",
+                    "account": holder,
+                }));
+                ins_key_xdr.push(key_xdrs[idx].clone());
+                ins_ledger.push(entry.last_modified_ledger);
+                ins_value.push(Some(serde_json::json!({ "balance": balance })));
+                ins_deleted.push(false);
+            }
+            None => {
+                if latest_ledger.is_none() {
+                    continue;
+                }
+                let tip = rpc.latest_ledger().await;
+                ins_contract.push(contract_id.clone());
+                ins_key_hash.push(key_hash.clone());
+                ins_key.push(serde_json::json!({
+                    "type": "trustline",
+                    "account": holder,
+                }));
+                ins_key_xdr.push(key_xdrs[idx].clone());
+                ins_ledger.push(tip);
+                ins_value.push(None);
+                ins_deleted.push(true);
+            }
+        }
+    }
+
+    if ins_contract.is_empty() {
+        return Ok(());
+    }
+
+    sqlx::query(
+        "INSERT INTO contract_data
+            (contract_id, key_hash, key, key_xdr, durability, ledger, value, label, deleted, archived)
+         SELECT $1::text[], $2::text[], $3::jsonb[], $4::text[],
+                'persistent', $5::bigint[], $6::jsonb[], 'balance', $7::boolean[],
+                false
+         FROM UNNEST($1::text[], $2::text[], $3::jsonb[], $4::text[], $5::bigint[], $6::jsonb[], $7::boolean[])
+         ON CONFLICT (contract_id, key_hash, ledger) DO NOTHING",
+    )
+    .bind(&ins_contract)
+    .bind(&ins_key_hash)
+    .bind(&ins_key)
+    .bind(&ins_key_xdr)
+    .bind(&ins_ledger)
+    .bind(&ins_value)
+    .bind(&ins_deleted)
+    .execute(pool)
+    .await?;
+    debug!(
+        count = ins_contract.len(),
+        "trustline balance snapshots recorded"
+    );
+    Ok(())
+}
+
+/// Decode the balance (in stroops) from a trustline or account ledger entry.
+fn decode_trustline_balance(val: &ScVal) -> Option<i64> {
+    match val {
+        ScVal::LedgerKeyContractInstance => None,
+        _ => {
+            // The RPC returns the entry's value as an ScVal; trustlines and
+            // accounts are encoded as LedgerEntryData, which the shared decoder
+            // surfaces as a JSON object with a `balance` field.
+            let json = decode_scval(val);
+            json.get("balance")
+                .and_then(|b| b.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| b.as_i64()))
         }
     }
 }
@@ -526,6 +787,7 @@ async fn try_write_snapshot_data(
     let key_xdr = key.to_xdr_base64(Limits::none())?;
     // Deprecated alias: sha256 of the base64 key text (durability-blind).
     let key_hash = hex::encode(Sha256::digest(key_xdr.as_bytes()));
+    let ledger_key_hash = ledger_key_hash(contract_id, key, durability)?;
 
     // Change detection: skip if we already have this key at this ledger.
     let latest: Option<i64> = sqlx::query_scalar(
@@ -604,4 +866,85 @@ fn decode_storage(storage: &ScVal) -> serde_json::Value {
 /// from the already-parsed typed enum.
 fn decode_scval(v: &ScVal) -> serde_json::Value {
     xdr::decode_scval(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn usdc_asset() -> Asset {
+        let issuer = AccountId::from_str(
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        )
+        .unwrap();
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(b"USDC");
+        Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
+            asset_code: buf,
+            issuer,
+        })
+    }
+
+    #[test]
+    fn classic_account_detection() {
+        assert!(is_classic_account(
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+        ));
+        assert!(!is_classic_account(
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+        ));
+    }
+
+    #[test]
+    fn trustline_key_for_credit_asset() {
+        let account = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+        let key = trustline_ledger_key(account, &usdc_asset()).unwrap();
+        match key {
+            LedgerKey::Trustline(t) => {
+                assert_eq!(t.account_id.to_string(), account);
+                assert_eq!(t.asset, TrustLineAsset::CreditAlphanum4(
+                    match usdc_asset() {
+                        Asset::CreditAlphanum4(a) => a,
+                        _ => unreachable!(),
+                    }
+                ));
+            }
+            other => panic!("expected trustline key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn account_key_for_native() {
+        let account = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+        let key = trustline_ledger_key(account, &Asset::Native).unwrap();
+        assert!(matches!(key, LedgerKey::Account(_)));
+    }
+
+    #[test]
+    fn sep11_asset_parsing() {
+        assert_eq!(parse_sep11_asset("native"), Some(Asset::Native));
+        assert!(matches!(
+            parse_sep11_asset("USDC:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"),
+            Some(Asset::CreditAlphanum4(_))
+        ));
+        assert!(matches!(
+            parse_sep11_asset("LONGCODE:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"),
+            Some(Asset::CreditAlphanum12(_))
+        ));
+        assert_eq!(parse_sep11_asset("garbage"), None);
+    }
+
+    #[test]
+    fn finds_name_in_instance_storage() {
+        let storage = ScVal::Map(Some(stellar_xdr::curr::ScMap(
+            vec![stellar_xdr::curr::ScMapEntry {
+                key: ScVal::Symbol("name".try_into().unwrap()),
+                val: ScVal::String("native".try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        )));
+        assert_eq!(find_instance_symbol(&storage, "name").as_deref(), Some("native"));
+        assert_eq!(find_instance_symbol(&storage, "symbol"), None);
+    }
 }

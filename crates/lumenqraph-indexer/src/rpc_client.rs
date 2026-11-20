@@ -1504,6 +1504,86 @@ impl RpcClient {
         Ok(Some((data, first.last_modified_ledger_seq)))
     }
 
+    /// Fetch a batch of arbitrary ledger entries in a single `getLedgerEntries`
+    /// call. Unlike [`get_contract_data_batch`], the keys may be of any
+    /// `LedgerKey` variant (contract data, trustline, account, …), which is what
+    /// balance snapshots for Stellar Asset Contracts need: a `G…` holder's
+    /// balance lives in a trustline (or the account entry for native XLM), while
+    /// a `C…` holder's balance is a `Balance(Address)` contract-data entry (#745).
+    ///
+    /// The returned `Vec` is positionally aligned with `keys`: `None` means the
+    /// entry was absent or could not be decoded. Callers should chunk large
+    /// slices to `MAX_BATCH_KEYS`.
+    pub async fn get_ledger_entries_batch(
+        &self,
+        keys: &[LedgerKey],
+    ) -> anyhow::Result<Vec<Option<LedgerEntryData>>> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Encode all input keys and record their index for matching response entries.
+        let mut key_b64s: Vec<String> = Vec::with_capacity(keys.len());
+        for key in keys {
+            key_b64s.push(
+                key.to_xdr_base64(Limits::none())
+                    .context("encode ledger key")?,
+            );
+        }
+
+        let key_to_idx: std::collections::HashMap<&str, usize> = key_b64s
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.as_str(), i))
+            .collect();
+
+        let result: LedgerEntriesResult = self
+            .call("getLedgerEntries", serde_json::json!({ "keys": key_b64s }))
+            .await?;
+
+        let mut output = vec![None; keys.len()];
+        for item in result.entries.into_iter().flatten() {
+            let data = match LedgerEntryData::from_xdr_base64(&item.xdr, XDR_LEDGER_ENTRY_LIMITS) {
+                Ok(d) => d,
+                Err(e) => {
+                    // An oversized or malformed entry only loses its own slot;
+                    // the other keys in the batch are still returned (#724).
+                    self.record_ledger_entry_decode_error();
+                    tracing::warn!(error = %e, "skipping undecodable ledger entry");
+                    continue;
+                }
+            };
+            // Re-derive the LedgerKey from the returned entry so we can match it
+            // back to its position in the input slice.
+            let entry_key = match &data {
+                LedgerEntryData::ContractData(cd) => LedgerKey::ContractData(LedgerKeyContractData {
+                    contract: cd.contract.clone(),
+                    key: cd.key.clone(),
+                    durability: cd.durability,
+                }),
+                LedgerEntryData::Trustline(tl) => LedgerKey::Trustline(
+                    stellar_xdr::curr::LedgerKeyTrustLine {
+                        account_id: tl.account_id.clone(),
+                        asset: tl.asset.clone(),
+                    },
+                ),
+                LedgerEntryData::Account(acct) => {
+                    LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                        account_id: acct.account_id.clone(),
+                    })
+                }
+                _ => continue,
+            };
+            if let Ok(k) = entry_key.to_xdr_base64(Limits::none()) {
+                if let Some(&idx) = key_to_idx.get(k.as_str()) {
+                    output[idx] = Some(data);
+                }
+            }
+        }
+
+        Ok(output)
+    }
+
     /// Fetch a batch of contract-data entries in a single `getLedgerEntries` call.
     /// The returned `Vec` is positionally aligned with `keys`: `None` means the
     /// entry was absent (e.g. a zero-balance holder whose entry never existed or
