@@ -166,6 +166,12 @@ async fn metrics(State(state): State<MetricsState>, headers: HeaderMap) -> impl 
         "lumenqraph_webhook_deliveries_pruned_total {}\n",
         crate::prune::DELIVERIES_PRUNED.load(Ordering::Relaxed)
     ));
+    body.push_str("# HELP lumenqraph_webhook_pending_expired_total Pending deliveries expired for inactive subscriptions since start\n");
+    body.push_str("# TYPE lumenqraph_webhook_pending_expired_total counter\n");
+    body.push_str(&format!(
+        "lumenqraph_webhook_pending_expired_total {}\n",
+        crate::prune::PENDING_DELIVERIES_EXPIRED.load(Ordering::Relaxed)
+    ));
 
     // Delivery latency and queue age, maintained by the dispatcher worker pool.
     // Emitted unconditionally so slow-subscriber impact stays visible even if

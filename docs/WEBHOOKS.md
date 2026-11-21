@@ -371,11 +371,10 @@ When `RETENTION_LEDGERS` is configured, the indexer periodically prunes old rows
 `events` table in batches. Webhook deliveries reference events, so pruning interacts with the
 delivery queue as follows:
 
-- **Pending deliveries are never pruned away.** The pruner skips any event that still has a
-  `webhook_deliveries` row in `pending` status (including deliveries waiting on retry backoff,
-  and deliveries for subscriptions that are down or auto-disabled). Those events stay in the
-  database until the delivery is resolved, so at-least-once delivery is preserved even if a
-  subscriber is unreachable for longer than the retention window.
+- **Active pending deliveries are never pruned away.** The pruner skips an event while an active,
+  non-auto-disabled subscription has a `pending` delivery for it, including retry backoff. Pending
+  deliveries for paused or auto-disabled subscriptions become `failed` with reason `expired` after
+  `WEBHOOK_PENDING_MAX_AGE` days (7 by default), so abandoned subscriptions cannot pin events forever.
 - **Delivered/failed history is pruned with the event.** Once a delivery is no longer pending
   (`delivered` or `failed`), it no longer blocks pruning. For each batch of out-of-window
   events, the pruner deletes the `delivered`/`failed` delivery rows for those events and then
@@ -475,9 +474,9 @@ Use a tool like [RequestBin](https://requestbin.com/) or [Webhook.cool](https://
 2. Verify the webhook URL is reachable
 3. Check for network/firewall issues
 4. Monitor `webhook_deliveries` for timeout or DNS errors in `last_error`
-5. If a subscription is down for a long time, pending deliveries will keep their source events
-   from being pruned (see [Retention and Event Pruning](#retention-and-event-pruning)). Resolve
-   or delete the stuck deliveries to allow retention to proceed.
+5. If a subscription is down for a long time, pause or auto-disable it. Its pending deliveries
+   expire after `WEBHOOK_PENDING_MAX_AGE` days, allowing source-event retention to proceed (see
+   [Retention and Event Pruning](#retention-and-event-pruning)).
 
 ## See Also
 

@@ -103,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(prune::run_pruner(
         pool.clone(),
         config.delivery_retention_days,
+        config.pending_max_age_days,
         shutdown.clone(),
     ));
 

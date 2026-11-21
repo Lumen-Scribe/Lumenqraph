@@ -17,9 +17,9 @@
 //! points at it. Webhooks promise at-least-once delivery with retries and
 //! redrive, so the policy is:
 //!
-//! - An event that still has a *pending* delivery is skipped by the pruner,
-//!   however far outside the window it is. A subscriber that is down,
-//!   auto-disabled, or backlogged therefore never silently loses events.
+//! - An event that still has a *pending* delivery for an active,
+//!   non-auto-disabled subscription is skipped by the pruner, however far
+//!   outside the window it is.
 //! - An event whose deliveries are all *delivered* or *failed* is prunable: the
 //!   pruner deletes those delivery rows itself, in the same transaction as the
 //!   event, and counts them in the
@@ -37,8 +37,6 @@
 //! Each table is pruned independently: a failure on one (e.g. a lock timeout)
 //! is logged and the others still run. `prune` only returns `Err` if every
 //! table's pass failed.
-=======
-
 use sqlx::PgPool;
 use tracing::{info, warn};
 
@@ -167,11 +165,19 @@ async fn prune_events(pool: &PgPool, cutoff: i64) -> anyhow::Result<u64> {
     for _ in 0..MAX_BATCHES {
         let mut tx = pool.begin().await?;
 
-        // Delivered/failed deliveries for out-of-window events are history too:
-        // remove them so the event itself can be deleted under RESTRICT.
+        // Only pending deliveries for active, non-auto-disabled subscriptions
+        // protect their event. Everything else is removable history.
         let dropped = sqlx::query(
             "DELETE FROM webhook_deliveries wd
-              WHERE wd.status <> 'pending'
+              WHERE NOT (
+                    wd.status = 'pending'
+                    AND EXISTS (
+                        SELECT 1 FROM webhook_subscriptions ws
+                         WHERE ws.id = wd.subscription_id
+                           AND ws.active
+                           AND ws.auto_disabled_at IS NULL
+                    )
+                )
                 AND wd.event_id IN (
                     SELECT e.event_id FROM events e
                      WHERE e.ledger < $1
@@ -189,8 +195,13 @@ async fn prune_events(pool: &PgPool, cutoff: i64) -> anyhow::Result<u64> {
                  SELECT e.event_id FROM events e
                   WHERE e.ledger < $1
                     AND NOT EXISTS (
-                        SELECT 1 FROM webhook_deliveries wd
-                         WHERE wd.event_id = e.event_id AND wd.status = 'pending'
+                        SELECT 1
+                          FROM webhook_deliveries wd
+                          JOIN webhook_subscriptions ws ON ws.id = wd.subscription_id
+                         WHERE wd.event_id = e.event_id
+                           AND wd.status = 'pending'
+                           AND ws.active
+                           AND ws.auto_disabled_at IS NULL
                     )
                   ORDER BY e.ledger
                   LIMIT $2
@@ -261,8 +272,11 @@ pub async fn prune_spec_versions(
                     )
                     AND NOT EXISTS (
                         SELECT 1 FROM webhook_deliveries wd
+                          JOIN webhook_subscriptions ws ON ws.id = wd.subscription_id
                          WHERE wd.upgrade_id = csv.id
                            AND wd.status = 'pending'
+                           AND ws.active
+                           AND ws.auto_disabled_at IS NULL
                     )
                   LIMIT $2
              )",
@@ -291,8 +305,11 @@ pub async fn prune_spec_versions(
                     )
                     AND NOT EXISTS (
                         SELECT 1 FROM webhook_deliveries wd
+                          JOIN webhook_subscriptions ws ON ws.id = wd.subscription_id
                          WHERE wd.upgrade_id = csv.id
                            AND wd.status = 'pending'
+                           AND ws.active
+                           AND ws.auto_disabled_at IS NULL
                     )
                   LIMIT $2
              )",
@@ -570,12 +587,23 @@ mod tests {
     // Issue #601: retention must not drop pending webhook deliveries
     // -------------------------------------------------------------------------
 
-    async fn insert_delivery(pool: &PgPool, id: &str, event_id: &str, status: &str) {
+    async fn insert_delivery(pool: &PgPool, _id: &str, event_id: &str, status: &str) {
+        let subscription_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000751")
+            .expect("valid fixture UUID");
         sqlx::query(
-            "INSERT INTO webhook_deliveries (delivery_id, subscription_id, event_id, status)
-             VALUES ($1, 'sub1', $2, $3)",
+            "INSERT INTO webhook_subscriptions (id, url, secret)
+             VALUES ($1, 'https://example.test/hook', 'plain')
+             ON CONFLICT (id) DO NOTHING",
         )
-        .bind(id)
+        .bind(subscription_id)
+        .execute(pool)
+        .await
+        .expect("insert subscription");
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (subscription_id, event_id, status)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(subscription_id)
         .bind(event_id)
         .bind(status)
         .execute(pool)
@@ -620,6 +648,27 @@ mod tests {
             .await,
             1,
             "the surviving delivery must still be pending"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs postgres"]
+    async fn pruning_drops_pending_deliveries_for_inactive_subscriptions() {
+        let pool = fixture().await;
+        insert_event(&pool, "inactive_evt", 100).await;
+        insert_delivery(&pool, "d1", "inactive_evt", "pending").await;
+        sqlx::query("UPDATE webhook_subscriptions SET active = false, auto_disabled_at = now()")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let deleted = prune(&pool, 1000, 500).await.expect("prune");
+
+        assert_eq!(deleted, 1);
+        assert_eq!(count(&pool, "SELECT count(*) FROM events").await, 0);
+        assert_eq!(
+            count(&pool, "SELECT count(*) FROM webhook_deliveries").await,
+            0
         );
     }
 

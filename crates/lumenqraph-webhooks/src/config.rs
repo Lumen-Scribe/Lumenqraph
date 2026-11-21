@@ -31,6 +31,8 @@ pub struct Config {
     pub encryption_key: String,
     /// Days to keep delivered/failed `webhook_deliveries` rows; `0` disables pruning.
     pub delivery_retention_days: i64,
+    /// Days an inactive subscription may keep a delivery pending; `0` disables expiry.
+    pub pending_max_age_days: i64,
 }
 
 impl std::fmt::Debug for Config {
@@ -53,6 +55,7 @@ impl std::fmt::Debug for Config {
             .field("db_connect_retries", &self.db_connect_retries)
             .field("encryption_key", &"[REDACTED]")
             .field("delivery_retention_days", &self.delivery_retention_days)
+            .field("pending_max_age_days", &self.pending_max_age_days)
             .finish()
     }
 }
@@ -98,6 +101,10 @@ impl Config {
                 "WEBHOOK_DELIVERY_RETENTION_DAYS",
                 crate::prune::DEFAULT_RETENTION_DAYS,
             )?,
+            pending_max_age_days: parse(
+                "WEBHOOK_PENDING_MAX_AGE",
+                crate::prune::DEFAULT_PENDING_MAX_AGE_DAYS,
+            )?,
         })
     }
 
@@ -122,6 +129,7 @@ impl Config {
             db_connect_retries: 1,
             encryption_key: "test-key".to_string(),
             delivery_retention_days: 0,
+            pending_max_age_days: 7,
         }
     }
 
