@@ -27,20 +27,29 @@ groups:
             The indexer is significantly behind. Immediate investigation required.
             Check database connectivity, RPC node status, and indexer health.
 
-      # Indexer stalled alert
+      # Indexer stalled alert. Fires when nothing was ingested while lag exists,
+      # OR when the cursor has not ADVANCED for 5+ minutes — a poller whose every
+      # cycle fails keeps its heartbeat (`seconds_since_update`) fresh via counter
+      # writes, but `seconds_since_progress` (progress_at) keeps growing (#756, #757).
       - alert: LumenqraphIndexerStalled
         expr: |
-          increase(lumenqraph_indexer_events_ingested_total[5m]) == 0
-          and
-          on(instance) lumenqraph_indexer_lag_ledgers > 0
+          (
+            increase(lumenqraph_indexer_events_ingested_total[5m]) == 0
+            and
+            on(instance) lumenqraph_indexer_lag_ledgers > 0
+          )
+          or
+          lumenqraph_indexer_seconds_since_progress > 300
         for: 5m
         labels:
           severity: critical
         annotations:
           summary: "Lumenqraph indexer appears stalled"
           description: |
-            No new events ingested in the last 5 minutes, but lag exists.
-            Indexer process may have crashed or be hanging.
+            No new events ingested in the last 5 minutes while lag exists, or the
+            cursor has not advanced in 5+ minutes (seconds_since_progress).
+            Indexer process may have crashed or be hanging — its /health endpoint
+            returns 503 in this state (#756).
             Check indexer logs and process status immediately.
 
       # Error rate alerts

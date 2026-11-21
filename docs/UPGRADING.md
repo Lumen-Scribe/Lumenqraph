@@ -145,6 +145,33 @@ CORS_ALLOWED_ORIGINS=https://yourdapp.com,https://app.yourdapp.com
 CORS_ALLOWED_ORIGINS=*
 ```
 
+#### 6. Indexer `/health` now answers **503 while degraded** (#756)
+
+The indexer's own `/health` endpoint (on `INDEXER_HTTP_BIND_ADDR`) previously
+always answered `200 OK` and only put `"status": "degraded"` in the JSON body,
+so Docker `HEALTHCHECK`, Kubernetes probes and Fly checks could never detect a
+stuck indexer. It now answers `503 Service Unavailable` when the cursor has not
+advanced for `HEALTH_MAX_STALE_SECS`, when the ledger lag reaches
+`HEALTH_MAX_LAG_LEDGERS`, when pending webhook deliveries reach
+`HEALTH_MAX_PENDING_DELIVERIES`, or when the database is unreachable. The JSON
+body is unchanged (plus new `seconds_since_progress`, `pending_deliveries` and
+`degraded_reasons` fields).
+
+Freshness is measured from the new `indexer_cursor.progress_at` column (set only
+by real progress writes), not from `updated_at`, which every error-counter write
+bumps — so a poller whose every cycle fails is now correctly reported as stuck
+(#757).
+
+New endpoints on the same listener: `/livez` (always 200 while the process is
+up — point pure liveness checks here) and `/readyz` (503 while degraded, always
+strict). The `healthcheck` subcommand (`lumenqraph-indexer healthcheck`, already
+referenced by `docker-compose.full.yml`) probes `/health` and exits non-zero on
+503.
+
+If an orchestrator must keep the old behaviour for `/health`, set
+`INDEXER_HEALTH_STRICT=false` — but prefer fixing the probe to handle 503, since
+503-on-degraded is what lets it restart a stuck indexer.
+
 ---
 
 ### New environment variables
@@ -167,8 +194,10 @@ All new variables have safe defaults and are **optional** unless marked
 | `RPC_TIMEOUT_SECS` | `30` | HTTP timeout for all outbound RPC calls (indexer + API). |
 | `READYZ_LAG_THRESHOLD` | `100` | Max ledger lag for `/readyz` to return `200`. |
 | `READYZ_MAX_AGE_SECS` | `120` | Max cursor age (seconds) for `/readyz` to return `200`. |
-| `HEALTH_MAX_LAG_LEDGERS` | `100` | Max ledger lag for `/health` to show `"ok"` status. |
-| `HEALTH_MAX_STALE_SECS` | `120` | Max cursor age for `/health` to show `"ok"` status. |
+| `HEALTH_MAX_LAG_LEDGERS` | `100` | Max ledger lag for the indexer's `/health`/`/readyz` to return `200`. |
+| `HEALTH_MAX_STALE_SECS` | `120` | Max seconds since the cursor last advanced (`progress_at`) for the indexer's `/health`/`/readyz` to return `200` (#756, #757). |
+| `HEALTH_MAX_PENDING_DELIVERIES` | `5000` | Pending webhook deliveries (queue depth) at which the indexer's `/health`/`/readyz` return `503`. |
+| `INDEXER_HEALTH_STRICT` | `true` | When `false`, the indexer's `/health` keeps the legacy always-`200` behaviour; `/readyz` stays strict (#756). |
 | `ENRICHMENT_WARN_THRESHOLD` | `0.5` | Warn if >N fraction of events fail enrichment in a poll cycle. `0.0` disables. |
 | `SPEC_CACHE_MAX_ENTRIES` | `2000` | In-memory spec cache size. Reduce if memory is constrained. |
 | `SPEC_VERSION_RETENTION` | `0` | Min interface versions to keep per contract when pruning. `0` = follow `RETENTION_LEDGERS`. |

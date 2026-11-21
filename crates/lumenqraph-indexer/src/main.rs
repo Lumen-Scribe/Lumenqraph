@@ -8,6 +8,7 @@
 //!   lumenqraph-indexer recover-gaps             # replay all recorded missed ranges
 //!   lumenqraph-indexer reenrich [--contract C] [--force]
 //!   lumenqraph-indexer inspect <CONTRACT>       # print a contract's on-chain interface
+//!   lumenqraph-indexer healthcheck               # GET own /health, exit 0 on 2xx (Docker HEALTHCHECK)
 //!
 //! `--help` and `--version` are handled by clap before any environment config
 //! is read, so they work without `DATABASE_URL` or any RPC settings.
@@ -119,6 +120,13 @@ enum Command {
     Inspect { contract_id: String },
     /// Run database migrations and exit.
     Migrate,
+    /// Container health probe (#469): GET this process's own `/health` on
+    /// `INDEXER_HTTP_BIND_ADDR` and exit 0 on a 2xx response, 1 otherwise.
+    /// `/health` is 503 while the indexer is degraded (#756), so Docker marks
+    /// a stuck indexer unhealthy. Runs before any config/DB/RPC setup, which
+    /// is what `docker-compose.full.yml`'s `lumenqraph-indexer healthcheck`
+    /// healthcheck relies on.
+    Healthcheck,
 }
 
 /// Holds the session-level Postgres advisory lock that makes exactly one
@@ -331,6 +339,16 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     let command = cli.command.unwrap_or(Command::Run);
 
+    // `healthcheck` runs before any config, database or RPC work so the
+    // container probe works on a bare environment (#469): it GETs our own
+    // /health on the HTTP bind address and exits 0 on 2xx, 1 otherwise.
+    // /health is 503 while degraded (#756), so orchestrators see a stuck
+    // indexer as unhealthy.
+    if matches!(command, Command::Healthcheck) {
+        let _ = dotenvy::dotenv();
+        lumenqraph_core::healthcheck::run_and_exit(&http_bind_addr(), "/health");
+    }
+
     let _ = dotenvy::dotenv();
     lumenqraph_core::telemetry::init_tracing();
 
@@ -439,7 +457,9 @@ async fn main() -> anyhow::Result<()> {
             http::start_http_server(Arc::new(pool.clone()), Arc::clone(&specs), &bind_addr).await?;
             poller::run(pool, rpc, config, specs).await
         }
-        Command::Migrate | Command::Inspect { .. } => unreachable!("handled above"),
+        Command::Migrate | Command::Inspect { .. } | Command::Healthcheck => {
+            unreachable!("handled above")
+        }
     }
 }
 

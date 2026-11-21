@@ -64,6 +64,22 @@ pub async fn read_last_processed(pool: &PgPool) -> anyhow::Result<Option<i64>> {
     Ok(read_snapshot(pool).await?.last_processed)
 }
 
+/// When the cursor last advanced (`progress_at`), or `None` if it never has.
+///
+/// Health freshness (`/health`, `/readyz`, the stalled alert) is computed from
+/// this timestamp, not from `updated_at`: every counter write bumps
+/// `updated_at` without indexing anything, and must not make a stuck poller
+/// look fresh (#756, #757). Only [`write_progress`] sets it.
+pub async fn read_progress_at(
+    pool: &PgPool,
+) -> anyhow::Result<Option<chrono::DateTime<chrono::Utc>>> {
+    let row: Option<(Option<chrono::DateTime<chrono::Utc>>,)> =
+        sqlx::query_as("SELECT progress_at FROM indexer_cursor WHERE id = 1")
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.and_then(|(progress_at,)| progress_at))
+}
+
 /// Pin the Soroban network the database holds data for (#714).
 ///
 /// The first run stores `live` in `indexer_cursor.network_passphrase`. Later
@@ -109,10 +125,12 @@ pub async fn pin_network_passphrase(
         to = %live,
         "ALLOW_NETWORK_CHANGE is set: re-pinning the database to a new network passphrase"
     );
-    sqlx::query("UPDATE indexer_cursor SET network_passphrase = $1, updated_at = now() WHERE id = 1")
-        .bind(live)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE indexer_cursor SET network_passphrase = $1, updated_at = now() WHERE id = 1",
+    )
+    .bind(live)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -121,6 +139,11 @@ pub async fn pin_network_passphrase(
 ///
 /// The write commits only if the version is still `expected_version`, the value
 /// the cycle read with [`read_snapshot`]. The position never moves backwards.
+///
+/// This is the ONLY writer of `progress_at` (besides the one-time migration
+/// backfill): `progress_at` marks "the cursor actually advanced", so health
+/// freshness computed from it cannot be faked by counter writes like
+/// `incr_errors` that only bump `updated_at` (#756, #757).
 pub async fn write_progress(
     pool: &PgPool,
     expected_version: i64,
@@ -134,7 +157,8 @@ pub async fn write_progress(
              chain_tip_ledger      = $2,
              events_ingested_total = events_ingested_total + $3,
              version               = version + 1,
-             updated_at            = now()
+             updated_at            = now(),
+             progress_at           = now()
          WHERE id = 1 AND version = $4",
     )
     .bind(last_processed)
@@ -146,7 +170,10 @@ pub async fn write_progress(
     .rows_affected();
 
     if rows_affected == 0 {
-        warn!(expected_version, "cursor update rejected: version changed since this cycle read it");
+        warn!(
+            expected_version,
+            "cursor update rejected: version changed since this cycle read it"
+        );
         return Err(CursorConflict { expected_version }.into());
     }
     Ok(())
@@ -163,7 +190,14 @@ pub async fn write_progress_locked(
     ingested_delta: u64,
 ) -> anyhow::Result<()> {
     let snapshot = read_snapshot(pool).await?;
-    write_progress(pool, snapshot.version, last_processed, chain_tip, ingested_delta).await
+    write_progress(
+        pool,
+        snapshot.version,
+        last_processed,
+        chain_tip,
+        ingested_delta,
+    )
+    .await
 }
 
 /// Record that a poll cycle failed, for the error-rate metric.
@@ -277,7 +311,13 @@ mod db_tests {
     async fn fresh_database_reads_as_not_started() {
         let db = new_db().await;
         let snap = read_snapshot(db.pool()).await.unwrap();
-        assert_eq!(snap, CursorSnapshot { last_processed: None, version: 0 });
+        assert_eq!(
+            snap,
+            CursorSnapshot {
+                last_processed: None,
+                version: 0
+            }
+        );
     }
 
     /// Counter write first, then progress: the progress write must succeed and
@@ -291,7 +331,9 @@ mod db_tests {
         assert_eq!(read_last_processed(db.pool()).await.unwrap(), None);
 
         let snap = read_snapshot(db.pool()).await.unwrap();
-        write_progress(db.pool(), snap.version, 1000, 1000, 5).await.unwrap();
+        write_progress(db.pool(), snap.version, 1000, 1000, 5)
+            .await
+            .unwrap();
         assert_eq!(read_last_processed(db.pool()).await.unwrap(), Some(1000));
     }
 
@@ -302,7 +344,9 @@ mod db_tests {
     async fn progress_before_counter_keeps_the_position() {
         let db = new_db().await;
         let snap = read_snapshot(db.pool()).await.unwrap();
-        write_progress(db.pool(), snap.version, 1000, 1000, 0).await.unwrap();
+        write_progress(db.pool(), snap.version, 1000, 1000, 0)
+            .await
+            .unwrap();
 
         incr_errors(db.pool()).await.unwrap();
         track_enrichment(db.pool(), 3, 1).await.unwrap();
@@ -317,7 +361,9 @@ mod db_tests {
         let db = new_db().await;
         let stale = read_snapshot(db.pool()).await.unwrap();
 
-        write_progress(db.pool(), stale.version, 1000, 1000, 0).await.unwrap();
+        write_progress(db.pool(), stale.version, 1000, 1000, 0)
+            .await
+            .unwrap();
 
         let err = write_progress(db.pool(), stale.version, 1100, 1100, 0)
             .await
@@ -333,10 +379,14 @@ mod db_tests {
     async fn cursor_never_moves_backwards() {
         let db = new_db().await;
         let snap = read_snapshot(db.pool()).await.unwrap();
-        write_progress(db.pool(), snap.version, 1200, 1200, 0).await.unwrap();
+        write_progress(db.pool(), snap.version, 1200, 1200, 0)
+            .await
+            .unwrap();
 
         let snap = read_snapshot(db.pool()).await.unwrap();
-        write_progress(db.pool(), snap.version, 1150, 1150, 0).await.unwrap();
+        write_progress(db.pool(), snap.version, 1150, 1150, 0)
+            .await
+            .unwrap();
 
         assert_eq!(read_last_processed(db.pool()).await.unwrap(), Some(1200));
     }
@@ -350,6 +400,55 @@ mod db_tests {
         write_progress_locked(db.pool(), 500, 500, 0).await.unwrap();
         write_progress_locked(db.pool(), 700, 700, 0).await.unwrap();
         assert_eq!(read_last_processed(db.pool()).await.unwrap(), Some(700));
+    }
+
+    /// Counter writes (error tracking, RPC metrics, ...) bump `updated_at` but
+    /// must NOT touch `progress_at`; only a real progress write may. Otherwise
+    /// a poller whose every cycle fails looks fresh forever (#756, #757).
+    // Multi-thread: `TestDb::drop` blocks its thread while it cleans up the schema.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn counter_writes_do_not_bump_progress_at() {
+        let db = new_db().await;
+
+        // Fresh database: the seeded row has never progressed.
+        assert_eq!(read_progress_at(db.pool()).await.unwrap(), None);
+
+        // Failed cycles: counters move, progress does not.
+        incr_errors(db.pool()).await.unwrap();
+        set_consecutive_errors(db.pool(), 5).await.unwrap();
+        track_rpc_call(db.pool(), 10, 3, 1, 0).await.unwrap();
+        track_enrichment(db.pool(), 1, 2).await.unwrap();
+        track_timestamp_parse_error(db.pool(), 1).await.unwrap();
+        assert_eq!(
+            read_progress_at(db.pool()).await.unwrap(),
+            None,
+            "counter writes must not fabricate progress (#757)"
+        );
+
+        // A real progress write sets progress_at.
+        let snap = read_snapshot(db.pool()).await.unwrap();
+        write_progress(db.pool(), snap.version, 1000, 1000, 7)
+            .await
+            .unwrap();
+        let first = read_progress_at(db.pool())
+            .await
+            .unwrap()
+            .expect("progress write must set progress_at");
+
+        // Later counter writes leave progress_at exactly where it was.
+        incr_errors(db.pool()).await.unwrap();
+        set_consecutive_errors(db.pool(), 6).await.unwrap();
+        let after = read_progress_at(db.pool()).await.unwrap().unwrap();
+        assert_eq!(first, after, "counter writes must not touch progress_at");
+
+        // A further progress write moves it forward (or at least not back).
+        let snap = read_snapshot(db.pool()).await.unwrap();
+        write_progress(db.pool(), snap.version, 1100, 1100, 0)
+            .await
+            .unwrap();
+        let later = read_progress_at(db.pool()).await.unwrap().unwrap();
+        assert!(later >= first, "progress_at must not move backwards");
     }
 }
 
@@ -370,7 +469,11 @@ mod network_pin_tests {
             .or_else(|_| std::env::var("DATABASE_URL"))
             .expect("TEST_DATABASE_URL or DATABASE_URL must point at a test Postgres");
         let schema = format!("test_{}", uuid::Uuid::new_v4().simple());
-        let admin = PgPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
         sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
             .execute(&admin)
             .await
@@ -421,9 +524,15 @@ mod network_pin_tests {
     #[ignore = "needs postgres"]
     async fn first_run_stores_passphrase_and_later_runs_must_match() {
         let pool = fresh_pool().await;
-        assert_eq!(stored(&pool).await, None, "fresh database has nothing pinned");
+        assert_eq!(
+            stored(&pool).await,
+            None,
+            "fresh database has nothing pinned"
+        );
 
-        pin_network_passphrase(&pool, PUBLIC, false).await.expect("first run pins");
+        pin_network_passphrase(&pool, PUBLIC, false)
+            .await
+            .expect("first run pins");
         assert_eq!(stored(&pool).await.as_deref(), Some(PUBLIC));
 
         pin_network_passphrase(&pool, PUBLIC, false)

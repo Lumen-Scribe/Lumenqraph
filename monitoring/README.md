@@ -115,7 +115,8 @@ Exposed by the `lumenqraph-webhooks` service on its own `/metrics` endpoint
 
 ### Critical Alerts
 
-- **IndexerStalled** - No events ingested in 5+ minutes but lag exists
+- **IndexerStalled** - No events ingested in 5+ minutes while lag exists, or the
+  cursor has not advanced (`lumenqraph_indexer_seconds_since_progress`) in 5+ minutes
 - **IndexerLagCritical** - Lag > 500 ledgers for 2+ minutes
 - **LumenqraphWebhookBacklogCritical** - Pending webhook deliveries > 5000 for 5+ minutes
 

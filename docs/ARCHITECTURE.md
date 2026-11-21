@@ -49,9 +49,14 @@ They coordinate only through Postgres — no direct RPC between services.
    event's XDR (`core::xdr`), and writes `events` idempotently (`ON CONFLICT
    (event_id) DO NOTHING`). `transfer` events are projected into
    `token_transfers`. The cursor row also records the chain tip and counters.
+   Its own HTTP listener (`INDEXER_HTTP_BIND_ADDR`) serves `/metrics` plus
+   `/health`, `/livez` and `/readyz`: `/livez` is 200 while the process is up,
+   while `/health` (with `INDEXER_HEALTH_STRICT=true`, the default) and
+   `/readyz` answer 503 when the indexer is degraded — stale cursor, ledger lag
+   or webhook queue depth — so orchestrators can detect a stuck poller (#756).
 2. **API** serves reads (`/contracts`, `/events`, `/transfers`), observability
-   (`/health`, `/metrics`), and webhook management — behind API-key auth +
-   rate limiting on data routes.
+   (`/health`, `/livez`, `/readyz`, `/metrics`), and webhook management — behind
+   API-key auth + rate limiting on data routes.
 3. **Webhooks** streams two sources — new events by monotonic `events.seq`, and
    new contract upgrades by `contract_spec_versions.id` — matches each to active
    subscriptions of the corresponding `kind`, and delivers HMAC-signed payloads
