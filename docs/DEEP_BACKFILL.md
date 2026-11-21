@@ -145,16 +145,13 @@ Any historical ingest provider implements the `HistoricalSource` trait defined i
 
 ```rust
 pub trait HistoricalSource: Send + Sync {
-    /// Collect all events in `[from_ledger, to_ledger]` into `out`.
-    ///
-    /// Implementations should stream data and keep memory bounded.
-    fn collect_range<'a>(
+    /// Stream events without buffering the complete range.
+    fn stream_range<'a>(
         &'a self,
         from_ledger: i64,
         to_ledger: i64,
         contract_ids: &'a [String],
-        out: &'a mut Vec<HistoricalEvent>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>;
+    ) -> BoxStream<'a, anyhow::Result<HistoricalEvent>>;
 }
 ```
 
@@ -177,7 +174,7 @@ pub struct HistoricalEvent {
 }
 ```
 
-- **Ascending order:** Events returned in `out` must be ordered by ledger sequence in ascending order.
+- **Ascending order:** Streamed events must be ordered by ledger sequence in ascending order.
 - **Contract filtering:** When `contract_ids` is non-empty, only events belonging to one of the specified contracts should be collected. When empty, all contract events are collected.
 - **Idempotency:** Inserts into Postgres are executed with `ON CONFLICT (event_id) DO NOTHING`. Even if a source returns duplicate events or overlaps with the live poller, storage is idempotent.
 
@@ -188,9 +185,9 @@ To implement an archive source (e.g. Stellar Core DB, BigQuery, AWS S3 / GCS buc
 1. **Define your source struct:**
    Store configuration such as database connection pools, HTTP client endpoints, or credentials.
 2. **Implement `HistoricalSource`:**
-   In `collect_range`, query your storage layer for ledgers between `from_ledger` and `to_ledger`.
+   In `stream_range`, query your storage layer for ledgers between `from_ledger` and `to_ledger`.
 3. **Handle Pagination and Memory:**
-   When reading from APIs or large dumps, iterate through pages or record streams using cursors, appending matching events to `out`. Stop once `to_ledger` is reached.
+   Yield pages or records incrementally. Do not collect the complete requested range before returning.
 4. **Register in CLI:**
    Add your source variant to `run_deep_backfill` in `crates/lumenqraph-indexer/src/main.rs`.
 
@@ -280,14 +277,10 @@ Both formats are auto-detected per line (by the presence of the `"events"` key).
 
 ## Known limitations
 
-- The deep backfill path doesn't fetch contract specs from RPC (RPC is not
-  available in data-lake mode). Events are still decoded (XDR → JSON) but the
-  `enriched` field (named/typed record from the on-chain spec) will be `null`
-  for contracts whose specs weren't already loaded by the live poller.
-  Run the live poller for at least one cycle before starting the deep backfill
-  to warm the spec cache for tracked contracts, or run the deep backfill first
-  and then allow the poller to enrich on next encounter.
-- Large exports (millions of ledgers) may use significant memory during the
-  collect phase. A future improvement will stream batches to Postgres.
+- Deep backfill does not require archive RPC access. It loads the persisted
+  `contract_spec_versions` entry in force at each event ledger, falling back to
+  the current `contract_specs` row when no historical version is available.
+- Archive input is streamed and flushed every 1,000 events, so memory remains
+  bounded independently of the requested ledger range.
 - Compressed inputs (`.gz`) are not decompressed automatically — decompress
   first with `gzip -d` or pipe through `gunzip`.

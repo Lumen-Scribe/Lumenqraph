@@ -1793,6 +1793,7 @@ dependencies = [
  "clap",
  "criterion",
  "dotenvy",
+ "futures",
  "hex",
  "hmac",
  "lru",

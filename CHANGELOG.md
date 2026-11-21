@@ -31,6 +31,8 @@ Breaking changes will be documented in the changelog with migration guidance whe
 
 ### Fixed
 
+- Deep backfill now streams archive events in bounded batches, enriches from
+  persisted ledger-versioned specs, and surfaces malformed input (#754).
 - Python SDK: `Retry-After` is honoured on every retry, backoff uses full jitter,
   and cancelling an async call stops further retries (#634).
 - Docker image: the explorer bundle (`app.js`) is built in the image, so the

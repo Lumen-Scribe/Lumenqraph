@@ -36,6 +36,7 @@ sha2.workspace = true
 uuid.workspace = true
 lru.workspace = true
 axum.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 lumenqraph-core = { workspace = true, features = ["db-test"] }

@@ -11,8 +11,8 @@
 //! # Architecture
 //!
 //! A [`HistoricalSource`] trait abstracts the source. Each implementation
-//! provides an async `collect_range` method that reads events in ascending
-//! ledger order and passes them to a callback. Because
+//! provides a `stream_range` method that yields events in ascending ledger
+//! order without accumulating the requested range in memory. Because
 //! [`crate::store::insert_events`] is idempotent (`ON CONFLICT DO NOTHING` on
 //! `event_id`), the seam between deep-backfill and live-tail is overlap-safe:
 //! running the live poller and a deep backfill concurrently, or restarting a
@@ -32,15 +32,14 @@
 //! struct MySource { /* … */ }
 //!
 //! impl HistoricalSource for MySource {
-//!     async fn collect_range(
+//!     fn stream_range(
 //!         &self,
 //!         from_ledger: i64,
 //!         to_ledger: i64,
 //!         contract_ids: &[String],
-//!         out: &mut Vec<HistoricalEvent>,
-//!     ) -> anyhow::Result<()> {
-//!         // fill `out` in ascending ledger order …
-//!         Ok(())
+//!     ) -> BoxStream<'_, anyhow::Result<HistoricalEvent>> {
+//!         // yield events in ascending ledger order …
+//!         todo!()
 //!     }
 //! }
 //! ```
@@ -61,19 +60,22 @@
 //!
 //! See `docs/DEEP_BACKFILL.md` for the full integration guide.
 
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
+use futures::stream::{self, BoxStream};
+use futures::StreamExt;
 use serde::Deserialize;
 use sqlx::PgPool;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tracing::{debug, info, warn};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader, Lines};
+use tracing::{debug, info};
 
-use lumenqraph_core::{EventType, NewEvent};
+use lumenqraph_core::{ContractSpec, EventType, NewEvent};
 
 use crate::config::Config;
-use crate::specs::SpecCache;
 use crate::store;
 
 // ---------------------------------------------------------------------------
@@ -112,21 +114,16 @@ fn default_true() -> bool {
 
 /// Pluggable historical data source.
 ///
-/// Implementations must fill `out` with events in `[from_ledger, to_ledger]`
-/// inclusive, in **ascending** ledger order. Passing an empty `contract_ids`
-/// slice means "all contracts".
+/// Implementations yield events in `[from_ledger, to_ledger]` inclusive, in
+/// **ascending** ledger order. Passing an empty `contract_ids` slice means
+/// "all contracts". Sources must not buffer the full range.
 pub trait HistoricalSource: Send + Sync {
-    /// Collect all events in `[from_ledger, to_ledger]` into `out`.
-    ///
-    /// Implementations should stream data and keep memory bounded. The runner
-    /// calls this once per source and processes the batch in chunks.
-    fn collect_range<'a>(
+    fn stream_range<'a>(
         &'a self,
         from_ledger: i64,
         to_ledger: i64,
         contract_ids: &'a [String],
-        out: &'a mut Vec<HistoricalEvent>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>;
+    ) -> BoxStream<'a, anyhow::Result<HistoricalEvent>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -237,23 +234,30 @@ impl GalexieSource {
         if json.get("events").is_some() {
             let env: GalexieEnvelope =
                 serde_json::from_value(json).context("deserialize ledger envelope")?;
-            let close_time = env
-                .ledger_close_time
-                .as_deref()
-                .and_then(|s| s.parse::<DateTime<Utc>>().ok())
-                .unwrap_or_else(Utc::now);
+            let close_time = match env.ledger_close_time.as_deref() {
+                Some(value) => value
+                    .parse::<DateTime<Utc>>()
+                    .context("invalid ledger_close_time")?,
+                None => Utc::now(),
+            };
             let events = env.events.unwrap_or_default();
-            return Ok(events
+            return events
                 .into_iter()
-                .filter_map(|e| {
-                    let eid = e.event_id.or(e.id)?;
-                    let cid = e.contract_id?;
+                .enumerate()
+                .map(|(index, e)| {
+                    let eid = e
+                        .event_id
+                        .or(e.id)
+                        .with_context(|| format!("event {index} missing id / event_id"))?;
+                    let cid = e
+                        .contract_id
+                        .with_context(|| format!("event {index} missing contract_id"))?;
                     let pg = if e.paging_token.is_empty() {
                         eid.clone()
                     } else {
                         e.paging_token
                     };
-                    Some(HistoricalEvent {
+                    Ok(HistoricalEvent {
                         event_id: eid,
                         contract_id: cid,
                         ledger: env.ledger,
@@ -266,7 +270,7 @@ impl GalexieSource {
                         paging_token: pg,
                     })
                 })
-                .collect());
+                .collect();
         }
 
         // Flat per-event record.
@@ -280,11 +284,12 @@ impl GalexieSource {
             .contract_id
             .context("event record missing contract_id")?;
         let ledger = flat.ledger.context("event record missing ledger")?;
-        let close_time = flat
-            .ledger_closed_at
-            .as_deref()
-            .and_then(|s| s.parse::<DateTime<Utc>>().ok())
-            .unwrap_or_else(Utc::now);
+        let close_time = match flat.ledger_closed_at.as_deref() {
+            Some(value) => value
+                .parse::<DateTime<Utc>>()
+                .context("invalid ledger_closed_at")?,
+            None => Utc::now(),
+        };
         let pg = if flat.paging_token.is_empty() {
             eid.clone()
         } else {
@@ -306,60 +311,87 @@ impl GalexieSource {
 }
 
 impl HistoricalSource for GalexieSource {
-    fn collect_range<'a>(
+    fn stream_range<'a>(
         &'a self,
         from_ledger: i64,
         to_ledger: i64,
         contract_ids: &'a [String],
-        out: &'a mut Vec<HistoricalEvent>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            for path in &self.inputs {
-                let file: Box<dyn tokio::io::AsyncRead + Send + Unpin> =
-                    if path.to_str() == Some("-") {
+    ) -> BoxStream<'a, anyhow::Result<HistoricalEvent>> {
+        type Reader = Lines<BufReader<Box<dyn AsyncRead + Send + Unpin>>>;
+        struct State {
+            paths: Vec<PathBuf>,
+            path_index: usize,
+            reader: Option<Reader>,
+            line_number: usize,
+            pending: VecDeque<HistoricalEvent>,
+            contracts: HashSet<String>,
+        }
+
+        let state = State {
+            paths: self.inputs.clone(),
+            path_index: 0,
+            reader: None,
+            line_number: 0,
+            pending: VecDeque::new(),
+            contracts: contract_ids.iter().cloned().collect(),
+        };
+
+        stream::try_unfold(state, move |mut state| async move {
+            loop {
+                if let Some(event) = state.pending.pop_front() {
+                    return Ok(Some((event, state)));
+                }
+
+                if state.reader.is_none() {
+                    let Some(path) = state.paths.get(state.path_index).cloned() else {
+                        return Ok(None);
+                    };
+                    state.path_index += 1;
+                    state.line_number = 0;
+                    let input: Box<dyn AsyncRead + Send + Unpin> = if path.to_str() == Some("-") {
                         Box::new(tokio::io::stdin())
                     } else {
                         Box::new(
-                            tokio::fs::File::open(path)
+                            tokio::fs::File::open(&path)
                                 .await
                                 .with_context(|| format!("cannot open {}", path.display()))?,
                         )
                     };
-
-                let reader = BufReader::new(file);
-                let mut lines = reader.lines();
-
-                while let Some(line) = lines.next_line().await? {
-                    let line = line.trim().to_string();
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
-                    }
-
-                    let parsed = match Self::parse_line(&line) {
-                        Ok(evs) => evs,
-                        Err(e) => {
-                            warn!(
-                                error = %e,
-                                preview = &line[..line.len().min(80)],
-                                "skipping unparseable line"
-                            );
-                            continue;
-                        }
-                    };
-
-                    for ev in parsed {
-                        if ev.ledger < from_ledger || ev.ledger > to_ledger {
-                            continue;
-                        }
-                        if !contract_ids.is_empty() && !contract_ids.contains(&ev.contract_id) {
-                            continue;
-                        }
-                        out.push(ev);
-                    }
+                    state.reader = Some(BufReader::new(input).lines());
                 }
+
+                let line = state
+                    .reader
+                    .as_mut()
+                    .expect("reader initialized")
+                    .next_line()
+                    .await?;
+                let Some(line) = line else {
+                    state.reader = None;
+                    continue;
+                };
+                state.line_number += 1;
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+
+                let events = GalexieSource::parse_line(line).with_context(|| {
+                    format!("invalid historical record at line {}", state.line_number)
+                })?;
+                let filtered: Vec<_> = events
+                    .into_iter()
+                    .filter(|event| {
+                        event.ledger >= from_ledger
+                            && event.ledger <= to_ledger
+                            && (state.contracts.is_empty()
+                                || state.contracts.contains(&event.contract_id))
+                    })
+                    .collect();
+                state.pending.extend(filtered);
             }
-            Ok(())
         })
+        .boxed()
     }
 }
 
@@ -382,7 +414,7 @@ impl HistoricalSource for GalexieSource {
 ///
 /// Rather than loading the entire input into a single `Vec<HistoricalEvent>`
 /// before writing, events are processed in configurable batches (default 1000)
-/// via the [`BatchingSource`] wrapper. The memory footprint is `O(batch_size)`
+/// directly from the source stream. The memory footprint is `O(batch_size)`
 /// regardless of export file size, making this safe on constrained instances
 /// (e.g. Render free tier at 512 MB RAM).
 ///
@@ -401,8 +433,6 @@ pub async fn run(
     to_ledger: Option<i64>,
 ) -> anyhow::Result<()> {
     let to = to_ledger.unwrap_or(i64::MAX);
-    let specs = SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
-
     info!(
         from = from_ledger,
         to = if to == i64::MAX {
@@ -413,76 +443,78 @@ pub async fn run(
         "starting deep backfill"
     );
 
-    // Process the source in streaming batches to keep memory bounded regardless
-    // of input file size. We re-use the existing collect_range trait method by
-    // passing a temporary accumulator and draining it in chunks.
     let batch_size = 1000usize;
     let mut total_inserted = 0u64;
-    let mut total_skipped = 0u64;
     let mut lines_processed = 0u64;
     let mut batch: Vec<NewEvent> = Vec::with_capacity(batch_size);
-    // A rolling window buffer: collect up to `batch_size` historical events at
-    // a time, flush, then collect the next window. Because `collect_range` fills
-    // a caller-supplied `Vec`, we stream by calling it repeatedly with a slice
-    // of the ledger range — but for file-based sources (whose reads are not
-    // ledger-splittable) the simplest correct strategy is to collect into a
-    // bounded staging buffer and flush whenever it reaches `batch_size`.
-    let mut staging: Vec<HistoricalEvent> = Vec::with_capacity(batch_size);
-    source
-        .collect_range(from_ledger, to, &config.contract_ids, &mut staging)
-        .await?;
-
-    for ev in staging {
+    let mut events = source.stream_range(from_ledger, to, &config.contract_ids);
+    while let Some(ev) = events.next().await.transpose()? {
         lines_processed += 1;
-        // Enrich with the spec version in force at the event's ledger, not the
-        // contract's current spec: deep-backfilled events predate upgrades.
-        let spec = specs
-            .get(&pool, &config.soroban_rpc_url, &ev.contract_id, ev.ledger)
-            .await;
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            historical_to_new_event(ev, spec.as_deref())
-        })) {
-            Ok(Some(new_ev)) => {
-                batch.push(new_ev);
-            }
-            Ok(None) => {
-                total_skipped += 1;
-                continue;
-            }
-            Err(_) => {
-                total_skipped += 1;
-                continue;
-            }
-        }
+        let spec = load_persisted_spec_at(&pool, &ev.contract_id, ev.ledger).await?;
+        batch.push(historical_to_new_event(ev, spec.as_deref())?);
 
         if batch.len() >= batch_size {
-            let n = flush_batch(&pool, &specs, &mut batch).await?;
+            let n = flush_batch(&pool, &mut batch).await?;
             total_inserted += n;
             debug!(inserted = n, lines_processed, "flushed batch");
         }
     }
 
     if !batch.is_empty() {
-        let n = flush_batch(&pool, &specs, &mut batch).await?;
+        let n = flush_batch(&pool, &mut batch).await?;
         total_inserted += n;
     }
 
-    info!(
-        total_inserted,
-        total_skipped, lines_processed, "deep backfill complete"
-    );
+    info!(total_inserted, lines_processed, "deep backfill complete");
     Ok(())
 }
 
-async fn flush_batch(
-    pool: &PgPool,
-    specs: &SpecCache,
-    batch: &mut Vec<NewEvent>,
-) -> anyhow::Result<u64> {
-    let inserted =
-        store::insert_events_with_resolver(pool, batch, &|cid| specs.kind(cid)).await?;
+async fn flush_batch(pool: &PgPool, batch: &mut Vec<NewEvent>) -> anyhow::Result<u64> {
+    let inserted = store::insert_events(pool, batch).await?;
     batch.clear();
     Ok(inserted)
+}
+
+async fn load_persisted_spec_at(
+    pool: &PgPool,
+    contract_id: &str,
+    ledger: i64,
+) -> anyhow::Result<Option<Arc<ContractSpec>>> {
+    let version: Option<String> = sqlx::query_scalar(
+        "SELECT spec_section
+           FROM contract_spec_versions
+          WHERE contract_id = $1
+            AND COALESCE(upgrade_ledger, observed_ledger) <= $2
+            AND spec_section <> ''
+          ORDER BY COALESCE(upgrade_ledger, observed_ledger) DESC, version DESC
+          LIMIT 1",
+    )
+    .bind(contract_id)
+    .bind(ledger)
+    .fetch_optional(pool)
+    .await?;
+
+    let section = match version {
+        Some(section) => Some(section),
+        None => {
+            sqlx::query_scalar(
+                "SELECT spec_section FROM contract_specs
+                  WHERE contract_id = $1 AND spec_section <> ''",
+            )
+            .bind(contract_id)
+            .fetch_optional(pool)
+            .await?
+        }
+    };
+
+    section
+        .map(|section| {
+            let bytes = hex::decode(&section).context("persisted spec_section is not hex")?;
+            ContractSpec::from_spec_xdr_simple(&bytes)
+                .map(Arc::new)
+                .context("persisted spec_section is not valid contract spec XDR")
+        })
+        .transpose()
 }
 
 /// Convert a [`HistoricalEvent`] into a [`NewEvent`] using the same XDR decode
@@ -490,9 +522,9 @@ async fn flush_batch(
 fn historical_to_new_event(
     ev: HistoricalEvent,
     spec: Option<&lumenqraph_core::ContractSpec>,
-) -> Option<NewEvent> {
-    // Unknown event types cannot satisfy the events.event_type CHECK; skip them.
-    let event_type = EventType::from_rpc_str(&ev.event_type)?;
+) -> anyhow::Result<NewEvent> {
+    let event_type = EventType::from_rpc_str(&ev.event_type)
+        .with_context(|| format!("unsupported historical event type: {}", ev.event_type))?;
     use lumenqraph_core::xdr;
 
     let decoded_topics = xdr::decode_topics(&ev.topics);
@@ -513,17 +545,12 @@ fn historical_to_new_event(
         ev.paging_token
     };
 
-    Some(NewEvent {
+    Ok(NewEvent {
         event_id: ev.event_id,
         contract_id: ev.contract_id,
         ledger: ev.ledger,
         ledger_closed_at: ev.ledger_closed_at,
-        // Unknown values fall back to `contract`, the same default used when the
-        // export omits the field.
-        event_type: ev
-            .event_type
-            .parse()
-            .unwrap_or(lumenqraph_core::EventType::Contract),
+        event_type,
         topics: ev.topics,
         decoded_topics,
         event_name,
@@ -543,6 +570,7 @@ fn historical_to_new_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     fn flat_line(id: &str, cid: &str, ledger: i64) -> String {
         serde_json::json!({
@@ -557,6 +585,25 @@ mod tests {
             "in_successful_contract_call": true,
         })
         .to_string()
+    }
+
+    #[test]
+    fn malformed_envelope_event_is_an_error() {
+        let line = r#"{"ledger":1,"events":[{"id":"missing-contract"}]}"#;
+        let error = GalexieSource::parse_line(line).expect_err("missing contract id must fail");
+        assert!(error.to_string().contains("missing contract_id"));
+    }
+
+    #[test]
+    fn unsupported_event_type_is_an_error() {
+        let mut events = GalexieSource::parse_line(&flat_line("event-1", "CA", 1)).unwrap();
+        events[0].event_type = "future-event".to_string();
+        let error = historical_to_new_event(events.remove(0), None)
+            .err()
+            .expect("unsupported event type must fail");
+        assert!(error
+            .to_string()
+            .contains("unsupported historical event type"));
     }
 
     fn envelope_line(ledger: i64, events: &[(&str, &str)]) -> String {
@@ -669,5 +716,40 @@ mod tests {
         };
         let new_ev = historical_to_new_event(ev, None).expect("known event type");
         assert_eq!(new_ev.paging_token, "custom-paging");
+    }
+
+    #[tokio::test]
+    async fn streams_large_input_with_a_bounded_batch() {
+        let path = std::env::temp_dir().join(format!(
+            "lumenqraph-deep-backfill-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let mut file = tokio::io::BufWriter::new(tokio::fs::File::create(&path).await.unwrap());
+        for ledger in 0..100_000i64 {
+            file.write_all(flat_line(&format!("e-{ledger}"), "CA", ledger).as_bytes())
+                .await
+                .unwrap();
+            file.write_all(b"\n").await.unwrap();
+        }
+        file.flush().await.unwrap();
+        drop(file);
+
+        let source = GalexieSource::new(vec![path.clone()]);
+        let mut events = source.stream_range(0, 99_999, &[]);
+        let mut count = 0usize;
+        let mut buffered = 0usize;
+        let mut max_buffered = 0usize;
+        while events.next().await.transpose().unwrap().is_some() {
+            count += 1;
+            buffered += 1;
+            max_buffered = max_buffered.max(buffered);
+            if buffered == 1_000 {
+                buffered = 0;
+            }
+        }
+
+        tokio::fs::remove_file(path).await.unwrap();
+        assert_eq!(count, 100_000);
+        assert!(max_buffered <= 1_000);
     }
 }
