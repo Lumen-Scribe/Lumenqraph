@@ -17,7 +17,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends pkg-config \
 RUN cargo install cargo-chef --locked
 
 FROM chef AS planner
-COPY . .
+# Copy only what `cargo chef prepare` needs to resolve the workspace graph:
+# the manifests, the lockfile and the crate sources. Everything else (docs,
+# .github, monitoring, scripts, SDKs) is excluded by .dockerignore so edits
+# there never invalidate this layer.
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
