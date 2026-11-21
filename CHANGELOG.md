@@ -31,6 +31,13 @@ Breaking changes will be documented in the changelog with migration guidance whe
 
 ### Fixed
 
+- Indexer: `reenrich` reads and writes event JSONB columns with SQLx JSON types,
+  and malformed rows are logged and skipped instead of panicking the pass
+  (#752).
+- Indexer: `reenrich` writes each 1,000-row page in one bulk update, and
+  `--force` clears stale enrichment when the current spec no longer matches;
+  progress output reports cleared rows (#753).
+
 - Python SDK: `Retry-After` is honoured on every retry, backoff uses full jitter,
   and cancelling an async call stops further retries (#634).
 - Docker image: the explorer bundle (`app.js`) is built in the image, so the
