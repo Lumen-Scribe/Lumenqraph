@@ -182,11 +182,11 @@ jobs:
       # Issue #523: fail fast with a clear message when the workspace
       # manifest itself is broken, before any compilation starts.
       - name: Validate workspace manifest
-        run: cargo metadata --format-version 1 >/dev/null
+        run: cargo metadata --locked --format-version 1 >/dev/null
       - name: Build on MSRV
-        run: cargo build --workspace --all-targets
+        run: cargo build --locked --workspace --all-targets
       - name: Check on MSRV
-        run: cargo check --workspace --all-targets
+        run: cargo check --locked --workspace --all-targets
 
   # Issue #355: the Docker toolchain check lives in docker.yml, which builds
   # the image once per PR. It reads /rustc-version.txt from the runtime image
@@ -253,15 +253,15 @@ jobs:
       - name: Test with coverage
         run: |
           cargo llvm-cov clean --workspace
-          cargo llvm-cov --workspace --no-report
-          cargo llvm-cov --no-report -p lumenqraph-indexer  -- --ignored --test-threads=1
-          cargo llvm-cov --no-report -p lumenqraph-webhooks -- --ignored --test-threads=1
-          cargo llvm-cov --no-report -p lumenqraph-api      -- --ignored --test-threads=1
-          cargo llvm-cov --no-report -p lumenqraph-mcp      -- --ignored --test-threads=1
+          cargo llvm-cov --locked --workspace --no-report
+          cargo llvm-cov --locked --no-report -p lumenqraph-indexer  -- --ignored --test-threads=1
+          cargo llvm-cov --locked --no-report -p lumenqraph-webhooks -- --ignored --test-threads=1
+          cargo llvm-cov --locked --no-report -p lumenqraph-api      -- --ignored --test-threads=1
+          cargo llvm-cov --locked --no-report -p lumenqraph-mcp      -- --ignored --test-threads=1
           # The end-to-end smoke test is gated behind the `smoke-tests` feature
           # so it never compiles into a plain `cargo test`. It uses a mock RPC
           # (no live network); run it here where Postgres is available.
-          cargo llvm-cov --no-report -p lumenqraph-indexer --features smoke-tests -- smoke --ignored --test-threads=1
+          cargo llvm-cov --locked --no-report -p lumenqraph-indexer --features smoke-tests -- smoke --ignored --test-threads=1
           cargo llvm-cov report --lcov --output-path lcov.info
           cargo llvm-cov report --summary-only
       - name: Upload coverage to Codecov
@@ -276,7 +276,7 @@ jobs:
           name: coverage-lcov
           path: lcov.info
       - name: Build (release)
-        run: cargo build --workspace --release
+        run: cargo build --locked --workspace --release
 
   # Issues #606/#607: codegen emits TypeScript and Python from contract-controlled
   # on-chain specs (docs and names). Prove hostile docs/names stay syntactically
@@ -310,7 +310,7 @@ jobs:
           CODEGEN_DUMP_DIR: ${{ runner.temp }}/codegen-out
         run: |
           mkdir -p "$CODEGEN_DUMP_DIR"
-          cargo test -p lumenqraph-core codegen -- --nocapture
+          cargo test --locked -p lumenqraph-core codegen -- --nocapture
           echo "Generated files:"
           find "$CODEGEN_DUMP_DIR" -type f -print
       - name: Type-check generated TypeScript
@@ -351,7 +351,7 @@ jobs:
         with:
           key: openapi-drift
       - name: Build lumenqraph-api
-        run: cargo build -p lumenqraph-api
+        run: cargo build --locked -p lumenqraph-api
       - name: Generate OpenAPI spec from code
         # --print-openapi dumps the utoipa-derived spec as JSON and exits
         # without connecting to Postgres or binding a port.

@@ -32,7 +32,7 @@ RUN rustup show active-toolchain \
 COPY --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo chef cook --release --recipe-path recipe.json
+    cargo chef cook --release --locked --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY migrations ./migrations
@@ -46,7 +46,7 @@ ENV LUMENQRAPH_GIT_SHA=${GIT_COMMIT}
 ENV LUMENQRAPH_BUILD_TIME=${BUILD_TIME}
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo build --release --workspace
+    cargo build --release --locked --workspace
 
 # Explorer UI bundle (#635). Built in its own Node stage: scripts/build.mjs
 # generates app.js (not committed) and index.html, which must exist in the
