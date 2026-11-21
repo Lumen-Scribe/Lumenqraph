@@ -4,6 +4,7 @@
 use std::io::{self, IsTerminal};
 use std::time::Instant;
 
+use sqlx::types::Json;
 use sqlx::{PgPool, Row};
 use tracing::{debug, info, warn};
 
@@ -105,27 +106,37 @@ pub async fn run_reenrich(
         pages += 1;
 
         for row in rows {
-            let ledger: i64 = row.get("ledger");
-            let event_id: String = row.get("event_id");
+            let ledger: i64 = row.try_get("ledger")?;
+            let event_id: String = row.try_get("event_id")?;
             cursor = Some((ledger, event_id.clone()));
-            let contract_id: String = row.get("contract_id");
-            let decoded_topics_json: String = row.get("decoded_topics");
-            let event_name: String = row.get("event_name");
-            let decoded_value_json: String = row.get("decoded_value");
             processed += 1;
 
-            let decoded_topics: Vec<serde_json::Value> =
-                match serde_json::from_str(&decoded_topics_json) {
+            let contract_id: String = match row.try_get("contract_id") {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(event_id, %error, "failed to decode contract_id");
+                    continue;
+                }
+            };
+            let event_name: String = match row.try_get("event_name") {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(event_id, %error, "failed to decode event_name");
+                    continue;
+                }
+            };
+            let Json(decoded_topics): Json<Vec<serde_json::Value>> =
+                match row.try_get("decoded_topics") {
                     Ok(value) => value,
                     Err(error) => {
-                        warn!(event_id, %error, "failed to parse decoded_topics");
+                        warn!(event_id, %error, "failed to decode decoded_topics");
                         continue;
                     }
                 };
-            let decoded_value: serde_json::Value = match serde_json::from_str(&decoded_value_json) {
+            let Json(decoded_value): Json<serde_json::Value> = match row.try_get("decoded_value") {
                 Ok(value) => value,
                 Err(error) => {
-                    warn!(event_id, %error, "failed to parse decoded_value");
+                    warn!(event_id, %error, "failed to decode decoded_value");
                     continue;
                 }
             };
@@ -139,11 +150,9 @@ pub async fn run_reenrich(
                 .as_deref()
                 .and_then(|spec| spec.enrich_event(&event_name, &decoded_topics, &decoded_value));
             if let Some(enriched_json) = enriched {
-                let enriched_str =
-                    serde_json::to_string(&enriched_json).unwrap_or_else(|_| "null".to_string());
                 if let Err(error) =
                     sqlx::query("UPDATE events SET enriched = $1 WHERE event_id = $2")
-                        .bind(enriched_str)
+                        .bind(Json(enriched_json))
                         .bind(&event_id)
                         .execute(&pool)
                         .await
