@@ -2,7 +2,9 @@
 name = "lumenqraph-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [features]
 # Expose the db_test helper module for use by other crates' integration tests.
