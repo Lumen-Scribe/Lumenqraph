@@ -54,6 +54,7 @@ pub async fn start_http_server(
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/livez", get(livez))
         .route("/metrics", get(metrics))
         .with_state(state);
 
@@ -80,12 +81,29 @@ pub async fn start_http_server(
     Ok(())
 }
 
+/// Liveness: 200 while the process and its HTTP listener are up (#756).
+async fn livez() -> impl IntoResponse {
+    Json(json!({ "status": "ok" }))
+}
+
+/// Status code for `/health`: 503 when degraded unless `INDEXER_HEALTH_STRICT=false` (#756).
+fn health_status_code(is_healthy: bool, strict: bool) -> axum::http::StatusCode {
+    if is_healthy || !strict {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
 async fn health(State(state): State<HttpState>) -> impl IntoResponse {
     match get_indexer_status(&state.pool).await {
         Ok(status) => {
             let health_status = if status.is_healthy { "ok" } else { "degraded" };
+            let strict = std::env::var("INDEXER_HEALTH_STRICT")
+                .map(|v| !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
             (
-                axum::http::StatusCode::OK,
+                health_status_code(status.is_healthy, strict),
                 Json(json!({
                     "status": health_status,
                     "last_processed_ledger": status.last_processed_ledger,
@@ -246,6 +264,7 @@ async fn metrics(
 /// Kept as a pure function so the rendering path can be unit tested without a
 /// live `PgPool` (see `tests::metrics_render_process_counters`).
 fn render_process_counters(body: &mut String) {
+    crate::timing::render(body);
     // Transfer-like events skipped by the SEP-41 projection (#600).
     body.push_str("# HELP lumenqraph_transfer_projection_skipped_total Transfer-like events skipped by the SEP-41 projection since start\n");
     body.push_str("# TYPE lumenqraph_transfer_projection_skipped_total counter\n");
@@ -301,7 +320,7 @@ struct IndexerStatus {
 
 async fn get_indexer_status(pool: &PgPool) -> anyhow::Result<IndexerStatus> {
     let status: Option<(i64, i64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-        "SELECT last_processed_ledger, chain_tip_ledger, updated_at
+        "SELECT last_processed_ledger, chain_tip_ledger, COALESCE(progress_at, updated_at)
          FROM indexer_cursor WHERE id = 1",
     )
     .fetch_optional(pool)
@@ -373,7 +392,7 @@ async fn gather_metrics(pool: &PgPool) -> anyhow::Result<IndexerMetrics> {
         "SELECT last_processed_ledger, chain_tip_ledger, events_ingested_total, errors_total, events_enriched_total, events_not_enriched_total,
                 COALESCE(rpc_failovers_total, 0),
                 COALESCE(timestamp_parse_errors_total, 0),
-                updated_at
+                COALESCE(progress_at, updated_at)
          FROM indexer_cursor WHERE id = 1",
     )
     .fetch_optional(pool)

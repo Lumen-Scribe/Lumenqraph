@@ -134,7 +134,8 @@ pub async fn write_progress(
              chain_tip_ledger      = $2,
              events_ingested_total = events_ingested_total + $3,
              version               = version + 1,
-             updated_at            = now()
+             updated_at            = now(),
+             progress_at           = now()
          WHERE id = 1 AND version = $4",
     )
     .bind(last_processed)
@@ -391,6 +392,7 @@ mod network_pin_tests {
                 last_processed_ledger BIGINT      NOT NULL,
                 network_passphrase    TEXT,
                 updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+                progress_at           TIMESTAMPTZ,
                 CONSTRAINT single_row CHECK (id = 1)
             )",
         )

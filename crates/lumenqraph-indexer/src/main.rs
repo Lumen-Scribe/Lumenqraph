@@ -33,6 +33,7 @@ mod rpc_client;
 mod specs;
 mod state;
 mod store;
+mod timing;
 
 #[cfg(test)]
 mod projections_tests;
