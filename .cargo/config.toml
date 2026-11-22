@@ -1,0 +1,4 @@
+# MSRV-aware version selection: `cargo update` prefers dependency versions
+# compatible with `rust-version`. Only valid here, not in Cargo.toml.
+[resolver]
+incompatible-rust-versions = "fallback"
