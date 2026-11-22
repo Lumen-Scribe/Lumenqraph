@@ -112,6 +112,8 @@ pub struct ApiConfig {
     pub webhook_encryption_key: String,
     /// Retention for delivered/failed webhook deliveries. `0` disables pruning.
     pub webhook_delivery_retention_days: i64,
+    /// Bearer credential for the admin API (`ADMIN_TOKEN`). `None` disables it.
+    pub admin_token: Option<String>,
 
     /// Sibling instances mounted under a path prefix (`INSTANCE_MOUNTS`).
     pub mounts: Vec<(String, String)>,
@@ -128,7 +130,8 @@ impl ApiConfig {
             env_parse("API_MAX_BODY_BYTES", 65536u64)?
         };
 
-        let webhook_encryption_key = required_env("WEBHOOK_ENCRYPTION_KEY")?;
+        let webhook_encryption_key =
+            webhook_encryption_key_from_value(std::env::var("WEBHOOK_ENCRYPTION_KEY").ok())?;
 
         // Reject bad origins at startup, naming the entry, rather than letting
         // CORS silently never match a browser's Origin header (#581).
@@ -191,6 +194,7 @@ impl ApiConfig {
 
             webhook_encryption_key,
             webhook_delivery_retention_days: env_parse("WEBHOOK_DELIVERY_RETENTION_DAYS", 14i64)?,
+            admin_token: std::env::var("ADMIN_TOKEN").ok().filter(|t| !t.is_empty()),
 
             mounts: crate::routes::proxy::parse_mounts(&env_string("INSTANCE_MOUNTS", "")),
             proxy: ProxyConfig {

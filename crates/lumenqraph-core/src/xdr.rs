@@ -192,7 +192,7 @@ pub fn decode_scval(sv: &stellar_xdr::curr::ScVal) -> Value {
 
 /// Render a `UInt256Parts` as a decimal string.
 fn u256_to_decimal(p: &stellar_xdr::curr::UInt256Parts) -> String {
-    let mut limbs = [p.hi_hi as u64, p.hi_lo, p.lo_hi, p.lo_lo];
+    let mut limbs = [p.hi_hi, p.hi_lo, p.lo_hi, p.lo_lo];
     // Repeated division by 10^19 (largest power of ten fitting in a u64).
     const CHUNK: u64 = 10_000_000_000_000_000_000;
     let mut chunks: Vec<u64> = Vec::new();
@@ -273,6 +273,13 @@ pub fn event_name_from_topic(topic_b64: &str) -> Option<String> {
     if !limited.inner.is_empty() {
         return None;
     }
+    event_name_from_scval(&sv)
+}
+
+/// An event name from a typed first topic: only `Symbol`/`String` qualify
+/// (#609). Shared by the indexing and simulation paths (#764).
+pub fn event_name_from_scval(sv: &stellar_xdr::curr::ScVal) -> Option<String> {
+    use stellar_xdr::curr::ScVal;
     match sv {
         ScVal::Symbol(s) => std::str::from_utf8(&s.0).ok().map(str::to_string),
         ScVal::String(s) => std::str::from_utf8(&s.0).ok().map(str::to_string),
@@ -352,7 +359,11 @@ pub fn sac_asset_from_instance_storage(instance: &Value) -> Option<SacAsset> {
         let is_name = key
             .as_str()
             .map(|s| s == "name")
-            .or_else(|| key.get("symbol").and_then(|s| s.as_str()).map(|s| s == "name"))
+            .or_else(|| {
+                key.get("symbol")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s == "name")
+            })
             .unwrap_or(false);
         if !is_name {
             continue;
@@ -390,7 +401,7 @@ pub fn balance_ledger_key(
     sac_contract: &str,
 ) -> Option<stellar_xdr::curr::LedgerKey> {
     use stellar_xdr::curr::{
-        AccountId, AlphaNum12, AlphaNum4, Asset, AssetCode12, AssetCode4, ContractDataDurability,
+        AccountId, AlphaNum12, AlphaNum4, AssetCode12, AssetCode4, ContractDataDurability,
         ContractId, Hash, LedgerKey, PublicKey, ScAddress, ScVal, Uint256,
     };
 
@@ -407,20 +418,24 @@ pub fn balance_ledger_key(
             .try_into()
             .ok()?,
         )));
-        return Some(LedgerKey::ContractData(stellar_xdr::curr::LedgerKeyContractData {
-            contract: ScAddress::Contract(ContractId(Hash(sac.0))),
-            key,
-            durability: ContractDataDurability::Persistent,
-        }));
+        return Some(LedgerKey::ContractData(
+            stellar_xdr::curr::LedgerKeyContractData {
+                contract: ScAddress::Contract(ContractId(Hash(sac.0))),
+                key,
+                durability: ContractDataDurability::Persistent,
+            },
+        ));
     }
 
     let account = stellar_strkey::ed25519::PublicKey::from_string(holder).ok()?;
     let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account.0)));
 
     let asset = match asset {
-        SacAsset::Native => return Some(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-            account_id,
-        })),
+        SacAsset::Native => {
+            return Some(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                account_id,
+            }))
+        }
         SacAsset::Credit { code, issuer } => {
             let issuer = stellar_strkey::ed25519::PublicKey::from_string(issuer).ok()?;
             let issuer_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(issuer.0)));
@@ -428,14 +443,14 @@ pub fn balance_ledger_key(
             if code_bytes.len() <= 4 {
                 let mut buf = [0u8; 4];
                 buf[..code_bytes.len()].copy_from_slice(code_bytes);
-                Asset::CreditAlphanum4(AlphaNum4 {
+                stellar_xdr::curr::TrustLineAsset::CreditAlphanum4(AlphaNum4 {
                     asset_code: AssetCode4(buf),
                     issuer: issuer_id,
                 })
             } else if code_bytes.len() <= 12 {
                 let mut buf = [0u8; 12];
                 buf[..code_bytes.len()].copy_from_slice(code_bytes);
-                Asset::CreditAlphanum12(AlphaNum12 {
+                stellar_xdr::curr::TrustLineAsset::CreditAlphanum12(AlphaNum12 {
                     asset_code: AssetCode12(buf),
                     issuer: issuer_id,
                 })
@@ -445,10 +460,9 @@ pub fn balance_ledger_key(
         }
     };
 
-    Some(LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
-        account_id,
-        asset,
-    }))
+    Some(LedgerKey::Trustline(
+        stellar_xdr::curr::LedgerKeyTrustLine { account_id, asset },
+    ))
 }
 
 /// Decode a trustline or account ledger entry into the same JSON shape used
