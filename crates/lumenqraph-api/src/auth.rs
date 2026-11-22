@@ -488,18 +488,9 @@ pub async fn auth_and_rate_limit(
 
     let (identity, limit, is_authenticated, _key_hash_opt) = match extract_key(&headers) {
         Some(key) => authenticate(&state, &key, &route, &method, SCOPE_READ).await?,
-        None => {
-            if state.require_auth {
-                return Err(ApiError::unauthorized("missing API key"));
-            }
-            let client_ip = extract_client_ip(&headers, Some(socket_addr), &state.ip_config);
-            (
-                format!("anon:{client_ip}"),
-                state.anon_rate_limit,
-                false,
-                None,
-            )
-        }
+        // #776: webhook creation always requires a key, regardless of
+        // REQUIRE_API_KEY, so no subscription can be created without an owner.
+        None => return Err(ApiError::unauthorized("missing API key")),
     };
 
     let rl_status = state.limiter.check(&identity, limit).await;
@@ -600,7 +591,7 @@ pub async fn rpc_auth_and_rate_limit(
 /// authenticated, so `create_webhook` can set `owner_key_hash` (#421).
 pub async fn webhook_auth_and_rate_limit(
     State(state): State<AppState>,
-    ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
+    ConnectInfo(_socket_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     mut req: Request,
     next: Next,

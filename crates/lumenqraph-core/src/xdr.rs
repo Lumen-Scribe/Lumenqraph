@@ -428,14 +428,14 @@ pub fn balance_ledger_key(
             if code_bytes.len() <= 4 {
                 let mut buf = [0u8; 4];
                 buf[..code_bytes.len()].copy_from_slice(code_bytes);
-                Asset::CreditAlphanum4(AlphaNum4 {
+                stellar_xdr::curr::TrustLineAsset::CreditAlphanum4(AlphaNum4 {
                     asset_code: AssetCode4(buf),
                     issuer: issuer_id,
                 })
             } else if code_bytes.len() <= 12 {
                 let mut buf = [0u8; 12];
                 buf[..code_bytes.len()].copy_from_slice(code_bytes);
-                Asset::CreditAlphanum12(AlphaNum12 {
+                stellar_xdr::curr::TrustLineAsset::CreditAlphanum12(AlphaNum12 {
                     asset_code: AssetCode12(buf),
                     issuer: issuer_id,
                 })
@@ -447,7 +447,7 @@ pub fn balance_ledger_key(
 
     Some(LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
         account_id,
-        asset,
+        asset: asset.into(),
     }))
 }
 

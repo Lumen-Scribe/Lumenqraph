@@ -185,7 +185,7 @@ pub async fn create_webhook(
     // `backfill_start` is the seq *before* the first event we want to
     // backfill; `starting_seq` becomes the current global max (the watermark
     // at which the live stream takes over once the backfill completes).
-    let (starting_seq, _backfill_seq): (i64, Option<i64>) = if let Some(ref since) = body.since {
+    let (starting_seq, backfill_seq): (i64, Option<i64>) = if let Some(ref since) = body.since {
         let backfill_start = calculate_starting_seq(&state.pool, since).await?;
         let global_max: i64 = sqlx::query_scalar("SELECT COALESCE(max(seq), 0) FROM events")
             .fetch_one(&state.pool)
@@ -203,15 +203,14 @@ pub async fn create_webhook(
     // The required key is validated and loaded once at API startup.
     let encryption_key = state.config.webhook_encryption_key.as_str();
 
-    // Set owner_key_hash from the authenticated caller (#421). Anonymous callers
-    // (no API key) create subscriptions with NULL owner, which are only accessible
-    // to admin keys.
+    // Set owner_key_hash from the authenticated caller (#421). Creation always
+    // requires an API key (#776), so the owner is never NULL in practice.
     let owner_key_hash: Option<String> = caller.map(|ext| ext.0 .0.clone());
 
     let sub: WebhookSubscription = sqlx::query_as(
         "INSERT INTO webhook_subscriptions
-             (url, kind, contract_id, event_name, contract_ids, event_names, filter, encrypted_secret, starting_seq, owner_key_hash)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, pgp_sym_encrypt($8, $9), $10, $11)
+             (url, kind, contract_id, event_name, contract_ids, event_names, filter, encrypted_secret, starting_seq, owner_key_hash, backfill_seq)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, pgp_sym_encrypt($8, $9), $10, $11, $12)
          RETURNING id, url, kind, contract_id, event_name, contract_ids, event_names, filter, active, created_at",
     )
     .bind(&body.url)
@@ -225,6 +224,7 @@ pub async fn create_webhook(
     .bind(encryption_key)
     .bind(starting_seq)
     .bind(&owner_key_hash)
+    .bind(backfill_seq)
     .fetch_one(&state.pool)
     .await?;
 
@@ -372,23 +372,27 @@ async fn calculate_starting_seq(pool: &sqlx::PgPool, since: &str) -> ApiResult<i
             .await?;
         Ok((current_max - count).max(0))
     } else if let Ok(ledger) = since.parse::<i64>() {
+        // #775: backfill window is `(backfill_seq, starting_seq]`, so return
+        // the seq just before the first wanted event.
         let seq: Option<i64> = sqlx::query_scalar("SELECT min(seq) FROM events WHERE ledger >= $1")
             .bind(ledger)
             .fetch_optional(pool)
             .await?
             .flatten();
-        Ok(seq.unwrap_or(0))
+        Ok(seq.map_or(0, |s| (s - 1).max(0)))
     } else {
         let ts = chrono::DateTime::parse_from_rfc3339(since)
             .map_err(|_| ApiError::bad_request("invalid timestamp format; expected ISO-8601"))?
             .with_timezone(&chrono::Utc);
-        let seq: Option<i64> =
-            sqlx::query_scalar("SELECT min(seq) FROM events WHERE ledger_closed_at >= $1")
-                .bind(ts)
-                .fetch_optional(pool)
-                .await?
-                .flatten();
-        Ok(seq.unwrap_or(0))
+        let seq: Option<i64> = sqlx::query_scalar(
+            "SELECT min(seq) FROM events WHERE ledger >= \
+                 (SELECT min(ledger) FROM events WHERE ledger_closed_at >= $1)",
+        )
+        .bind(ts)
+        .fetch_optional(pool)
+        .await?
+        .flatten();
+        Ok(seq.map_or(0, |s| (s - 1).max(0)))
     }
 }
 
@@ -535,6 +539,8 @@ pub async fn test_webhook(
             host,
             std::net::SocketAddr::new(ip, parsed.port_or_known_default().unwrap_or(443)),
         )
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| ApiError::Internal(e.into()))?;
@@ -561,7 +567,14 @@ pub async fn test_webhook(
         Err(e) => json!({
             "delivery_id": delivery_id,
             "delivered": false,
-            "error": e.to_string(),
+            // #777: coarse error class only; never reflect raw reqwest text.
+            "error": if e.is_timeout() {
+                "timeout"
+            } else if e.is_connect() {
+                "connect_failed"
+            } else {
+                "request_failed"
+            },
         }),
     }))
 }
