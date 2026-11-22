@@ -127,8 +127,7 @@ pub fn verify_webhook(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let tolerance_secs = tolerance.as_secs() as i64;
-    if (now - ts).abs() > tolerance_secs {
+    if now.abs_diff(ts) > tolerance.as_secs() {
         return Err(VerifyError::StaleTimestamp);
     }
 
@@ -139,20 +138,18 @@ pub fn verify_webhook(
     mac.update(body);
     let expected = mac.finalize().into_bytes();
 
-    let mut saw_candidate = false;
     for sig in signatures {
-        let decoded = hex::decode(sig).map_err(|_| VerifyError::InvalidHex)?;
-        saw_candidate = true;
-        if bool::from(expected.as_slice().ct_eq(decoded.as_slice())) {
+        let Ok(decoded) = hex::decode(sig) else {
+            continue;
+        };
+        if decoded.len() == expected.len()
+            && bool::from(expected.as_slice().ct_eq(decoded.as_slice()))
+        {
             return Ok(());
         }
     }
 
-    if saw_candidate {
-        Err(VerifyError::Mismatch)
-    } else {
-        Err(VerifyError::MissingSignature)
-    }
+    Err(VerifyError::Mismatch)
 }
 
 /// The placeholder shipped in older `.env.example` files. It is a public string,
@@ -174,7 +171,10 @@ const MIN_DISTINCT_KEY_CHARS: usize = 8;
 pub fn validate_webhook_encryption_key(key: &str) -> anyhow::Result<()> {
     const HINT: &str = "generate a strong key with `openssl rand -hex 32`";
 
-    if key.to_ascii_uppercase().starts_with(WEBHOOK_KEY_PLACEHOLDER_PREFIX) {
+    if key
+        .to_ascii_uppercase()
+        .starts_with(WEBHOOK_KEY_PLACEHOLDER_PREFIX)
+    {
         anyhow::bail!(
             "the value is the placeholder from .env.example, which is public and \
              gives no protection; {HINT}"
@@ -365,7 +365,9 @@ mod tests {
     #[test]
     fn webhook_key_rejects_short_and_common_values() {
         for weak in ["changeme", "secret", "0123456789abcdef", "", " "] {
-            let err = validate_webhook_encryption_key(weak).unwrap_err().to_string();
+            let err = validate_webhook_encryption_key(weak)
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("openssl rand -hex 32"), "{weak:?}: {err}");
         }
     }

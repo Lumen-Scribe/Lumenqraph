@@ -85,7 +85,7 @@ use stellar_strkey::Contract;
 /// #608: the bytes are parsed into a typed `ScVal` (with `Limits`) and handed
 /// to [`decode_scval`], so the byte path and the typed path can never drift.
 pub fn decode_scval_base64(b64: &str) -> Value {
-    use stellar_xdr::curr::{Limited, Limits, ReadXdr, ScVal};
+    use stellar_xdr::curr::{Limited, ReadXdr, ScVal};
 
     let fallback = || json!({ "_type": "unknown", "xdr": b64 });
     let bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
@@ -94,7 +94,7 @@ pub fn decode_scval_base64(b64: &str) -> Value {
     };
     // #410: reject trailing bytes — they indicate a misaligned cursor that
     // would corrupt siblings in a vec/map context.
-    let mut limited = Limited::new(bytes.as_slice(), Limits::none());
+    let mut limited = Limited::new(bytes.as_slice(), untrusted_limits(bytes.len()));
     match ScVal::read_xdr(&mut limited) {
         Ok(sv) if limited.inner.is_empty() => decode_scval(&sv),
         _ => fallback(),
@@ -108,11 +108,46 @@ pub fn decode_scval_base64(b64: &str) -> Value {
 /// value is already in memory as a typed Rust enum. Converting back to XDR and
 /// then base64 just to feed the byte-level decoder is wasted work.
 pub fn decode_scval(sv: &stellar_xdr::curr::ScVal) -> Value {
-    use stellar_xdr::curr::ScVal;
+    decode_scval_at(sv, 0)
+}
+
+/// #759: maximum nesting depth for untrusted `ScVal`s, shared by parsing and decoding.
+pub const MAX_DEPTH: u32 = 256;
+
+/// #759: the single set of XDR limits used for all untrusted parsing in core.
+fn untrusted_limits(len: usize) -> stellar_xdr::curr::Limits {
+    stellar_xdr::curr::Limits {
+        depth: MAX_DEPTH,
+        len,
+    }
+}
+
+fn decode_scval_at(sv: &stellar_xdr::curr::ScVal, depth: u32) -> Value {
+    use stellar_xdr::curr::{Limits, ScError, ScVal, WriteXdr};
+    if depth > MAX_DEPTH {
+        let xdr = sv.to_xdr_base64(Limits::none()).unwrap_or_default();
+        return json!({ "_type": "unknown", "xdr": xdr });
+    }
+    let decode_scval = |v: &ScVal| decode_scval_at(v, depth + 1);
     match sv {
         ScVal::Bool(b) => Value::Bool(*b),
         ScVal::Void => Value::Null,
-        ScVal::Error(_) => json!({ "_error": true }),
+        // #760: keep the error type and code.
+        ScVal::Error(e) => {
+            let code = match e {
+                ScError::Contract(c) => json!(c),
+                ScError::WasmVm(c)
+                | ScError::Context(c)
+                | ScError::Storage(c)
+                | ScError::Object(c)
+                | ScError::Crypto(c)
+                | ScError::Events(c)
+                | ScError::Budget(c)
+                | ScError::Value(c)
+                | ScError::Auth(c) => json!(c.name()),
+            };
+            json!({ "_type": "error", "kind": e.name(), "code": code })
+        }
         ScVal::U32(n) => json!(n),
         ScVal::I32(n) => json!(n),
         ScVal::U64(n) => Value::String(n.to_string()),
@@ -158,7 +193,8 @@ pub fn decode_scval(sv: &stellar_xdr::curr::ScVal) -> Value {
                     let k = decode_scval(&entry.key);
                     let v = decode_scval(&entry.val);
                     match &k {
-                        Value::String(s) => {
+                        // #760: a duplicate key would overwrite; use the pairs form.
+                        Value::String(s) if all_stringy && !obj.contains_key(s) => {
                             obj.insert(s.clone(), v.clone());
                         }
                         _ => all_stringy = false,
@@ -263,12 +299,12 @@ pub fn decode_topics(topics: &[String]) -> Vec<Value> {
 /// Addresses, integers, bytes and other variants return `None` so that
 /// event-name filters and stats are not polluted with addresses/numbers.
 pub fn event_name_from_topic(topic_b64: &str) -> Option<String> {
-    use stellar_xdr::curr::{Limited, Limits, ReadXdr, ScVal};
+    use stellar_xdr::curr::{Limited, ReadXdr, ScVal};
 
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(topic_b64)
         .ok()?;
-    let mut limited = Limited::new(bytes.as_slice(), Limits::none());
+    let mut limited = Limited::new(bytes.as_slice(), untrusted_limits(bytes.len()));
     let sv = ScVal::read_xdr(&mut limited).ok()?;
     if !limited.inner.is_empty() {
         return None;
@@ -352,7 +388,11 @@ pub fn sac_asset_from_instance_storage(instance: &Value) -> Option<SacAsset> {
         let is_name = key
             .as_str()
             .map(|s| s == "name")
-            .or_else(|| key.get("symbol").and_then(|s| s.as_str()).map(|s| s == "name"))
+            .or_else(|| {
+                key.get("symbol")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s == "name")
+            })
             .unwrap_or(false);
         if !is_name {
             continue;
@@ -407,20 +447,24 @@ pub fn balance_ledger_key(
             .try_into()
             .ok()?,
         )));
-        return Some(LedgerKey::ContractData(stellar_xdr::curr::LedgerKeyContractData {
-            contract: ScAddress::Contract(ContractId(Hash(sac.0))),
-            key,
-            durability: ContractDataDurability::Persistent,
-        }));
+        return Some(LedgerKey::ContractData(
+            stellar_xdr::curr::LedgerKeyContractData {
+                contract: ScAddress::Contract(ContractId(Hash(sac.0))),
+                key,
+                durability: ContractDataDurability::Persistent,
+            },
+        ));
     }
 
     let account = stellar_strkey::ed25519::PublicKey::from_string(holder).ok()?;
     let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(account.0)));
 
     let asset = match asset {
-        SacAsset::Native => return Some(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-            account_id,
-        })),
+        SacAsset::Native => {
+            return Some(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                account_id,
+            }))
+        }
         SacAsset::Credit { code, issuer } => {
             let issuer = stellar_strkey::ed25519::PublicKey::from_string(issuer).ok()?;
             let issuer_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(issuer.0)));
@@ -445,10 +489,9 @@ pub fn balance_ledger_key(
         }
     };
 
-    Some(LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
-        account_id,
-        asset,
-    }))
+    Some(LedgerKey::Trustline(
+        stellar_xdr::curr::LedgerKeyTrustLine { account_id, asset },
+    ))
 }
 
 /// Decode a trustline or account ledger entry into the same JSON shape used
