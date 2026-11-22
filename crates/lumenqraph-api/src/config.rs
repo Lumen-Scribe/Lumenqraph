@@ -147,7 +147,7 @@ impl ApiConfig {
                 connect_retries: env_parse("DATABASE_CONNECT_RETRIES", 30)?,
             },
             bind_addr: env_string("API_BIND_ADDR", "0.0.0.0:8080"),
-            rpc_url: env_string("RPC_URL", "https://soroban-testnet.stellar.org"),
+            rpc_url: std::env::var("RPC_URL").context("missing RPC_URL")?,
             rpc_timeout_secs: env_parse("RPC_TIMEOUT_SECS", 30)?,
             request_timeout_secs: env_parse("API_REQUEST_TIMEOUT_SECS", 60)?,
             shutdown_timeout_secs: env_parse("API_SHUTDOWN_TIMEOUT_SECS", 30)?,

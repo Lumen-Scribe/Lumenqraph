@@ -473,6 +473,23 @@ fn concurrency_limited_response(limit: usize) -> Response {
     response
 }
 
+/// `/metrics` auth when `METRICS_REQUIRE_API_KEY=true`: always requires a key,
+/// regardless of `REQUIRE_API_KEY`, then applies the normal auth/rate-limit path (#767).
+pub async fn metrics_auth(
+    state: State<AppState>,
+    connect_info: ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    req: Request,
+    next: Next,
+) -> ApiResult<Response> {
+    if extract_key(&headers).is_none() {
+        return Err(ApiError::unauthorized(
+            "/metrics requires an API key when METRICS_REQUIRE_API_KEY is set",
+        ));
+    }
+    auth_and_rate_limit(state, connect_info, headers, req, next).await
+}
+
 pub async fn auth_and_rate_limit(
     State(state): State<AppState>,
     ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
