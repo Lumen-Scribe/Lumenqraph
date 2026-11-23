@@ -83,12 +83,12 @@ audit: ## Run cargo-audit for known vulnerabilities
 	cargo audit
 
 dashboards-check: ## Validate dashboard metric definitions
-	python3 scripts/validate_dashboards.py
+	python3 scripts/validate_dashboard_metrics.py
 
 env-check: ## Verify .env.example documents every env var the code reads
 	python3 scripts/check_env_example.py
 
-ci: fmt lint env-check test sdk-ts sdk-py openapi-check deny ## Run the same checks as CI (minus network-dependent E2E)
+ci: fmt lint env-check dashboards-check test sdk-ts sdk-py openapi-check deny ## Run the same checks as CI (minus network-dependent E2E)
 
 up: ## Full stack in Docker
 	docker compose -f docker-compose.full.yml up --build -d

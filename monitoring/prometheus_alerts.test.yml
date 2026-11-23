@@ -1,0 +1,359 @@
+rule_files:
+  - prometheus_alerts.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: "lumenqraph_indexer_lag_ledgers{instance=\"test\"}"
+        values: "101+0x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphIndexerLagHigh
+        exp_alerts:
+          - exp_labels:
+              instance: test
+              severity: warning
+            exp_annotations:
+              summary: "Indexer lag exceeds 100 ledgers."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphindexerlaghigh"
+
+  - interval: 1m
+    input_series:
+      - series: "lumenqraph_indexer_lag_ledgers{instance=\"test\"}"
+        values: "501+0x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphIndexerLagCritical
+        exp_alerts:
+          - exp_labels:
+              instance: test
+              severity: critical
+            exp_annotations:
+              summary: "Indexer lag exceeds 500 ledgers."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphindexerlagcritical"
+
+  - interval: 1m
+    input_series:
+      - series: "lumenqraph_indexer_lag_ledgers{instance=\"test\",job=\"lumenqraph-indexer\"}"
+        values: "21+0x30"
+      - series: "lumenqraph_indexer_last_processed_ledger{instance=\"test\",job=\"lumenqraph-indexer\"}"
+        values: "1000+0x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphIndexerStalled
+        exp_alerts:
+          - exp_labels:
+              instance: test
+              job: lumenqraph-indexer
+              severity: critical
+            exp_annotations:
+              summary: "Indexer cursor has not advanced in 10 minutes and is more than 20 ledgers behind."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphindexerstalled"
+
+  - interval: 1m
+    input_series:
+      - series: "lumenqraph_indexer_errors_total{instance=\"test\"}"
+        values: "0+1x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphIndexerErrorRateHigh
+        exp_alerts:
+          - exp_labels:
+              instance: test
+              severity: warning
+            exp_annotations:
+              summary: "Indexer error rate exceeds 0.01 errors per second over five minutes."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphindexererrorratehigh"
+
+  - interval: 1m
+    input_series:
+      - series: "lumenqraph_indexer_lag_ledgers{instance=\"test\"}"
+        values: "0+50x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphLargeLagGrowth
+        exp_alerts:
+          - exp_labels:
+              instance: test
+              severity: warning
+            exp_annotations:
+              summary: "Indexer lag growth exceeds 1,000 ledgers over the last hour."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphlargelaggrowth"
+
+  - interval: 1m
+    input_series:
+      - series: "lumenqraph_webhook_oldest_pending_age_seconds{instance=\"test\"}"
+        values: "301+0x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphWebhookBacklogHigh
+        exp_alerts:
+          - exp_labels:
+              instance: test
+              severity: warning
+            exp_annotations:
+              summary: "The oldest pending webhook delivery is more than five minutes old."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphwebhookbackloghigh"
+
+  - interval: 1m
+    input_series:
+      - series: "lumenqraph_webhook_oldest_pending_age_seconds{instance=\"test\"}"
+        values: "3601+0x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphWebhookBacklogCritical
+        exp_alerts:
+          - exp_labels:
+              instance: test
+              severity: critical
+            exp_annotations:
+              summary: "The oldest pending webhook delivery is more than one hour old."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphwebhookbacklogcritical"
+
+  - interval: 1m
+    input_series:
+      - series: "lumenqraph_indexer_unrecovered_missed_ranges{instance=\"test\"}"
+        values: "1+0x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphUnrecoveredMissedRanges
+        exp_alerts:
+          - exp_labels:
+              instance: test
+              severity: warning
+            exp_annotations:
+              summary: "Indexer ledger gaps have remained unrecovered for 15 minutes."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphunrecoveredmissedranges"
+
+  - interval: 1m
+    input_series:
+      - series: "lumenqraph_indexer_unrecoverable_missed_ranges{instance=\"test\"}"
+        values: "1+0x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphUnrecoverableMissedRanges
+        exp_alerts:
+          - exp_labels:
+              instance: test
+              severity: critical
+            exp_annotations:
+              summary: "At least one ledger gap is outside current RPC retention."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphunrecoverablemissedranges"
+
+  - interval: 1m
+    input_series:
+      - series: "lumenqraph_indexer_last_processed_ledger{instance=\"test\"}"
+        values: "1019+0x30"
+      - series: "lumenqraph_rpc_oldest_ledger{instance=\"test\"}"
+        values: "1000+0x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphRPCRetentionMarginLow
+        exp_alerts:
+          - exp_labels:
+              instance: test
+              severity: critical
+            exp_annotations:
+              summary: "The indexer cursor is fewer than 20 ledgers ahead of the RPC retention floor, or already behind it."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphrpcretentionmarginlow"
+
+  - interval: 1m
+    input_series:
+      - series: "lumenqraph_indexer_rpc_failovers_total{instance=\"test\"}"
+        values: "0+1x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphRPCFailovers
+        exp_alerts:
+          - exp_labels:
+              instance: test
+              severity: warning
+            exp_annotations:
+              summary: "The indexer switched RPC providers in the last 10 minutes."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphrpcfailovers"
+
+  - interval: 1m
+    input_series:
+      - series: "lumenqraph_audit_dropped_total{instance=\"test\"}"
+        values: "0+1x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphAuditDrops
+        exp_alerts:
+          - exp_labels:
+              instance: test
+              severity: warning
+            exp_annotations:
+              summary: "Audit records were dropped in the last five minutes."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphauditdrops"
+
+  - interval: 1m
+    input_series:
+      - series: "lumenqraph_rate_limit_backend_errors_total{instance=\"test\"}"
+        values: "0+1x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphRateLimitBackendErrors
+        exp_alerts:
+          - exp_labels:
+              instance: test
+              severity: warning
+            exp_annotations:
+              summary: "The rate-limit backend returned errors in the last five minutes."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphratelimitbackenderrors"
+
+  - interval: 1m
+    input_series:
+      - series: "lumenqraph_spec_fetch_failures_total{instance=\"test\"}"
+        values: "0+1x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphSpecFetchFailures
+        exp_alerts:
+          - exp_labels:
+              instance: test
+              severity: warning
+            exp_annotations:
+              summary: "Contract specification fetches failed in the last five minutes."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphspecfetchfailures"
+
+  - interval: 1m
+    input_series:
+      - series: "lumenqraph_indexer_timestamp_parse_errors_total{instance=\"test\"}"
+        values: "0+1x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphTimestampParseErrors
+        exp_alerts:
+          - exp_labels:
+              instance: test
+              severity: warning
+            exp_annotations:
+              summary: "Indexer ledger timestamps failed to parse in the last five minutes."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphtimestampparseerrors"
+
+  - interval: 1m
+    input_series:
+      - series: "lumenqraph_consecutive_errors{instance=\"test\"}"
+        values: "20+0x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphConsecutiveErrors
+        exp_alerts:
+          - exp_labels:
+              instance: test
+              severity: critical
+            exp_annotations:
+              summary: "Consecutive poll failures reached the default circuit-breaker threshold of 20."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphconsecutiveerrors"
+
+  - interval: 1m
+    input_series:
+      - series: "lumenqraph_sse_listener_up{instance=\"test\"}"
+        values: "0+0x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphSSEListenerDown
+        exp_alerts:
+          - exp_labels:
+              instance: test
+              severity: critical
+            exp_annotations:
+              summary: "The API SSE listener has been down for two minutes."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphsselistenerdown"
+
+  - interval: 1m
+    input_series:
+      - series: "lumenqraph_enrichment_rate{instance=\"test\"}"
+        values: "0.4+0x30"
+      - series: "lumenqraph_indexer_events_ingested_total{instance=\"test\"}"
+        values: "0+1x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphEnrichmentRateLow
+        exp_alerts:
+          - exp_labels:
+              instance: test
+              severity: warning
+            exp_annotations:
+              summary: "Fewer than half of events are enriched while the indexer is ingesting events."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphenrichmentratelow"
+
+  # Quiet deployment: low lag, progressing cursor and no demand.
+  - interval: 1m
+    input_series:
+      - series: 'lumenqraph_indexer_lag_ledgers{job="lumenqraph-indexer"}'
+        values: "1+0x30"
+      - series: 'lumenqraph_indexer_last_processed_ledger{job="lumenqraph-indexer"}'
+        values: "1000+12x30"
+      - series: lumenqraph_rpc_oldest_ledger
+        values: "500+12x30"
+      - series: lumenqraph_webhook_oldest_pending_age_seconds
+        values: "0+0x30"
+      - series: lumenqraph_indexer_errors_total
+        values: "0+0x30"
+      - series: lumenqraph_indexer_events_ingested_total
+        values: "0+0x30"
+      - series: lumenqraph_api_requests_total
+        values: "0+0x30"
+      - series: lumenqraph_sse_listener_up
+        values: "1+0x30"
+      - series: lumenqraph_enrichment_rate
+        values: "0+0x30"
+      - series: lumenqraph_webhooks_pending_deliveries
+        values: "600+0x1 0+0x28"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphIndexerLagHigh
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphIndexerLagCritical
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphIndexerStalled
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphIndexerErrorRateHigh
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphLargeLagGrowth
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphWebhookBacklogHigh
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphWebhookBacklogCritical
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphUnrecoveredMissedRanges
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphUnrecoverableMissedRanges
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphRPCRetentionMarginLow
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphRPCFailovers
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphAuditDrops
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphRateLimitBackendErrors
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphSpecFetchFailures
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphTimestampParseErrors
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphConsecutiveErrors
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphSSEListenerDown
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphEnrichmentRateLow
+        exp_alerts: []

@@ -113,20 +113,7 @@ Exposed by the `lumenqraph-webhooks` service on its own `/metrics` endpoint
 
 ## Alert Rules
 
-### Critical Alerts
-
-- **IndexerStalled** - No events ingested in 5+ minutes but lag exists
-- **IndexerLagCritical** - Lag > 500 ledgers for 2+ minutes
-- **LumenqraphWebhookBacklogCritical** - Pending webhook deliveries > 5000 for 5+ minutes
-
-### Warning Alerts
-
-- **IndexerLagHigh** - Lag > 100 ledgers for 5+ minutes
-- **IndexerErrorRateHigh** - Error rate > 1% over 5 minutes
-- **LargeLagGrowth** - Lag grew > 1000 ledgers/hour
-- **IngestRateLow** - Processing < 1 event/sec for 10+ minutes
-- **APINoRequests** - No API requests for 5+ minutes
-- **LumenqraphWebhookBacklogHigh** - Pending webhook deliveries > 500 for 5+ minutes
+See the [alert runbook](#alert-runbook) for rule thresholds and operational responses.
 
 ## Validating the Configuration
 
@@ -144,6 +131,9 @@ docker run --rm -v "$PWD/monitoring:/etc/prometheus:ro" \
 docker run --rm -v "$PWD/monitoring:/etc/prometheus:ro" \
   --entrypoint promtool prom/prometheus:v2.54.1 \
   check rules /etc/prometheus/prometheus_alerts.yml
+docker run --rm -v "$PWD/monitoring:/etc/prometheus:ro" \
+  --entrypoint promtool prom/prometheus:v2.54.1 \
+  test rules /etc/prometheus/prometheus_alerts.test.yml
 ```
 
 ## Customization
@@ -152,7 +142,7 @@ docker run --rm -v "$PWD/monitoring:/etc/prometheus:ro" \
 
 Edit `prometheus_alerts.yml` to adjust:
 - Lag thresholds (currently 100/500 ledgers)
-- Duration before firing (currently 2-10 minutes)
+- Duration before firing (varies by rule)
 - Error rate thresholds (currently 1%)
 
 ### Adding More Panels
@@ -192,3 +182,70 @@ Store these files in your repository and:
 - Ensure Prometheus data source is configured correctly
 - Check time range selection in dashboard
 - Verify metrics are being scraped (check Prometheus targets)
+
+## Alert runbook
+
+Scrape the API, indexer, and webhook endpoints. Metrics used together in a rule
+must come from the same scrape target. Alert thresholds for the circuit breaker
+and enrichment reflect the defaults for `MAX_CONSECUTIVE_ERRORS` (20) and
+`ENRICHMENT_WARN_THRESHOLD` (0.5 unenriched). Adjust the corresponding rules
+when deploying with different values. The error-rate rule is in errors per
+second because the exporter does not report a poll-attempt denominator.
+
+### LumenqraphIndexerLagHigh
+Check indexer throughput, database latency, and RPC response times.
+
+### LumenqraphIndexerLagCritical
+Check the indexer process, RPC availability, and database connectivity immediately.
+
+### LumenqraphIndexerStalled
+Inspect poller and database errors and confirm the cursor is advancing before closing the incident.
+
+### LumenqraphIndexerErrorRateHigh
+Inspect recent indexer errors and isolate the failing RPC or database operation.
+
+### LumenqraphLargeLagGrowth
+Compare poll throughput against chain growth and check for throttling or slow database writes.
+
+### LumenqraphWebhookBacklogHigh
+Inspect retry logs and identify slow or failing subscriber endpoints.
+
+### LumenqraphWebhookBacklogCritical
+Check dispatcher health and database connectivity, then mitigate consistently failing subscriber endpoints.
+
+### LumenqraphUnrecoveredMissedRanges
+Inspect recorded missed ranges and confirm backfill is advancing while the ledgers are still available.
+
+### LumenqraphUnrecoverableMissedRanges
+Identify the affected ledger ranges and arrange backfill from an archival provider.
+
+### LumenqraphRPCRetentionMarginLow
+Switch to an RPC provider with sufficient history or arrange archival backfill before the cursor falls outside retention.
+
+### LumenqraphRPCFailovers
+Check primary RPC health, throttling, and failover logs before restoring normal routing.
+
+### LumenqraphConsecutiveErrors
+Inspect the failing poll operations and resolve the upstream dependency before expecting the circuit breaker to recover.
+
+### LumenqraphAuditDrops
+Check the audit queue and its database writer; assess which records were lost.
+
+### LumenqraphRateLimitBackendErrors
+Check Redis reachability, authentication, and saturation.
+
+### LumenqraphSSEListenerDown
+Check the API listener task and its upstream connection; verify that a new SSE client receives events after recovery.
+
+### LumenqraphSpecFetchFailures
+Check specification fetch logs, contract availability, and RPC health.
+
+### LumenqraphTimestampParseErrors
+Inspect RPC ledger timestamp payloads and check for provider or parser compatibility changes.
+
+### LumenqraphEnrichmentRateLow
+Check enrichment dependencies and recent contract specification failures while events are being ingested.
+
+The recoverable missed-range gauge is covered by the unrecovered-range alert.
+Ingestion rate and API request count are dashboard signals. Zero traffic alone
+does not indicate an unhealthy deployment.

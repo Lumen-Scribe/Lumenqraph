@@ -600,6 +600,11 @@ jobs:
           docker run --rm -v "$PWD/monitoring:/etc/prometheus:ro" \
             --entrypoint promtool prom/prometheus:v2.54.1 \
             check rules /etc/prometheus/prometheus_alerts.yml
+      - name: promtool test rules
+        run: |
+          docker run --rm -v "$PWD/monitoring:/etc/prometheus:ro" \
+            --entrypoint promtool prom/prometheus:v2.54.1 \
+            test rules /etc/prometheus/prometheus_alerts.test.yml
 
   dashboard-metrics:
     name: Dashboard Metrics Validation
@@ -613,7 +618,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Validate dashboard metrics
-        run: python3 scripts/validate_dashboard_metrics.py
+        run: |
+          make dashboards-check
+          python3 -m unittest discover -s scripts -p test_validate_dashboard_metrics.py
 
   # Issue #529: this job was accidentally merged into `dashboard-metrics`, so
   # branch protection requiring `supply-chain-security` could never be

@@ -37,15 +37,16 @@ def extract_metrics_from_rust(rust_dir: str) -> set[str]:
     for rust_file in Path(rust_dir).rglob("*.rs"):
         with open(rust_file) as f:
             content = f.read()
-            # Find all metric definitions: "lumenqraph_metric_name"
-            found = re.findall(r'"(lumenqraph_\w+)"', content)
-            metrics.update(found)
+            for metric, kind in re.findall(r"# TYPE (lumenqraph_\w+) (\w+)", content):
+                metrics.add(metric)
+                if kind == "histogram":
+                    metrics.update(metric + suffix for suffix in ("_bucket", "_sum", "_count"))
 
     return metrics
 
 
-def main() -> int:
-    repo_root = Path(__file__).parent.parent
+def main(repo_root: Path | None = None) -> int:
+    repo_root = repo_root or Path(__file__).resolve().parent.parent
     dashboard_path = repo_root / "monitoring" / "grafana_dashboard.json"
     rust_crates = repo_root / "crates"
 
@@ -54,29 +55,25 @@ def main() -> int:
         return 1
 
     try:
-        dashboard_metrics = extract_metrics_from_dashboard(str(dashboard_path))
-        rust_metrics = extract_metrics_from_rust(str(rust_crates))
-    except Exception as e:
+        dashboard = extract_metrics_from_dashboard(str(dashboard_path))
+        alerts = (repo_root / "monitoring" / "prometheus_alerts.yml").read_text()
+        # Match inline expressions and indented YAML block or multiline scalars.
+        expressions = re.findall(r"(?m)^([ ]*)expr:[ ]*([^\n]*(?:\n\1[ ]+[^\n]*)*)", alerts)
+        alert_metrics = set(re.findall(r"\b(lumenqraph_\w+)\b", " ".join(expr for _, expr in expressions)))
+        exported = extract_metrics_from_rust(str(rust_crates))
+    except (OSError, ValueError) as e:
         print(f"error reading files: {e}", file=sys.stderr)
         return 1
 
-    # Find metrics in dashboard but not in code
-    missing = dashboard_metrics - rust_metrics
-    if missing:
-        print("error: dashboard references metrics not found in code:", file=sys.stderr)
-        for metric in sorted(missing):
-            print(f"  - {metric}", file=sys.stderr)
-        return 1
-
-    # Find metrics in code but not in dashboard (warning only)
-    unused = rust_metrics - dashboard_metrics
-    if unused:
-        print("warning: metrics in code but not in dashboard:", file=sys.stderr)
-        for metric in sorted(unused):
-            print(f"  - {metric}", file=sys.stderr)
-
-    print(f"✓ dashboard references {len(dashboard_metrics)} valid metrics", file=sys.stderr)
-    return 0
+    failed = False
+    for source, metrics in (("dashboard", dashboard), ("alerts", alert_metrics)):
+        missing = metrics - exported
+        if missing:
+            print(f"error: {source} references metrics not found in code: {', '.join(sorted(missing))}", file=sys.stderr)
+            failed = True
+        else:
+            print(f"{source} references {len(metrics)} valid metrics")
+    return int(failed)
 
 
 if __name__ == "__main__":
