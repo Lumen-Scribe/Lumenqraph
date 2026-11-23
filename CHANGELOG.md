@@ -28,9 +28,30 @@ Breaking changes will be documented in the changelog with migration guidance whe
   `POST /admin/keys/{prefix}/revoke` and `POST /admin/keys/{prefix}/rotate`.
   Guarded by the new `ADMIN_TOKEN` credential; the routes return 404 unless it is
   set. Every action is written to the audit log.
+- Indexer health endpoints (#756): the indexer's HTTP listener now also serves
+  `/livez` (always 200 while the process is up) and `/readyz` (503 while
+  degraded), and the `lumenqraph-indexer healthcheck` subcommand that
+  `docker-compose.full.yml` already referenced now exists — it GETs `/health`
+  on `INDEXER_HTTP_BIND_ADDR` and exits non-zero on a non-2xx response.
+- New settings: `INDEXER_HEALTH_STRICT` (default `true` — `/health` answers 503
+  while degraded) and `HEALTH_MAX_PENDING_DELIVERIES` (default `5000` — queue
+  depth threshold). New `indexer_cursor.progress_at` column, set only by real
+  progress writes, plus a `lumenqraph_indexer_seconds_since_progress` metric and
+  a `LumenqraphIndexerStalled` alert clause on it (#757).
 
 ### Fixed
 
+- Indexer `/health` returned HTTP 200 even when degraded, so Docker
+  `HEALTHCHECK`, Kubernetes probes and Fly checks could not detect a stuck
+  poller; it now returns 503 when the cursor has not advanced for
+  `HEALTH_MAX_STALE_SECS`, when lag reaches `HEALTH_MAX_LAG_LEDGERS`, when the
+  webhook queue depth reaches `HEALTH_MAX_PENDING_DELIVERIES`, or when the
+  database is unreachable. The JSON body is unchanged apart from added
+  `seconds_since_progress`, `pending_deliveries` and `degraded_reasons` fields
+  (#756).
+- Health freshness is now computed from `indexer_cursor.progress_at` (last cursor
+  advance) instead of `updated_at`, which every error-counter write bumps — a
+  poller whose every cycle fails no longer looks fresh (#757).
 - Indexer: `reenrich` reads and writes event JSONB columns with SQLx JSON types,
   and malformed rows are logged and skipped instead of panicking the pass
   (#752).

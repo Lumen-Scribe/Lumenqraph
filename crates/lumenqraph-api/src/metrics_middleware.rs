@@ -3,6 +3,7 @@
 //! cardinality bounded.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -12,38 +13,28 @@ use axum::middleware::Next;
 use axum::response::Response;
 use parking_lot::RwLock;
 
-/// Upper bounds, in milliseconds, of the latency histogram buckets. Samples
-/// above the last bound are counted only in `+Inf`.
-pub const LATENCY_BUCKETS_MS: [u64; 9] = [1, 5, 10, 50, 100, 500, 1_000, 5_000, 10_000];
+/// Upper bounds, in seconds, of the latency histogram buckets. Samples above
+/// the last bound are counted only in `+Inf`.
+pub const LATENCY_BUCKETS_SECONDS: [f64; 14] = [
+    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
 
-/// Fixed-size latency histogram. Its memory does not depend on how many
-/// samples it has seen, so it is safe to keep for the life of the process.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Point-in-time copy of an [`AtomicLatencyHistogram`], used for rendering.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct LatencyHistogram {
     /// Non-cumulative count per bucket; `buckets[i]` holds samples in
-    /// `(LATENCY_BUCKETS_MS[i-1], LATENCY_BUCKETS_MS[i]]`.
-    pub buckets: [u64; LATENCY_BUCKETS_MS.len()],
+    /// `(LATENCY_BUCKETS_SECONDS[i-1], LATENCY_BUCKETS_SECONDS[i]]`.
+    pub buckets: [u64; LATENCY_BUCKETS_SECONDS.len()],
     /// Total number of samples, including those above the last bound.
     pub count: u64,
-    /// Sum of all samples in milliseconds.
-    pub sum_ms: u64,
+    /// Sum of all samples in seconds.
+    pub sum_seconds: f64,
 }
 
 impl LatencyHistogram {
-    pub fn observe(&mut self, elapsed_ms: u64) {
-        self.count += 1;
-        self.sum_ms = self.sum_ms.saturating_add(elapsed_ms);
-        if let Some(i) = LATENCY_BUCKETS_MS
-            .iter()
-            .position(|&bound| elapsed_ms <= bound)
-        {
-            self.buckets[i] += 1;
-        }
-    }
-
     /// Cumulative count for each bucket bound, as Prometheus `le` buckets expect.
-    pub fn cumulative(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
-        LATENCY_BUCKETS_MS
+    pub fn cumulative(&self) -> impl Iterator<Item = (f64, u64)> + '_ {
+        LATENCY_BUCKETS_SECONDS
             .iter()
             .zip(self.buckets.iter())
             .scan(0u64, |running, (&bound, &n)| {
@@ -53,27 +44,84 @@ impl LatencyHistogram {
     }
 }
 
+/// Fixed-size latency histogram updated with atomic adds, so recording never
+/// takes a lock. Its memory does not depend on how many samples it has seen,
+/// so it is safe to keep for the life of the process.
+#[derive(Debug, Default)]
+pub struct AtomicLatencyHistogram {
+    buckets: [AtomicU64; LATENCY_BUCKETS_SECONDS.len()],
+    count: AtomicU64,
+    /// Sum of all samples in nanoseconds.
+    sum_nanos: AtomicU64,
+}
+
+impl AtomicLatencyHistogram {
+    pub fn observe(&self, elapsed_seconds: f64) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_nanos
+            .fetch_add((elapsed_seconds * 1e9) as u64, Ordering::Relaxed);
+        if let Some(i) = LATENCY_BUCKETS_SECONDS
+            .iter()
+            .position(|&bound| elapsed_seconds <= bound)
+        {
+            self.buckets[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn snapshot(&self) -> LatencyHistogram {
+        LatencyHistogram {
+            buckets: std::array::from_fn(|i| self.buckets[i].load(Ordering::Relaxed)),
+            count: self.count.load(Ordering::Relaxed),
+            sum_seconds: self.sum_nanos.load(Ordering::Relaxed) as f64 / 1e9,
+        }
+    }
+}
+
 /// Route label for requests that matched no registered route. All of them
 /// share this one value, so probes of random paths cannot create series.
 pub const UNMATCHED_ROUTE: &str = "unmatched";
 
-/// Label set that identifies one histogram series.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct HistogramKey {
-    pub route: String,
-    pub method: String,
+/// Method label for any method outside the standard set. All extension
+/// methods share this one value, so arbitrary method tokens cannot create
+/// series.
+pub const OTHER_METHOD: &str = "OTHER";
+
+/// Latency histogram and status-code counters for one `(route, method)` label
+/// set.
+#[derive(Debug, Default)]
+pub struct SeriesMetrics {
+    pub latency: AtomicLatencyHistogram,
+    pub status_counts: RwLock<HashMap<u16, AtomicU64>>,
 }
 
+impl SeriesMetrics {
+    fn record(&self, status: StatusCode, elapsed_seconds: f64) {
+        self.latency.observe(elapsed_seconds);
+        let code = status.as_u16();
+        if let Some(counter) = self.status_counts.read().get(&code) {
+            counter.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.status_counts
+            .write()
+            .entry(code)
+            .or_default()
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Series keyed by route, then method, so the request path can look one up
+/// with borrowed labels instead of building a key.
+pub type SeriesMap = HashMap<String, HashMap<String, SeriesMetrics>>;
+
 pub struct MetricsCollector {
-    pub histogram_buckets: Arc<RwLock<HashMap<HistogramKey, LatencyHistogram>>>,
-    pub status_counters: Arc<RwLock<HashMap<String, u64>>>,
+    pub series: Arc<RwLock<SeriesMap>>,
 }
 
 impl MetricsCollector {
     pub fn new() -> Self {
         Self {
-            histogram_buckets: Arc::new(RwLock::new(HashMap::new())),
-            status_counters: Arc::new(RwLock::new(HashMap::new())),
+            series: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -81,51 +129,61 @@ impl MetricsCollector {
     /// template (for example `/contracts/:contract_id/events`).
     pub async fn middleware(self: Arc<Self>, req: Request, next: Next) -> Response {
         let method = req.method().clone();
-        let route = route_label(&req);
+        let matched = matched_path(&req);
         let start = Instant::now();
 
         let response = next.run(req).await;
-        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let elapsed_seconds = start.elapsed().as_secs_f64();
 
-        self.record(&route, &method, response.status(), elapsed_ms);
+        let route = matched
+            .as_ref()
+            .map_or(UNMATCHED_ROUTE, MatchedPath::as_str);
+        self.record(route, &method, response.status(), elapsed_seconds);
         response
     }
 
     /// Record one finished request. Memory grows only with the number of
     /// distinct label sets, never with the number of requests.
-    pub fn record(&self, route: &str, method: &Method, status: StatusCode, elapsed_ms: u64) {
-        let counter_key = format!(
-            "http_requests{{route=\"{}\",method=\"{}\",status=\"{}\"}}",
-            escape_label_value(route),
-            escape_label_value(method.as_str()),
-            status.as_u16()
-        );
+    ///
+    /// Once a series exists this takes only shared locks and atomic adds, so
+    /// requests and `/metrics` rendering do not block each other.
+    pub fn record(&self, route: &str, method: &Method, status: StatusCode, elapsed_seconds: f64) {
+        let method = method_label(method);
+        if let Some(series) = self
+            .series
+            .read()
+            .get(route)
+            .and_then(|by_method| by_method.get(method))
         {
-            let mut counters = self.status_counters.write();
-            *counters.entry(counter_key).or_insert(0) += 1;
+            series.record(status, elapsed_seconds);
+            return;
         }
-
-        let key = HistogramKey {
-            route: route.to_string(),
-            method: method.to_string(),
-        };
-        self.histogram_buckets
+        self.series
             .write()
-            .entry(key)
+            .entry(route.to_string())
             .or_default()
-            .observe(elapsed_ms);
+            .entry(method.to_string())
+            .or_default()
+            .record(status, elapsed_seconds);
     }
 }
 
-/// The matched route template for a request, or [`UNMATCHED_ROUTE`].
+/// The matched route template for a request, if any.
 ///
 /// axum records `MatchedPath` on the request before the route's layers run,
-/// so this is the registered template rather than the raw path.
-fn route_label(req: &Request) -> String {
-    req.extensions()
-        .get::<MatchedPath>()
-        .map(|matched| matched.as_str().to_string())
-        .unwrap_or_else(|| UNMATCHED_ROUTE.to_string())
+/// so this is the registered template rather than the raw path. Cloning it
+/// only bumps a reference count.
+fn matched_path(req: &Request) -> Option<MatchedPath> {
+    req.extensions().get::<MatchedPath>().cloned()
+}
+
+/// The method label for a request: the method name for the standard methods,
+/// or [`OTHER_METHOD`].
+fn method_label(method: &Method) -> &str {
+    match method.as_str() {
+        m @ ("GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS") => m,
+        _ => OTHER_METHOD,
+    }
 }
 
 /// Escape a label value for the Prometheus text exposition format: backslash,
@@ -182,15 +240,22 @@ mod tests {
     }
 
     fn routes_seen(collector: &MetricsCollector) -> Vec<String> {
-        let mut routes: Vec<String> = collector
-            .histogram_buckets
-            .read()
-            .keys()
-            .map(|k| k.route.clone())
-            .collect();
+        let mut routes: Vec<String> = collector.series.read().keys().cloned().collect();
         routes.sort();
         routes.dedup();
         routes
+    }
+
+    fn methods_seen(collector: &MetricsCollector) -> Vec<String> {
+        let mut methods: Vec<String> = collector
+            .series
+            .read()
+            .values()
+            .flat_map(|by_method| by_method.keys().cloned())
+            .collect();
+        methods.sort();
+        methods.dedup();
+        methods
     }
 
     #[tokio::test]
@@ -234,6 +299,28 @@ mod tests {
         assert!(routes_seen(&collector).len() <= 3);
     }
 
+    #[tokio::test]
+    async fn extension_methods_share_one_label() {
+        let collector = Arc::new(MetricsCollector::new());
+        let router = app(collector.clone());
+
+        for i in 0..1_000 {
+            router
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(format!("FOOBAR{i}").as_str())
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(methods_seen(&collector), vec![OTHER_METHOD]);
+    }
+
     #[test]
     fn escape_label_value_escapes_exposition_metacharacters() {
         assert_eq!(escape_label_value("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
@@ -249,33 +336,47 @@ mod tests {
                 routes[(i % 3) as usize],
                 &Method::GET,
                 StatusCode::OK,
-                i % 1_500,
+                (i % 1_500) as f64 / 1_000.0,
             );
         }
 
-        let histograms = collector.histogram_buckets.read();
+        let series = collector.series.read();
+        let histograms: Vec<LatencyHistogram> = series
+            .values()
+            .flat_map(|by_method| by_method.values())
+            .map(|s| s.latency.snapshot())
+            .collect();
         assert_eq!(histograms.len(), routes.len());
-        let total: u64 = histograms.values().map(|h| h.count).sum();
+        let total: u64 = histograms.iter().map(|h| h.count).sum();
         assert_eq!(total, 1_000_000);
         // Each series is a fixed-size struct: no per-sample storage exists.
         assert_eq!(
-            std::mem::size_of::<LatencyHistogram>(),
-            (LATENCY_BUCKETS_MS.len() + 2) * std::mem::size_of::<u64>()
+            std::mem::size_of::<AtomicLatencyHistogram>(),
+            (LATENCY_BUCKETS_SECONDS.len() + 2) * std::mem::size_of::<u64>()
         );
     }
 
     #[test]
     fn histogram_buckets_are_cumulative_and_include_overflow() {
-        let mut h = LatencyHistogram::default();
-        for ms in [0, 3, 7, 20_000] {
-            h.observe(ms);
+        let h = AtomicLatencyHistogram::default();
+        for seconds in [0.0, 0.003, 0.007, 20.0] {
+            h.observe(seconds);
         }
-        let cumulative: Vec<(u64, u64)> = h.cumulative().collect();
-        assert_eq!(cumulative[0], (1, 1));
-        assert_eq!(cumulative[1], (5, 2));
-        assert_eq!(cumulative[2], (10, 3));
-        assert_eq!(*cumulative.last().unwrap(), (10_000, 3));
+        let h = h.snapshot();
+        let cumulative: Vec<(f64, u64)> = h.cumulative().collect();
+        assert_eq!(cumulative[0], (0.0005, 1));
+        assert_eq!(cumulative[3], (0.005, 2));
+        assert_eq!(cumulative[4], (0.01, 3));
+        assert_eq!(*cumulative.last().unwrap(), (10.0, 3));
         assert_eq!(h.count, 4);
-        assert_eq!(h.sum_ms, 20_010);
+        assert!((h.sum_seconds - 20.01).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sub_millisecond_request_lands_below_one_millisecond() {
+        let h = AtomicLatencyHistogram::default();
+        h.observe(0.000_4);
+        let cumulative: Vec<(f64, u64)> = h.snapshot().cumulative().collect();
+        assert_eq!(cumulative[0], (0.0005, 1));
     }
 }

@@ -204,7 +204,7 @@ impl SseStreamLimiter {
         // Saturating decrement of the global counter.
         let _ = self
             .global
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
                 if v > 0 {
                     Some(v - 1)
                 } else {

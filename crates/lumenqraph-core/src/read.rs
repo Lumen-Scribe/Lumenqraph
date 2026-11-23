@@ -404,24 +404,23 @@ fn json_to_scval(
         // the flagship simulate-a-transfer use case requires it.  We accept the
         // same three strkey forms the SDK accepts:
         //   G… → ScAddress::Account (plain Ed25519 public key)
-        //   M… → ScAddress::Account (Ed25519 key extracted from the muxed strkey;
-        //          the Soroban host ignores the mux ID at the XDR layer)
+        //   M… → ScAddress::MuxedAccount (CAP-67: Ed25519 key plus mux ID)
         //   C… → ScAddress::Contract
         T::MuxedAddress => {
             let s = str_of(v, name)?;
             let addr = if s.starts_with('M') {
-                // Parse the M… muxed-account strkey and extract the underlying
-                // Ed25519 public key. The Soroban host encodes MuxedAddress as a
-                // plain ScAddress::Account — the mux ID is not carried in the
-                // ScVal wire format.
+                // Protocol 23 (CAP-67) carries the mux ID on the wire as
+                // ScAddress::MuxedAccount, so keep it rather than dropping it.
                 use stellar_strkey::Strkey;
                 match Strkey::from_string(s)
                     .map_err(|_| bad("invalid muxed address strkey (expected M…)"))?
                 {
-                    Strkey::MuxedAccountEd25519(mux) => ScAddress::from_str(
-                        &stellar_strkey::ed25519::PublicKey(mux.ed25519).to_string(),
-                    )
-                    .map_err(|_| bad("could not re-encode muxed address as G… strkey"))?,
+                    Strkey::MuxedAccountEd25519(mux) => {
+                        ScAddress::MuxedAccount(stellar_xdr::curr::MuxedEd25519Account {
+                            id: mux.id,
+                            ed25519: stellar_xdr::curr::Uint256(mux.ed25519),
+                        })
+                    }
                     _ => return Err(bad("expected an M… muxed account strkey")),
                 }
             } else {
@@ -807,7 +806,10 @@ pub fn decode_events(
             .map(|c| ScAddress::Contract(c).to_string());
         let topics: Vec<Value> = body.topics.iter().map(scval_to_json).collect();
         let data = scval_to_json(&body.data);
-        let event_name = topics.first().and_then(|t| t.as_str().map(String::from));
+        let event_name = body
+            .topics
+            .first()
+            .and_then(crate::xdr::event_name_from_scval);
 
         // Enrich events emitted by the contract we're simulating.
         let enriched = match (spec, &event_name, &contract_id) {

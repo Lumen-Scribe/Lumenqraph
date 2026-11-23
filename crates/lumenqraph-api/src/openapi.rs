@@ -173,12 +173,9 @@ impl OpenApiBuilder {
             ))
             .build();
 
-        let api = UtoipaOpenApiBuilder::default().info(info).build();
-
         // TODO: Add route-specific OpenAPI documentation via Modify trait
         // The routes will be documented using utoipa attributes on handler functions
-
-        api
+        UtoipaOpenApiBuilder::default().info(info).build()
     }
 }
 

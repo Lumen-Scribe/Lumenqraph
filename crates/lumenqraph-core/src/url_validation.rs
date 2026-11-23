@@ -6,6 +6,9 @@ use url::Url;
 
 pub fn validate_webhook_url(url: &str) -> Result<(), String> {
     let parsed = Url::parse(url).map_err(|e| format!("invalid URL: {}", e))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("url must not contain credentials".to_string());
+    }
 
     match parsed.scheme() {
         "http" | "https" => {}
@@ -73,6 +76,7 @@ fn is_reserved_ip(ip: &IpAddr) -> bool {
                 || is_reserved_v4(v4)
                 || is_shared_address_space_v4(v4)
                 || is_benchmarking_v4(v4)
+                || is_special_purpose_v4(v4)
         }
         IpAddr::V6(v6) => {
             // Check for IPv4-mapped IPv6 addresses (::ffff:0:0/96)
@@ -102,8 +106,26 @@ fn is_reserved_ip(ip: &IpAddr) -> bool {
                 || v6.is_unique_local()
                 || is_documentation_v6(v6)
                 || is_discard_prefix(v6)
+                || is_special_purpose_v6(v6)
         }
     }
+}
+
+/// IETF protocol assignments (192.0.0.0/24) and the deprecated 6to4 relay
+/// anycast (192.88.99.0/24): neither is globally reachable.
+fn is_special_purpose_v4(ip: &std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    (o[0] == 192 && o[1] == 0 && o[2] == 0) || (o[0] == 192 && o[1] == 88 && o[2] == 99)
+}
+
+/// Teredo (2001::/32), local-use NAT64 (64:ff9b:1::/48) and deprecated
+/// site-local (fec0::/10). Teredo is blocked as a whole, which covers any
+/// embedded client IPv4.
+fn is_special_purpose_v6(ip: &std::net::Ipv6Addr) -> bool {
+    let s = ip.segments();
+    (s[0] == 0x2001 && s[1] == 0)
+        || (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1)
+        || (s[0] & 0xffc0) == 0xfec0
 }
 
 fn is_documentation_v4(ip: &std::net::Ipv4Addr) -> bool {
@@ -179,6 +201,9 @@ fn is_localhost(host: &str) -> bool {
 /// Returns the validated public IP address to be used for connection pinning.
 pub async fn validate_webhook_url_at_delivery(url: &str) -> Result<IpAddr, String> {
     let parsed = Url::parse(url).map_err(|e| format!("invalid URL: {}", e))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("url must not contain credentials".to_string());
+    }
 
     if let Some(host_str) = parsed.host_str() {
         // If it's already an IP address, validate it again (rules may have changed)
@@ -230,6 +255,40 @@ pub async fn validate_webhook_url_at_delivery(url: &str) -> Result<IpAddr, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SPECIAL_PURPOSE: &[&str] = &[
+        "http://192.0.0.8/",
+        "http://192.0.0.170/",
+        "http://192.88.99.1/",
+        "http://[2001:0:4136:e378:8000:63bf:3fff:fdd2]/",
+        "http://[64:ff9b:1::a00:1]/",
+        "http://[fec0::1]/",
+    ];
+
+    #[tokio::test]
+    async fn rejects_special_purpose_ranges() {
+        for url in SPECIAL_PURPOSE {
+            assert!(validate_webhook_url(url).is_err(), "{url}");
+            assert!(
+                validate_webhook_url_at_delivery(url).await.is_err(),
+                "{url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_userinfo() {
+        for url in [
+            "https://user:pass@example.com/",
+            "https://user@example.com/",
+        ] {
+            assert!(validate_webhook_url(url).is_err(), "{url}");
+            assert!(
+                validate_webhook_url_at_delivery(url).await.is_err(),
+                "{url}"
+            );
+        }
+    }
 
     #[test]
     fn rejects_ipv4_mapped_ipv6_loopback() {

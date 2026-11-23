@@ -7,7 +7,6 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
-use chrono::Utc;
 use serde_json::json;
 use sqlx::PgPool;
 use std::net::SocketAddr;
@@ -16,6 +15,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::dispatcher::{
+    DELIVERIES_DELIVERED_TOTAL, DELIVERIES_FAILED_TOTAL, DELIVERIES_RETRIED_TOTAL,
     DELIVERY_ATTEMPTS_TOTAL, DELIVERY_LATENCY_LAST_SECONDS, DELIVERY_LATENCY_SECONDS_TOTAL,
     PENDING_DELIVERIES, QUEUE_AGE_OLDEST_SECONDS,
 };
@@ -183,6 +183,19 @@ async fn metrics(State(state): State<MetricsState>, headers: HeaderMap) -> impl 
         DELIVERY_ATTEMPTS_TOTAL.load(Ordering::Relaxed)
     ));
 
+    body.push_str("# HELP lumenqraph_webhook_deliveries_total Delivery outcomes recorded by the worker pool since start\n");
+    body.push_str("# TYPE lumenqraph_webhook_deliveries_total counter\n");
+    for (result, counter) in [
+        ("delivered", &DELIVERIES_DELIVERED_TOTAL),
+        ("failed", &DELIVERIES_FAILED_TOTAL),
+        ("retried", &DELIVERIES_RETRIED_TOTAL),
+    ] {
+        body.push_str(&format!(
+            "lumenqraph_webhook_deliveries_total{{result=\"{result}\"}} {}\n",
+            counter.load(Ordering::Relaxed)
+        ));
+    }
+
     body.push_str("# HELP lumenqraph_webhook_delivery_latency_seconds_total Cumulative time spent in delivery attempts since start\n");
     body.push_str("# TYPE lumenqraph_webhook_delivery_latency_seconds_total counter\n");
     body.push_str(&format!(
@@ -242,24 +255,6 @@ async fn metrics(State(state): State<MetricsState>, headers: HeaderMap) -> impl 
                 "lumenqraph_webhook_delivered_total {}\n",
                 metrics.delivered_count
             ));
-
-            body.push_str(
-                "# HELP lumenqraph_webhook_delivered_last_min Last minute delivered webhooks\n",
-            );
-            body.push_str("# TYPE lumenqraph_webhook_delivered_last_min gauge\n");
-            body.push_str(&format!(
-                "lumenqraph_webhook_delivered_last_min {}\n",
-                metrics.delivered_last_min
-            ));
-
-            body.push_str(
-                "# HELP lumenqraph_webhook_failed_last_min Last minute failed webhooks\n",
-            );
-            body.push_str("# TYPE lumenqraph_webhook_failed_last_min gauge\n");
-            body.push_str(&format!(
-                "lumenqraph_webhook_failed_last_min {}\n",
-                metrics.failed_last_min
-            ));
         }
         Err(e) => {
             error!(error = %e, "failed to gather webhook metrics");
@@ -278,8 +273,6 @@ struct WebhookMetrics {
     oldest_pending_age_secs: i64,
     failed_count: i64,
     delivered_count: i64,
-    delivered_last_min: i64,
-    failed_last_min: i64,
 }
 
 async fn gather_metrics(pool: &PgPool) -> anyhow::Result<WebhookMetrics> {
@@ -300,32 +293,11 @@ async fn gather_metrics(pool: &PgPool) -> anyhow::Result<WebhookMetrics> {
             .fetch_one(pool)
             .await?;
 
-    let now = Utc::now();
-    let one_min_ago = now - chrono::Duration::minutes(1);
-
-    let delivered_last_min: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM webhook_deliveries
-         WHERE status = 'delivered' AND delivered_at >= $1",
-    )
-    .bind(one_min_ago)
-    .fetch_one(pool)
-    .await?;
-
-    let failed_last_min: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM webhook_deliveries
-         WHERE status = 'failed' AND created_at >= $1",
-    )
-    .bind(one_min_ago)
-    .fetch_one(pool)
-    .await?;
-
     Ok(WebhookMetrics {
         pending_count: pending.0,
         oldest_pending_age_secs: pending.1.unwrap_or(0),
         failed_count: failed,
         delivered_count: delivered,
-        delivered_last_min,
-        failed_last_min,
     })
 }
 
