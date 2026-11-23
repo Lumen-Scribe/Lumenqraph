@@ -28,7 +28,7 @@ const PRUNE_LOCK: i64 = 567_002;
 const BATCH: i64 = 1000;
 
 /// Rows removed by the pruner since this process started. Exported as
-/// `lumenqraph_webhook_deliveries_pruned_total`.
+/// `lumenqraph_webhooks_deliveries_pruned_total`.
 pub static DELIVERIES_PRUNED: AtomicU64 = AtomicU64::new(0);
 
 /// Inactive-subscription deliveries expired since this process started.

@@ -58,7 +58,7 @@ fn worker_id() -> String {
 pub static PENDING_DELIVERIES: AtomicI64 = AtomicI64::new(0);
 
 /// Delivery attempts made by the worker pool since start
-/// (`lumenqraph_webhook_delivery_attempts_total`).
+/// (`lumenqraph_webhooks_delivery_attempts_total`).
 pub static DELIVERY_ATTEMPTS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Cumulative time spent in delivery attempts, in seconds.
@@ -68,7 +68,7 @@ pub static DELIVERY_LATENCY_SECONDS_TOTAL: AtomicF64 = AtomicF64::new(0.0);
 pub static DELIVERY_LATENCY_LAST_SECONDS: AtomicF64 = AtomicF64::new(0.0);
 
 /// Age of the oldest pending delivery in seconds, kept in step with the
-/// `/metrics` scrape (`lumenqraph_webhook_queue_age_oldest_seconds`).
+/// `/metrics` scrape (`lumenqraph_webhooks_oldest_pending_age_seconds`).
 pub static QUEUE_AGE_OLDEST_SECONDS: AtomicF64 = AtomicF64::new(0.0);
 
 /// An `f64` stored as its bit pattern in an [`AtomicU64`], for the second-valued

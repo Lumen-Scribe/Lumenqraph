@@ -379,7 +379,7 @@ delivery queue as follows:
   (`delivered` or `failed`), it no longer blocks pruning. For each batch of out-of-window
   events, the pruner deletes the `delivered`/`failed` delivery rows for those events and then
   deletes the events themselves, in the same transaction. The deleted delivery rows are counted
-  in the `lumenqraph_webhook_deliveries_dropped_by_retention_total` metric. If you need to audit
+  in the `lumenqraph_indexer_webhook_deliveries_dropped_by_retention_total` metric. If you need to audit
   or redrive failed deliveries, do so before the event falls outside the retention window, or
   increase `RETENTION_LEDGERS`.
 - **`ON DELETE RESTRICT` is a safety net.** Because `webhook_deliveries.event_id` is declared

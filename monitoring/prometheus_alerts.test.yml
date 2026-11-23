@@ -82,7 +82,7 @@ tests:
 
   - interval: 1m
     input_series:
-      - series: "lumenqraph_webhook_oldest_pending_age_seconds{instance=\"test\"}"
+      - series: "lumenqraph_webhooks_oldest_pending_age_seconds{instance=\"test\"}"
         values: "301+0x30"
     alert_rule_test:
       - eval_time: 30m
@@ -97,7 +97,7 @@ tests:
 
   - interval: 1m
     input_series:
-      - series: "lumenqraph_webhook_oldest_pending_age_seconds{instance=\"test\"}"
+      - series: "lumenqraph_webhooks_oldest_pending_age_seconds{instance=\"test\"}"
         values: "3601+0x30"
     alert_rule_test:
       - eval_time: 30m
@@ -112,7 +112,7 @@ tests:
 
   - interval: 1m
     input_series:
-      - series: "lumenqraph_indexer_unrecovered_missed_ranges{instance=\"test\"}"
+      - series: "lumenqraph_indexer_open_missed_ranges{instance=\"test\"}"
         values: "1+0x30"
     alert_rule_test:
       - eval_time: 30m
@@ -127,7 +127,7 @@ tests:
 
   - interval: 1m
     input_series:
-      - series: "lumenqraph_indexer_unrecoverable_missed_ranges{instance=\"test\"}"
+      - series: "lumenqraph_indexer_permanent_missed_ranges{instance=\"test\"}"
         values: "1+0x30"
     alert_rule_test:
       - eval_time: 30m
@@ -144,7 +144,7 @@ tests:
     input_series:
       - series: "lumenqraph_indexer_last_processed_ledger{instance=\"test\"}"
         values: "1019+0x30"
-      - series: "lumenqraph_rpc_oldest_ledger{instance=\"test\"}"
+      - series: "lumenqraph_indexer_rpc_oldest_ledger{instance=\"test\"}"
         values: "1000+0x30"
     alert_rule_test:
       - eval_time: 30m
@@ -174,7 +174,7 @@ tests:
 
   - interval: 1m
     input_series:
-      - series: "lumenqraph_audit_dropped_total{instance=\"test\"}"
+      - series: "lumenqraph_api_audit_dropped_total{instance=\"test\"}"
         values: "0+1x30"
     alert_rule_test:
       - eval_time: 30m
@@ -189,7 +189,7 @@ tests:
 
   - interval: 1m
     input_series:
-      - series: "lumenqraph_rate_limit_backend_errors_total{instance=\"test\"}"
+      - series: "lumenqraph_api_rate_limit_backend_errors_total{instance=\"test\"}"
         values: "0+1x30"
     alert_rule_test:
       - eval_time: 30m
@@ -204,7 +204,7 @@ tests:
 
   - interval: 1m
     input_series:
-      - series: "lumenqraph_spec_fetch_failures_total{instance=\"test\"}"
+      - series: "lumenqraph_indexer_spec_fetch_failures_total{instance=\"test\"}"
         values: "0+1x30"
     alert_rule_test:
       - eval_time: 30m
@@ -234,7 +234,7 @@ tests:
 
   - interval: 1m
     input_series:
-      - series: "lumenqraph_consecutive_errors{instance=\"test\"}"
+      - series: "lumenqraph_indexer_consecutive_errors{instance=\"test\"}"
         values: "20+0x30"
     alert_rule_test:
       - eval_time: 30m
@@ -249,7 +249,7 @@ tests:
 
   - interval: 1m
     input_series:
-      - series: "lumenqraph_sse_listener_up{instance=\"test\"}"
+      - series: "lumenqraph_api_sse_listener_up{instance=\"test\"}"
         values: "0+0x30"
     alert_rule_test:
       - eval_time: 30m
@@ -264,7 +264,7 @@ tests:
 
   - interval: 1m
     input_series:
-      - series: "lumenqraph_enrichment_rate{instance=\"test\"}"
+      - series: "lumenqraph_indexer_enrichment_rate{instance=\"test\"}"
         values: "0.4+0x30"
       - series: "lumenqraph_indexer_events_ingested_total{instance=\"test\"}"
         values: "0+1x30"
@@ -286,9 +286,9 @@ tests:
         values: "1+0x30"
       - series: 'lumenqraph_indexer_last_processed_ledger{job="lumenqraph-indexer"}'
         values: "1000+12x30"
-      - series: lumenqraph_rpc_oldest_ledger
+      - series: lumenqraph_indexer_rpc_oldest_ledger
         values: "500+12x30"
-      - series: lumenqraph_webhook_oldest_pending_age_seconds
+      - series: lumenqraph_webhooks_oldest_pending_age_seconds
         values: "0+0x30"
       - series: lumenqraph_indexer_errors_total
         values: "0+0x30"
@@ -296,9 +296,9 @@ tests:
         values: "0+0x30"
       - series: lumenqraph_api_requests_total
         values: "0+0x30"
-      - series: lumenqraph_sse_listener_up
+      - series: lumenqraph_api_sse_listener_up
         values: "1+0x30"
-      - series: lumenqraph_enrichment_rate
+      - series: lumenqraph_indexer_enrichment_rate
         values: "0+0x30"
       - series: lumenqraph_webhooks_pending_deliveries
         values: "600+0x1 0+0x28"

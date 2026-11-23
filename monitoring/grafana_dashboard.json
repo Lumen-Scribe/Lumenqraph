@@ -227,7 +227,7 @@
       "pluginVersion": "8.0.0",
       "targets": [
         {
-          "expr": "rate(lumenqraph_indexer_ingested_total[5m])",
+          "expr": "rate(lumenqraph_indexer_events_ingested_total[5m])",
           "legendFormat": "Ingestion Rate (events/sec)",
           "refId": "A"
         }
@@ -442,7 +442,7 @@
       "pluginVersion": "8.0.0",
       "targets": [
         {
-          "expr": "lumenqraph_events_total",
+          "expr": "lumenqraph_api_events_stored",
           "legendFormat": "Total Events",
           "refId": "A"
         }
@@ -716,7 +716,7 @@
       "pluginVersion": "8.0.0",
       "targets": [
         {
-          "expr": "rate(lumenqraph_transfer_projection_skipped_total[5m])",
+          "expr": "rate(lumenqraph_indexer_transfer_projection_skipped_total[5m])",
           "legendFormat": "Transfer Projection Skips (events/sec)",
           "refId": "A"
         }
@@ -796,7 +796,7 @@
       "pluginVersion": "8.0.0",
       "targets": [
         {
-          "expr": "rate(lumenqraph_webhook_deliveries_dropped_by_retention_total[5m])",
+          "expr": "rate(lumenqraph_indexer_webhook_deliveries_dropped_by_retention_total[5m])",
           "legendFormat": "Deliveries Dropped by Retention (deliveries/sec)",
           "refId": "A"
         }

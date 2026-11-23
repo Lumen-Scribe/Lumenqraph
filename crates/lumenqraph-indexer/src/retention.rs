@@ -23,7 +23,7 @@
 //! - An event whose deliveries are all *delivered* or *failed* is prunable: the
 //!   pruner deletes those delivery rows itself, in the same transaction as the
 //!   event, and counts them in the
-//!   `lumenqraph_webhook_deliveries_dropped_by_retention_total` counter (also
+//!   `lumenqraph_indexer_webhook_deliveries_dropped_by_retention_total` counter (also
 //!   logged). The webhooks service would otherwise keep them until
 //!   `WEBHOOK_DELIVERY_RETENTION_DAYS`, which can be far longer than the event
 //!   window and would block event pruning entirely.
@@ -44,7 +44,7 @@ use tracing::{info, warn};
 /// delivered/failed deliveries whose event fell outside the window, deleted
 /// explicitly by the pruner (the FK is `ON DELETE RESTRICT`, so they cannot
 /// cascade). Exposed as the
-/// `lumenqraph_webhook_deliveries_dropped_by_retention_total` metric.
+/// `lumenqraph_indexer_webhook_deliveries_dropped_by_retention_total` metric.
 static WEBHOOK_DELIVERIES_DROPPED_BY_RETENTION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 

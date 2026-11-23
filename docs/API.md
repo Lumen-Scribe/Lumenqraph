@@ -81,9 +81,9 @@ cascading restarts during slow startup. Configurable via environment:
 - `READYZ_MAX_AGE_SECS` (seconds, default 120)
 
 ### `GET /metrics`
-Prometheus text: `lumenqraph_indexer_lag_ledgers`, `lumenqraph_events_total`,
-`lumenqraph_indexer_ingested_total`, `lumenqraph_indexer_errors_total`,
-`lumenqraph_api_requests_total`, …
+Prometheus text for API-owned metrics, including `lumenqraph_api_events_stored` and
+`lumenqraph_api_requests_total`. Scrape the indexer separately for cursor and poll
+metrics. See the [metric inventory](../monitoring/README.md#metric-inventory).
 
 ## Decoded JSON dialect
 

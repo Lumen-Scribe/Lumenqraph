@@ -1,5 +1,4 @@
-//! `GET /metrics` — Prometheus text exposition. Indexer numbers come from the
-//! status row the indexer maintains; API numbers from in-process counters.
+//! `GET /metrics` — Prometheus text exposition for the API service.
 
 use std::sync::atomic::Ordering;
 
@@ -12,36 +11,10 @@ use crate::metrics_middleware::escape_label_value;
 use crate::state::AppState;
 
 pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
-    // Column order matches the SELECT below.
-    type CursorRow = (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64);
-    let status: Option<CursorRow> = sqlx::query_as(
-        "SELECT last_processed_ledger, chain_tip_ledger, events_ingested_total, errors_total,
-                events_enriched_total, events_not_enriched_total, spec_fetch_failures_total,
-                rpc_calls_total, rpc_errors_total, rpc_errors_32001_total, consecutive_errors
-         FROM indexer_cursor WHERE id = 1",
-    )
-    .fetch_optional(&state.pool)
-    .await?;
-
     let total_events: (i64,) = sqlx::query_as("SELECT count(*) FROM events")
         .fetch_one(&state.pool)
         .await?;
 
-    let (
-        last,
-        tip,
-        ingested,
-        errors,
-        enriched,
-        not_enriched,
-        spec_fetch_failures,
-        rpc_calls,
-        rpc_errors,
-        rpc_errors_32001,
-        consecutive_errors,
-    ) = status.unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
-    let lag = (tip - last).max(0);
-    let lag_time_secs = lag * 5; // Approximate ~5 seconds per ledger
     let requests = state.http_requests.load(Ordering::Relaxed);
     let audit_dropped = state.audit_dropped.load(Ordering::Relaxed);
     let rate_limit_backend_errors = crate::rate_limit::backend_error_count();
@@ -57,95 +30,43 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
     let sse_lagged = state.event_fanout.lagged_total();
 
     let mut body = format!(
-        "# HELP lumenqraph_indexer_last_processed_ledger Last ledger the indexer processed\n\
-         # TYPE lumenqraph_indexer_last_processed_ledger gauge\n\
-         lumenqraph_indexer_last_processed_ledger {last}\n\
-         # HELP lumenqraph_indexer_chain_tip_ledger Latest ledger observed on chain\n\
-         # TYPE lumenqraph_indexer_chain_tip_ledger gauge\n\
-         lumenqraph_indexer_chain_tip_ledger {tip}\n\
-         # HELP lumenqraph_indexer_lag_ledgers Ledgers behind the chain tip\n\
-         # TYPE lumenqraph_indexer_lag_ledgers gauge\n\
-         lumenqraph_indexer_lag_ledgers {lag}\n\
-         # HELP lumenqraph_indexer_lag_seconds Estimated time behind the chain tip in seconds\n\
-         # TYPE lumenqraph_indexer_lag_seconds gauge\n\
-         lumenqraph_indexer_lag_seconds {lag_time_secs}\n\
-         # HELP lumenqraph_events_total Total events stored\n\
-         # TYPE lumenqraph_events_total counter\n\
-         lumenqraph_events_total {events}\n\
-         # HELP lumenqraph_indexer_ingested_total Events ingested by the indexer\n\
-         # TYPE lumenqraph_indexer_ingested_total counter\n\
-         lumenqraph_indexer_ingested_total {ingested}\n\
-         # HELP lumenqraph_indexer_errors_total Indexer poll-cycle errors\n\
-         # TYPE lumenqraph_indexer_errors_total counter\n\
-         lumenqraph_indexer_errors_total {errors}\n\
-         # HELP lumenqraph_rate_limit_backend_errors_total Redis rate-limit backend errors (each applies the configured fail mode)\n\
-         # TYPE lumenqraph_rate_limit_backend_errors_total counter\n\
-         lumenqraph_rate_limit_backend_errors_total {rate_limit_backend_errors}\n\
-         # HELP lumenqraph_consecutive_errors Current number of consecutive poll-cycle failures (circuit breaker gauge; resets to 0 on success)\n\
-         # TYPE lumenqraph_consecutive_errors gauge\n\
-         lumenqraph_consecutive_errors {consecutive_errors}\n\
-         # HELP lumenqraph_events_enriched_total Events successfully enriched with spec data\n\
-         # TYPE lumenqraph_events_enriched_total counter\n\
-         lumenqraph_events_enriched_total {enriched}\n\
-         # HELP lumenqraph_events_not_enriched_total Events without matching spec (fallback to decoded)\n\
-         # TYPE lumenqraph_events_not_enriched_total counter\n\
-         lumenqraph_events_not_enriched_total {not_enriched}\n\
-         # HELP lumenqraph_spec_fetch_failures_total Failed attempts to fetch contract specs\n\
-         # TYPE lumenqraph_spec_fetch_failures_total counter\n\
-         lumenqraph_spec_fetch_failures_total {spec_fetch_failures}\n\
-         # HELP lumenqraph_rpc_calls_total Total RPC method calls made\n\
-         # TYPE lumenqraph_rpc_calls_total counter\n\
-         lumenqraph_rpc_calls_total {rpc_calls}\n\
-         # HELP lumenqraph_rpc_errors_total RPC errors encountered\n\
-         # TYPE lumenqraph_rpc_errors_total counter\n\
-         lumenqraph_rpc_errors_total {rpc_errors}\n\
-         # HELP lumenqraph_rpc_errors_32001_total RPC -32001 processing-limit errors\n\
-         # TYPE lumenqraph_rpc_errors_32001_total counter\n\
-         lumenqraph_rpc_errors_32001_total {rpc_errors_32001}\n\
+        "# HELP lumenqraph_api_events_stored Current number of stored events\n\
+         # TYPE lumenqraph_api_events_stored gauge\n\
+         lumenqraph_api_events_stored {events}\n\
+         # HELP lumenqraph_api_rate_limit_backend_errors_total Redis rate-limit backend errors (each applies the configured fail mode)\n\
+         # TYPE lumenqraph_api_rate_limit_backend_errors_total counter\n\
+         lumenqraph_api_rate_limit_backend_errors_total {rate_limit_backend_errors}\n\
          # HELP lumenqraph_api_requests_total API requests served\n\
          # TYPE lumenqraph_api_requests_total counter\n\
          lumenqraph_api_requests_total {requests}\n\
-         # HELP lumenqraph_audit_dropped_total Audit events dropped because the writer queue was full\n\
-         # TYPE lumenqraph_audit_dropped_total counter\n\
-         lumenqraph_audit_dropped_total {audit_dropped}\n\
-         # HELP lumenqraph_call_cache_hits_total Total cache hits for /call results\n\
-         # TYPE lumenqraph_call_cache_hits_total counter\n\
-         lumenqraph_call_cache_hits_total {cache_hits}\n\
-         # HELP lumenqraph_call_cache_misses_total Total cache misses for /call results\n\
-         # TYPE lumenqraph_call_cache_misses_total counter\n\
-         lumenqraph_call_cache_misses_total {cache_misses}\n\
-         # HELP lumenqraph_call_cache_evictions_total Total entries evicted from /call cache\n\
-         # TYPE lumenqraph_call_cache_evictions_total counter\n\
-         lumenqraph_call_cache_evictions_total {cache_evictions}\n\
-         # HELP lumenqraph_call_cache_size Current number of entries in /call cache\n\
-         # TYPE lumenqraph_call_cache_size gauge\n\
-         lumenqraph_call_cache_size {cache_size}\n\
-         # HELP lumenqraph_sse_active_streams Currently open SSE streams\n\
-         # TYPE lumenqraph_sse_active_streams gauge\n\
-         lumenqraph_sse_active_streams {sse_active_streams}\n\
-         # HELP lumenqraph_sse_listener_up 1 while the shared LISTEN connection is connected\n\
-         # TYPE lumenqraph_sse_listener_up gauge\n\
-         lumenqraph_sse_listener_up {sse_listener_up}\n\
-         # HELP lumenqraph_sse_broadcast_receivers SSE connections subscribed to the fan-out\n\
-         # TYPE lumenqraph_sse_broadcast_receivers gauge\n\
-         lumenqraph_sse_broadcast_receivers {sse_receivers}\n\
-         # HELP lumenqraph_sse_broadcast_lagged_total Events dropped by SSE subscribers that fell behind\n\
-         # TYPE lumenqraph_sse_broadcast_lagged_total counter\n\
-         lumenqraph_sse_broadcast_lagged_total {sse_lagged}\n",
-        last = last,
-        tip = tip,
-        lag = lag,
-        lag_time_secs = lag_time_secs,
+         # HELP lumenqraph_api_audit_dropped_total Audit events dropped because the writer queue was full\n\
+         # TYPE lumenqraph_api_audit_dropped_total counter\n\
+         lumenqraph_api_audit_dropped_total {audit_dropped}\n\
+         # HELP lumenqraph_api_call_cache_hits_total Total cache hits for /call results\n\
+         # TYPE lumenqraph_api_call_cache_hits_total counter\n\
+         lumenqraph_api_call_cache_hits_total {cache_hits}\n\
+         # HELP lumenqraph_api_call_cache_misses_total Total cache misses for /call results\n\
+         # TYPE lumenqraph_api_call_cache_misses_total counter\n\
+         lumenqraph_api_call_cache_misses_total {cache_misses}\n\
+         # HELP lumenqraph_api_call_cache_evictions_total Total entries evicted from /call cache\n\
+         # TYPE lumenqraph_api_call_cache_evictions_total counter\n\
+         lumenqraph_api_call_cache_evictions_total {cache_evictions}\n\
+         # HELP lumenqraph_api_call_cache_size Current number of entries in /call cache\n\
+         # TYPE lumenqraph_api_call_cache_size gauge\n\
+         lumenqraph_api_call_cache_size {cache_size}\n\
+         # HELP lumenqraph_api_sse_active_streams Currently open SSE streams\n\
+         # TYPE lumenqraph_api_sse_active_streams gauge\n\
+         lumenqraph_api_sse_active_streams {sse_active_streams}\n\
+         # HELP lumenqraph_api_sse_listener_up 1 while the shared LISTEN connection is connected\n\
+         # TYPE lumenqraph_api_sse_listener_up gauge\n\
+         lumenqraph_api_sse_listener_up {sse_listener_up}\n\
+         # HELP lumenqraph_api_sse_broadcast_receivers SSE connections subscribed to the fan-out\n\
+         # TYPE lumenqraph_api_sse_broadcast_receivers gauge\n\
+         lumenqraph_api_sse_broadcast_receivers {sse_receivers}\n\
+         # HELP lumenqraph_api_sse_broadcast_lagged_total Events dropped by SSE subscribers that fell behind\n\
+         # TYPE lumenqraph_api_sse_broadcast_lagged_total counter\n\
+         lumenqraph_api_sse_broadcast_lagged_total {sse_lagged}\n",
         events = total_events.0,
-        ingested = ingested,
-        errors = errors,
-        consecutive_errors = consecutive_errors,
-        enriched = enriched,
-        not_enriched = not_enriched,
-        spec_fetch_failures = spec_fetch_failures,
-        rpc_calls = rpc_calls,
-        rpc_errors = rpc_errors,
-        rpc_errors_32001 = rpc_errors_32001,
         requests = requests,
         cache_hits = cache_hits,
         cache_misses = cache_misses,
@@ -157,8 +78,10 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
         sse_lagged = sse_lagged,
     );
 
-    body.push_str("# HELP lumenqraph_http_request_duration_ms Per-route HTTP request latency\n");
-    body.push_str("# TYPE lumenqraph_http_request_duration_ms histogram\n");
+    body.push_str(
+        "# HELP lumenqraph_api_http_request_duration_ms Per-route HTTP request latency\n",
+    );
+    body.push_str("# TYPE lumenqraph_api_http_request_duration_ms histogram\n");
     {
         let histograms = state.metrics.histogram_buckets.read();
         for (key, hist) in histograms.iter() {
@@ -169,19 +92,19 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
             );
             for (bound, cumulative) in hist.cumulative() {
                 body.push_str(&format!(
-                    "lumenqraph_http_request_duration_ms_bucket{{{labels},le=\"{bound}\"}} {cumulative}\n"
+                    "lumenqraph_api_http_request_duration_ms_bucket{{{labels},le=\"{bound}\"}} {cumulative}\n"
                 ));
             }
             body.push_str(&format!(
-                "lumenqraph_http_request_duration_ms_bucket{{{labels},le=\"+Inf\"}} {}\n",
+                "lumenqraph_api_http_request_duration_ms_bucket{{{labels},le=\"+Inf\"}} {}\n",
                 hist.count
             ));
             body.push_str(&format!(
-                "lumenqraph_http_request_duration_ms_sum{{{labels}}} {}\n",
+                "lumenqraph_api_http_request_duration_ms_sum{{{labels}}} {}\n",
                 hist.sum_ms
             ));
             body.push_str(&format!(
-                "lumenqraph_http_request_duration_ms_count{{{labels}}} {}\n",
+                "lumenqraph_api_http_request_duration_ms_count{{{labels}}} {}\n",
                 hist.count
             ));
         }

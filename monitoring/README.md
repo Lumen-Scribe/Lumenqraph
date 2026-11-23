@@ -76,13 +76,13 @@ To send alerts to Alertmanager, set the `alerting.alertmanagers` targets in `pro
 - **`lumenqraph_indexer_lag_ledgers`** - Ledgers behind chain tip (lower is better)
 - **`lumenqraph_indexer_last_processed_ledger`** - Most recent ledger processed
 - **`lumenqraph_indexer_chain_tip_ledger`** - Latest ledger on chain
-- **`lumenqraph_indexer_events_ingested_total`** - Events ingested by the indexer process (cumulative). The API also exposes `lumenqraph_indexer_ingested_total`, derived from the database.
+- **`lumenqraph_indexer_events_ingested_total`** - Events ingested by the indexer process (cumulative). The API also exposes `lumenqraph_indexer_events_ingested_total`, derived from the database.
 - **`lumenqraph_indexer_errors_total`** - Total indexer poll-cycle errors (cumulative)
-- **`lumenqraph_transfer_projection_skipped_total`** - Cumulative count of
+- **`lumenqraph_indexer_transfer_projection_skipped_total`** - Cumulative count of
   transfer-like events skipped by the SEP-41 projection gate (#600). A
   non-zero, rising value means events are being dropped before projection;
   investigate the gate's classification rules.
-- **`lumenqraph_webhook_deliveries_dropped_by_retention_total`** - Cumulative
+- **`lumenqraph_indexer_webhook_deliveries_dropped_by_retention_total`** - Cumulative
   count of `webhook_deliveries` rows dropped by the retention job (#601). A
   rising value means deliveries are being lost to retention before they are
   dispatched; consider raising the retention window or draining the backlog.
@@ -96,7 +96,7 @@ dedicated Grafana dashboard panels.
 
 ### Data Metrics
 
-- **`lumenqraph_events_total`** - Total events stored in database
+- **`lumenqraph_api_events_stored`** - Total events stored in database
 
 ### Webhook Metrics
 
@@ -106,10 +106,69 @@ Exposed by the `lumenqraph-webhooks` service on its own `/metrics` endpoint
 - **`lumenqraph_webhooks_pending_deliveries`** - Deliveries in the `pending`
   state (queue depth), refreshed once per dispatcher tick. A sustained rise
   means the dispatcher is falling behind a slow or unresponsive subscriber.
-- **`lumenqraph_webhook_oldest_pending_age_seconds`** - Age of the oldest
+- **`lumenqraph_webhooks_oldest_pending_age_seconds`** - Age of the oldest
   pending delivery.
-- **`lumenqraph_webhook_delivered_total`** / **`lumenqraph_webhook_failed_total`**
-  - Lifetime delivery outcomes.
+- **`lumenqraph_webhooks_delivered_deliveries`** / **`lumenqraph_webhooks_failed_deliveries`**
+  - Retained delivery outcomes. Retention can reduce these gauges.
+
+## Metric inventory
+
+| Metric | Type | Unit | Owner |
+| --- | --- | --- | --- |
+| `lumenqraph_api_audit_dropped_total` | counter | count | API |
+| `lumenqraph_api_call_cache_evictions_total` | counter | count | API |
+| `lumenqraph_api_call_cache_hits_total` | counter | count | API |
+| `lumenqraph_api_call_cache_misses_total` | counter | count | API |
+| `lumenqraph_api_call_cache_size` | gauge | count | API |
+| `lumenqraph_api_events_stored` | gauge | count | API |
+| `lumenqraph_api_http_request_duration_ms` | histogram | milliseconds | API |
+| `lumenqraph_api_rate_limit_backend_errors_total` | counter | count | API |
+| `lumenqraph_api_requests_total` | counter | count | API |
+| `lumenqraph_api_sse_active_streams` | gauge | count | API |
+| `lumenqraph_api_sse_broadcast_lagged_total` | counter | count | API |
+| `lumenqraph_api_sse_broadcast_receivers` | gauge | count | API |
+| `lumenqraph_api_sse_listener_up` | gauge | boolean (0 or 1) | API |
+| `lumenqraph_indexer_chain_tip_ledger` | gauge | ledgers | Indexer |
+| `lumenqraph_indexer_consecutive_errors` | gauge | count | Indexer |
+| `lumenqraph_indexer_enrichment_rate` | gauge | fraction (0–1) | Indexer |
+| `lumenqraph_indexer_errors_total` | counter | count | Indexer |
+| `lumenqraph_indexer_events_enriched_total` | counter | count | Indexer |
+| `lumenqraph_indexer_events_ingested_total` | counter | count | Indexer |
+| `lumenqraph_indexer_events_not_enriched_total` | counter | count | Indexer |
+| `lumenqraph_indexer_lag_ledgers` | gauge | ledgers | Indexer |
+| `lumenqraph_indexer_lag_seconds` | gauge | seconds (estimated) | Indexer |
+| `lumenqraph_indexer_last_processed_ledger` | gauge | ledgers | Indexer |
+| `lumenqraph_indexer_open_missed_ranges` | gauge | count | Indexer |
+| `lumenqraph_indexer_permanent_missed_ranges` | gauge | count | Indexer |
+| `lumenqraph_indexer_recoverable_missed_ranges` | gauge | count | Indexer |
+| `lumenqraph_indexer_rpc_calls_total` | counter | count | Indexer |
+| `lumenqraph_indexer_rpc_errors_32001_total` | counter | count | Indexer |
+| `lumenqraph_indexer_rpc_errors_total` | counter | count | Indexer |
+| `lumenqraph_indexer_rpc_failovers_total` | counter | count | Indexer |
+| `lumenqraph_indexer_rpc_oldest_ledger` | gauge | ledgers | Indexer |
+| `lumenqraph_indexer_seconds_since_update` | gauge | count | Indexer |
+| `lumenqraph_indexer_spec_cache_size` | gauge | count | Indexer |
+| `lumenqraph_indexer_spec_fetch_failures_total` | counter | count | Indexer |
+| `lumenqraph_indexer_timestamp_parse_errors_total` | counter | count | Indexer |
+| `lumenqraph_indexer_transfer_projection_skipped_total` | counter | count | Indexer |
+| `lumenqraph_indexer_webhook_deliveries_dropped_by_retention_total` | counter | count | Indexer |
+| `lumenqraph_webhooks_delivered_deliveries` | gauge | count | Webhooks |
+| `lumenqraph_webhooks_delivered_last_min` | gauge | deliveries in the last minute | Webhooks |
+| `lumenqraph_webhooks_deliveries_pruned_total` | counter | count | Webhooks |
+| `lumenqraph_webhooks_delivery_attempts_total` | counter | count | Webhooks |
+| `lumenqraph_webhooks_delivery_latency_last_seconds` | gauge | seconds | Webhooks |
+| `lumenqraph_webhooks_delivery_latency_seconds_total` | counter | seconds | Webhooks |
+| `lumenqraph_webhooks_failed_deliveries` | gauge | count | Webhooks |
+| `lumenqraph_webhooks_failed_last_min` | gauge | deliveries in the last minute | Webhooks |
+| `lumenqraph_webhooks_oldest_pending_age_seconds` | gauge | seconds | Webhooks |
+| `lumenqraph_webhooks_pending_deliveries` | gauge | count | Webhooks |
+| `lumenqraph_webhooks_pending_expired_total` | counter | count | Webhooks |
+
+The indexer endpoint now owns all cursor and poll metrics. Update queries using
+the old API cursor series or the old singular webhook prefix to the names above.
+The stored-event and retained webhook delivery counts can fall after retention,
+so use them as gauges. Use the cursor lag (ledgers) for chain progress and
+seconds since update for cursor freshness.
 
 ## Alert Rules
 

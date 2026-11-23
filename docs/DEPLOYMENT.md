@@ -376,11 +376,11 @@ The indexer's position relative to the chain tip is exported as two metrics:
 ### Error and enrichment metrics
 
 - `lumenqraph_indexer_errors_total` — poll-cycle errors (check rate for spikes).
-- `lumenqraph_events_enriched_total` / `lumenqraph_events_not_enriched_total` —
+- `lumenqraph_indexer_events_enriched_total` / `lumenqraph_indexer_events_not_enriched_total` —
   enrichment coverage (calculate `enriched / (enriched + not_enriched)` as a
   percentage; a drop may indicate missing specs or spec-fetching issues).
-- `lumenqraph_spec_fetch_failures_total` — failed contract spec fetches.
-- `lumenqraph_rpc_errors_32001_total` — RPC quota-limit hits (indicates sustained
+- `lumenqraph_indexer_spec_fetch_failures_total` — failed contract spec fetches.
+- `lumenqraph_indexer_rpc_errors_32001_total` — RPC quota-limit hits (indicates sustained
   load pressure; may need higher RPC plan or longer `POLL_INTERVAL_SECS`).
 
 ### Webhook metrics
@@ -394,11 +394,11 @@ The webhook service exposes its own `/metrics` endpoint (default
   a subscriber endpoint is slow, failing, or unreachable and its retries are
   starving the queue. Alert when it stays above ~500 for 5 minutes (warning) and
   ~5000 for 5 minutes (critical).
-- `lumenqraph_webhook_oldest_pending_age_seconds` (gauge) — age of the oldest
+- `lumenqraph_webhooks_oldest_pending_age_seconds` (gauge) — age of the oldest
   pending delivery; pairs with the backlog gauge to tell a transient spike from
   a genuine stall.
-- `lumenqraph_webhook_delivered_total` / `lumenqraph_webhook_failed_total`
-  (counters) — lifetime delivery outcomes.
+- `lumenqraph_webhooks_delivered_deliveries` / `lumenqraph_webhooks_failed_deliveries`
+  (gauges) — retained delivery outcomes.
 
 ### Monitoring Setup
 
@@ -445,10 +445,10 @@ Ship-ready Prometheus alert rules and Grafana dashboards are included in the
 | `lumenqraph_indexer_lag_ledgers` | Gauge | Ledgers behind chain tip |
 | `lumenqraph_indexer_last_processed_ledger` | Gauge | Most recent ledger processed |
 | `lumenqraph_indexer_chain_tip_ledger` | Gauge | Latest ledger on chain |
-| `lumenqraph_indexer_ingested_total` | Counter | Total events ingested |
+| `lumenqraph_indexer_events_ingested_total` | Counter | Total events ingested |
 | `lumenqraph_indexer_errors_total` | Counter | Total poll-cycle errors |
 | `lumenqraph_api_requests_total` | Counter | Total API requests served |
-| `lumenqraph_events_total` | Gauge | Total events in database |
+| `lumenqraph_api_events_stored` | Gauge | Total events in database |
 | `lumenqraph_webhooks_pending_deliveries` | Gauge | Webhook deliveries pending (queue depth), refreshed each dispatcher tick |
 
 #### Alert Rules
@@ -531,7 +531,7 @@ restore. This is the recommended primary recovery path.
      through `lumenqraph-indexer deep-backfill` (see
      [docs/DEEP_BACKFILL.md](DEEP_BACKFILL.md)). Without one of those, events
      older than ~7 days before the rebuild are **permanently lost**.
-3. Let the indexer run until lag is near zero (`lumenqraph_indexer_lag_seconds`).
+3. Let the indexer run until lag is near zero (`lumenqraph_indexer_lag_ledgers`).
 4. Re-create the non-derived tables — see the next two sections.
 
 > **Idempotency caveat.** `ON CONFLICT (event_id) DO NOTHING` de-dupes writes

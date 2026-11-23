@@ -48,7 +48,7 @@ groups:
           runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphlargelaggrowth"
 
       - alert: LumenqraphWebhookBacklogHigh
-        expr: "lumenqraph_webhook_oldest_pending_age_seconds > 300"
+        expr: "lumenqraph_webhooks_oldest_pending_age_seconds > 300"
         for: 5m
         labels:
           severity: warning
@@ -57,7 +57,7 @@ groups:
           runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphwebhookbackloghigh"
 
       - alert: LumenqraphWebhookBacklogCritical
-        expr: "lumenqraph_webhook_oldest_pending_age_seconds > 3600"
+        expr: "lumenqraph_webhooks_oldest_pending_age_seconds > 3600"
         for: 5m
         labels:
           severity: critical
@@ -66,7 +66,7 @@ groups:
           runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphwebhookbacklogcritical"
 
       - alert: LumenqraphUnrecoveredMissedRanges
-        expr: "lumenqraph_indexer_unrecovered_missed_ranges > 0"
+        expr: "lumenqraph_indexer_open_missed_ranges > 0"
         for: 15m
         labels:
           severity: warning
@@ -75,7 +75,7 @@ groups:
           runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphunrecoveredmissedranges"
 
       - alert: LumenqraphUnrecoverableMissedRanges
-        expr: "lumenqraph_indexer_unrecoverable_missed_ranges > 0"
+        expr: "lumenqraph_indexer_permanent_missed_ranges > 0"
         for: 1m
         labels:
           severity: critical
@@ -84,7 +84,7 @@ groups:
           runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphunrecoverablemissedranges"
 
       - alert: LumenqraphRPCRetentionMarginLow
-        expr: "(lumenqraph_indexer_last_processed_ledger - lumenqraph_rpc_oldest_ledger < 20) and lumenqraph_rpc_oldest_ledger > 0 and lumenqraph_indexer_last_processed_ledger > 0"
+        expr: "(lumenqraph_indexer_last_processed_ledger - lumenqraph_indexer_rpc_oldest_ledger < 20) and lumenqraph_indexer_rpc_oldest_ledger > 0 and lumenqraph_indexer_last_processed_ledger > 0"
         for: 2m
         labels:
           severity: critical
@@ -102,7 +102,7 @@ groups:
           runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphrpcfailovers"
 
       - alert: LumenqraphAuditDrops
-        expr: "increase(lumenqraph_audit_dropped_total[5m]) > 0"
+        expr: "increase(lumenqraph_api_audit_dropped_total[5m]) > 0"
         for: 1m
         labels:
           severity: warning
@@ -111,7 +111,7 @@ groups:
           runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphauditdrops"
 
       - alert: LumenqraphRateLimitBackendErrors
-        expr: "increase(lumenqraph_rate_limit_backend_errors_total[5m]) > 0"
+        expr: "increase(lumenqraph_api_rate_limit_backend_errors_total[5m]) > 0"
         for: 1m
         labels:
           severity: warning
@@ -120,7 +120,7 @@ groups:
           runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphratelimitbackenderrors"
 
       - alert: LumenqraphSpecFetchFailures
-        expr: "increase(lumenqraph_spec_fetch_failures_total[5m]) > 0"
+        expr: "increase(lumenqraph_indexer_spec_fetch_failures_total[5m]) > 0"
         for: 1m
         labels:
           severity: warning
@@ -138,7 +138,7 @@ groups:
           runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphtimestampparseerrors"
 
       - alert: LumenqraphConsecutiveErrors
-        expr: "lumenqraph_consecutive_errors >= 20"
+        expr: "lumenqraph_indexer_consecutive_errors >= 20"
         for: 2m
         labels:
           severity: critical
@@ -147,7 +147,7 @@ groups:
           runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphconsecutiveerrors"
 
       - alert: LumenqraphSSEListenerDown
-        expr: "lumenqraph_sse_listener_up == 0"
+        expr: "lumenqraph_api_sse_listener_up == 0"
         for: 2m
         labels:
           severity: critical
@@ -156,7 +156,7 @@ groups:
           runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphsselistenerdown"
 
       - alert: LumenqraphEnrichmentRateLow
-        expr: "lumenqraph_enrichment_rate < 0.5 and increase(lumenqraph_indexer_events_ingested_total[15m]) > 0"
+        expr: "lumenqraph_indexer_enrichment_rate < 0.5 and increase(lumenqraph_indexer_events_ingested_total[15m]) > 0"
         for: 5m
         labels:
           severity: warning

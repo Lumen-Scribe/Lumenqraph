@@ -160,104 +160,90 @@ async fn metrics(State(state): State<MetricsState>, headers: HeaderMap) -> impl 
         "lumenqraph_webhooks_pending_deliveries {}\n",
         PENDING_DELIVERIES.load(Ordering::Relaxed)
     ));
-    body.push_str("# HELP lumenqraph_webhook_deliveries_pruned_total Delivery rows removed by retention since start\n");
-    body.push_str("# TYPE lumenqraph_webhook_deliveries_pruned_total counter\n");
+    body.push_str("# HELP lumenqraph_webhooks_deliveries_pruned_total Delivery rows removed by retention since start\n");
+    body.push_str("# TYPE lumenqraph_webhooks_deliveries_pruned_total counter\n");
     body.push_str(&format!(
-        "lumenqraph_webhook_deliveries_pruned_total {}\n",
+        "lumenqraph_webhooks_deliveries_pruned_total {}\n",
         crate::prune::DELIVERIES_PRUNED.load(Ordering::Relaxed)
     ));
-    body.push_str("# HELP lumenqraph_webhook_pending_expired_total Pending deliveries expired for inactive subscriptions since start\n");
-    body.push_str("# TYPE lumenqraph_webhook_pending_expired_total counter\n");
+    body.push_str("# HELP lumenqraph_webhooks_pending_expired_total Pending deliveries expired for inactive subscriptions since start\n");
+    body.push_str("# TYPE lumenqraph_webhooks_pending_expired_total counter\n");
     body.push_str(&format!(
-        "lumenqraph_webhook_pending_expired_total {}\n",
+        "lumenqraph_webhooks_pending_expired_total {}\n",
         crate::prune::PENDING_DELIVERIES_EXPIRED.load(Ordering::Relaxed)
     ));
 
     // Delivery latency and queue age, maintained by the dispatcher worker pool.
     // Emitted unconditionally so slow-subscriber impact stays visible even if
     // the scrape-time queries below fail.
-    body.push_str("# HELP lumenqraph_webhook_delivery_attempts_total Delivery attempts made by the worker pool since start\n");
-    body.push_str("# TYPE lumenqraph_webhook_delivery_attempts_total counter\n");
+    body.push_str("# HELP lumenqraph_webhooks_delivery_attempts_total Delivery attempts made by the worker pool since start\n");
+    body.push_str("# TYPE lumenqraph_webhooks_delivery_attempts_total counter\n");
     body.push_str(&format!(
-        "lumenqraph_webhook_delivery_attempts_total {}\n",
+        "lumenqraph_webhooks_delivery_attempts_total {}\n",
         DELIVERY_ATTEMPTS_TOTAL.load(Ordering::Relaxed)
     ));
 
-    body.push_str("# HELP lumenqraph_webhook_delivery_latency_seconds_total Cumulative time spent in delivery attempts since start\n");
-    body.push_str("# TYPE lumenqraph_webhook_delivery_latency_seconds_total counter\n");
+    body.push_str("# HELP lumenqraph_webhooks_delivery_latency_seconds_total Cumulative time spent in delivery attempts since start\n");
+    body.push_str("# TYPE lumenqraph_webhooks_delivery_latency_seconds_total counter\n");
     body.push_str(&format!(
-        "lumenqraph_webhook_delivery_latency_seconds_total {}\n",
+        "lumenqraph_webhooks_delivery_latency_seconds_total {}\n",
         DELIVERY_LATENCY_SECONDS_TOTAL.load(Ordering::Relaxed)
     ));
 
-    body.push_str("# HELP lumenqraph_webhook_delivery_latency_last_seconds Duration of the most recent delivery attempt\n");
-    body.push_str("# TYPE lumenqraph_webhook_delivery_latency_last_seconds gauge\n");
+    body.push_str("# HELP lumenqraph_webhooks_delivery_latency_last_seconds Duration of the most recent delivery attempt\n");
+    body.push_str("# TYPE lumenqraph_webhooks_delivery_latency_last_seconds gauge\n");
     body.push_str(&format!(
-        "lumenqraph_webhook_delivery_latency_last_seconds {}\n",
+        "lumenqraph_webhooks_delivery_latency_last_seconds {}\n",
         DELIVERY_LATENCY_LAST_SECONDS.load(Ordering::Relaxed)
     ));
 
-    body.push_str("# HELP lumenqraph_webhook_queue_age_oldest_seconds Age of the oldest pending delivery, refreshed each dispatcher tick\n");
-    body.push_str("# TYPE lumenqraph_webhook_queue_age_oldest_seconds gauge\n");
+    body.push_str("# HELP lumenqraph_webhooks_oldest_pending_age_seconds Age of the oldest pending delivery, refreshed each dispatcher tick\n");
+    body.push_str("# TYPE lumenqraph_webhooks_oldest_pending_age_seconds gauge\n");
     body.push_str(&format!(
-        "lumenqraph_webhook_queue_age_oldest_seconds {}\n",
+        "lumenqraph_webhooks_oldest_pending_age_seconds {}\n",
         QUEUE_AGE_OLDEST_SECONDS.load(Ordering::Relaxed)
     ));
 
     match gather_metrics(&state.pool).await {
         Ok(metrics) => {
-            body.push_str("# HELP lumenqraph_webhook_pending_backlog Pending webhook deliveries waiting to be sent\n");
-            body.push_str("# TYPE lumenqraph_webhook_pending_backlog gauge\n");
-            body.push_str(&format!(
-                "lumenqraph_webhook_pending_backlog {}\n",
-                metrics.pending_count
-            ));
-
-            body.push_str("# HELP lumenqraph_webhook_oldest_pending_age_seconds Age of oldest pending webhook delivery\n");
-            body.push_str("# TYPE lumenqraph_webhook_oldest_pending_age_seconds gauge\n");
-            body.push_str(&format!(
-                "lumenqraph_webhook_oldest_pending_age_seconds {}\n",
-                metrics.oldest_pending_age_secs
-            ));
-
             // Keep the dispatcher-maintained gauge in sync with the scrape-time
             // value so it stays accurate even between dispatcher ticks.
             QUEUE_AGE_OLDEST_SECONDS
                 .store(metrics.oldest_pending_age_secs as f64, Ordering::Relaxed);
 
             body.push_str(
-                "# HELP lumenqraph_webhook_failed_total Terminal failed webhook deliveries\n",
+                "# HELP lumenqraph_webhooks_failed_deliveries Retained terminal failed webhook deliveries\n",
             );
-            body.push_str("# TYPE lumenqraph_webhook_failed_total counter\n");
+            body.push_str("# TYPE lumenqraph_webhooks_failed_deliveries gauge\n");
             body.push_str(&format!(
-                "lumenqraph_webhook_failed_total {}\n",
+                "lumenqraph_webhooks_failed_deliveries {}\n",
                 metrics.failed_count
             ));
 
             body.push_str(
-                "# HELP lumenqraph_webhook_delivered_total Total delivered webhook deliveries\n",
+                "# HELP lumenqraph_webhooks_delivered_deliveries Retained delivered webhook deliveries\n",
             );
-            body.push_str("# TYPE lumenqraph_webhook_delivered_total counter\n");
+            body.push_str("# TYPE lumenqraph_webhooks_delivered_deliveries gauge\n");
             body.push_str(&format!(
-                "lumenqraph_webhook_delivered_total {}\n",
+                "lumenqraph_webhooks_delivered_deliveries {}\n",
                 metrics.delivered_count
             ));
 
             body.push_str(
-                "# HELP lumenqraph_webhook_delivered_last_min Last minute delivered webhooks\n",
+                "# HELP lumenqraph_webhooks_delivered_last_min Last minute delivered webhooks\n",
             );
-            body.push_str("# TYPE lumenqraph_webhook_delivered_last_min gauge\n");
+            body.push_str("# TYPE lumenqraph_webhooks_delivered_last_min gauge\n");
             body.push_str(&format!(
-                "lumenqraph_webhook_delivered_last_min {}\n",
+                "lumenqraph_webhooks_delivered_last_min {}\n",
                 metrics.delivered_last_min
             ));
 
             body.push_str(
-                "# HELP lumenqraph_webhook_failed_last_min Last minute failed webhooks\n",
+                "# HELP lumenqraph_webhooks_failed_last_min Last minute failed webhooks\n",
             );
-            body.push_str("# TYPE lumenqraph_webhook_failed_last_min gauge\n");
+            body.push_str("# TYPE lumenqraph_webhooks_failed_last_min gauge\n");
             body.push_str(&format!(
-                "lumenqraph_webhook_failed_last_min {}\n",
+                "lumenqraph_webhooks_failed_last_min {}\n",
                 metrics.failed_last_min
             ));
         }
