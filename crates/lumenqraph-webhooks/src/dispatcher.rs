@@ -71,6 +71,18 @@ pub static DELIVERY_LATENCY_LAST_SECONDS: AtomicF64 = AtomicF64::new(0.0);
 /// `/metrics` scrape (`lumenqraph_webhook_queue_age_oldest_seconds`).
 pub static QUEUE_AGE_OLDEST_SECONDS: AtomicF64 = AtomicF64::new(0.0);
 
+/// Deliveries marked `delivered` since start
+/// (`lumenqraph_webhook_deliveries_total{result="delivered"}`).
+pub static DELIVERIES_DELIVERED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Deliveries marked terminally `failed` since start
+/// (`lumenqraph_webhook_deliveries_total{result="failed"}`).
+pub static DELIVERIES_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Failed attempts rescheduled for retry since start
+/// (`lumenqraph_webhook_deliveries_total{result="retried"}`).
+pub static DELIVERIES_RETRIED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// An `f64` stored as its bit pattern in an [`AtomicU64`], for the second-valued
 /// gauges and counters above.
 pub struct AtomicF64(AtomicU64);
@@ -705,6 +717,7 @@ async fn mark_failed_permanent(
     .bind(error_msg)
     .execute(pool)
     .await?;
+    DELIVERIES_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -1058,6 +1071,7 @@ async fn mark_delivered(
     .bind(response_snippet)
     .execute(pool)
     .await?;
+    DELIVERIES_DELIVERED_TOTAL.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -1153,6 +1167,11 @@ async fn mark_retry_at(
     }
 
     tx.commit().await?;
+    if final_retry {
+        DELIVERIES_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    } else {
+        DELIVERIES_RETRIED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
     Ok(())
 }
 
