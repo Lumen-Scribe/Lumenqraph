@@ -81,6 +81,11 @@ impl AtomicLatencyHistogram {
 /// share this one value, so probes of random paths cannot create series.
 pub const UNMATCHED_ROUTE: &str = "unmatched";
 
+/// Method label for any method outside the standard set. All extension
+/// methods share this one value, so arbitrary method tokens cannot create
+/// series.
+pub const OTHER_METHOD: &str = "OTHER";
+
 /// Latency histogram and status-code counters for one `(route, method)` label
 /// set.
 #[derive(Debug, Default)]
@@ -143,7 +148,7 @@ impl MetricsCollector {
     /// Once a series exists this takes only shared locks and atomic adds, so
     /// requests and `/metrics` rendering do not block each other.
     pub fn record(&self, route: &str, method: &Method, status: StatusCode, elapsed_seconds: f64) {
-        let method = method.as_str();
+        let method = method_label(method);
         if let Some(series) = self
             .series
             .read()
@@ -170,6 +175,15 @@ impl MetricsCollector {
 /// only bumps a reference count.
 fn matched_path(req: &Request) -> Option<MatchedPath> {
     req.extensions().get::<MatchedPath>().cloned()
+}
+
+/// The method label for a request: the method name for the standard methods,
+/// or [`OTHER_METHOD`].
+fn method_label(method: &Method) -> &str {
+    match method.as_str() {
+        m @ ("GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS") => m,
+        _ => OTHER_METHOD,
+    }
 }
 
 /// Escape a label value for the Prometheus text exposition format: backslash,
@@ -232,6 +246,18 @@ mod tests {
         routes
     }
 
+    fn methods_seen(collector: &MetricsCollector) -> Vec<String> {
+        let mut methods: Vec<String> = collector
+            .series
+            .read()
+            .values()
+            .flat_map(|by_method| by_method.keys().cloned())
+            .collect();
+        methods.sort();
+        methods.dedup();
+        methods
+    }
+
     #[tokio::test]
     async fn route_label_is_the_registered_template() {
         let collector = Arc::new(MetricsCollector::new());
@@ -271,6 +297,28 @@ mod tests {
 
         // Two registered routes plus the unmatched label.
         assert!(routes_seen(&collector).len() <= 3);
+    }
+
+    #[tokio::test]
+    async fn extension_methods_share_one_label() {
+        let collector = Arc::new(MetricsCollector::new());
+        let router = app(collector.clone());
+
+        for i in 0..1_000 {
+            router
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(format!("FOOBAR{i}").as_str())
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(methods_seen(&collector), vec![OTHER_METHOD]);
     }
 
     #[test]
