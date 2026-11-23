@@ -312,10 +312,12 @@ async fn delete_derived(
         "nft_events",
         "liquidity_events",
     ] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE event_id = ANY($1::text[])"))
-            .bind(event_ids)
-            .execute(&mut **tx)
-            .await?;
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE event_id = ANY($1::text[])"
+        ))
+        .bind(event_ids)
+        .execute(&mut **tx)
+        .await?;
     }
     Ok(())
 }
@@ -1022,10 +1024,7 @@ fn extract_liquidity_event(
     };
 
     let extra_amounts = match &e.decoded_value {
-        Value::Object(map) => map
-            .get("extra_amounts")
-            .cloned()
-            .unwrap_or(Value::Null),
+        Value::Object(map) => map.get("extra_amounts").cloned().unwrap_or(Value::Null),
         _ => Value::Null,
     };
 
@@ -1049,7 +1048,6 @@ mod tests {
     use super::*;
 
     use serde_json::json;
-
 
     /// Test resolver: treats every contract as a confirmed fungible token so the
     /// transfer projection itself is what the assertions exercise.
@@ -1137,7 +1135,12 @@ mod tests {
     fn extracts_legacy_sac_mint_recipient_not_admin() {
         let e = event(
             Some("mint"),
-            vec![json!("mint"), json!("GADMIN"), json!("GRECIPIENT"), json!("native")],
+            vec![
+                json!("mint"),
+                json!("GADMIN"),
+                json!("GRECIPIENT"),
+                json!("native"),
+            ],
             json!("1000"),
         );
         let t = extract_transfer(&e, &fungible).expect("legacy mint should be recognised");
@@ -1161,7 +1164,12 @@ mod tests {
     fn extracts_legacy_sac_clawback_victim_not_admin() {
         let e = event(
             Some("clawback"),
-            vec![json!("clawback"), json!("GADMIN"), json!("GVICTIM"), json!("native")],
+            vec![
+                json!("clawback"),
+                json!("GADMIN"),
+                json!("GVICTIM"),
+                json!("native"),
+            ],
             json!("750"),
         );
         let t = extract_transfer(&e, &fungible).expect("legacy clawback should be recognised");
@@ -1185,7 +1193,12 @@ mod tests {
     fn enriched_params_take_precedence_for_mint() {
         let mut e = event(
             Some("mint"),
-            vec![json!("mint"), json!("GADMIN"), json!("GWRONG"), json!("native")],
+            vec![
+                json!("mint"),
+                json!("GADMIN"),
+                json!("GWRONG"),
+                json!("native"),
+            ],
             json!("1000"),
         );
         e.enriched = Some(json!({
@@ -1268,7 +1281,10 @@ mod tests {
             json!({"token_id": 123}),
         );
         // No `amount` field: skipped and counted, never projected as a transfer.
-        assert!(extract_transfer(&e, &fungible).is_none(), "value without an amount is skipped");
+        assert!(
+            extract_transfer(&e, &fungible).is_none(),
+            "value without an amount is skipped"
+        );
     }
 
     // Issue #384: CAP-67 Protocol 23 support for muxed addresses and SAC assets
@@ -1343,7 +1359,10 @@ mod tests {
             vec![json!("transfer"), json!("GFROM"), json!("GTO")],
             vector_value,
         );
-        assert!(extract_transfer(&e, &fungible).is_none(), "non-amount value is skipped");
+        assert!(
+            extract_transfer(&e, &fungible).is_none(),
+            "non-amount value is skipped"
+        );
     }
 
     #[test]
@@ -1361,7 +1380,10 @@ mod tests {
             struct_value,
         );
         // Only a top-level `amount` key counts; a nested one does not.
-        assert!(extract_transfer(&e, &fungible).is_none(), "struct without top-level amount is skipped");
+        assert!(
+            extract_transfer(&e, &fungible).is_none(),
+            "struct without top-level amount is skipped"
+        );
     }
 
     #[test]
@@ -1371,7 +1393,10 @@ mod tests {
             vec![json!("burn"), json!("GBURNER")],
             json!(null),
         );
-        assert!(extract_transfer(&e, &fungible).is_none(), "null amount is skipped");
+        assert!(
+            extract_transfer(&e, &fungible).is_none(),
+            "null amount is skipped"
+        );
     }
 
     #[test]
@@ -1381,7 +1406,10 @@ mod tests {
             vec![json!("clawback"), json!("GVICTIM")],
             json!(true),
         );
-        assert!(extract_transfer(&e, &fungible).is_none(), "boolean amount is skipped");
+        assert!(
+            extract_transfer(&e, &fungible).is_none(),
+            "boolean amount is skipped"
+        );
     }
 
     // Issue #382: REORG_OVERLAP_LEDGERS upsert should skip no-op updates

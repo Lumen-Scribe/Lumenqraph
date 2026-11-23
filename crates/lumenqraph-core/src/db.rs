@@ -92,8 +92,13 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn pooled_sessions_run_in_utc() {
-        let pool = connect_with_retry(&test_url(), &DbConfig::default()).await.unwrap();
-        let tz: String = sqlx::query_scalar("SHOW TIME ZONE").fetch_one(&pool).await.unwrap();
+        let pool = connect_with_retry(&test_url(), &DbConfig::default())
+            .await
+            .unwrap();
+        let tz: String = sqlx::query_scalar("SHOW TIME ZONE")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(tz, "UTC");
     }
 
@@ -103,13 +108,19 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn timestamptz_filter_is_session_timezone_independent() {
-        let pool = connect_with_retry(&test_url(), &DbConfig::default()).await.unwrap();
+        let pool = connect_with_retry(&test_url(), &DbConfig::default())
+            .await
+            .unwrap();
         let mut conn = pool.acquire().await.unwrap();
         sqlx::query("CREATE TEMP TABLE tz_probe (ts TIMESTAMPTZ NOT NULL)")
             .execute(&mut *conn)
             .await
             .unwrap();
-        for ts in ["2026-03-01 00:00:00+00", "2026-03-01 12:00:00+00", "2026-03-02 00:00:00+00"] {
+        for ts in [
+            "2026-03-01 00:00:00+00",
+            "2026-03-01 12:00:00+00",
+            "2026-03-02 00:00:00+00",
+        ] {
             sqlx::query("INSERT INTO tz_probe (ts) VALUES ($1::timestamptz)")
                 .bind(ts)
                 .execute(&mut *conn)
@@ -122,7 +133,10 @@ mod tests {
         // that same connection. `SET TIME ZONE` is session-local, so each
         // iteration deliberately moves away from the UTC pooled default.
         for tz in ["UTC", "America/New_York", "Asia/Tokyo"] {
-            sqlx::query(&format!("SET TIME ZONE '{tz}'")).execute(&mut *conn).await.unwrap();
+            sqlx::query(&format!("SET TIME ZONE '{tz}'"))
+                .execute(&mut *conn)
+                .await
+                .unwrap();
             let count: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM tz_probe WHERE ($1::timestamptz IS NULL OR ts >= $1)",
             )

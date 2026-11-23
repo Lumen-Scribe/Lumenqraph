@@ -25,6 +25,7 @@ mod cursor;
 mod deep_backfill;
 mod http;
 mod keys;
+mod metrics;
 mod poller;
 #[cfg(test)]
 mod projections_tests;
@@ -54,7 +55,6 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use config::Config;
-use lumenqraph_core::ContractSpec;
 use deep_backfill::{GalexieSource, HistoricalSource};
 use reenrich::ReenrichOptions;
 use rpc_client::RpcClient;
@@ -361,9 +361,7 @@ async fn main() -> anyhow::Result<()> {
     config
         .validate_state_indexing()
         .context("unsupported state indexing configuration")?;
-    if config.contract_ids.is_empty()
-        && (config.key_indexing || config.state_indexing)
-    {
+    if config.contract_ids.is_empty() && (config.key_indexing || config.state_indexing) {
         info!(
             max_state_keys_per_cycle = config.max_state_keys_per_cycle,
             max_state_contracts_per_cycle = config.max_state_contracts_per_cycle,
@@ -381,7 +379,9 @@ async fn main() -> anyhow::Result<()> {
         config.rpc_timeout_secs,
         config.rpc_headers.clone(),
     )
-    .with_max_retry_after(std::time::Duration::from_secs(config.rpc_max_retry_after_secs));
+    .with_max_retry_after(std::time::Duration::from_secs(
+        config.rpc_max_retry_after_secs,
+    ));
     // Only commands that use the RPC need a reachable endpoint, and then only
     // one of them (#713). `migrate` and `deep-backfill` make no RPC calls.
     let live_passphrase = if matches!(command, Command::Migrate | Command::DeepBackfill { .. }) {
@@ -411,17 +411,30 @@ async fn main() -> anyhow::Result<()> {
             let _lock = try_one_shot_lock(&pool, "backfill").await?;
             backfill::run(pool, rpc, config, ledger.map(i64::from).unwrap_or(0)).await
         }
-        Command::DeepBackfill { from, to, source, input } => {
+        Command::DeepBackfill {
+            from,
+            to,
+            source,
+            input,
+        } => {
             let _lock = try_one_shot_lock(&pool, "deep-backfill").await?;
             run_deep_backfill(pool, config, from, to, source, input).await
         }
         Command::RecoverGaps => {
             let _lock = try_one_shot_lock(&pool, "recover-gaps").await?;
-            let specs = specs::SpecCache::new(
-                config.spec_cache_max_entries,
-                config.spec_fetch_concurrency,
+            let specs =
+                specs::SpecCache::new(config.spec_cache_max_entries, config.spec_fetch_concurrency);
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let summary = poller::recover_gaps(&pool, &rpc, &config, &specs, &shutdown).await?;
+            info!(
+                recovered = summary.recovered,
+                partially_recovered = summary.partially_recovered,
+                unrecoverable = summary.unrecoverable,
+                failed = summary.failed,
+                interrupted = summary.interrupted,
+                "gap recovery finished"
             );
-            poller::recover_gaps(&pool, &rpc, &config, &specs).await
+            Ok(())
         }
         Command::Reenrich { contract, force } => {
             let _lock = try_one_shot_lock(&pool, "reenrich").await?;
@@ -477,12 +490,17 @@ mod one_shot_lock_tests {
         let db = TestDb::new_with_migrations("../../migrations").await;
 
         // Stand in for the live indexer.
-        let leader = LeaderLock::acquire(db.pool()).await.expect("leader acquires");
+        let leader = LeaderLock::acquire(db.pool())
+            .await
+            .expect("leader acquires");
 
         let err = try_one_shot_lock(db.pool(), "backfill")
             .await
             .expect_err("backfill must not run beside the live indexer");
-        assert!(err.to_string().contains("refusing to run `backfill`"), "got: {err}");
+        assert!(
+            err.to_string().contains("refusing to run `backfill`"),
+            "got: {err}"
+        );
 
         // Release the leader. Dropping its connection releases the session lock; the
         // server may take a moment to notice, so retry briefly.
@@ -503,7 +521,10 @@ mod one_shot_lock_tests {
         let err = try_one_shot_lock(db.pool(), "recover-gaps")
             .await
             .expect_err("one-shot commands must not overlap");
-        assert!(err.to_string().contains("refusing to run `recover-gaps`"), "got: {err}");
+        assert!(
+            err.to_string().contains("refusing to run `recover-gaps`"),
+            "got: {err}"
+        );
 
         drop(first);
     }

@@ -33,6 +33,7 @@ sqlx.workspace = true
 reqwest.workspace = true
 rand.workspace = true
 stellar-xdr.workspace = true
+stellar-strkey.workspace = true
 hex.workspace = true
 sha2.workspace = true
 uuid.workspace = true
@@ -43,7 +44,6 @@ futures.workspace = true
 [dev-dependencies]
 lumenqraph-core = { workspace = true, features = ["db-test"] }
 hmac.workspace = true
-stellar-strkey.workspace = true
 tower = { workspace = true, features = ["util"] }
 sha2.workspace = true
 reqwest.workspace = true

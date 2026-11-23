@@ -46,7 +46,14 @@ impl KeyTemplate {
     pub fn validate(&self) -> anyhow::Result<()> {
         let ident = self.identifier();
 
-        if ScSymbol::try_from(self.symbol.as_str()).is_err() {
+        // Soroban symbols are 1-32 characters from [a-zA-Z0-9_].
+        let symbol_ok = !self.symbol.is_empty()
+            && self.symbol.len() <= 32
+            && self
+                .symbol
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        if !symbol_ok || ScSymbol::try_from(self.symbol.as_str()).is_err() {
             anyhow::bail!(
                 "KEY_TEMPLATES: template {ident:?} has invalid symbol {:?}: \
                  must be 1-32 characters from the ScSymbol charset",
@@ -71,13 +78,13 @@ impl KeyTemplate {
         for &idx in &self.param_indices {
             if idx == 0 {
                 anyhow::bail!(
-                    "KEY_TEMPLATES: template {ident:?} uses param index 0, which is the \
+                    "KEY_TEMPLATES: template {ident:?} uses param_indices entry 0, which is the \
                      event-name topic; use indices >= 1"
                 );
             }
             if idx >= MAX_TOPIC_SEGMENTS {
                 anyhow::bail!(
-                    "KEY_TEMPLATES: template {ident:?} uses param index {idx}, which is \
+                    "KEY_TEMPLATES: template {ident:?} uses param_indices entry {idx}, which is \
                      out of range (topics have at most {MAX_TOPIC_SEGMENTS} segments)"
                 );
             }
@@ -212,26 +219,6 @@ pub fn is_contract_address(s: &str) -> bool {
     s.starts_with('C') && ScAddress::from_str(s).is_ok()
 }
 
-/// Whether a contract is a Stellar Asset Contract (SAC).
-///
-/// A SAC's contract id is derived deterministically from the asset it wraps, so
-/// the reliable test is to derive the SAC id for each candidate asset and
-/// compare. `asset` is the asset derived from the contract's `name` instance
-/// storage (or a SEP-11 asset string seen in CAP-67 topics); when it is `None`
-/// we cannot confirm SAC-ness and report `false`.
-pub fn is_sac_contract(contract_id: &str, asset: Option<&Asset>) -> bool {
-    let Some(asset) = asset else {
-        return false;
-    };
-    match ScAddress::from_str(contract_id) {
-        Ok(ScAddress::Contract(contract)) => {
-            let derived = stellar_xdr::curr::ContractId::from(asset.clone());
-            derived == contract
-        }
-        _ => false,
-    }
-}
-
 /// Parse a SEP-11 asset string (`native`, `CODE:ISSUER`, or `CODE:ISSUER:CONTRACT`)
 /// into an [`Asset`]. Returns `None` for anything that isn't a valid asset.
 pub fn asset_from_sep11(s: &str) -> Option<Asset> {
@@ -313,13 +300,19 @@ pub fn balance_ledger_key(
         let account_id = AccountId::from_str(holder)
             .map_err(|_| anyhow::anyhow!("invalid account strkey {holder:?}"))?;
         return Ok(match asset {
-            Asset::Native => LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-                account_id,
-            }),
-            other => LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
-                account_id,
-                asset: other.clone(),
-            }),
+            Asset::Native => LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount { account_id }),
+            Asset::CreditAlphanum4(a) => {
+                LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
+                    account_id,
+                    asset: stellar_xdr::curr::TrustLineAsset::CreditAlphanum4(a.clone()),
+                })
+            }
+            Asset::CreditAlphanum12(a) => {
+                LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
+                    account_id,
+                    asset: stellar_xdr::curr::TrustLineAsset::CreditAlphanum12(a.clone()),
+                })
+            }
         });
     }
 
@@ -536,16 +529,18 @@ mod tests {
             asset_code: stellar_xdr::curr::AssetCode4(*b"USDC"),
             issuer: issuer.clone(),
         });
-        let sac_id = ScAddress::Contract(stellar_xdr::curr::ContractId::from(asset.clone()))
-            .to_string();
-        assert!(is_sac_contract(&sac_id, Some(&asset)));
-
         let holder = account_strkey(1);
         let key = balance_ledger_key(true, Some(&asset), &holder, "Balance").expect("key");
         match key {
             LedgerKey::Trustline(tl) => {
                 assert_eq!(tl.account_id, AccountId::from_str(&holder).unwrap());
-                assert_eq!(tl.asset, asset);
+                assert_eq!(
+                    tl.asset,
+                    stellar_xdr::curr::TrustLineAsset::CreditAlphanum4(match &asset {
+                        Asset::CreditAlphanum4(a) => a.clone(),
+                        _ => unreachable!(),
+                    })
+                );
             }
             other => panic!("expected trustline key, got {other:?}"),
         }
@@ -553,9 +548,6 @@ mod tests {
 
     #[test]
     fn sac_native_account_holder_produces_account_key() {
-        let sac_id =
-            ScAddress::Contract(stellar_xdr::curr::ContractId::from(Asset::Native)).to_string();
-        assert!(is_sac_contract(&sac_id, Some(&Asset::Native)));
         let key = balance_ledger_key(true, Some(&Asset::Native), &account_strkey(2), "Balance")
             .expect("key");
         assert!(matches!(key, LedgerKey::Account(_)));

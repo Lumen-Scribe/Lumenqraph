@@ -112,7 +112,7 @@ pub async fn run_reenrich(
             break;
         }
         pages += 1;
-        let mut batch_ids = Vec::with_capacity(rows.len());
+        let mut batch_ids: Vec<String> = Vec::with_capacity(rows.len());
         let mut batch_enriched: Vec<Option<Json<serde_json::Value>>> =
             Vec::with_capacity(rows.len());
         let mut batch_updated = 0u64;

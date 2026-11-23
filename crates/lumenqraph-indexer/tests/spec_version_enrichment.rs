@@ -100,7 +100,12 @@ mod spec_version_enrichment_tests {
         .await
         .expect("Failed to query version at ledger");
 
-        row.map(|r| (r.get::<i32, _>("version"), r.get::<serde_json::Value, _>("interface")))
+        row.map(|r| {
+            (
+                r.get::<i32, _>("version"),
+                r.get::<serde_json::Value, _>("interface"),
+            )
+        })
     }
 
     #[tokio::test]

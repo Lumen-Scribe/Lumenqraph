@@ -26,12 +26,15 @@
 use lumenqraph_core::xdr;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use std::str::FromStr;
 use stellar_xdr::curr::{
-    AccountId, Asset, ContractDataDurability, ContractId, Hash, LedgerKey, LedgerKeyAccount,
-    LedgerKeyContractData, LedgerKeyTrustLine, Limits, ScAddress, ScVal, TrustLineAsset, WriteXdr,
+    AccountId, AlphaNum12, AlphaNum4, Asset, AssetCode12, AssetCode4, ContractDataDurability,
+    ContractId, Hash, LedgerKey, LedgerKeyAccount, LedgerKeyContractData, LedgerKeyTrustLine,
+    Limits, PublicKey, ScAddress, ScVal, TrustLineAsset, Uint256, WriteXdr,
 };
 use tracing::{debug, warn};
 
+use crate::keys;
 use crate::rpc_client::{DataEntry, RpcClient};
 use crate::specs::SpecCache;
 
@@ -60,7 +63,8 @@ pub async fn snapshot_instances_batch(
         return 0;
     }
 
-    let (selected, deferred) = cap_and_prioritise_instances(pool, contract_ids, max_per_cycle).await;
+    let (selected, deferred) =
+        cap_and_prioritise_instances(pool, contract_ids, max_per_cycle).await;
     if deferred > 0 {
         debug!(
             deferred,
@@ -109,7 +113,11 @@ async fn cap_and_prioritise_instances(
     ordered.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
     let deferred = ordered.len() - max_per_cycle;
-    let selected = ordered.into_iter().take(max_per_cycle).map(|(cid, _)| cid).collect();
+    let selected = ordered
+        .into_iter()
+        .take(max_per_cycle)
+        .map(|(cid, _)| cid)
+        .collect();
     (selected, deferred)
 }
 
@@ -174,10 +182,7 @@ async fn try_snapshot_instances_batch(
     .bind(&changed_storage)
     .execute(pool)
     .await?;
-    debug!(
-        count = changed_ids.len(),
-        "state snapshots recorded"
-    );
+    debug!(count = changed_ids.len(), "state snapshots recorded");
     Ok(())
 }
 
@@ -246,8 +251,6 @@ pub async fn snapshot_balances_batch(
     durability: ContractDataDurability,
     max_per_cycle: usize,
 ) -> usize {
-    use crate::keys;
-
     // Build the flat list of (contract_id, key, durability, label) to fetch,
     // deduplicated by (contract_id, key_hash).
     let mut batch: Vec<(String, ScVal, ContractDataDurability, &str)> = Vec::new();
@@ -324,7 +327,11 @@ pub async fn snapshot_balances_batch(
     );
 
     for chunk in batch.chunks(MAX_BATCH_KEYS) {
-        if let Err(e) = snapshot_data_chunk(pool, rpc, chunk).await {
+        let owned: Vec<(String, ScVal, ContractDataDurability, Option<String>)> = chunk
+            .iter()
+            .map(|(cid, key, dur, label)| (cid.clone(), key.clone(), *dur, Some(label.to_string())))
+            .collect();
+        if let Err(e) = snapshot_data_chunk(pool, rpc, &owned).await {
             warn!(error = %e, "batch contract-data snapshot failed");
         }
     }
@@ -334,11 +341,11 @@ pub async fn snapshot_balances_batch(
 /// Apply the per-cycle cap to a batch of contract-data keys, ordering by
 /// last-snapshot age (never-snapshotted first, then oldest `max(ledger)`).
 /// Returns the selected batch and the number of keys deferred.
-async fn cap_and_prioritise_keys(
+async fn cap_and_prioritise_keys<L>(
     pool: &PgPool,
-    batch: Vec<(String, ScVal, ContractDataDurability, &str)>,
+    batch: Vec<(String, ScVal, ContractDataDurability, L)>,
     max_per_cycle: usize,
-) -> (Vec<(String, ScVal, ContractDataDurability, &str)>, usize) {
+) -> (Vec<(String, ScVal, ContractDataDurability, L)>, usize) {
     if max_per_cycle == 0 || batch.len() <= max_per_cycle {
         return (batch, 0);
     }
@@ -381,9 +388,9 @@ async fn cap_and_prioritise_keys(
     indexed.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
     let deferred = indexed.len() - max_per_cycle;
-    let mut slots: Vec<Option<(String, ScVal, ContractDataDurability, &str)>> =
+    let mut slots: Vec<Option<(String, ScVal, ContractDataDurability, L)>> =
         batch.into_iter().map(Some).collect();
-    let selected: Vec<(String, ScVal, ContractDataDurability, &str)> = indexed
+    let selected: Vec<(String, ScVal, ContractDataDurability, L)> = indexed
         .into_iter()
         .take(max_per_cycle)
         .filter_map(|(idx, _)| slots[idx].take())
@@ -524,7 +531,9 @@ async fn snapshot_data_chunk(
         chunk.iter().zip(results.iter()).enumerate()
     {
         let key_hash = &key_hashes[idx];
-        let latest_ledger = latest.get(&(contract_id.clone(), key_hash.clone())).copied();
+        let latest_ledger = latest
+            .get(&(contract_id.clone(), key_hash.clone()))
+            .copied();
 
         match entry_opt {
             Some(entry) => {
@@ -548,7 +557,13 @@ async fn snapshot_data_chunk(
                 if latest_ledger.is_none() {
                     continue;
                 }
-                let tip = rpc.latest_ledger().await;
+                let tip = match rpc.get_latest_ledger().await {
+                    Ok(tip) => tip,
+                    Err(e) => {
+                        debug!(contract_id = %contract_id, error = %e, "skipping tombstone: latest ledger unavailable");
+                        continue;
+                    }
+                };
                 let archived = *dur == ContractDataDurability::Persistent
                     && entry_archived(rpc, contract_id, key, tip).await;
                 ins_contract.push(contract_id.clone());
@@ -597,6 +612,86 @@ async fn snapshot_data_chunk(
     Ok(())
 }
 
+/// Latest snapshotted ledger per contract (`None` = never snapshotted), from
+/// `contract_state`. Used to prioritise stale contracts (#746).
+pub async fn last_snapshot_ledgers(
+    pool: &PgPool,
+    contract_ids: &[String],
+) -> anyhow::Result<std::collections::HashMap<String, Option<i64>>> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT contract_id, max(ledger) FROM contract_state
+         WHERE contract_id = ANY($1)
+         GROUP BY contract_id",
+    )
+    .bind(contract_ids)
+    .fetch_all(pool)
+    .await?;
+    let mut out: std::collections::HashMap<String, Option<i64>> =
+        contract_ids.iter().map(|c| (c.clone(), None)).collect();
+    for (cid, ledger) in rows {
+        out.insert(cid, Some(ledger));
+    }
+    Ok(out)
+}
+
+/// Latest balance-snapshot ledger per holder address (`None` = never
+/// snapshotted). Balance keys decode to `[symbol, address]`, so the holder is
+/// element 1 of the key JSON (#746).
+pub async fn last_balance_snapshot_ledgers(
+    pool: &PgPool,
+    holders: &[String],
+) -> anyhow::Result<std::collections::HashMap<String, Option<i64>>> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT key->>1, max(ledger) FROM contract_data
+         WHERE label = 'balance' AND key->>1 = ANY($1)
+         GROUP BY key->>1",
+    )
+    .bind(holders)
+    .fetch_all(pool)
+    .await?;
+    let mut out: std::collections::HashMap<String, Option<i64>> =
+        holders.iter().map(|h| (h.clone(), None)).collect();
+    for (holder, ledger) in rows {
+        out.insert(holder, Some(ledger));
+    }
+    Ok(out)
+}
+
+/// Whether `holder` is a classic Stellar account (`G…`) rather than a contract.
+fn is_classic_account(holder: &str) -> bool {
+    keys::is_account_address(holder)
+}
+
+/// The ledger key holding a classic account's balance of `asset`: the account
+/// entry for the native asset, otherwise its trustline.
+fn trustline_ledger_key(holder: &str, asset: &Asset) -> anyhow::Result<LedgerKey> {
+    keys::balance_ledger_key(true, Some(asset), holder, "Balance")
+}
+
+/// If `contract_id` is a Stellar Asset Contract, return the classic asset it
+/// wraps (read from the instance's `METADATA.name`). `None` for WASM contracts
+/// or when the instance can't be read.
+async fn detect_sac_asset(rpc: &RpcClient, contract_id: &str) -> Option<Asset> {
+    let inst = rpc.get_contract_instance(contract_id).await.ok()??;
+    if inst.wasm_hash.is_some() {
+        return None;
+    }
+    let ScVal::Map(Some(storage)) = &inst.storage else {
+        return None;
+    };
+    let sym =
+        |v: &ScVal, want: &str| matches!(v, ScVal::Symbol(s) if s.0.as_slice() == want.as_bytes());
+    let metadata = storage.0.iter().find(|e| sym(&e.key, "METADATA"))?;
+    let ScVal::Map(Some(meta)) = &metadata.val else {
+        return None;
+    };
+    let name = meta.0.iter().find(|e| sym(&e.key, "name"))?;
+    let ScVal::String(name) = &name.val else {
+        return None;
+    };
+    keys::asset_from_sac_name(&ScVal::String(name.clone()))
+}
+
 /// Compute the hex-encoded SHA-256 of a key's XDR base64 encoding.
 fn key_hash_of(key: &ScVal) -> anyhow::Result<String> {
     let key_xdr = key.to_xdr_base64(Limits::none())?;
@@ -614,12 +709,7 @@ fn durability_str(durability: ContractDataDurability) -> &'static str {
 /// Best-effort check whether a persistent entry that returned no data is
 /// archived (restorable) rather than deleted. Uses the entry's TTL /
 /// `liveUntilLedgerSeq` when the RPC provides it; defaults to `false`.
-async fn entry_archived(
-    rpc: &RpcClient,
-    contract_id: &str,
-    key: &ScVal,
-    tip: i64,
-) -> bool {
+async fn entry_archived(rpc: &RpcClient, contract_id: &str, key: &ScVal, tip: i64) -> bool {
     match rpc
         .get_contract_data_ttl(contract_id, key, ContractDataDurability::Persistent)
         .await
@@ -684,7 +774,11 @@ async fn write_tombstone_if_needed(
     .bind(label)
     .execute(pool)
     .await?;
-    debug!(contract_id, ledger = tip, "contract-data tombstone recorded");
+    debug!(
+        contract_id,
+        ledger = tip,
+        "contract-data tombstone recorded"
+    );
     Ok(())
 }
 
@@ -800,7 +894,11 @@ mod tests {
             .collect();
         indexed.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         let deferred = indexed.len() - max_per_cycle;
-        let selected = indexed.into_iter().take(max_per_cycle).map(|(i, _)| i).collect();
+        let selected = indexed
+            .into_iter()
+            .take(max_per_cycle)
+            .map(|(i, _)| i)
+            .collect();
         (selected, deferred)
     }
 

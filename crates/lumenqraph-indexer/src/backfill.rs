@@ -256,14 +256,13 @@ mod tests {
             rpc_timeout_secs: 30,
             rpc_max_retry_after_secs: 60,
             rpc_headers: Default::default(),
-            max_consecutive_errors: 20,
-            degraded_poll_interval_secs: 30,
             enrichment_warn_threshold: 0.5,
             key_templates: vec![],
             spec_cache_max_entries: 2000,
             spec_fetch_concurrency: 4,
-            max_consecutive_errors: 20,
-            degraded_poll_interval_secs: 300,
+            event_topic_filters: vec![],
+            max_state_keys_per_cycle: 0,
+            max_state_contracts_per_cycle: 0,
         }
     }
 

@@ -82,8 +82,7 @@ mod reenrich_cli_flags_tests {
         let decoded_value = json!("1000");
 
         // Insert events for both contracts
-        for (i, contract) in [&contract_1, &contract_2].iter().enumerate()
-        {
+        for (i, contract) in [&contract_1, &contract_2].iter().enumerate() {
             for j in 0..3 {
                 let event_id = format!("event_{}_{}", i, j);
                 sqlx::query(
@@ -205,7 +204,10 @@ mod reenrich_cli_flags_tests {
         .await
         .expect("Failed to count");
 
-        assert_eq!(count_without_force.0, 2, "Without --force, only 2 un-enriched events");
+        assert_eq!(
+            count_without_force.0, 2,
+            "Without --force, only 2 un-enriched events"
+        );
 
         // With --force: count all events (simulating the flag behavior)
         let count_with_force: (i64,) = sqlx::query_as(
@@ -273,7 +275,10 @@ mod reenrich_cli_flags_tests {
         .await
         .expect("Failed to count");
 
-        assert_eq!(count_full_range.0, 101, "Should have 101 events (1000-1100)");
+        assert_eq!(
+            count_full_range.0, 101,
+            "Should have 101 events (1000-1100)"
+        );
 
         let count_partial_range: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM events
@@ -391,8 +396,7 @@ mod reenrich_cli_flags_tests {
         let enrichment = json!({"old": "value"});
 
         // Insert events for both contracts (some enriched, some not)
-        for (i, contract) in [&contract_1, &contract_2].iter().enumerate()
-        {
+        for (i, contract) in [&contract_1, &contract_2].iter().enumerate() {
             for j in 0..4 {
                 let event_id = format!("event_{}_{}", i, j);
                 let enriched = if j % 2 == 0 {
@@ -434,7 +438,10 @@ mod reenrich_cli_flags_tests {
         .fetch_one(&pool)
         .await
         .expect("Failed to count");
-        assert_eq!(default_count.0, 4, "Default: 4 un-enriched events (2 per contract)");
+        assert_eq!(
+            default_count.0, 4,
+            "Default: 4 un-enriched events (2 per contract)"
+        );
 
         // With --contract only: filter to contract 1, un-enriched only
         let contract_filtered: (i64,) = sqlx::query_as(

@@ -620,7 +620,7 @@ pub async fn rpc_auth_and_rate_limit(
 /// authenticated, so `create_webhook` can set `owner_key_hash` (#421).
 pub async fn webhook_auth_and_rate_limit(
     State(state): State<AppState>,
-    ConnectInfo(_socket_addr): ConnectInfo<SocketAddr>,
+    ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     mut req: Request,
     next: Next,

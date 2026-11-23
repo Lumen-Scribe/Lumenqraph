@@ -1220,7 +1220,11 @@ mod tests {
     async fn no_rpc_url_and_no_stored_passphrase_is_an_error() {
         let state = fixture_state().await;
         let err = resolve_rpc_url(&state.pool, None).await.unwrap_err();
-        assert!(err.to_string().contains("network_passphrase is unavailable"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("network_passphrase is unavailable"),
+            "{err}"
+        );
     }
 
     fn percent_encode(s: &str) -> String {

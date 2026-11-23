@@ -124,7 +124,7 @@ pub fn template_match_tracker() -> &'static TemplateMatchTracker {
 
 /// The label used for a template in logs and metrics: its `label` when set,
 /// otherwise its `symbol`.
-pub fn template_metric_label(template: &crate::config::KeyTemplate) -> String {
+pub fn template_metric_label(template: &crate::keys::KeyTemplate) -> String {
     template
         .label
         .clone()
@@ -314,7 +314,10 @@ async fn poll_once(
         }
         None => {
             let fallback = (latest - MAX_LOOKBACK_LEDGERS).max(1);
-            warn!(fallback, "RPC did not report oldestLedger; using fallback retention window");
+            warn!(
+                fallback,
+                "RPC did not report oldestLedger; using fallback retention window"
+            );
             RPC_OLDEST_LEDGER.store(fallback, Ordering::Relaxed);
             fallback
         }
@@ -683,7 +686,9 @@ async fn fetch_and_store_with_shutdown(
             if let Some(next) = next_checkpoint(checkpointed, last_ledger, tip) {
                 match cursor::checkpoint_progress(pool, next).await {
                     Ok(()) => checkpointed = next,
-                    Err(e) => warn!(error = %e, checkpoint = next, "cursor checkpoint failed; continuing"),
+                    Err(e) => {
+                        warn!(error = %e, checkpoint = next, "cursor checkpoint failed; continuing")
+                    }
                 }
             }
         }
@@ -724,8 +729,7 @@ async fn fetch_and_store_with_shutdown(
                 metrics::record_deferred_state_contracts(deferred as u64);
                 debug!(
                     deferred,
-                    cap,
-                    "deferring contracts past MAX_STATE_CONTRACTS_PER_CYCLE to later cycles"
+                    cap, "deferring contracts past MAX_STATE_CONTRACTS_PER_CYCLE to later cycles"
                 );
             }
         }
@@ -733,7 +737,14 @@ async fn fetch_and_store_with_shutdown(
             // Batch instance reads with bounded concurrency.
             // Change-detected, so unchanged instances are no-op writes.
             // Also notes the executable hash, detecting upgrades for free.
-            state::snapshot_instances_batch(pool, rpc, specs, &targets).await;
+            state::snapshot_instances_batch(
+                pool,
+                rpc,
+                specs,
+                &targets,
+                config.max_state_contracts_per_cycle,
+            )
+            .await;
         } else {
             // Upgrade watch in index-all mode: batch the instance reads, then
             // note each executable hash. One getLedgerEntries per chunk instead
@@ -786,8 +797,7 @@ async fn fetch_and_store_with_shutdown(
                 metrics::record_deferred_state_keys(deferred as u64);
                 debug!(
                     deferred,
-                    cap,
-                    "deferring balance keys past MAX_STATE_KEYS_PER_CYCLE to later cycles"
+                    cap, "deferring balance keys past MAX_STATE_KEYS_PER_CYCLE to later cycles"
                 );
             }
         }
@@ -800,6 +810,7 @@ async fn fetch_and_store_with_shutdown(
             &config.contract_ids,
             &config.balance_key_symbol,
             durability,
+            config.max_state_keys_per_cycle,
         )
         .await;
     }
@@ -812,6 +823,7 @@ async fn fetch_and_store_with_shutdown(
             &template_keys_by_contract,
             &config.contract_ids,
             &config.key_templates,
+            config.max_state_keys_per_cycle,
         )
         .await;
     }
@@ -846,10 +858,7 @@ async fn prioritise_by_snapshot_age(pool: &PgPool, targets: &mut [String]) {
 /// A failed lookup leaves the existing order intact (#746).
 async fn prioritise_holders_by_snapshot_age(
     pool: &PgPool,
-    holders_by_contract: &mut std::collections::HashMap<
-        String,
-        std::collections::HashSet<String>,
-    >,
+    holders_by_contract: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
 ) {
     let mut all: Vec<String> = Vec::new();
     for holders in holders_by_contract.values() {
@@ -962,7 +971,11 @@ pub enum RangePlan {
     /// Entirely inside the retained window.
     Replay { from: i64, to: i64 },
     /// Straddles the retention floor. `[from, unrecoverable_to]` is lost; `[replay_from, to]` is replayed.
-    Split { unrecoverable_to: i64, replay_from: i64, to: i64 },
+    Split {
+        unrecoverable_to: i64,
+        replay_from: i64,
+        to: i64,
+    },
     /// Entirely older than the retention floor.
     Unrecoverable,
 }
@@ -1033,7 +1046,11 @@ pub async fn recover_gaps(
 
     // One getHealth for the whole run: the floor does not need re-reading per range.
     let oldest_available = rpc.oldest_available_ledger().await?;
-    info!(count = unrecovered.len(), ?oldest_available, "replaying recorded missed ranges");
+    info!(
+        count = unrecovered.len(),
+        ?oldest_available,
+        "replaying recorded missed ranges"
+    );
 
     for range in unrecovered {
         if shutdown.is_cancelled() {
@@ -1044,19 +1061,30 @@ pub async fn recover_gaps(
 
         match plan_range(from, to, oldest_available) {
             RangePlan::Unrecoverable => {
-                sqlx::query("UPDATE missed_ranges SET recoverable = FALSE, last_error = $2 WHERE id = $1")
-                    .bind(range.id)
-                    .bind(OUT_OF_RETENTION_REASON)
-                    .execute(pool)
-                    .await?;
-                warn!(id = range.id, from, to, "missed range is outside RPC retention; marked unrecoverable");
+                sqlx::query(
+                    "UPDATE missed_ranges SET recoverable = FALSE, last_error = $2 WHERE id = $1",
+                )
+                .bind(range.id)
+                .bind(OUT_OF_RETENTION_REASON)
+                .execute(pool)
+                .await?;
+                warn!(
+                    id = range.id,
+                    from, to, "missed range is outside RPC retention; marked unrecoverable"
+                );
                 summary.unrecoverable += 1;
             }
             RangePlan::Replay { from, to } => {
                 match replay_range(pool, rpc, config, specs, from, to, shutdown).await {
                     Ok(ReplayOutcome::Complete { inserted }) => {
                         mark_recovered(pool, range.id).await?;
-                        info!(id = range.id, from, to, events_inserted = inserted, "missed range recovered");
+                        info!(
+                            id = range.id,
+                            from,
+                            to,
+                            events_inserted = inserted,
+                            "missed range recovered"
+                        );
                         summary.recovered += 1;
                     }
                     Ok(ReplayOutcome::Interrupted) => {
@@ -1069,7 +1097,11 @@ pub async fn recover_gaps(
                     }
                 }
             }
-            RangePlan::Split { unrecoverable_to, replay_from, to } => {
+            RangePlan::Split {
+                unrecoverable_to,
+                replay_from,
+                to,
+            } => {
                 // Move the original row to the replayable part first, so a failed
                 // replay leaves exactly one row to retry and the lost prefix is recorded once.
                 sqlx::query("UPDATE missed_ranges SET start_ledger = $2 WHERE id = $1")
@@ -1077,13 +1109,32 @@ pub async fn recover_gaps(
                     .bind(replay_from)
                     .execute(pool)
                     .await?;
-                record_missed_range_classified(pool, from, unrecoverable_to, OUT_OF_RETENTION_REASON, false).await?;
-                warn!(id = range.id, from, unrecoverable_to, replay_from, "missed range straddles RPC retention; splitting");
+                record_missed_range_classified(
+                    pool,
+                    from,
+                    unrecoverable_to,
+                    OUT_OF_RETENTION_REASON,
+                    false,
+                )
+                .await?;
+                warn!(
+                    id = range.id,
+                    from,
+                    unrecoverable_to,
+                    replay_from,
+                    "missed range straddles RPC retention; splitting"
+                );
 
                 match replay_range(pool, rpc, config, specs, replay_from, to, shutdown).await {
                     Ok(ReplayOutcome::Complete { inserted }) => {
                         mark_recovered(pool, range.id).await?;
-                        info!(id = range.id, from = replay_from, to, events_inserted = inserted, "missed range partially recovered");
+                        info!(
+                            id = range.id,
+                            from = replay_from,
+                            to,
+                            events_inserted = inserted,
+                            "missed range partially recovered"
+                        );
                         summary.partially_recovered += 1;
                     }
                     Ok(ReplayOutcome::Interrupted) => {
@@ -1193,7 +1244,9 @@ async fn replay_range(
         }
     }
 
-    Ok(ReplayOutcome::Complete { inserted: inserted_total })
+    Ok(ReplayOutcome::Complete {
+        inserted: inserted_total,
+    })
 }
 
 /// Re-fetch events from a range of recently-closed ledgers and upsert them,
@@ -1421,7 +1474,11 @@ mod tests {
         }
 
         let keys = template_keys_by_contract.get(&contract).unwrap();
-        assert_eq!(keys.len(), 1, "duplicate template keys must collapse to one");
+        assert_eq!(
+            keys.len(),
+            1,
+            "duplicate template keys must collapse to one"
+        );
         assert!(keys.contains(&(0usize, params)));
     }
 
@@ -1529,7 +1586,9 @@ mod db_tests {
             "/",
             post(move |Json(req): Json<Value>| async move {
                 let result = match req["method"].as_str().unwrap_or_default() {
-                    "getLatestLedger" => json!({ "id": "tip", "protocolVersion": 21, "sequence": latest }),
+                    "getLatestLedger" => {
+                        json!({ "id": "tip", "protocolVersion": 21, "sequence": latest })
+                    }
                     "getHealth" => json!({
                         "status": "healthy",
                         "latestLedger": latest,
@@ -1567,6 +1626,9 @@ mod db_tests {
             upgrade_watch: false,
             reorg_overlap_ledgers: 0,
             rpc_timeout_secs: 5,
+            rpc_max_retry_after_secs: 60,
+            rpc_headers: Default::default(),
+            event_topic_filters: vec![],
             enrichment_warn_threshold: 0.5,
             key_templates: vec![],
             spec_cache_max_entries: 16,
@@ -1604,7 +1666,9 @@ mod db_tests {
         let url = spawn_mock_rpc(10_000, 1).await;
         let config = test_config(1);
 
-        let processed = run_cycle(&db, &url, &config).await.expect("cycle should succeed");
+        let processed = run_cycle(&db, &url, &config)
+            .await
+            .expect("cycle should succeed");
         assert_eq!(processed, Some(10_000));
 
         // clamped = 10_000 - 4_000 = 6_000, so the skipped range is 1..=5_999.
@@ -1614,7 +1678,10 @@ mod db_tests {
         assert_eq!(ranges[0].1, 5_999);
         assert_eq!(ranges[0].2.as_deref(), Some("catch-up skip"));
 
-        assert_eq!(cursor::read_last_processed(db.pool()).await.unwrap(), Some(10_000));
+        assert_eq!(
+            cursor::read_last_processed(db.pool()).await.unwrap(),
+            Some(10_000)
+        );
     }
 
     /// The gap record is written best-effort: if it cannot be stored, the cycle
@@ -1631,9 +1698,14 @@ mod db_tests {
             .await
             .unwrap();
 
-        let processed = run_cycle(&db, &url, &config).await.expect("cycle must not fail on the gap record");
+        let processed = run_cycle(&db, &url, &config)
+            .await
+            .expect("cycle must not fail on the gap record");
         assert_eq!(processed, Some(10_000));
-        assert_eq!(cursor::read_last_processed(db.pool()).await.unwrap(), Some(10_000));
+        assert_eq!(
+            cursor::read_last_processed(db.pool()).await.unwrap(),
+            Some(10_000)
+        );
     }
 
     /// On a fresh database, START_LEDGER is the first ledger processed. The first
@@ -1647,10 +1719,15 @@ mod db_tests {
         cursor::incr_errors(db.pool()).await.unwrap();
         let config = test_config(9_500);
 
-        let processed = run_cycle(&db, &url, &config).await.expect("first cycle must not error");
+        let processed = run_cycle(&db, &url, &config)
+            .await
+            .expect("first cycle must not error");
         assert_eq!(processed, Some(10_000));
         // Had START_LEDGER been ignored, the cycle would start at 1 and record a gap.
         assert!(missed_ranges(db.pool()).await.is_empty());
-        assert_eq!(cursor::read_last_processed(db.pool()).await.unwrap(), Some(10_000));
+        assert_eq!(
+            cursor::read_last_processed(db.pool()).await.unwrap(),
+            Some(10_000)
+        );
     }
 }

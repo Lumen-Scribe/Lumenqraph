@@ -1702,7 +1702,11 @@ mod redirect_tests {
             .send()
             .await
             .expect("hook responds");
-        assert!(resp.status().is_redirection(), "expected 3xx, got {}", resp.status());
+        assert!(
+            resp.status().is_redirection(),
+            "expected 3xx, got {}",
+            resp.status()
+        );
 
         tokio::time::sleep(StdDuration::from_millis(100)).await;
         assert_eq!(

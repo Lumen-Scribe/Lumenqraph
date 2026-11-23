@@ -179,6 +179,27 @@ pub async fn write_progress(
     Ok(())
 }
 
+/// Mid-cycle checkpoint: move the cursor forward to `ledger` (never backwards)
+/// so a crash does not replay the whole cycle (#717).
+///
+/// Deliberately does NOT bump `version`: the cycle's final [`write_progress`]
+/// commits against the version it read at the start, and a checkpoint must not
+/// make that write look like a concurrent-writer conflict. It does mark progress,
+/// since the cursor really advanced.
+pub async fn checkpoint_progress(pool: &PgPool, ledger: i64) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE indexer_cursor
+         SET last_processed_ledger = GREATEST(last_processed_ledger, $1),
+             updated_at            = now(),
+             progress_at           = now()
+         WHERE id = 1",
+    )
+    .bind(ledger)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Progress write for one-shot commands (`backfill`, `recover-gaps`, ...) that
 /// hold the leader lock, so no live poller can move the cursor concurrently.
 /// Reads the current version, then writes against it. The poller must not use

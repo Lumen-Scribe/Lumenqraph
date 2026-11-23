@@ -122,6 +122,26 @@ impl std::fmt::Debug for Config {
 }
 
 impl Config {
+    /// Reject index-all state/key indexing with no per-cycle cap: with an empty
+    /// `CONTRACT_IDS` every active contract and holder is a candidate each
+    /// cycle, so an unbounded cap would make RPC cost grow with the network
+    /// (#746). Capped index-all is allowed; the remainder is deferred.
+    pub fn validate_state_indexing(&self) -> anyhow::Result<()> {
+        if !self.contract_ids.is_empty() {
+            return Ok(());
+        }
+        if self.state_indexing && self.max_state_contracts_per_cycle == 0 {
+            anyhow::bail!(
+                "STATE_INDEXING with an empty CONTRACT_IDS requires MAX_STATE_CONTRACTS_PER_CYCLE > 0"
+            );
+        }
+        if self.key_indexing && self.max_state_keys_per_cycle == 0 {
+            anyhow::bail!(
+                "key indexing with an empty CONTRACT_IDS requires MAX_STATE_KEYS_PER_CYCLE > 0"
+            );
+        }
+        Ok(())
+    }
     pub fn db_config() -> anyhow::Result<DbConfig> {
         let max_connections = clamp_with_warning(
             "INDEXER_DATABASE_MAX_CONNECTIONS",
@@ -664,8 +684,8 @@ pub fn parse_rpc_headers(raw: &str) -> anyhow::Result<HeaderMap> {
     if raw.is_empty() {
         return Ok(HeaderMap::new());
     } else if raw.starts_with('{') {
-        let map: std::collections::BTreeMap<String, String> =
-            serde_json::from_str(raw).context("RPC_HEADERS JSON must be an object of string values")?;
+        let map: std::collections::BTreeMap<String, String> = serde_json::from_str(raw)
+            .context("RPC_HEADERS JSON must be an object of string values")?;
         pairs.extend(map);
     } else {
         for entry in raw.split(';').map(str::trim).filter(|e| !e.is_empty()) {
@@ -680,8 +700,9 @@ pub fn parse_rpc_headers(raw: &str) -> anyhow::Result<HeaderMap> {
     for (name, value) in pairs {
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .with_context(|| format!("RPC_HEADERS has an invalid header name `{name}`"))?;
-        let mut header_value = HeaderValue::from_str(&value)
-            .with_context(|| format!("RPC_HEADERS value for `{name}` is not a valid header value"))?;
+        let mut header_value = HeaderValue::from_str(&value).with_context(|| {
+            format!("RPC_HEADERS value for `{name}` is not a valid header value")
+        })?;
         header_value.set_sensitive(true);
         headers.append(header_name, header_value);
     }
@@ -702,7 +723,10 @@ mod tests {
     #[test]
     fn rpc_headers_parse_semicolon_pairs_and_keep_equals_in_values() {
         let h = parse_rpc_headers("Authorization=Bearer abc==;X-Api-Key=k1").unwrap();
-        assert_eq!(h.get("authorization").unwrap().to_str().unwrap(), "Bearer abc==");
+        assert_eq!(
+            h.get("authorization").unwrap().to_str().unwrap(),
+            "Bearer abc=="
+        );
         assert_eq!(h.get("x-api-key").unwrap().to_str().unwrap(), "k1");
         assert!(h.get("authorization").unwrap().is_sensitive());
     }
@@ -725,20 +749,30 @@ mod tests {
         let cfg = Config::from_env().expect("config should load");
         std::env::remove_var("RPC_HEADERS");
 
-        assert_eq!(cfg.rpc_headers.get("x-api-key").unwrap().to_str().unwrap(), "very-secret-key");
+        assert_eq!(
+            cfg.rpc_headers.get("x-api-key").unwrap().to_str().unwrap(),
+            "very-secret-key"
+        );
         let dbg = format!("{cfg:?}");
         assert!(dbg.contains("x-api-key: [REDACTED]"), "{dbg}");
-        assert!(!dbg.contains("very-secret-key"), "Debug must not print header values");
+        assert!(
+            !dbg.contains("very-secret-key"),
+            "Debug must not print header values"
+        );
     }
 
     #[test]
     fn rpc_headers_reject_bad_names_and_never_echo_values() {
-        let err = parse_rpc_headers("bad name=supersecret").unwrap_err().to_string();
+        let err = parse_rpc_headers("bad name=supersecret")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("invalid header name"), "{err}");
-        assert!(!err.contains("supersecret"), "error must not leak the value: {err}");
+        assert!(
+            !err.contains("supersecret"),
+            "error must not leak the value: {err}"
+        );
         assert!(parse_rpc_headers("no-equals-sign").is_err());
     }
-
 
     #[test]
     fn page_size_clamping() {
@@ -864,7 +898,9 @@ mod tests {
     #[test]
     fn event_topic_filters_validation_rejects_too_many_segments() {
         let too_long = vec![vec!["a".to_string(); MAX_TOPIC_SEGMENTS + 1]];
-        let err = validate_event_filters(&[], &too_long).unwrap_err().to_string();
+        let err = validate_event_filters(&[], &too_long)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("segments"), "{err}");
         // Empty pattern is rejected.
         let empty = vec![Vec::<String>::new()];
@@ -888,10 +924,16 @@ mod tests {
     #[test]
     fn event_topic_filters_parsed_from_env() {
         let _guard = env_lock();
-        let saved: Vec<(String, Option<String>)> = ["DATABASE_URL", "RPC_URL", "RPC_URLS", "CONTRACT_IDS", "EVENT_TOPIC_FILTERS"]
-            .iter()
-            .map(|k| ((*k).to_string(), std::env::var(k).ok()))
-            .collect();
+        let saved: Vec<(String, Option<String>)> = [
+            "DATABASE_URL",
+            "RPC_URL",
+            "RPC_URLS",
+            "CONTRACT_IDS",
+            "EVENT_TOPIC_FILTERS",
+        ]
+        .iter()
+        .map(|k| ((*k).to_string(), std::env::var(k).ok()))
+        .collect();
 
         std::env::set_var("DATABASE_URL", "postgres://localhost/test");
         std::env::set_var("RPC_URL", "https://example.com");
@@ -949,7 +991,10 @@ mod tests {
         std::env::remove_var("MAX_STATE_KEYS_PER_CYCLE");
         std::env::remove_var("MAX_STATE_CONTRACTS_PER_CYCLE");
         let cfg = Config::from_env().expect("config should load");
-        assert_eq!(cfg.max_state_keys_per_cycle, DEFAULT_MAX_STATE_KEYS_PER_CYCLE);
+        assert_eq!(
+            cfg.max_state_keys_per_cycle,
+            DEFAULT_MAX_STATE_KEYS_PER_CYCLE
+        );
         assert_eq!(
             cfg.max_state_contracts_per_cycle,
             DEFAULT_MAX_STATE_CONTRACTS_PER_CYCLE
@@ -1020,23 +1065,13 @@ mod tests {
         )
         .is_ok());
         // Only the relevant cap is required per feature.
-        assert!(validate_index_all_state_caps(
-            &[],
-            false,
-            true,
-            Some("500".to_string()),
-            None
-        )
-        .is_ok());
+        assert!(
+            validate_index_all_state_caps(&[], false, true, Some("500".to_string()), None).is_ok()
+        );
         // Empty env values do not count as explicit.
-        assert!(validate_index_all_state_caps(
-            &[],
-            false,
-            true,
-            Some("  ".to_string()),
-            None
-        )
-        .is_err());
+        assert!(
+            validate_index_all_state_caps(&[], false, true, Some("  ".to_string()), None).is_err()
+        );
     }
 
     #[test]
@@ -1066,7 +1101,10 @@ mod tests {
         std::env::remove_var("MAX_STATE_CONTRACTS_PER_CYCLE");
 
         let err = Config::from_env().expect_err("index-all KEY_INDEXING must be refused");
-        assert!(err.to_string().contains("MAX_STATE_KEYS_PER_CYCLE"), "{err}");
+        assert!(
+            err.to_string().contains("MAX_STATE_KEYS_PER_CYCLE"),
+            "{err}"
+        );
 
         // Setting the cap makes it load.
         std::env::set_var("MAX_STATE_KEYS_PER_CYCLE", "250");
@@ -1202,7 +1240,10 @@ mod tests {
             .expect_err("invalid symbol must fail")
             .to_string();
         assert!(err.contains("KEY_TEMPLATES"), "{err}");
-        assert!(err.contains("bad-sym"), "error should name the template: {err}");
+        assert!(
+            err.contains("bad-sym"),
+            "error should name the template: {err}"
+        );
         assert!(err.contains("symbol"), "{err}");
     }
 
@@ -1215,7 +1256,10 @@ mod tests {
         .expect_err("empty event_names must fail")
         .to_string();
         assert!(err.contains("KEY_TEMPLATES"), "{err}");
-        assert!(err.contains("no-events"), "error should name the template: {err}");
+        assert!(
+            err.contains("no-events"),
+            "error should name the template: {err}"
+        );
         assert!(err.contains("event_names"), "{err}");
     }
 
@@ -1228,7 +1272,10 @@ mod tests {
         .expect_err("empty param_indices must fail")
         .to_string();
         assert!(err.contains("KEY_TEMPLATES"), "{err}");
-        assert!(err.contains("no-params"), "error should name the template: {err}");
+        assert!(
+            err.contains("no-params"),
+            "error should name the template: {err}"
+        );
         assert!(err.contains("param_indices"), "{err}");
     }
 
@@ -1241,7 +1288,10 @@ mod tests {
         .expect_err("param index 0 must fail")
         .to_string();
         assert!(err.contains("KEY_TEMPLATES"), "{err}");
-        assert!(err.contains("zero-param"), "error should name the template: {err}");
+        assert!(
+            err.contains("zero-param"),
+            "error should name the template: {err}"
+        );
         assert!(err.contains("param_indices"), "{err}");
     }
 
@@ -1254,7 +1304,10 @@ mod tests {
         .expect_err("out-of-range param index must fail")
         .to_string();
         assert!(err.contains("KEY_TEMPLATES"), "{err}");
-        assert!(err.contains("oob-param"), "error should name the template: {err}");
+        assert!(
+            err.contains("oob-param"),
+            "error should name the template: {err}"
+        );
         assert!(err.contains("param_indices"), "{err}");
     }
 }

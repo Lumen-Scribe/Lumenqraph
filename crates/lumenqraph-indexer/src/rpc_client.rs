@@ -178,7 +178,11 @@ fn parse_retry_after(value: &str, now: chrono::DateTime<chrono::Utc>) -> Option<
         return Some(Duration::from_secs(secs));
     }
     let when = chrono::DateTime::parse_from_rfc2822(value).ok()?;
-    Some((when.with_timezone(&chrono::Utc) - now).to_std().unwrap_or(Duration::ZERO))
+    Some(
+        (when.with_timezone(&chrono::Utc) - now)
+            .to_std()
+            .unwrap_or(Duration::ZERO),
+    )
 }
 
 #[derive(Serialize)]
@@ -359,13 +363,22 @@ pub struct RpcHealth {
     pub latest_ledger: i64,
 }
 
+/// The subset of `getHealth` the fail-back probe needs.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProbeHealth {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    latest_ledger: i64,
+}
+
 /// The chain tip and retention floor reported by one `getHealth` call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TipSnapshot {
     pub latest: i64,
     pub oldest_available: Option<i64>,
 }
-
 
 // ---- getEvents ----
 
@@ -456,7 +469,10 @@ fn event_filters_with_topics(
     let id_chunks: Vec<Vec<String>> = if contract_ids.is_empty() {
         vec![vec![]]
     } else {
-        contract_ids.chunks(MAX_IDS_PER_FILTER).map(<[String]>::to_vec).collect()
+        contract_ids
+            .chunks(MAX_IDS_PER_FILTER)
+            .map(<[String]>::to_vec)
+            .collect()
     };
     let topic_sets: Vec<Vec<String>> = if topic_patterns.is_empty() {
         vec![vec![]]
@@ -481,7 +497,11 @@ fn event_filters_with_topics(
             filters.push(EventFilter {
                 filter_type: "contract",
                 contract_ids: chunk.clone(),
-                topics: if topics.is_empty() { vec![] } else { vec![topics.clone()] },
+                topics: if topics.is_empty() {
+                    vec![]
+                } else {
+                    vec![topics.clone()]
+                },
             });
         }
     }
@@ -591,7 +611,8 @@ impl RpcClient {
 
     /// Count one ledger entry (or batch key) skipped by a batch helper (#724).
     fn record_ledger_entry_decode_error(&self) {
-        self.ledger_entry_decode_errors.fetch_add(1, Ordering::Relaxed);
+        self.ledger_entry_decode_errors
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count one failed attempt, both in the aggregate and in its class
@@ -626,30 +647,6 @@ impl RpcClient {
         host_of(self.urls.get(idx).unwrap_or(&self.urls[0]))
     }
 
-    /// Ask one endpoint for its network passphrase (`getNetwork`).
-    async fn fetch_network_passphrase(&self, url: &str) -> anyhow::Result<String> {
-        let req = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getNetwork", "params": {} });
-        let response = self
-            .http
-            .post(url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .json(&req)
-            .send()
-            .await
-            .with_context(|| format!("getNetwork request failed for RPC host {}", host_of(url)))?
-            .error_for_status()
-            .with_context(|| format!("getNetwork failed for RPC host {}", host_of(url)))?;
-        let rpc: RpcResponse<NetworkResult> = response
-            .json()
-            .await
-            .with_context(|| format!("getNetwork response decode failed for RPC host {}", host_of(url)))?;
-        Ok(rpc
-            .result
-            .ok_or_else(|| anyhow!("getNetwork returned no result for RPC host {}", host_of(url)))?
-            .network_passphrase)
-    }
-
     /// Pin the network passphrase at startup (#713).
     ///
     /// Requires at least one reachable endpoint. Endpoints that are unreachable
@@ -657,91 +654,144 @@ impl RpcClient {
     /// instead of blocking startup. Two reachable endpoints that disagree on the
     /// passphrase are still a hard error.
     pub async fn validate_network_passphrases(&self) -> anyhow::Result<String> {
-        let mut expected: Option<String> = None;
-        for url in &self.urls {
-            let req = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getNetwork", "params": {} });
-            let response = self
-                .http
-                .post(url)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .header(reqwest::header::USER_AGENT, USER_AGENT)
-                .json(&req)
-                .send()
-                .await
-                .with_context(|| {
-                    format!("getNetwork request failed for RPC host {}", host_of(url))
-                })?
-                .error_for_status()
-                .with_context(|| format!("getNetwork failed for RPC host {}", host_of(url)))?;
-            let rpc: RpcResponse<NetworkResult> = response.json().await.with_context(|| {
-                format!(
-                    "getNetwork response decode failed for RPC host {}",
-                    host_of(url)
-                )
-            })?;
-            let passphrase = rpc
-                .result
-                .ok_or_else(|| {
-                    anyhow!(
-                        "getNetwork returned no result for RPC host {}",
-                        host_of(url)
-                    )
-                })?
-                .network_passphrase;
-            if let Some(ref prior) = expected {
-                if prior != &passphrase {
-                    anyhow::bail!(
-                        "RPC network mismatch: endpoint {} returned a different network passphrase",
-                        host_of(url)
+        let mut pinned: Option<String> = None;
+        for (idx, url) in self.urls.iter().enumerate() {
+            let actual = match self.fetch_network_passphrase(url, None).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        endpoint = %host_of(url),
+                        error = %e,
+                        "RPC endpoint unreachable at startup; will verify before first use"
                     );
+                    self.unverified.lock().unwrap().insert(idx);
+                    continue;
                 }
-            } else {
-                expected = Some(passphrase);
+            };
+            match &pinned {
+                Some(prior) if prior != &actual => anyhow::bail!(
+                    "RPC network mismatch: endpoint {} returned a different network passphrase",
+                    host_of(url)
+                ),
+                Some(_) => {}
+                None => pinned = Some(actual),
             }
         }
         let passphrase = pinned.ok_or_else(|| {
-            anyhow!("no RPC endpoint is reachable ({} configured)", self.urls.len())
+            anyhow!(
+                "no RPC endpoint is reachable ({} configured)",
+                self.urls.len()
+            )
         })?;
         *self.network_passphrase.lock().unwrap() = Some(passphrase.clone());
         Ok(passphrase)
+    }
+
+    /// Whether the endpoint at `idx` was unreachable at startup and has not
+    /// been verified since (#713).
+    fn is_unverified(&self, idx: usize) -> bool {
+        self.unverified.lock().unwrap().contains(&idx)
+    }
+
+    /// POST a parameterless JSON-RPC `method` to `url` and decode its result.
+    /// Bypasses retry/failover: callers (probes, network checks) want one
+    /// attempt with an optional tight `timeout`.
+    async fn raw_rpc<R: for<'de> Deserialize<'de>>(
+        &self,
+        url: &str,
+        method: &str,
+        timeout: Option<Duration>,
+    ) -> anyhow::Result<R> {
+        let req = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": {} });
+        let mut builder = self
+            .http
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::USER_AGENT, USER_AGENT)
+            .json(&req);
+        if let Some(t) = timeout {
+            builder = builder.timeout(t);
+        }
+        let rpc: RpcResponse<R> = builder
+            .send()
+            .await
+            .with_context(|| format!("{method} request failed for RPC host {}", host_of(url)))?
+            .error_for_status()
+            .with_context(|| format!("{method} failed for RPC host {}", host_of(url)))?
+            .json()
+            .await
+            .with_context(|| {
+                format!(
+                    "{method} response decode failed for RPC host {}",
+                    host_of(url)
+                )
+            })?;
+        if let Some(e) = rpc.error {
+            anyhow::bail!(
+                "{method} error {} from RPC host {}: {}",
+                e.code,
+                host_of(url),
+                e.message
+            );
+        }
+        rpc.result
+            .ok_or_else(|| anyhow!("{method} returned no result for RPC host {}", host_of(url)))
+    }
+
+    async fn fetch_network_passphrase(
+        &self,
+        url: &str,
+        timeout: Option<Duration>,
+    ) -> anyhow::Result<String> {
+        let net: NetworkResult = self.raw_rpc(url, "getNetwork", timeout).await?;
+        Ok(net.network_passphrase)
     }
 
     /// Check an endpoint's network identity before it serves traffic.
     ///
     /// A wrong network is a hard error. An endpoint that cannot be reached is
     /// reported as [`NetworkCheck::Unreachable`] so the caller can skip it.
-    async fn check_endpoint_network(&self, idx: usize) -> anyhow::Result<NetworkCheck> {
+    async fn check_endpoint_network(
+        &self,
+        idx: usize,
+        timeout: Option<Duration>,
+    ) -> anyhow::Result<NetworkCheck> {
         let expected = self.network_passphrase.lock().unwrap().clone();
         let Some(expected) = expected else {
-            return Ok(());
+            return Ok(NetworkCheck::Verified);
         };
         let url = self.url_at(idx).to_string();
-        let req =
-            serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getNetwork", "params": {} });
-        let rpc: RpcResponse<NetworkResult> = self
-            .http
-            .post(&url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .json(&req)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        let actual = rpc
-            .result
-            .ok_or_else(|| {
-                anyhow!(
-                    "getNetwork returned no result for RPC host {}",
-                    host_of(&url)
-                )
-            })?
-            .network_passphrase;
+        let actual = match self.fetch_network_passphrase(&url, timeout).await {
+            Ok(p) => p,
+            Err(e) => return Ok(NetworkCheck::Unreachable(e)),
+        };
         if actual != expected {
             anyhow::bail!("RPC failover network mismatch at {}", host_of(&url));
         }
-        Ok(())
+        self.unverified.lock().unwrap().remove(&idx);
+        Ok(NetworkCheck::Verified)
+    }
+
+    /// Check that endpoint `idx` has reached `cursor`. Returns `Ok(None)` when
+    /// it has, `Ok(Some(tip))` with its tip when it is behind. The highest tip
+    /// seen since the last switch is cached, since tips only move forward.
+    async fn endpoint_tip_at_least(
+        &self,
+        idx: usize,
+        url: &str,
+        cursor: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        let known = self.failover.lock().unwrap().known_tip[idx];
+        if known.is_some_and(|t| t >= cursor) {
+            return Ok(None);
+        }
+        let latest: LatestLedgerResult = self.raw_rpc(url, "getLatestLedger", None).await?;
+        let tip = latest.sequence;
+        {
+            let mut state = self.failover.lock().unwrap();
+            state.known_tip[idx] = Some(state.known_tip[idx].map_or(tip, |t| t.max(tip)));
+        }
+        Ok((tip < cursor).then_some(tip))
     }
 
     /// Return the URL at `idx` (clamped to the list length).
@@ -826,34 +876,10 @@ impl RpcClient {
     /// to it. Called only when we are not currently on the primary and enough
     /// time has passed since the last failover.
     async fn maybe_probe_primary(&self) {
-        let (is_on_primary, should_probe) = {
-            let state = self.failover.lock().unwrap();
-            let on_primary = state.active_idx == 0;
-            let probe = !on_primary
-                && state
-                    .last_failover_at
-                    .map(|t| t.elapsed() >= PRIMARY_PROBE_INTERVAL)
-                    .unwrap_or(false);
-            (on_primary, probe)
-        };
-        if is_on_primary || !should_probe {
-            return;
-        }
-        // Only the primary (index 0) is probed for fail-back.
-        let primary_url = &self.urls[0];
-        let req_body = serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "getHealth", "params": {}
-        });
-        let result = self
-            .http
-            .post(primary_url.as_str())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .json(&req_body)
-            .send()
-            .await;
-        let ok = matches!(result, Ok(r) if r.status().is_success());
-        if ok {
+        // Only the primary (index 0) is probed for fail-back, and only when we
+        // are on a failover endpoint and both the failover and the previous
+        // probe are older than the probe interval.
+        let active_tip = {
             let mut state = self.failover.lock().unwrap();
             if state.active_idx == 0 {
                 return;
@@ -900,7 +926,7 @@ impl RpcClient {
     /// Any HTTP 200 is not enough (#722).
     async fn probe_primary(&self, active_tip: Option<i64>) -> anyhow::Result<()> {
         let primary = self.urls[0].clone();
-        let health: RpcHealth = self
+        let health: ProbeHealth = self
             .raw_rpc(&primary, "getHealth", Some(PRIMARY_PROBE_TIMEOUT))
             .await?;
         anyhow::ensure!(
@@ -908,7 +934,12 @@ impl RpcClient {
             "primary reports status {:?}",
             health.status
         );
-        self.check_endpoint_network(0, Some(PRIMARY_PROBE_TIMEOUT)).await?;
+        if let NetworkCheck::Unreachable(e) = self
+            .check_endpoint_network(0, Some(PRIMARY_PROBE_TIMEOUT))
+            .await?
+        {
+            return Err(e.context("primary network check failed"));
+        }
         if let Some(tip) = active_tip {
             anyhow::ensure!(
                 health.latest_ledger + FAILBACK_LEDGER_TOLERANCE >= tip,
@@ -988,9 +1019,14 @@ impl RpcClient {
             // unreachable at startup and never verified (#713). An unreachable
             // endpoint is skipped; a wrong network is a hard error.
             let mut attempts = MAX_ATTEMPTS_PER_URL;
-            if url_idx != 0 || self.is_unverified(url_idx) {
-                match self.check_endpoint_network(url_idx).await? {
-                    NetworkCheck::Verified => {}
+            let needs_network_check = self.is_unverified(url_idx)
+                || (url_idx != 0 && !self.failover.lock().unwrap().network_verified[url_idx]);
+            if needs_network_check {
+                match self.check_endpoint_network(url_idx, None).await? {
+                    NetworkCheck::Verified => {
+                        // Checked once per switch, not before every call (#721).
+                        self.failover.lock().unwrap().network_verified[url_idx] = true;
+                    }
                     NetworkCheck::Unreachable(error) => {
                         tracing::warn!(
                             endpoint = %host_of(&url),
@@ -999,6 +1035,33 @@ impl RpcClient {
                         );
                         last_err = Some(error);
                         attempts = 0;
+                    }
+                }
+            }
+
+            // A failover candidate must have reached the cursor we are resuming
+            // from, or it would serve a page that skips ledgers (#720).
+            if attempts > 0 && url_idx != 0 {
+                if let Some(cursor) = cursor_ledger {
+                    match self.endpoint_tip_at_least(url_idx, &url, cursor).await {
+                        Ok(None) => {}
+                        Ok(Some(tip)) => {
+                            tracing::warn!(
+                                endpoint = %host_of(&url),
+                                tip,
+                                cursor,
+                                "failover endpoint is behind the cursor; skipping"
+                            );
+                            last_err = Some(anyhow!(
+                                "failover endpoint {} is behind the cursor (tip {tip} < {cursor})",
+                                host_of(&url)
+                            ));
+                            attempts = 0;
+                        }
+                        Err(error) => {
+                            last_err = Some(error);
+                            attempts = 0;
+                        }
                     }
                 }
             }
@@ -1248,13 +1311,18 @@ impl RpcClient {
         };
         let start_ledger = if cursor.is_some() { None } else { start_ledger };
         let params = GetEventsParams {
-            end_ledger: if start_ledger.is_some() { end_ledger } else { None },
+            end_ledger: if start_ledger.is_some() {
+                end_ledger
+            } else {
+                None
+            },
             start_ledger,
             filters: event_filters_with_topics(contract_ids, topic_patterns)?,
             pagination: Pagination { limit, cursor },
             xdr_format: "base64",
         };
-        self.call_with_cursor("getEvents", params, cursor_ledger).await
+        self.call_with_cursor("getEvents", params, cursor_ledger)
+            .await
     }
 
     /// Fetch a contract's deployed WASM (hex hash + bytes), so its on-chain
@@ -1335,6 +1403,41 @@ impl RpcClient {
             storage: ScVal::Map(inst.storage),
             last_modified_ledger,
         }))
+    }
+
+    /// The `liveUntilLedgerSeq` of a contract-data entry, from its TTL ledger
+    /// entry. `Ok(None)` when no TTL entry exists (the entry is gone, not just
+    /// archived).
+    pub async fn get_contract_data_ttl(
+        &self,
+        contract_id: &str,
+        key: &ScVal,
+        durability: ContractDataDurability,
+    ) -> anyhow::Result<Option<i64>> {
+        use sha2::{Digest, Sha256};
+        use stellar_xdr::curr::{Hash, LedgerKeyTtl, Limits, WriteXdr};
+
+        let addr = ScAddress::from_str(contract_id)
+            .with_context(|| format!("invalid contract id {contract_id}"))?;
+        let data_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: addr,
+            key: key.clone(),
+            durability,
+        });
+        // A TTL entry is keyed by the SHA-256 of the entry's XDR ledger key.
+        let digest = Sha256::digest(data_key.to_xdr(Limits::none())?);
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&digest);
+        let ttl_key = LedgerKey::Ttl(LedgerKeyTtl {
+            key_hash: Hash(hash),
+        });
+        let Some((data, _)) = self.get_ledger_entry(&ttl_key).await? else {
+            return Ok(None);
+        };
+        match data {
+            LedgerEntryData::Ttl(ttl) => Ok(Some(i64::from(ttl.live_until_ledger_seq))),
+            _ => Ok(None),
+        }
     }
 
     /// Fetch a batch of contract instance entries in a single `getLedgerEntries` call.
@@ -1576,17 +1679,19 @@ impl RpcClient {
             // Re-derive the LedgerKey from the returned entry so we can match it
             // back to its position in the input slice.
             let entry_key = match &data {
-                LedgerEntryData::ContractData(cd) => LedgerKey::ContractData(LedgerKeyContractData {
-                    contract: cd.contract.clone(),
-                    key: cd.key.clone(),
-                    durability: cd.durability,
-                }),
-                LedgerEntryData::Trustline(tl) => LedgerKey::Trustline(
-                    stellar_xdr::curr::LedgerKeyTrustLine {
+                LedgerEntryData::ContractData(cd) => {
+                    LedgerKey::ContractData(LedgerKeyContractData {
+                        contract: cd.contract.clone(),
+                        key: cd.key.clone(),
+                        durability: cd.durability,
+                    })
+                }
+                LedgerEntryData::Trustline(tl) => {
+                    LedgerKey::Trustline(stellar_xdr::curr::LedgerKeyTrustLine {
                         account_id: tl.account_id.clone(),
                         asset: tl.asset.clone(),
-                    },
-                ),
+                    })
+                }
                 LedgerEntryData::Account(acct) => {
                     LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
                         account_id: acct.account_id.clone(),
@@ -1789,7 +1894,11 @@ mod tests {
 
     #[test]
     fn topic_filters_are_emitted_with_wildcards() {
-        let topics = vec![vec!["transfer".to_string(), "*".to_string(), "*".to_string()]];
+        let topics = vec![vec![
+            "transfer".to_string(),
+            "*".to_string(),
+            "*".to_string(),
+        ]];
         let filters = event_filters_with_topics(&[], &topics).unwrap();
         assert_eq!(filters.len(), 1);
         assert!(filters[0].contract_ids.is_empty());
@@ -1808,15 +1917,24 @@ mod tests {
     #[test]
     fn topic_filter_limits_are_validated() {
         let too_many = vec![vec!["a".to_string()]; MAX_FILTERS + 1];
-        let err = event_filters_with_topics(&[], &too_many).err().unwrap().to_string();
+        let err = event_filters_with_topics(&[], &too_many)
+            .err()
+            .unwrap()
+            .to_string();
         assert!(err.contains("topic filters"), "unexpected error: {err}");
 
         let too_deep = vec![vec!["a".to_string(); MAX_TOPIC_SEGMENTS + 1]];
-        let err = event_filters_with_topics(&[], &too_deep).err().unwrap().to_string();
+        let err = event_filters_with_topics(&[], &too_deep)
+            .err()
+            .unwrap()
+            .to_string();
         assert!(err.contains("topic segments"), "unexpected error: {err}");
 
         let cross = vec![vec!["a".to_string()]; 3];
-        let err = event_filters_with_topics(&ids(25), &cross).err().unwrap().to_string();
+        let err = event_filters_with_topics(&ids(25), &cross)
+            .err()
+            .unwrap()
+            .to_string();
         assert!(err.contains("filters"), "unexpected error: {err}");
     }
 
@@ -1827,7 +1945,10 @@ mod tests {
         let json = serde_json::to_value(&filters[0]).unwrap();
         assert_eq!(json["topics"][0][0], "transfer");
         assert_eq!(json["topics"][0][1], "*");
-        assert!(json.get("contractIds").is_none(), "empty contractIds are omitted");
+        assert!(
+            json.get("contractIds").is_none(),
+            "empty contractIds are omitted"
+        );
     }
 
     #[test]
@@ -1931,21 +2052,38 @@ mod tests {
             .await
             .expect("one healthy endpoint is enough to start");
         assert_eq!(passphrase, "Public Global Stellar Network ; September 2015");
-        assert!(client.is_unverified(1), "dead secondary must be marked unverified");
+        assert!(
+            client.is_unverified(1),
+            "dead secondary must be marked unverified"
+        );
         assert!(!client.is_unverified(0), "healthy primary is verified");
     }
 
     #[tokio::test]
     async fn startup_fails_when_no_endpoint_is_reachable() {
-        let client = RpcClient::with_urls(vec![DEAD_URL.to_string(), "http://127.0.0.1:2".to_string()], 5);
+        let client = RpcClient::with_urls(
+            vec![DEAD_URL.to_string(), "http://127.0.0.1:2".to_string()],
+            5,
+        );
         let err = client.validate_network_passphrases().await.unwrap_err();
-        assert!(err.to_string().contains("no RPC endpoint is reachable"), "{err}");
+        assert!(
+            err.to_string().contains("no RPC endpoint is reachable"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
     async fn startup_rejects_reachable_endpoints_that_disagree() {
-        let a = spawn_counting_mock(Arc::new(AtomicUsize::new(0)), Arc::new(|_| (200, NET_PUBLIC))).await;
-        let b = spawn_counting_mock(Arc::new(AtomicUsize::new(0)), Arc::new(|_| (200, NET_TESTNET))).await;
+        let a = spawn_counting_mock(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(|_| (200, NET_PUBLIC)),
+        )
+        .await;
+        let b = spawn_counting_mock(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(|_| (200, NET_TESTNET)),
+        )
+        .await;
         let client = RpcClient::with_urls(vec![a, b], 5);
         let err = client.validate_network_passphrases().await.unwrap_err();
         assert!(err.to_string().contains("network mismatch"), "{err}");
@@ -1963,11 +2101,20 @@ mod tests {
         .await;
         let secondary = spawn_counting_mock(
             Arc::new(AtomicUsize::new(0)),
-            Arc::new(|n| if n == 0 { (500, "") } else { (200, NET_TESTNET) }),
+            Arc::new(|n| {
+                if n == 0 {
+                    (500, "")
+                } else {
+                    (200, NET_TESTNET)
+                }
+            }),
         )
         .await;
         let client = RpcClient::with_urls(vec![primary, secondary], 5);
-        client.validate_network_passphrases().await.expect("startup");
+        client
+            .validate_network_passphrases()
+            .await
+            .expect("startup");
 
         let err = client.get_latest_ledger().await.unwrap_err();
         assert!(err.to_string().contains("network mismatch"), "{err}");
@@ -1993,9 +2140,15 @@ mod tests {
         )
         .await;
         let client = RpcClient::with_urls(vec![primary, secondary], 5);
-        client.validate_network_passphrases().await.expect("startup");
+        client
+            .validate_network_passphrases()
+            .await
+            .expect("startup");
 
-        let seq = client.get_latest_ledger().await.expect("served by verified secondary");
+        let seq = client
+            .get_latest_ledger()
+            .await
+            .expect("served by verified secondary");
         assert_eq!(seq, 2000);
         assert!(
             secondary_count.load(Ordering::SeqCst) >= 2,
@@ -2037,7 +2190,10 @@ mod tests {
         .await;
 
         let client = RpcClient::new(&url, 5);
-        let seq: i64 = client.get_latest_ledger().await.expect("third attempt succeeds");
+        let seq: i64 = client
+            .get_latest_ledger()
+            .await
+            .expect("third attempt succeeds");
         assert_eq!(seq, 1000);
 
         let (calls, errors, _, _) = client.take_metrics();
@@ -2061,7 +2217,11 @@ mod tests {
         let (calls, errors, _, _) = client.take_metrics();
         assert_eq!(calls, 3);
         assert_eq!(errors, 3, "each failed attempt is counted once");
-        assert_eq!(client.take_calls_exhausted(), 1, "the whole call failed once");
+        assert_eq!(
+            client.take_calls_exhausted(),
+            1,
+            "the whole call failed once"
+        );
     }
 
     #[tokio::test]
@@ -2262,7 +2422,10 @@ mod tests {
             builder.body(axum::body::Body::from(body)).unwrap()
         }
         let count = Arc::new(AtomicUsize::new(0));
-        let state = S { count: count.clone(), responder };
+        let state = S {
+            count: count.clone(),
+            responder,
+        };
         let app = Router::new().route("/", post(handler)).with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2286,7 +2449,10 @@ mod tests {
 
         let client = RpcClient::new(&url, 5);
         let start = std::time::Instant::now();
-        let seq: i64 = client.get_latest_ledger().await.expect("should succeed after 429");
+        let seq: i64 = client
+            .get_latest_ledger()
+            .await
+            .expect("should succeed after 429");
         let elapsed = start.elapsed();
 
         assert_eq!(seq, 1000);
@@ -2295,7 +2461,10 @@ mod tests {
             elapsed >= Duration::from_millis(1_900),
             "retry came after {elapsed:?}, before the 2s Retry-After elapsed"
         );
-        assert!(elapsed < Duration::from_secs(4), "retry waited too long: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "retry waited too long: {elapsed:?}"
+        );
     }
 
     #[tokio::test]
@@ -2315,37 +2484,53 @@ mod tests {
 
         let client = RpcClient::new(&url, 5);
         let start = std::time::Instant::now();
-        let seq: i64 = client.get_latest_ledger().await.expect("should succeed after 503");
+        let seq: i64 = client
+            .get_latest_ledger()
+            .await
+            .expect("should succeed after 503");
         let elapsed = start.elapsed();
 
         assert_eq!(seq, 1000);
         assert_eq!(count.load(Ordering::SeqCst), 2);
-        assert!(elapsed >= Duration::from_millis(1_500), "retry came too early: {elapsed:?}");
-        assert!(elapsed < Duration::from_secs(5), "retry waited too long: {elapsed:?}");
+        assert!(
+            elapsed >= Duration::from_millis(1_500),
+            "retry came too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "retry waited too long: {elapsed:?}"
+        );
     }
 
     #[tokio::test]
     async fn retry_after_above_cap_fails_over_without_waiting() {
         // Issue #726: a `Retry-After` beyond the cap must not be slept on. The
         // client fails over to the next endpoint immediately.
-        let (url_a, a_count) = spawn_retry_after_mock(Arc::new(|_| {
-            (429, String::new(), Some("3600".to_string()))
-        }))
-        .await;
-        let (url_b, _) = spawn_retry_after_mock(Arc::new(|_| {
-            (200, OK_SEQ_1000.to_string(), None)
-        }))
-        .await;
+        let (url_a, a_count) =
+            spawn_retry_after_mock(Arc::new(|_| (429, String::new(), Some("3600".to_string()))))
+                .await;
+        let (url_b, _) =
+            spawn_retry_after_mock(Arc::new(|_| (200, OK_SEQ_1000.to_string(), None))).await;
 
         let client = RpcClient::with_urls(vec![url_a, url_b.clone()], 5)
             .with_max_retry_after(Duration::from_secs(60));
         let start = std::time::Instant::now();
-        let seq: i64 = client.get_latest_ledger().await.expect("should fail over to B");
+        let seq: i64 = client
+            .get_latest_ledger()
+            .await
+            .expect("should fail over to B");
         let elapsed = start.elapsed();
 
         assert_eq!(seq, 1000);
-        assert_eq!(a_count.load(Ordering::SeqCst), 1, "A is not retried after a capped wait");
-        assert!(elapsed < Duration::from_secs(2), "must not sleep the 3600s: {elapsed:?}");
+        assert_eq!(
+            a_count.load(Ordering::SeqCst),
+            1,
+            "A is not retried after a capped wait"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must not sleep the 3600s: {elapsed:?}"
+        );
         assert_eq!(client.active_endpoint_host(), host_of(&url_b));
     }
 
@@ -2382,12 +2567,19 @@ mod tests {
         }))
         .await;
 
-        let headers = crate::config::parse_rpc_headers("Authorization=Bearer tok;X-Api-Key=key-1").unwrap();
+        let headers =
+            crate::config::parse_rpc_headers("Authorization=Bearer tok;X-Api-Key=key-1").unwrap();
         let client = RpcClient::with_urls_and_headers(vec![url], 5, headers);
 
         client.get_health().await.expect("getHealth");
-        client.validate_network_passphrases().await.expect("getNetwork");
-        client.get_events(Some(1), &[], None, 10).await.expect("getEvents");
+        client
+            .validate_network_passphrases()
+            .await
+            .expect("getNetwork");
+        client
+            .get_events(Some(1), &[], None, 10)
+            .await
+            .expect("getEvents");
         client
             .get_contract_data_batch(&[(
                 CONTRACT_A.to_string(),
@@ -2403,7 +2595,11 @@ mod tests {
                 .iter()
                 .find(|r| r.method == method)
                 .unwrap_or_else(|| panic!("{method} was never sent"));
-            assert_eq!(req.headers.get("authorization").unwrap(), "Bearer tok", "{method}");
+            assert_eq!(
+                req.headers.get("authorization").unwrap(),
+                "Bearer tok",
+                "{method}"
+            );
             assert_eq!(req.headers.get("x-api-key").unwrap(), "key-1", "{method}");
         }
     }
@@ -2471,7 +2667,11 @@ mod tests {
             .expect("should fail over back to the recovered secondary");
         assert_eq!(seq, 1000);
         assert_eq!(client.active_endpoint_host(), host_of(&url_b));
-        assert_eq!(b_count.load(Ordering::SeqCst), 4, "B: three failures then one success");
+        assert_eq!(
+            b_count.load(Ordering::SeqCst),
+            4,
+            "B: three failures then one success"
+        );
     }
 
     // ── recording mock (used by #724 and #725 tests) ──────────────────────
@@ -2504,7 +2704,11 @@ mod tests {
                 .and_then(|v| v["method"].as_str().map(str::to_owned))
                 .unwrap_or_default();
             let reply = (s.respond)(&method);
-            s.log.lock().unwrap().push(RecordedRequest { method, body, headers });
+            s.log.lock().unwrap().push(RecordedRequest {
+                method,
+                body,
+                headers,
+            });
             axum::response::Response::builder()
                 .status(200)
                 .header("content-type", "application/json")
@@ -2512,7 +2716,10 @@ mod tests {
                 .unwrap()
         }
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let state = S { log: log.clone(), respond };
+        let state = S {
+            log: log.clone(),
+            respond,
+        };
         let app = Router::new().route("/", post(handler)).with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2541,13 +2748,27 @@ mod tests {
     #[tokio::test]
     async fn contract_data_batch_skips_oversized_entry_and_keeps_the_rest() {
         let keys = vec![
-            (CONTRACT_A.to_string(), ScVal::U32(1), ContractDataDurability::Persistent),
-            (CONTRACT_A.to_string(), ScVal::U32(2), ContractDataDurability::Persistent),
-            (CONTRACT_A.to_string(), ScVal::U32(3), ContractDataDurability::Persistent),
+            (
+                CONTRACT_A.to_string(),
+                ScVal::U32(1),
+                ContractDataDurability::Persistent,
+            ),
+            (
+                CONTRACT_A.to_string(),
+                ScVal::U32(2),
+                ContractDataDurability::Persistent,
+            ),
+            (
+                CONTRACT_A.to_string(),
+                ScVal::U32(3),
+                ContractDataDurability::Persistent,
+            ),
         ];
         // Entry 2 encodes fine but exceeds XDR_LEDGER_ENTRY_LIMITS when decoded.
         let oversized = ScVal::Bytes(
-            vec![0u8; XDR_LEDGER_ENTRY_LIMITS.len as usize + 1].try_into().unwrap(),
+            vec![0u8; XDR_LEDGER_ENTRY_LIMITS.len as usize + 1]
+                .try_into()
+                .unwrap(),
         );
         let response = serde_json::json!({
             "jsonrpc": "2.0", "id": 1,
@@ -2561,12 +2782,24 @@ mod tests {
         let (url, _log) = spawn_recording_mock(Arc::new(move |_| response.clone())).await;
 
         let client = RpcClient::new(&url, 5);
-        let out = client.get_contract_data_batch(&keys).await.expect("batch must succeed");
+        let out = client
+            .get_contract_data_batch(&keys)
+            .await
+            .expect("batch must succeed");
 
         assert_eq!(out.len(), 3);
-        assert!(matches!(out[0].as_ref().map(|e| &e.val), Some(ScVal::U32(10))));
-        assert!(out[1].is_none(), "the oversized entry is dropped, not the batch");
-        assert!(matches!(out[2].as_ref().map(|e| &e.val), Some(ScVal::U32(30))));
+        assert!(matches!(
+            out[0].as_ref().map(|e| &e.val),
+            Some(ScVal::U32(10))
+        ));
+        assert!(
+            out[1].is_none(),
+            "the oversized entry is dropped, not the batch"
+        );
+        assert!(matches!(
+            out[2].as_ref().map(|e| &e.val),
+            Some(ScVal::U32(30))
+        ));
         assert_eq!(client.take_ledger_entry_decode_errors(), 1);
     }
 
@@ -2592,7 +2825,10 @@ mod tests {
         let (url, log) = spawn_recording_mock(Arc::new(move |_| response.clone())).await;
 
         let client = RpcClient::new(&url, 5);
-        let out = client.get_contract_instances_batch(&ids).await.expect("batch must succeed");
+        let out = client
+            .get_contract_instances_batch(&ids)
+            .await
+            .expect("batch must succeed");
 
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].as_ref().map(|e| e.last_modified_ledger), Some(11));
@@ -2660,9 +2896,10 @@ mod tests {
                 .unwrap()
         }
         let log: MethodLog = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let app = Router::new()
-            .route("/", post(handler))
-            .with_state(S { log: log.clone(), respond });
+        let app = Router::new().route("/", post(handler)).with_state(S {
+            log: log.clone(),
+            respond,
+        });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -2670,7 +2907,11 @@ mod tests {
     }
 
     fn method_count(log: &MethodLog, method: &str) -> usize {
-        log.lock().unwrap().iter().filter(|m| m.as_str() == method).count()
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.as_str() == method)
+            .count()
     }
 
     fn network_body() -> String {
@@ -2723,9 +2964,16 @@ mod tests {
         let client = RpcClient::with_urls(vec![primary, secondary], 5);
         pin_passphrase(&client);
         for _ in 0..10 {
-            assert_eq!(client.get_latest_ledger().await.expect("secondary serves"), 2000);
+            assert_eq!(
+                client.get_latest_ledger().await.expect("secondary serves"),
+                2000
+            );
         }
-        assert_eq!(method_count(&log, "getNetwork"), 1, "one network check per switch");
+        assert_eq!(
+            method_count(&log, "getNetwork"),
+            1,
+            "one network check per switch"
+        );
         assert_eq!(method_count(&log, "getLatestLedger"), 10);
     }
 
@@ -2743,7 +2991,13 @@ mod tests {
 
         let client = RpcClient::with_urls(vec![primary, bad, good], 5);
         pin_passphrase(&client);
-        assert_eq!(client.get_latest_ledger().await.expect("third endpoint serves"), 2000);
+        assert_eq!(
+            client
+                .get_latest_ledger()
+                .await
+                .expect("third endpoint serves"),
+            2000
+        );
         assert_eq!(
             method_count(&bad_log, "getLatestLedger"),
             0,
@@ -2770,8 +3024,15 @@ mod tests {
             .get_events(Some(1001), &[], None, 10)
             .await
             .expect_err("lagging secondary must be rejected");
-        assert!(err.to_string().contains("behind the cursor"), "unexpected error: {err}");
-        assert_eq!(method_count(&log, "getEvents"), 0, "no page may come from a lagging endpoint");
+        assert!(
+            err.to_string().contains("behind the cursor"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            method_count(&log, "getEvents"),
+            0,
+            "no page may come from a lagging endpoint"
+        );
     }
 
     #[tokio::test]
@@ -2787,7 +3048,10 @@ mod tests {
 
         let client = RpcClient::with_urls(vec![primary, secondary], 5);
         pin_passphrase(&client);
-        let page = client.get_events(Some(1001), &[], None, 10).await.expect("tip == cursor is accepted");
+        let page = client
+            .get_events(Some(1001), &[], None, 10)
+            .await
+            .expect("tip == cursor is accepted");
         assert!(page.events.is_empty());
         assert_eq!(method_count(&log, "getEvents"), 1);
     }
@@ -2800,12 +3064,20 @@ mod tests {
         let (secondary, _) = spawn_method_mock(responder(|_| (200, latest_body(2000)))).await;
 
         let client = RpcClient::with_urls(vec![primary, secondary], 5);
-        force_failover_state(&client, 1, Instant::now() - PRIMARY_PROBE_INTERVAL - Duration::from_secs(1));
+        force_failover_state(
+            &client,
+            1,
+            Instant::now() - PRIMARY_PROBE_INTERVAL - Duration::from_secs(1),
+        );
         for _ in 0..20 {
             client.get_latest_ledger().await.expect("secondary serves");
         }
         assert_eq!(method_count(&log, "getHealth"), 1);
-        assert_eq!(client.active_url_idx.load(Ordering::Relaxed), 1, "still failed over");
+        assert_eq!(
+            client.active_url_idx.load(Ordering::Relaxed),
+            1,
+            "still failed over"
+        );
     }
 
     #[tokio::test]
@@ -2821,7 +3093,11 @@ mod tests {
 
         let client = RpcClient::with_urls(vec![primary, secondary], 5);
         pin_passphrase(&client);
-        force_failover_state(&client, 1, Instant::now() - PRIMARY_PROBE_INTERVAL - Duration::from_secs(1));
+        force_failover_state(
+            &client,
+            1,
+            Instant::now() - PRIMARY_PROBE_INTERVAL - Duration::from_secs(1),
+        );
         client.get_latest_ledger().await.expect("secondary serves");
         assert_eq!(client.active_url_idx.load(Ordering::Relaxed), 1);
     }
@@ -2842,7 +3118,11 @@ mod tests {
 
         let client = RpcClient::with_urls(vec![primary, secondary], 5);
         pin_passphrase(&client);
-        force_failover_state(&client, 1, Instant::now() - PRIMARY_PROBE_INTERVAL - Duration::from_secs(1));
+        force_failover_state(
+            &client,
+            1,
+            Instant::now() - PRIMARY_PROBE_INTERVAL - Duration::from_secs(1),
+        );
         client.get_latest_ledger().await.expect("secondary serves");
         assert_eq!(client.active_url_idx.load(Ordering::Relaxed), 1);
     }
@@ -2859,15 +3139,27 @@ mod tests {
 
         let client = RpcClient::with_urls(vec![primary, secondary], 5);
         pin_passphrase(&client);
-        force_failover_state(&client, 1, Instant::now() - PRIMARY_PROBE_INTERVAL - Duration::from_secs(1));
-        assert_eq!(client.get_latest_ledger().await.expect("primary serves"), 2000);
-        assert_eq!(client.active_url_idx.load(Ordering::Relaxed), 0, "fails back to primary");
+        force_failover_state(
+            &client,
+            1,
+            Instant::now() - PRIMARY_PROBE_INTERVAL - Duration::from_secs(1),
+        );
+        assert_eq!(
+            client.get_latest_ledger().await.expect("primary serves"),
+            2000
+        );
+        assert_eq!(
+            client.active_url_idx.load(Ordering::Relaxed),
+            0,
+            "fails back to primary"
+        );
     }
 
     // ── Method-routing mock (#715–#718) ───────────────────────────────────
 
     type RequestLog = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
-    type RpcResponder = Arc<dyn Fn(&str, usize, &serde_json::Value) -> (u16, String) + Send + Sync + 'static>;
+    type RpcResponder =
+        Arc<dyn Fn(&str, usize, &serde_json::Value) -> (u16, String) + Send + Sync + 'static>;
 
     /// Mock RPC that routes on the JSON-RPC `method`. `respond` receives the
     /// method, how many times it has been called before (0-based) and the whole
@@ -2919,53 +3211,84 @@ mod tests {
     }
 
     const HEALTH_2000_1500: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy","latestLedger":2000,"oldestLedger":1500,"ledgerRetentionWindow":500}}"#;
-    const HEALTH_NO_OLDEST: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy","latestLedger":1000}}"#;
-    const ERR_32601_HEALTH: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#;
+    const HEALTH_NO_OLDEST: &str =
+        r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy","latestLedger":1000}}"#;
+    const ERR_32601_HEALTH: &str =
+        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#;
     const ERR_OUT_OF_RETENTION: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"startLedger must be between the oldest ledger: 1500 and the latest ledger: 2000"}}"#;
-    const EMPTY_EVENTS: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"latestLedger":2000,"events":[],"cursor":null}}"#;
+    const EMPTY_EVENTS: &str =
+        r#"{"jsonrpc":"2.0","id":1,"result":{"latestLedger":2000,"events":[],"cursor":null}}"#;
 
     // #718: one getHealth per cycle supplies both the tip and the retention floor.
 
     #[tokio::test]
     async fn tip_snapshot_uses_a_single_get_health_call() {
-        let (url, log) = spawn_rpc_mock(Arc::new(|method: &str, _n: usize, _r: &serde_json::Value| match method {
-            "getHealth" => (200, HEALTH_2000_1500.to_string()),
-            other => (500, format!("unexpected method {other}")),
-        }))
+        let (url, log) = spawn_rpc_mock(Arc::new(
+            |method: &str, _n: usize, _r: &serde_json::Value| match method {
+                "getHealth" => (200, HEALTH_2000_1500.to_string()),
+                other => (500, format!("unexpected method {other}")),
+            },
+        ))
         .await;
 
         let client = RpcClient::new(&url, 5);
         let snap = client.get_tip_snapshot().await.expect("snapshot");
-        assert_eq!(snap, TipSnapshot { latest: 2000, oldest_available: Some(1500) });
-        assert_eq!(methods_called(&log), vec!["getHealth"], "exactly one tip-related call per cycle");
+        assert_eq!(
+            snap,
+            TipSnapshot {
+                latest: 2000,
+                oldest_available: Some(1500)
+            }
+        );
+        assert_eq!(
+            methods_called(&log),
+            vec!["getHealth"],
+            "exactly one tip-related call per cycle"
+        );
     }
 
     #[tokio::test]
     async fn tip_snapshot_falls_back_to_get_latest_ledger_when_health_is_unsupported() {
-        let (url, log) = spawn_rpc_mock(Arc::new(|method: &str, _n: usize, _r: &serde_json::Value| match method {
-            "getHealth" => (200, ERR_32601_HEALTH.to_string()),
-            "getLatestLedger" => (200, OK_SEQ_1000.to_string()),
-            other => (500, format!("unexpected method {other}")),
-        }))
+        let (url, log) = spawn_rpc_mock(Arc::new(
+            |method: &str, _n: usize, _r: &serde_json::Value| match method {
+                "getHealth" => (200, ERR_32601_HEALTH.to_string()),
+                "getLatestLedger" => (200, OK_SEQ_1000.to_string()),
+                other => (500, format!("unexpected method {other}")),
+            },
+        ))
         .await;
 
         let client = RpcClient::new(&url, 5);
         let snap = client.get_tip_snapshot().await.expect("snapshot");
-        assert_eq!(snap, TipSnapshot { latest: 1000, oldest_available: None });
+        assert_eq!(
+            snap,
+            TipSnapshot {
+                latest: 1000,
+                oldest_available: None
+            }
+        );
         assert_eq!(methods_called(&log), vec!["getHealth", "getLatestLedger"]);
     }
 
     #[tokio::test]
     async fn tip_snapshot_without_oldest_ledger_does_not_make_a_second_call() {
-        let (url, log) = spawn_rpc_mock(Arc::new(|method: &str, _n: usize, _r: &serde_json::Value| match method {
-            "getHealth" => (200, HEALTH_NO_OLDEST.to_string()),
-            other => (500, format!("unexpected method {other}")),
-        }))
+        let (url, log) = spawn_rpc_mock(Arc::new(
+            |method: &str, _n: usize, _r: &serde_json::Value| match method {
+                "getHealth" => (200, HEALTH_NO_OLDEST.to_string()),
+                other => (500, format!("unexpected method {other}")),
+            },
+        ))
         .await;
 
         let client = RpcClient::new(&url, 5);
         let snap = client.get_tip_snapshot().await.expect("snapshot");
-        assert_eq!(snap, TipSnapshot { latest: 1000, oldest_available: None });
+        assert_eq!(
+            snap,
+            TipSnapshot {
+                latest: 1000,
+                oldest_available: None
+            }
+        );
         assert_eq!(methods_called(&log), vec!["getHealth"]);
     }
 
@@ -2988,19 +3311,27 @@ mod tests {
             !is_non_retryable_rpc_error(&err),
             "must not count towards the permanent-error budget"
         );
-        assert_eq!(methods_called(&log).len(), 1, "a range error is not retried on the same URL");
+        assert_eq!(
+            methods_called(&log).len(),
+            1,
+            "a range error is not retried on the same URL"
+        );
     }
 
     #[tokio::test]
     async fn other_invalid_params_stay_permanent() {
-        let err_contract = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid contract id"}}"#;
-        let (url, _log) = spawn_rpc_mock(Arc::new(move |_m: &str, _n: usize, _r: &serde_json::Value| {
-            (200, err_contract.to_string())
-        }))
+        let err_contract =
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid contract id"}}"#;
+        let (url, _log) = spawn_rpc_mock(Arc::new(
+            move |_m: &str, _n: usize, _r: &serde_json::Value| (200, err_contract.to_string()),
+        ))
         .await;
 
         let client = RpcClient::new(&url, 5);
-        let err = client.get_events(Some(10), &[], None, 10).await.expect_err("bad contract id");
+        let err = client
+            .get_events(Some(10), &[], None, 10)
+            .await
+            .expect_err("bad contract id");
         assert!(is_non_retryable_rpc_error(&err));
         assert!(!is_out_of_retention(&err));
     }
@@ -3013,7 +3344,10 @@ mod tests {
         .await;
         let client = RpcClient::new(&url, 5);
 
-        client.get_events_bounded(Some(10), Some(21), &[], None, 10).await.unwrap();
+        client
+            .get_events_bounded(Some(10), Some(21), &[], None, 10)
+            .await
+            .unwrap();
         client
             .get_events_bounded(Some(10), Some(21), &[], Some("cursor-1".into()), 10)
             .await
@@ -3024,7 +3358,13 @@ mod tests {
         assert_eq!(first["startLedger"], 10);
         assert_eq!(first["endLedger"], 21, "first page is bounded at the tip");
         let continuation = &requests[1]["params"];
-        assert!(continuation.get("startLedger").is_none(), "cursor pages carry no startLedger");
-        assert!(continuation.get("endLedger").is_none(), "endLedger is not sent with a cursor");
+        assert!(
+            continuation.get("startLedger").is_none(),
+            "cursor pages carry no startLedger"
+        );
+        assert!(
+            continuation.get("endLedger").is_none(),
+            "endLedger is not sent with a cursor"
+        );
     }
 }

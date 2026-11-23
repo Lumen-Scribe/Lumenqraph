@@ -420,6 +420,7 @@ async fn metrics(
 /// live `PgPool` (see `tests::metrics_render_process_counters`).
 fn render_process_counters(body: &mut String) {
     crate::timing::render(body);
+    crate::metrics::render(body);
     // Transfer-like events skipped by the SEP-41 projection (#600).
     body.push_str("# HELP lumenqraph_indexer_transfer_projection_skipped_total Transfer-like events skipped by the SEP-41 projection since start\n");
     body.push_str("# TYPE lumenqraph_indexer_transfer_projection_skipped_total counter\n");

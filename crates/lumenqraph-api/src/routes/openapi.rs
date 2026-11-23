@@ -32,7 +32,5 @@ where
     S: Clone + Send + Sync + 'static,
 {
     // `/openapi.json` is served by the Swagger UI router below.
-    Router::new()
-        .merge(swagger_ui())
-        .merge(redoc_ui())
+    Router::new().merge(swagger_ui()).merge(redoc_ui())
 }

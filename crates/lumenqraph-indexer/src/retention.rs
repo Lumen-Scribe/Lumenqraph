@@ -689,7 +689,10 @@ mod tests {
         // tip 1000, keep 500 => cutoff 500; all events are outside the window.
         let deleted = prune(&pool, 1000, 500).await.expect("prune must not fail");
 
-        assert_eq!(deleted, 2, "the delivered and failed events should be pruned");
+        assert_eq!(
+            deleted, 2,
+            "the delivered and failed events should be pruned"
+        );
         assert_eq!(
             count(
                 &pool,

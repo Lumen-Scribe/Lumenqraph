@@ -74,6 +74,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader, Lines};
 use tracing::{debug, info};
 
 use lumenqraph_core::{ContractSpec, EventType, NewEvent};
+use std::str::FromStr;
 
 use crate::config::Config;
 use crate::store;
@@ -244,6 +245,15 @@ impl GalexieSource {
             return events
                 .into_iter()
                 .enumerate()
+                // An event with no id cannot be deduplicated or paged, so it is
+                // skipped rather than failing the whole ledger.
+                .filter(|(index, e)| {
+                    let has_id = e.event_id.is_some() || e.id.is_some();
+                    if !has_id {
+                        tracing::warn!(index, ledger = env.ledger, "skipping event missing id / event_id");
+                    }
+                    has_id
+                })
                 .map(|(index, e)| {
                     let eid = e
                         .event_id
@@ -583,8 +593,9 @@ fn historical_to_new_event(
     ev: HistoricalEvent,
     spec: Option<&lumenqraph_core::ContractSpec>,
 ) -> anyhow::Result<NewEvent> {
-    let event_type = EventType::from_rpc_str(&ev.event_type)
-        .with_context(|| format!("unsupported historical event type: {}", ev.event_type))?;
+    let event_type = EventType::from_str(&ev.event_type).map_err(|e| {
+        anyhow::anyhow!("unsupported historical event type {:?}: {e}", ev.event_type)
+    })?;
     use lumenqraph_core::xdr;
 
     let decoded_topics = xdr::decode_topics(&ev.topics);
