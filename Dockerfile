@@ -51,7 +51,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Explorer UI bundle (#635). Built in its own Node stage: scripts/build.mjs
 # generates app.js (not committed) and index.html, which must exist in the
 # image for the page's <script src="app.js"> to load under the CSP.
-FROM node:20-slim AS explorer-build
+FROM node:26-slim AS explorer-build
 WORKDIR /app/explorer
 COPY explorer/package.json explorer/package-lock.json ./
 RUN npm ci
