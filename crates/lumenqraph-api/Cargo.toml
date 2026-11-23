@@ -53,3 +53,7 @@ criterion.workspace = true
 [[bench]]
 name = "rate_limit"
 harness = false
+
+[[bench]]
+name = "metrics_record"
+harness = false

@@ -162,30 +162,33 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
     );
     body.push_str("# TYPE lumenqraph_http_request_duration_seconds histogram\n");
     {
-        let histograms = state.metrics.histogram_buckets.read();
-        for (key, hist) in histograms.iter() {
-            let labels = format!(
-                "route=\"{}\",method=\"{}\"",
-                escape_label_value(&key.route),
-                escape_label_value(&key.method)
-            );
-            for (bound, cumulative) in hist.cumulative() {
+        let series = state.metrics.series.read();
+        for (route, by_method) in series.iter() {
+            for (method, metrics) in by_method.iter() {
+                let hist = metrics.latency.snapshot();
+                let labels = format!(
+                    "route=\"{}\",method=\"{}\"",
+                    escape_label_value(route),
+                    escape_label_value(method)
+                );
+                for (bound, cumulative) in hist.cumulative() {
+                    body.push_str(&format!(
+                        "lumenqraph_http_request_duration_seconds_bucket{{{labels},le=\"{bound}\"}} {cumulative}\n"
+                    ));
+                }
                 body.push_str(&format!(
-                    "lumenqraph_http_request_duration_seconds_bucket{{{labels},le=\"{bound}\"}} {cumulative}\n"
+                    "lumenqraph_http_request_duration_seconds_bucket{{{labels},le=\"+Inf\"}} {}\n",
+                    hist.count
+                ));
+                body.push_str(&format!(
+                    "lumenqraph_http_request_duration_seconds_sum{{{labels}}} {}\n",
+                    hist.sum_seconds
+                ));
+                body.push_str(&format!(
+                    "lumenqraph_http_request_duration_seconds_count{{{labels}}} {}\n",
+                    hist.count
                 ));
             }
-            body.push_str(&format!(
-                "lumenqraph_http_request_duration_seconds_bucket{{{labels},le=\"+Inf\"}} {}\n",
-                hist.count
-            ));
-            body.push_str(&format!(
-                "lumenqraph_http_request_duration_seconds_sum{{{labels}}} {}\n",
-                hist.sum_seconds
-            ));
-            body.push_str(&format!(
-                "lumenqraph_http_request_duration_seconds_count{{{labels}}} {}\n",
-                hist.count
-            ));
         }
     }
 
