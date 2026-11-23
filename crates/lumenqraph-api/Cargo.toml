@@ -2,7 +2,9 @@
 name = "lumenqraph-api"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "lumenqraph-api"
@@ -52,4 +54,8 @@ criterion.workspace = true
 
 [[bench]]
 name = "rate_limit"
+harness = false
+
+[[bench]]
+name = "metrics_record"
 harness = false

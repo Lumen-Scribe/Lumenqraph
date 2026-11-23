@@ -2,7 +2,9 @@
 name = "lumenqraph-indexer"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [features]
 # Opt-in gate for the heavy end-to-end smoke test in `src/smoke.rs`. It is

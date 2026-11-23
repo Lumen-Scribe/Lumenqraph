@@ -115,7 +115,8 @@ Exposed by the `lumenqraph-webhooks` service on its own `/metrics` endpoint
 
 ### Critical Alerts
 
-- **IndexerStalled** - No events ingested in 5+ minutes but lag exists
+- **IndexerStalled** - No events ingested in 5+ minutes while lag exists, or the
+  cursor has not advanced (`lumenqraph_indexer_seconds_since_progress`) in 5+ minutes
 - **IndexerLagCritical** - Lag > 500 ledgers for 2+ minutes
 - **LumenqraphWebhookBacklogCritical** - Pending webhook deliveries > 5000 for 5+ minutes
 
@@ -192,3 +193,13 @@ Store these files in your repository and:
 - Ensure Prometheus data source is configured correctly
 - Check time range selection in dashboard
 - Verify metrics are being scraped (check Prometheus targets)
+
+## Duration histograms (#758)
+
+The indexer `/metrics` exports fixed-bucket histograms (5ms–30s):
+
+- `lumenqraph_indexer_cycle_duration_seconds{phase}`: poll cycle time; `phase` is `events`, `reorg` or `total`.
+- `lumenqraph_indexer_rpc_request_duration_seconds{method, endpoint_host}`: RPC latency per method, including retries.
+- `lumenqraph_indexer_db_write_duration_seconds{table}`: database write latency (`indexer_cursor`).
+
+The "Poll cycle phase breakdown" Grafana panel plots p95 per phase.

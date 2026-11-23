@@ -95,6 +95,18 @@ This document outlines Lumenqraph's security posture, including trust boundaries
    - Complexity limit: 1000 (prevent expensive aggregations)
    - Configurable via `GRAPHQL_MAX_DEPTH` / `GRAPHQL_MAX_COMPLEXITY`
 
+### ✓ API KEY SCOPES ON PUBLIC READS
+
+When `REQUIRE_API_KEY=false`, data-read routes are public. A valid key presented on
+those routes **adds** privileges (its own rate limit and owner identity) but never
+removes public access: a `webhooks:write`-only or `rpc`-only key can still read
+anything an anonymous caller can. The `read` scope is enforced only when
+`REQUIRE_API_KEY=true`. Scopes still gate capabilities anonymous callers lack
+(webhook management, RPC proxy). Invalid, revoked or expired keys are rejected.
+
+Webhook-management routes are rate limited in their own `manage:` bucket, so a
+key exhausting its data-read budget can still manage its webhooks.
+
 ### ✓ NETWORK ISOLATION
 
 1. **Webhook SSRF Prevention**

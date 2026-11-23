@@ -1,7 +1,49 @@
-/target
-/.pgdata
+# Allow-list build context (#785).
+#
+# Everything is excluded by default and only what the Dockerfile actually
+# COPYs is let back in. This keeps the context small (well under 5 MB for a
+# clean checkout) and, more importantly, keeps edits to docs/, .github/,
+# monitoring/, scripts/ and the SDKs from invalidating the cargo-chef planner
+# layer, which runs `cargo chef prepare` over the copied tree.
+#
+# Dockerfile COPYs that must stay visible:
+#   rust-toolchain.toml, Cargo.toml, Cargo.lock, crates/, migrations/,
+#   explorer/ (package.json, package-lock.json, sources for `npm run build`).
+# Also kept: docs/examples/webhooks/test_vector.json, pulled in by
+# include_str! in crates/lumenqraph-core/src/crypto.rs (test-only, but the
+# file must exist for `cargo build --all-targets` / `cargo test`).
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates/
+!migrations/
+!explorer/
+!docs/
+!docs/examples/
+!docs/examples/webhooks/
+!docs/examples/webhooks/test_vector.json
+
+# Never ship secrets or local state, even if a rule above would allow them.
 .env
-.env.local
-*.log
-.git
-explorer/node_modules
+.env.*
+**/.env
+**/.env.*
+!.env.example
+**/node_modules
+**/target
+**/.git
+**/*.log
+**/.DS_Store
+**/coverage
+**/.nyc_output
+**/dist
+**/.turbo
+**/.cache
+**/.vscode
+**/.idea
+**/*.swp
+**/.pgdata
+**/.sqlx
+**/playwright-report
+**/test-results

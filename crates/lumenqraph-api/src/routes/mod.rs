@@ -32,7 +32,7 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::auth::{
-    admin_auth, auth_and_rate_limit, concurrency_limit, proxy_rate_limit, rpc_auth_and_rate_limit,
+    admin_auth, auth_and_rate_limit, concurrency_limit, metrics_auth, proxy_rate_limit, rpc_auth_and_rate_limit,
     webhook_auth_and_rate_limit, webhook_manage_auth_and_rate_limit,
 };
 use crate::graphql::{self, AppSchema};
@@ -77,7 +77,7 @@ pub fn router(state: AppState) -> Router {
             .route("/metrics", get(metrics::metrics))
             .layer(middleware::from_fn_with_state(
                 state.clone(),
-                auth_and_rate_limit,
+                metrics_auth,
             ))
     } else {
         Router::new().route("/metrics", get(metrics::metrics))
