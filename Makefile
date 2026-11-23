@@ -20,10 +20,10 @@ seed: ## Populate demo dataset for local exploration
 	psql "$$DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/seed.sql
 
 build: ## Build the workspace
-	cargo build --workspace
+	cargo build --locked --workspace
 
 test: ## Run tests (unit + integration, no Postgres required)
-	cargo test --workspace
+	cargo test --locked --workspace
 
 test-db: db ## Run Postgres-backed tests (requires TEST_DATABASE_URL or a running local Postgres)
 	@if [ -z "$$TEST_DATABASE_URL" ]; then \
@@ -32,10 +32,10 @@ test-db: db ## Run Postgres-backed tests (requires TEST_DATABASE_URL or a runnin
 	psql "$$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -c 'SELECT 1' >/dev/null 2>&1 || \
 	  psql "postgres://lumenqraph:lumenqraph@localhost:5432/postgres" -v ON_ERROR_STOP=1 \
 	    -c 'CREATE DATABASE lumenqraph_test' >/dev/null 2>&1 || true; \
-	cargo test -p lumenqraph-indexer  -- --ignored; \
-	cargo test -p lumenqraph-webhooks -- --ignored; \
-	cargo test -p lumenqraph-api      -- --ignored; \
-	cargo test -p lumenqraph-mcp      -- --ignored
+	cargo test --locked -p lumenqraph-indexer  -- --ignored; \
+	cargo test --locked -p lumenqraph-webhooks -- --ignored; \
+	cargo test --locked -p lumenqraph-api      -- --ignored; \
+	cargo test --locked -p lumenqraph-mcp      -- --ignored
 
 test-smoke: db ## Run the gated end-to-end smoke test (requires TEST_DATABASE_URL or a running local Postgres)
 	@if [ -z "$$TEST_DATABASE_URL" ]; then \
@@ -44,7 +44,7 @@ test-smoke: db ## Run the gated end-to-end smoke test (requires TEST_DATABASE_UR
 	psql "$$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -c 'SELECT 1' >/dev/null 2>&1 || \
 	  psql "postgres://lumenqraph:lumenqraph@localhost:5432/postgres" -v ON_ERROR_STOP=1 \
 	    -c 'CREATE DATABASE lumenqraph_test' >/dev/null 2>&1 || true; \
-	cargo test -p lumenqraph-indexer --features smoke-tests smoke -- --ignored
+	cargo test --locked -p lumenqraph-indexer --features smoke-tests smoke -- --ignored
 
 fmt: ## Format
 	cargo fmt --all

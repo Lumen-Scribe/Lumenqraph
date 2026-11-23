@@ -936,6 +936,26 @@ impl RpcClient {
         params: P,
         cursor_ledger: Option<i64>,
     ) -> anyhow::Result<R> {
+        let started = std::time::Instant::now();
+        let result = self
+            .call_with_cursor_untimed(method, params, cursor_ledger)
+            .await;
+        crate::timing::RPC_REQUEST_DURATION.observe(
+            &[
+                ("method", method),
+                ("endpoint_host", &self.active_endpoint_host()),
+            ],
+            started.elapsed(),
+        );
+        result
+    }
+
+    async fn call_with_cursor_untimed<P: Serialize, R: for<'de> Deserialize<'de>>(
+        &self,
+        method: &str,
+        params: P,
+        cursor_ledger: Option<i64>,
+    ) -> anyhow::Result<R> {
         let req = RpcRequest {
             jsonrpc: "2.0",
             id: 1,

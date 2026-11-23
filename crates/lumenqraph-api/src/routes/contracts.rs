@@ -211,7 +211,8 @@ async fn contract_interface_at_version(
     version: i32,
     headers: &HeaderMap,
 ) -> Result<axum::response::Response, ApiError> {
-    let row: Option<(SqlxJson<Value>, String, DateTime<Utc>, i64, Option<i64>)> = sqlx::query_as(
+    type VersionRow = (SqlxJson<Value>, String, DateTime<Utc>, i64, Option<i64>);
+    let row: Option<VersionRow> = sqlx::query_as(
         "SELECT interface, wasm_hash, observed_at, observed_ledger, upgrade_ledger
          FROM contract_spec_versions
          WHERE contract_id = $1 AND version = $2",
@@ -527,7 +528,7 @@ async fn load_version_ledger(
     .await?;
 
     match row {
-        Some((observed_ledger, Some(upgrade_ledger))) => Ok((upgrade_ledger, "exact")),
+        Some((_, Some(upgrade_ledger))) => Ok((upgrade_ledger, "exact")),
         Some((observed_ledger, None)) => Ok((observed_ledger, "observed_upper_bound")),
         None => Err(ApiError::not_found(format!(
             "no version {version} recorded for this contract"
@@ -692,9 +693,9 @@ pub async fn contract_data(
     // bounds the set of keys returned. Tombstones are included here so the
     // newest row per key is always the truth, then split out below.
     let rows: Vec<DataRow> = sqlx::query_as(
-        "SELECT key_hash, key, durability, ledger, value, label, captured_at, deleted, archived FROM (
-                 SELECT DISTINCT ON (key_hash)
-                        key_hash, key, durability, ledger, value, label, captured_at,
+        "SELECT ledger_key_hash, key_hash, key, durability, ledger, value, label, captured_at, deleted, archived FROM (
+                 SELECT DISTINCT ON (ledger_key_hash)
+                        ledger_key_hash, key_hash, key, durability, ledger, value, label, captured_at,
                         deleted, archived
                  FROM contract_data
                  WHERE contract_id = $1 AND ($2::text IS NULL OR label = $2)
@@ -727,14 +728,25 @@ pub async fn contract_data(
 
     let mut keys: Vec<Value> = Vec::new();
     let mut deleted: Vec<Value> = Vec::new();
-    for (key_hash, key, durability, ledger, value, label, captured_at, is_deleted, archived) in
-        rows
+    for (
+        ledger_key_hash,
+        key_hash,
+        key,
+        durability,
+        ledger,
+        value,
+        label,
+        captured_at,
+        is_deleted,
+        archived,
+    ) in rows
     {
         if is_deleted || value.is_none() {
             // The entry is gone: report it as absent, never with its stale
             // last value. `archived` distinguishes a restorable persistent
             // entry from one that was actually deleted.
             deleted.push(json!({
+                "ledger_key_hash": ledger_key_hash,
                 "key_hash": key_hash,
                 "key": key.0,
                 "durability": durability,
@@ -745,6 +757,7 @@ pub async fn contract_data(
             continue;
         }
         keys.push(json!({
+            "ledger_key_hash": ledger_key_hash,
             "key_hash": key_hash,
             "key": key.0,
             "durability": durability,
@@ -784,7 +797,8 @@ pub async fn contract_data_key(
     Query(q): Query<DataHistoryQuery>,
 ) -> ApiResult<Json<Value>> {
     let limit = q.limit.clamp(1, 500);
-    // (key, durability, ledger, value, label, captured_at, deleted, archived)
+    // (ledger_key_hash, key_hash, key, durability, ledger, value, label,
+    //  captured_at, deleted, archived)
     type HistRow = (
         String,
         String,
@@ -801,7 +815,7 @@ pub async fn contract_data_key(
     // consulted when no ledger-key hash matches, and is restricted to a single
     // (key, durability) entry so it can never interleave two histories.
     let rows: Vec<HistRow> = sqlx::query_as(
-        "SELECT key, durability, ledger, value, label, captured_at, deleted, archived
+        "SELECT ledger_key_hash, key_hash, key, durability, ledger, value, label, captured_at, deleted, archived
              FROM contract_data
              WHERE contract_id = $1
                AND ledger_key_hash = (
@@ -822,7 +836,7 @@ pub async fn contract_data_key(
         // key exists under both durabilities the alias is ambiguous, so pick
         // the persistent entry deterministically rather than mixing them.
         sqlx::query_as(
-            "SELECT ledger_key_hash, key_hash, key, durability, ledger, value, label, captured_at
+            "SELECT ledger_key_hash, key_hash, key, durability, ledger, value, label, captured_at, deleted, archived
                  FROM contract_data
                  WHERE contract_id = $1
                    AND ledger_key_hash = (
@@ -847,25 +861,29 @@ pub async fn contract_data_key(
     }
 
     // Key and durability are constant across a key's history; take them once.
-    let key = rows[0].0 .0.clone();
-    let durability = rows[0].1.clone();
-    let label = rows[0].4.clone();
+    let resolved_ledger_key_hash = rows[0].0.clone();
+    let key_hash = rows[0].1.clone();
+    let key = rows[0].2 .0.clone();
+    let durability = rows[0].3.clone();
+    let label = rows[0].6.clone();
     // The newest row decides whether the key currently exists.
-    let deleted = rows[0].6;
-    let archived = rows[0].7;
+    let deleted = rows[0].8;
+    let archived = rows[0].9;
     let versions: Vec<Value> = rows
         .into_iter()
-        .map(|(_, _, ledger, value, _, captured_at, is_deleted, is_archived)| {
-            // Tombstone rows carry no value; expose them so a caller can see
-            // exactly when the entry was deleted or expired (#742).
-            json!({
-                "ledger": ledger,
-                "value": value.map(|v| v.0),
-                "deleted": is_deleted,
-                "archived": is_archived,
-                "captured_at": captured_at,
-            })
-        })
+        .map(
+            |(_, _, _, _, ledger, value, _, captured_at, is_deleted, is_archived)| {
+                // Tombstone rows carry no value; expose them so a caller can see
+                // exactly when the entry was deleted or expired (#742).
+                json!({
+                    "ledger": ledger,
+                    "value": value.map(|v| v.0),
+                    "deleted": is_deleted,
+                    "archived": is_archived,
+                    "captured_at": captured_at,
+                })
+            },
+        )
         .collect();
     Ok(Json(json!({
         "contract_id": contract_id,

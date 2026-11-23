@@ -10,7 +10,7 @@ use crate::state::AppState;
 
 pub async fn health(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let status: Option<(i64, i64, i64, i64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-        "SELECT last_processed_ledger, chain_tip_ledger, events_ingested_total, errors_total, updated_at
+        "SELECT last_processed_ledger, chain_tip_ledger, events_ingested_total, errors_total, COALESCE(progress_at, updated_at)
          FROM indexer_cursor WHERE id = 1",
     )
     .fetch_optional(&state.pool)
@@ -114,7 +114,7 @@ pub async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Value>) 
     if state.config.readyz_require_fresh_index {
         let cursor: Result<Option<(i64, i64, chrono::DateTime<chrono::Utc>)>, sqlx::Error> =
             sqlx::query_as(
-                "SELECT last_processed_ledger, chain_tip_ledger, updated_at
+                "SELECT last_processed_ledger, chain_tip_ledger, COALESCE(progress_at, updated_at)
                  FROM indexer_cursor WHERE id = 1",
             )
             .fetch_optional(&state.pool)

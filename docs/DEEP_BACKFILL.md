@@ -284,3 +284,16 @@ Both formats are auto-detected per line (by the presence of the `"events"` key).
   bounded independently of the requested ledger range.
 - Compressed inputs (`.gz`) are not decompressed automatically — decompress
   first with `gzip -d` or pipe through `gunzip`.
+
+## Reconciling `missed_ranges`
+
+After a bounded run (`--to` given) with no contract filter completes without
+errors, `deep-backfill` reconciles `missed_ranges` (#755):
+
+- unrecovered rows fully inside `[from, to]` get `recovered_at = now()` and
+  `recovered_by=deep-backfill` appended to `reason`;
+- partially overlapping rows are split: the covered part is marked recovered
+  and the uncovered remainder stays as a new unrecovered row;
+- a summary log line reports how many ranges were recovered fully and partially.
+
+Unbounded runs and runs filtered to specific contracts leave `missed_ranges` untouched.

@@ -185,7 +185,7 @@ pub async fn create_webhook(
     // `backfill_start` is the seq *before* the first event we want to
     // backfill; `starting_seq` becomes the current global max (the watermark
     // at which the live stream takes over once the backfill completes).
-    let (starting_seq, _backfill_seq): (i64, Option<i64>) = if let Some(ref since) = body.since {
+    let (starting_seq, backfill_seq): (i64, Option<i64>) = if let Some(ref since) = body.since {
         let backfill_start = calculate_starting_seq(&state.pool, since).await?;
         let global_max: i64 = sqlx::query_scalar("SELECT COALESCE(max(seq), 0) FROM events")
             .fetch_one(&state.pool)
@@ -203,15 +203,14 @@ pub async fn create_webhook(
     // The required key is validated and loaded once at API startup.
     let encryption_key = state.config.webhook_encryption_key.as_str();
 
-    // Set owner_key_hash from the authenticated caller (#421). Anonymous callers
-    // (no API key) create subscriptions with NULL owner, which are only accessible
-    // to admin keys.
+    // Set owner_key_hash from the authenticated caller (#421). Creation always
+    // requires an API key (#776), so the owner is never NULL in practice.
     let owner_key_hash: Option<String> = caller.map(|ext| ext.0 .0.clone());
 
     let sub: WebhookSubscription = sqlx::query_as(
         "INSERT INTO webhook_subscriptions
-             (url, kind, contract_id, event_name, contract_ids, event_names, filter, encrypted_secret, starting_seq, owner_key_hash)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, pgp_sym_encrypt($8, $9), $10, $11)
+             (url, kind, contract_id, event_name, contract_ids, event_names, filter, encrypted_secret, starting_seq, owner_key_hash, backfill_seq)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, pgp_sym_encrypt($8, $9), $10, $11, $12)
          RETURNING id, url, kind, contract_id, event_name, contract_ids, event_names, filter, active, created_at",
     )
     .bind(&body.url)
@@ -225,6 +224,7 @@ pub async fn create_webhook(
     .bind(encryption_key)
     .bind(starting_seq)
     .bind(&owner_key_hash)
+    .bind(backfill_seq)
     .fetch_one(&state.pool)
     .await?;
 
@@ -372,23 +372,27 @@ async fn calculate_starting_seq(pool: &sqlx::PgPool, since: &str) -> ApiResult<i
             .await?;
         Ok((current_max - count).max(0))
     } else if let Ok(ledger) = since.parse::<i64>() {
+        // #775: backfill window is `(backfill_seq, starting_seq]`, so return
+        // the seq just before the first wanted event.
         let seq: Option<i64> = sqlx::query_scalar("SELECT min(seq) FROM events WHERE ledger >= $1")
             .bind(ledger)
             .fetch_optional(pool)
             .await?
             .flatten();
-        Ok(seq.unwrap_or(0))
+        Ok(seq.map_or(0, |s| (s - 1).max(0)))
     } else {
         let ts = chrono::DateTime::parse_from_rfc3339(since)
             .map_err(|_| ApiError::bad_request("invalid timestamp format; expected ISO-8601"))?
             .with_timezone(&chrono::Utc);
-        let seq: Option<i64> =
-            sqlx::query_scalar("SELECT min(seq) FROM events WHERE ledger_closed_at >= $1")
-                .bind(ts)
-                .fetch_optional(pool)
-                .await?
-                .flatten();
-        Ok(seq.unwrap_or(0))
+        let seq: Option<i64> = sqlx::query_scalar(
+            "SELECT min(seq) FROM events WHERE ledger >= \
+                 (SELECT min(ledger) FROM events WHERE ledger_closed_at >= $1)",
+        )
+        .bind(ts)
+        .fetch_optional(pool)
+        .await?
+        .flatten();
+        Ok(seq.map_or(0, |s| (s - 1).max(0)))
     }
 }
 
@@ -535,6 +539,8 @@ pub async fn test_webhook(
             host,
             std::net::SocketAddr::new(ip, parsed.port_or_known_default().unwrap_or(443)),
         )
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| ApiError::Internal(e.into()))?;
@@ -561,7 +567,14 @@ pub async fn test_webhook(
         Err(e) => json!({
             "delivery_id": delivery_id,
             "delivered": false,
-            "error": e.to_string(),
+            // #777: coarse error class only; never reflect raw reqwest text.
+            "error": if e.is_timeout() {
+                "timeout"
+            } else if e.is_connect() {
+                "connect_failed"
+            } else {
+                "request_failed"
+            },
         }),
     }))
 }
@@ -872,7 +885,7 @@ const REDRIVE_JITTER_SECS: f64 = 300.0;
 /// (optionally only those created at or after `since`) back to pending.
 pub async fn redrive_webhook(
     State(state): State<AppState>,
-    Extension(_caller): Extension<CallerKeyHash>,
+    Extension(caller): Extension<CallerKeyHash>,
     Path(id): Path<Uuid>,
     Query(query): Query<RedriveQuery>,
 ) -> ApiResult<Json<Value>> {
@@ -884,12 +897,15 @@ pub async fn redrive_webhook(
         )));
     }
 
-    let (active, auto_disabled_at): (bool, Option<chrono::DateTime<chrono::Utc>>) =
-        sqlx::query_as("SELECT active, auto_disabled_at FROM webhook_subscriptions WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&state.pool)
-            .await?
-            .ok_or_else(|| ApiError::not_found("subscription not found"))?;
+    let (active, auto_disabled_at): (bool, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+        "SELECT active, auto_disabled_at FROM webhook_subscriptions
+             WHERE id = $1 AND owner_key_hash = $2",
+    )
+    .bind(id)
+    .bind(&caller.0)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::not_found("subscription not found"))?;
     if !active || auto_disabled_at.is_some() {
         return Err(ApiError::conflict(
             "subscription is inactive or auto-disabled; re-enable it before redriving",
@@ -908,6 +924,9 @@ pub async fn redrive_webhook(
              SELECT id FROM webhook_deliveries
              WHERE subscription_id = $1 AND status = 'failed'
                AND ($2::timestamptz IS NULL OR created_at >= $2)
+               AND subscription_id IN (
+                   SELECT id FROM webhook_subscriptions WHERE id = $1 AND owner_key_hash = $5
+               )
              ORDER BY id
              LIMIT $3
          )",
@@ -916,6 +935,7 @@ pub async fn redrive_webhook(
     .bind(query.since)
     .bind(batch)
     .bind(REDRIVE_JITTER_SECS)
+    .bind(&caller.0)
     .execute(&state.pool)
     .await?
     .rows_affected();
@@ -941,11 +961,13 @@ pub async fn reenable_webhook(
     Extension(caller): Extension<CallerKeyHash>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
-    let exists: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id = $1)")
-            .bind(id)
-            .fetch_one(&state.pool)
-            .await?;
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM webhook_subscriptions WHERE id = $1 AND owner_key_hash = $2)",
+    )
+    .bind(id)
+    .bind(&caller.0)
+    .fetch_one(&state.pool)
+    .await?;
     if !exists {
         return Err(ApiError::not_found("webhook subscription not found"));
     }
@@ -1010,11 +1032,33 @@ pub async fn rotate_webhook_secret(
         .unwrap_or_else(default_grace_seconds);
     validate_grace_seconds(grace_seconds)?;
 
-    // The required key is validated and loaded once at API startup.
-    let _encryption_key = state.config.webhook_encryption_key.as_str();
-
     // Same key source as create_webhook (#441); no public fallback is read from the environment.
     let encryption_key = state.config.webhook_encryption_key.as_str();
+
+    let owner_key_hash: Option<String> = caller.as_ref().map(|ext| ext.0 .0.clone());
+
+    // Owner-scoped lookup (#773/#774): unknown and foreign IDs both return 404.
+    let in_grace: Option<Option<chrono::DateTime<chrono::Utc>>> = sqlx::query_scalar(
+        "SELECT CASE WHEN previous_secret_expires_at > now() THEN previous_secret_expires_at END
+           FROM webhook_subscriptions
+          WHERE id = $1 AND owner_key_hash IS NOT DISTINCT FROM $2",
+    )
+    .bind(id)
+    .bind(&owner_key_hash)
+    .fetch_optional(&state.pool)
+    .await?;
+    match in_grace {
+        None => return Err(ApiError::not_found("webhook subscription not found")),
+        // A second rotation inside the grace window would drop the original
+        // secret before its advertised expiry (#774), so it is rejected.
+        Some(Some(until)) => {
+            return Err(ApiError::conflict(format!(
+                "rotation in progress until {}",
+                until.to_rfc3339()
+            )))
+        }
+        Some(None) => {}
+    }
 
     let new_secret = random_secret();
 
@@ -1025,23 +1069,22 @@ pub async fn rotate_webhook_secret(
             SET previous_encrypted_secret  = encrypted_secret,
                 previous_secret_expires_at = now() + ($1 * interval '1 second'),
                 encrypted_secret           = pgp_sym_encrypt($2, $3)
-          WHERE id = $4
+          WHERE id = $4 AND owner_key_hash IS NOT DISTINCT FROM $5
+            AND (previous_secret_expires_at IS NULL OR previous_secret_expires_at <= now())
           RETURNING id, previous_secret_expires_at",
     )
     .bind(grace_seconds)
     .bind(&new_secret)
     .bind(encryption_key)
     .bind(id)
-    .bind(caller.as_ref().map(|ext| ext.0 .0.clone()))
+    .bind(&owner_key_hash)
     .fetch_optional(&state.pool)
     .await?;
 
     let (id, previous_expires_at) =
         updated.ok_or_else(|| ApiError::not_found("webhook subscription not found"))?;
 
-    let key_prefix = caller
-        .map(|ext| ext.0 .0.clone())
-        .unwrap_or_else(|| "anon".to_string());
+    let key_prefix = owner_key_hash.unwrap_or_else(|| "anon".to_string());
     log_webhook_action(
         &state.pool,
         &key_prefix,

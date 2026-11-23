@@ -803,6 +803,31 @@
       ],
       "title": "Webhook Deliveries Dropped by Retention",
       "type": "timeseries"
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Poll cycle phase breakdown (p95)",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 48
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (phase, le) (rate(lumenqraph_indexer_cycle_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{phase}}",
+          "refId": "A"
+        }
+      ]
     }
   ],
   "refresh": "30s",

@@ -56,9 +56,6 @@ pub fn is_plausible_key(key: &str) -> bool {
         && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
-/// Minimum interval between `last_used_at` writes for one key (#559).
-const LAST_USED_TOUCH_SECS: u64 = 60;
-
 /// The value stored for a cache hit.
 #[derive(Clone, Debug)]
 pub enum CachedKey {
@@ -161,14 +158,10 @@ impl KeyCache {
         scopes: Vec<String>,
         expires_at: Option<DateTime<Utc>>,
     ) {
-        let entry = Entry {
-            value: CachedKey::Valid {
-                rate_limit_per_min,
-                scopes,
-                expires_at,
-            },
-            expires_at: Instant::now() + self.ttl,
-            last_touch: None,
+        let value = CachedKey::Valid {
+            rate_limit_per_min,
+            scopes,
+            expires_at,
         };
         // A key that is now valid must not keep a stale negative entry.
         self.negative.lock().pop(key_hash);
@@ -201,7 +194,7 @@ impl KeyCache {
             expires_at: Instant::now() + self.neg_ttl,
             last_touch: None,
         };
-        self.inner.lock().put(key_hash.to_string(), entry);
+        self.negative.lock().put(key_hash.to_string(), entry);
     }
 
     /// Insert a negative (not-found) entry for `key_hash`.
@@ -211,7 +204,7 @@ impl KeyCache {
             expires_at: Instant::now() + self.neg_ttl,
             last_touch: None,
         };
-        self.inner.lock().put(key_hash.to_string(), entry);
+        self.negative.lock().put(key_hash.to_string(), entry);
     }
 
     /// Explicitly evict a key from the cache (e.g. on known revocation).

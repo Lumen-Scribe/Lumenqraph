@@ -473,6 +473,23 @@ fn concurrency_limited_response(limit: usize) -> Response {
     response
 }
 
+/// `/metrics` auth when `METRICS_REQUIRE_API_KEY=true`: always requires a key,
+/// regardless of `REQUIRE_API_KEY`, then applies the normal auth/rate-limit path (#767).
+pub async fn metrics_auth(
+    state: State<AppState>,
+    connect_info: ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    req: Request,
+    next: Next,
+) -> ApiResult<Response> {
+    if extract_key(&headers).is_none() {
+        return Err(ApiError::unauthorized(
+            "/metrics requires an API key when METRICS_REQUIRE_API_KEY is set",
+        ));
+    }
+    auth_and_rate_limit(state, connect_info, headers, req, next).await
+}
+
 pub async fn auth_and_rate_limit(
     State(state): State<AppState>,
     ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
@@ -487,19 +504,22 @@ pub async fn auth_and_rate_limit(
     let route = uri.split('?').next().unwrap_or("").to_string();
 
     let (identity, limit, is_authenticated, _key_hash_opt) = match extract_key(&headers) {
-        Some(key) => authenticate(&state, &key, &route, &method, SCOPE_READ).await?,
-        None => {
-            if state.require_auth {
-                return Err(ApiError::unauthorized("missing API key"));
-            }
-            let client_ip = extract_client_ip(&headers, Some(socket_addr), &state.ip_config);
+        // Public reads (#772): with REQUIRE_API_KEY=false a valid key adds its own
+        // rate limit and identity but never removes anonymous read access, so the
+        // `read` scope is only enforced when keys are required.
+        Some(key) if !state.require_auth => {
+            let resolved = resolve_key(&state, &key, &route, &method).await?;
             (
-                format!("anon:{client_ip}"),
-                state.anon_rate_limit,
-                false,
-                None,
+                format!("key:{}", resolved.hash),
+                resolved.rate_limit_per_min,
+                true,
+                Some(resolved.hash),
             )
         }
+        Some(key) => authenticate(&state, &key, &route, &method, SCOPE_READ).await?,
+        // #776: webhook creation always requires a key, regardless of
+        // REQUIRE_API_KEY, so no subscription can be created without an owner.
+        None => return Err(ApiError::unauthorized("missing API key")),
     };
 
     let rl_status = state.limiter.check(&identity, limit).await;
@@ -600,7 +620,7 @@ pub async fn rpc_auth_and_rate_limit(
 /// authenticated, so `create_webhook` can set `owner_key_hash` (#421).
 pub async fn webhook_auth_and_rate_limit(
     State(state): State<AppState>,
-    ConnectInfo(socket_addr): ConnectInfo<SocketAddr>,
+    ConnectInfo(_socket_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     mut req: Request,
     next: Next,
@@ -703,25 +723,17 @@ pub async fn webhook_manage_auth_and_rate_limit(
     let (identity, limit, _, _) = authenticate(&state, &key, &route, &method, required).await?;
     let hash = identity.trim_start_matches("key:").to_string();
 
-    let identity = format!("key:{hash}");
+    // Separate `manage:` namespace so webhook management never shares a
+    // bucket with data reads for the same key (#771).
+    let identity = format!("manage:{hash}");
     let rl_status = state.limiter.check(&identity, limit).await;
     if !rl_status.allowed {
-        let mut response = (
-            StatusCode::TOO_MANY_REQUESTS,
-            crate::error::rate_limit_error(),
-        )
-            .into_response();
-        if let Some(retry_after) = rl_status.retry_after_secs {
-            response.headers_mut().insert(
-                "Retry-After",
-                retry_after
-                    .to_string()
-                    .parse()
-                    .unwrap_or_else(|_| "60".parse().unwrap()),
-            );
-        }
         log_audit_event(&state, &hash, &route, &method, 429);
-        return Ok(response);
+        return Ok(rate_limited_response(
+            limit,
+            rl_status.retry_after_secs,
+            rl_status.tokens_remaining,
+        ));
     }
 
     // Inject the caller's key hash into request extensions so webhook handlers

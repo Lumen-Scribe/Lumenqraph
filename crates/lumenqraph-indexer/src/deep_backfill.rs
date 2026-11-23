@@ -466,7 +466,67 @@ pub async fn run(
     }
 
     info!(total_inserted, lines_processed, "deep backfill complete");
+
+    // Only a bounded, unfiltered run covers every ledger in the range (#755).
+    if to != i64::MAX && config.contract_ids.is_empty() {
+        let (full, partial) = reconcile_missed_ranges(&pool, from_ledger, to).await?;
+        info!(
+            recovered = full,
+            partially_recovered = partial,
+            "reconciled missed_ranges"
+        );
+    }
     Ok(())
+}
+
+/// Marks unrecovered `missed_ranges` covered by `[from, to]` as recovered (#755).
+///
+/// Rows fully inside the range are marked recovered. Partially overlapping rows
+/// are split: the covered part is marked recovered and the uncovered remainder
+/// is re-inserted as a new unrecovered row. Returns `(full, partial)` counts.
+pub async fn reconcile_missed_ranges(
+    pool: &PgPool,
+    from: i64,
+    to: i64,
+) -> anyhow::Result<(u64, u64)> {
+    let mut tx = pool.begin().await?;
+    const OVERLAP: &str = "recovered_at IS NULL AND start_ledger <= $2 AND end_ledger >= $1";
+    sqlx::query(&format!(
+        "INSERT INTO missed_ranges (contract_id, start_ledger, end_ledger, detected_at, reason)
+         SELECT contract_id, start_ledger, $1 - 1, detected_at, reason
+           FROM missed_ranges WHERE {OVERLAP} AND start_ledger < $1"
+    ))
+    .bind(from)
+    .bind(to)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!(
+        "INSERT INTO missed_ranges (contract_id, start_ledger, end_ledger, detected_at, reason)
+         SELECT contract_id, $2 + 1, end_ledger, detected_at, reason
+           FROM missed_ranges WHERE {OVERLAP} AND end_ledger > $2"
+    ))
+    .bind(from)
+    .bind(to)
+    .execute(&mut *tx)
+    .await?;
+    let rows: Vec<(bool,)> = sqlx::query_as(&format!(
+        "UPDATE missed_ranges m
+            SET start_ledger = GREATEST(m.start_ledger, $1),
+                end_ledger   = LEAST(m.end_ledger, $2),
+                recovered_at = now(),
+                reason       = COALESCE(m.reason || '; ', '') || 'recovered_by=deep-backfill'
+           FROM (SELECT id, start_ledger >= $1 AND end_ledger <= $2 AS full
+                   FROM missed_ranges WHERE {OVERLAP}) o
+          WHERE m.id = o.id
+         RETURNING o.full"
+    ))
+    .bind(from)
+    .bind(to)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let full = rows.iter().filter(|(f,)| *f).count() as u64;
+    Ok((full, rows.len() as u64 - full))
 }
 
 async fn flush_batch(pool: &PgPool, batch: &mut Vec<NewEvent>) -> anyhow::Result<u64> {

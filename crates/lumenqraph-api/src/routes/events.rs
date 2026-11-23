@@ -50,7 +50,7 @@ pub struct EventsQuery {
     /// Optional parameter filter as `name:value`, e.g. `param=from:GXXXX`. The name
     /// is split at the first `:`, so the value may contain colons.
     param: Option<String>,
-    /// Optional filter to return only events from successful contract calls (default: false, returns all).
+    /// Optional filter to return only events from successful contract calls (`true` = successful only; `false` or absent = all events).
     successful_only: Option<bool>,
 }
 
@@ -88,12 +88,10 @@ fn parse_param_filter(raw: Option<&str>) -> ApiResult<Option<String>> {
         .ok_or_else(|| {
             ApiError::bad_request("param must be in the form name:value, e.g. param=from:GABC...")
         })?;
-    let mut object = serde_json::Map::new();
-    object.insert(
-        name.to_string(),
-        serde_json::Value::String(value.to_string()),
-    );
-    Ok(Some(serde_json::Value::Object(object).to_string()))
+    // Match the stored enriched shape `{"params": {name: {"type", "value"}}}` (#770).
+    Ok(Some(
+        serde_json::json!({ "params": { name: { "value": value } } }).to_string(),
+    ))
 }
 
 /// Response envelope for `GET /contracts/:contract_id/events`.
@@ -173,7 +171,7 @@ pub async fn list_events(
            AND ($9::text IS NULL OR (decoded_topics -> 2) = $9::jsonb)
            AND ($10::text IS NULL OR (decoded_topics -> 3) = $10::jsonb)
            AND ($11::text IS NULL OR enriched @> ($11::jsonb))
-           AND ($15::boolean IS NULL OR in_successful_call = $15)
+           AND ($15::boolean IS NULL OR NOT COALESCE($15, false) OR in_successful_call)
            AND ($12::bigint IS NULL OR ledger < $12 OR (ledger = $12 AND event_id < $13))
          ORDER BY ledger DESC, event_id DESC
          LIMIT $14 OFFSET $16",
@@ -274,7 +272,7 @@ async fn page_transaction_events(
                 enriched, tx_hash, in_successful_call, paging_token, created_at
          FROM events
          WHERE tx_hash = $1
-           AND ($2::boolean IS NULL OR in_successful_call = $2)
+           AND ($2::boolean IS NULL OR NOT COALESCE($2, false) OR in_successful_call)
            AND ($3::bigint IS NULL OR ledger > $3 OR (ledger = $3 AND event_id > $4))
          ORDER BY ledger ASC, event_id ASC
          LIMIT $5",
@@ -307,7 +305,7 @@ pub struct TxEventsQuery {
     limit: Option<i64>,
     /// Opaque cursor from a previous response's `next_cursor`.
     after: Option<String>,
-    /// Optional filter to return only events from successful contract calls (default: false, returns all).
+    /// Optional filter to return only events from successful contract calls (`true` = successful only; `false` or absent = all events).
     successful_only: Option<bool>,
 }
 

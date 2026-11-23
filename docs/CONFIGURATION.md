@@ -641,7 +641,7 @@ Every service reads the shared `DATABASE_*` settings. Each service also reads it
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `INDEXER_HTTP_BIND_ADDR` | `127.0.0.1:9090` | Address for the indexer's `/health` and `/metrics`. Loopback by default, so they are not public (#605). **Sensitive:** binding to `0.0.0.0` exposes both. |
+| `INDEXER_HTTP_BIND_ADDR` | `127.0.0.1:9090` | Address for the indexer's `/health`, `/livez`, `/readyz` and `/metrics`. Loopback by default, so they are not public (#605). **Sensitive:** binding to `0.0.0.0` exposes all of them. |
 | `METRICS_BEARER_TOKEN` | unset | When set, `/metrics` requires `Authorization: Bearer <token>`. An empty value means no authentication. **Sensitive.** |
 | `METRICS_API_KEY` | unset | Used for `/metrics` only when `METRICS_BEARER_TOKEN` is unset. Provided for parity with the API's `METRICS_REQUIRE_API_KEY`. **Sensitive.** |
 | `RPC_URLS` | unset | Comma-separated Soroban RPC endpoints, tried in order. Takes precedence over `RPC_URL`. |
@@ -652,8 +652,10 @@ Every service reads the shared `DATABASE_*` settings. Each service also reads it
 | `SPEC_VERSION_RETENTION` | 0 | Number of contract spec versions to keep. `0` disables pruning. |
 | `SPEC_CACHE_MAX_ENTRIES` | 2000 | Maximum contract specs cached in memory. Clamped to at least 1. |
 | `SPEC_FETCH_CONCURRENCY` | 4 | Maximum concurrent contract spec fetches. Clamped to at least 1. |
-| `HEALTH_MAX_LAG_LEDGERS` | 100 | `/health` reports unhealthy when the indexer is at least this many ledgers behind the chain tip. Also read by the API. |
-| `HEALTH_MAX_STALE_SECS` | 120 | `/health` reports unhealthy when the last update is older than this. Also read by the API. |
+| `HEALTH_MAX_LAG_LEDGERS` | 100 | `/health` and `/readyz` report degraded (503) when the indexer is at least this many ledgers behind the chain tip. Also read by the API. |
+| `HEALTH_MAX_STALE_SECS` | 120 | `/health` and `/readyz` report degraded (503) when the cursor has not advanced (`progress_at`) for longer than this. Measured from the last progress write, not the last counter write, so a stuck poller cannot look fresh (#756, #757). Also read by the API. |
+| `HEALTH_MAX_PENDING_DELIVERIES` | 5000 | `/health` and `/readyz` report degraded (503) when this many webhook deliveries are pending (queue depth), matching the critical backlog alert. |
+| `INDEXER_HEALTH_STRICT` | `true` | When `true`, the indexer's `/health` answers 503 while degraded, so Docker `HEALTHCHECK`, Kubernetes probes and Fly checks detect a stuck indexer (#756). When `false`, `/health` keeps the legacy 200-with-`"degraded"` body. `/readyz` is always strict, and `/livez` is always 200 while the process is up. |
 | `MAX_STATE_CONTRACTS_PER_CYCLE` | 100 | Cap on contracts snapshotted per cycle when `STATE_INDEXING=true`. Excess contracts are deferred by last-snapshot age. See the cost model above. |
 | `MAX_STATE_KEYS_PER_CYCLE` | 1000 | Cap on storage keys fetched per cycle when `KEY_INDEXING=true`. Excess keys are deferred by last-snapshot age and counted by the `lumenqraph_indexer_state_keys_deferred` metric. See the cost model above. |
 

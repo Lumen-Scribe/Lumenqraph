@@ -159,7 +159,10 @@ pub async fn run(
         .collect();
 
     loop {
-        let sleep_for = match poll_once(&pool, &rpc, &config, &specs, &shutdown).await {
+        let cycle_started = std::time::Instant::now();
+        let cycle_result = poll_once(&pool, &rpc, &config, &specs, &shutdown).await;
+        crate::timing::CYCLE_DURATION.observe(&[("phase", "total")], cycle_started.elapsed());
+        let sleep_for = match cycle_result {
             Ok(processed_to) => {
                 consecutive_permanent = 0;
                 // Report templates that have never matched after enough cycles (#747).
@@ -383,9 +386,11 @@ async fn poll_once(
         // we know both endpoints after clamping.
         cycle_span_for_record.record("from", start);
 
+        let events_started = std::time::Instant::now();
         let (inserted, enrichment) =
             fetch_and_store_with_shutdown(pool, rpc, config, specs, start, latest, shutdown)
                 .await?;
+        crate::timing::CYCLE_DURATION.observe(&[("phase", "events")], events_started.elapsed());
 
         if shutdown.is_cancelled() {
             return Ok(Some(latest));
@@ -419,8 +424,10 @@ async fn poll_once(
         let mut reorg_updated = 0u64;
         if config.reorg_overlap_ledgers > 0 && latest > config.reorg_overlap_ledgers {
             let reorg_start = latest - config.reorg_overlap_ledgers;
+            let reorg_started = std::time::Instant::now();
             reorg_updated =
                 fetch_and_upsert(pool, rpc, config, specs, reorg_start, latest, shutdown).await?;
+            crate::timing::CYCLE_DURATION.observe(&[("phase", "reorg")], reorg_started.elapsed());
             if reorg_updated > 0 {
                 debug!(
                     reorg_updated,
@@ -445,7 +452,10 @@ async fn poll_once(
                 .await?;
         }
 
+        let write_started = std::time::Instant::now();
         cursor::write_progress(pool, snapshot.version, latest, latest, inserted).await?;
+        crate::timing::DB_WRITE_DURATION
+            .observe(&[("table", "indexer_cursor")], write_started.elapsed());
         if inserted > 0 {
             info!(inserted, up_to_ledger = latest, "indexed events");
         }
