@@ -12,38 +12,40 @@ use axum::middleware::Next;
 use axum::response::Response;
 use parking_lot::RwLock;
 
-/// Upper bounds, in milliseconds, of the latency histogram buckets. Samples
-/// above the last bound are counted only in `+Inf`.
-pub const LATENCY_BUCKETS_MS: [u64; 9] = [1, 5, 10, 50, 100, 500, 1_000, 5_000, 10_000];
+/// Upper bounds, in seconds, of the latency histogram buckets. Samples above
+/// the last bound are counted only in `+Inf`.
+pub const LATENCY_BUCKETS_SECONDS: [f64; 14] = [
+    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
 
 /// Fixed-size latency histogram. Its memory does not depend on how many
 /// samples it has seen, so it is safe to keep for the life of the process.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct LatencyHistogram {
     /// Non-cumulative count per bucket; `buckets[i]` holds samples in
-    /// `(LATENCY_BUCKETS_MS[i-1], LATENCY_BUCKETS_MS[i]]`.
-    pub buckets: [u64; LATENCY_BUCKETS_MS.len()],
+    /// `(LATENCY_BUCKETS_SECONDS[i-1], LATENCY_BUCKETS_SECONDS[i]]`.
+    pub buckets: [u64; LATENCY_BUCKETS_SECONDS.len()],
     /// Total number of samples, including those above the last bound.
     pub count: u64,
-    /// Sum of all samples in milliseconds.
-    pub sum_ms: u64,
+    /// Sum of all samples in seconds.
+    pub sum_seconds: f64,
 }
 
 impl LatencyHistogram {
-    pub fn observe(&mut self, elapsed_ms: u64) {
+    pub fn observe(&mut self, elapsed_seconds: f64) {
         self.count += 1;
-        self.sum_ms = self.sum_ms.saturating_add(elapsed_ms);
-        if let Some(i) = LATENCY_BUCKETS_MS
+        self.sum_seconds += elapsed_seconds;
+        if let Some(i) = LATENCY_BUCKETS_SECONDS
             .iter()
-            .position(|&bound| elapsed_ms <= bound)
+            .position(|&bound| elapsed_seconds <= bound)
         {
             self.buckets[i] += 1;
         }
     }
 
     /// Cumulative count for each bucket bound, as Prometheus `le` buckets expect.
-    pub fn cumulative(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
-        LATENCY_BUCKETS_MS
+    pub fn cumulative(&self) -> impl Iterator<Item = (f64, u64)> + '_ {
+        LATENCY_BUCKETS_SECONDS
             .iter()
             .zip(self.buckets.iter())
             .scan(0u64, |running, (&bound, &n)| {
@@ -85,15 +87,15 @@ impl MetricsCollector {
         let start = Instant::now();
 
         let response = next.run(req).await;
-        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let elapsed_seconds = start.elapsed().as_secs_f64();
 
-        self.record(&route, &method, response.status(), elapsed_ms);
+        self.record(&route, &method, response.status(), elapsed_seconds);
         response
     }
 
     /// Record one finished request. Memory grows only with the number of
     /// distinct label sets, never with the number of requests.
-    pub fn record(&self, route: &str, method: &Method, status: StatusCode, elapsed_ms: u64) {
+    pub fn record(&self, route: &str, method: &Method, status: StatusCode, elapsed_seconds: f64) {
         let counter_key = format!(
             "http_requests{{route=\"{}\",method=\"{}\",status=\"{}\"}}",
             escape_label_value(route),
@@ -113,7 +115,7 @@ impl MetricsCollector {
             .write()
             .entry(key)
             .or_default()
-            .observe(elapsed_ms);
+            .observe(elapsed_seconds);
     }
 }
 
@@ -249,7 +251,7 @@ mod tests {
                 routes[(i % 3) as usize],
                 &Method::GET,
                 StatusCode::OK,
-                i % 1_500,
+                (i % 1_500) as f64 / 1_000.0,
             );
         }
 
@@ -260,22 +262,30 @@ mod tests {
         // Each series is a fixed-size struct: no per-sample storage exists.
         assert_eq!(
             std::mem::size_of::<LatencyHistogram>(),
-            (LATENCY_BUCKETS_MS.len() + 2) * std::mem::size_of::<u64>()
+            (LATENCY_BUCKETS_SECONDS.len() + 2) * std::mem::size_of::<u64>()
         );
     }
 
     #[test]
     fn histogram_buckets_are_cumulative_and_include_overflow() {
         let mut h = LatencyHistogram::default();
-        for ms in [0, 3, 7, 20_000] {
-            h.observe(ms);
+        for seconds in [0.0, 0.003, 0.007, 20.0] {
+            h.observe(seconds);
         }
-        let cumulative: Vec<(u64, u64)> = h.cumulative().collect();
-        assert_eq!(cumulative[0], (1, 1));
-        assert_eq!(cumulative[1], (5, 2));
-        assert_eq!(cumulative[2], (10, 3));
-        assert_eq!(*cumulative.last().unwrap(), (10_000, 3));
+        let cumulative: Vec<(f64, u64)> = h.cumulative().collect();
+        assert_eq!(cumulative[0], (0.0005, 1));
+        assert_eq!(cumulative[3], (0.005, 2));
+        assert_eq!(cumulative[4], (0.01, 3));
+        assert_eq!(*cumulative.last().unwrap(), (10.0, 3));
         assert_eq!(h.count, 4);
-        assert_eq!(h.sum_ms, 20_010);
+        assert!((h.sum_seconds - 20.01).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sub_millisecond_request_lands_below_one_millisecond() {
+        let mut h = LatencyHistogram::default();
+        h.observe(0.000_4);
+        let cumulative: Vec<(f64, u64)> = h.cumulative().collect();
+        assert_eq!(cumulative[0], (0.0005, 1));
     }
 }

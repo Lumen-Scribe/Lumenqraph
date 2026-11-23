@@ -157,8 +157,10 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
         sse_lagged = sse_lagged,
     );
 
-    body.push_str("# HELP lumenqraph_http_request_duration_ms Per-route HTTP request latency\n");
-    body.push_str("# TYPE lumenqraph_http_request_duration_ms histogram\n");
+    body.push_str(
+        "# HELP lumenqraph_http_request_duration_seconds Per-route HTTP request latency\n",
+    );
+    body.push_str("# TYPE lumenqraph_http_request_duration_seconds histogram\n");
     {
         let histograms = state.metrics.histogram_buckets.read();
         for (key, hist) in histograms.iter() {
@@ -169,19 +171,19 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
             );
             for (bound, cumulative) in hist.cumulative() {
                 body.push_str(&format!(
-                    "lumenqraph_http_request_duration_ms_bucket{{{labels},le=\"{bound}\"}} {cumulative}\n"
+                    "lumenqraph_http_request_duration_seconds_bucket{{{labels},le=\"{bound}\"}} {cumulative}\n"
                 ));
             }
             body.push_str(&format!(
-                "lumenqraph_http_request_duration_ms_bucket{{{labels},le=\"+Inf\"}} {}\n",
+                "lumenqraph_http_request_duration_seconds_bucket{{{labels},le=\"+Inf\"}} {}\n",
                 hist.count
             ));
             body.push_str(&format!(
-                "lumenqraph_http_request_duration_ms_sum{{{labels}}} {}\n",
-                hist.sum_ms
+                "lumenqraph_http_request_duration_seconds_sum{{{labels}}} {}\n",
+                hist.sum_seconds
             ));
             body.push_str(&format!(
-                "lumenqraph_http_request_duration_ms_count{{{labels}}} {}\n",
+                "lumenqraph_http_request_duration_seconds_count{{{labels}}} {}\n",
                 hist.count
             ));
         }
