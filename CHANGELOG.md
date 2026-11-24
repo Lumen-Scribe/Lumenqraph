@@ -24,6 +24,13 @@ Breaking changes will be documented in the changelog with migration guidance whe
 
 ### Added
 
+- Pre-commit hooks (#795): the repo now ships a `.pre-commit-config.yaml` so
+  formatting, lint and drift failures are caught locally. Fast checks
+  (`cargo fmt --check`, shellcheck, actionlint, YAML/TOML sanity, a
+  `detect-secrets` scan against `.secrets.baseline`, and the `.env.example`
+  drift check) run on every commit; `cargo clippy` and the OpenAPI drift check
+  run on the pre-push hook. Install with
+  `pip install pre-commit && pre-commit install --install-hooks && pre-commit install --hook-type pre-push`.
 - Admin API for API-key management (#431): `GET /admin/keys`, `POST /admin/keys`,
   `POST /admin/keys/{prefix}/revoke` and `POST /admin/keys/{prefix}/rotate`.
   Guarded by the new `ADMIN_TOKEN` credential; the routes return 404 unless it is

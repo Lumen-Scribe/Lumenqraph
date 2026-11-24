@@ -42,6 +42,26 @@ cargo deny check
 
 The `cargo audit` and `cargo deny check` commands verify dependency security and license compliance. These must pass in CI; running them locally catches issues before pushing.
 
+### Pre-commit hooks
+
+The repo ships a `.pre-commit-config.yaml` so formatting, lint and drift failures
+are caught locally instead of after a round-trip through CI (#795). Fast checks
+(`cargo fmt --check`, shellcheck, actionlint, YAML/TOML sanity, a secret scan
+against `.secrets.baseline`, and the `.env.example` drift check) run on every
+commit; slower checks (`cargo clippy`, the OpenAPI drift check) run on the
+pre-push hook so a quick commit is never blocked by a build.
+
+Set it up in one command (requires a working Rust toolchain, Python 3 and Git):
+
+```bash
+pip install pre-commit && pre-commit install --install-hooks && pre-commit install --hook-type pre-push
+```
+
+`pre-commit run --all-files` then reproduces the fast checks on a clean
+checkout. To regenerate the secret-scan baseline after intentionally adding a
+new test vector or fixture, run `detect-secrets scan $(git ls-files) >
+.secrets.baseline` and commit the updated file.
+
 ### Compile-time query checking
 
 The codebase uses sqlx's offline mode for compile-time verification of SQL queries. After modifying any SQL queries in the code:
