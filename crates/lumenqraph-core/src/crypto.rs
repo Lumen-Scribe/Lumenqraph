@@ -83,18 +83,34 @@ impl std::error::Error for VerifyError {}
 ///
 /// # Example
 ///
-/// ```ignore
+/// The header carries the timestamp and one or more hex `v1` signatures; each
+/// signature is HMAC-SHA256 over `"{timestamp}.{body}"`. Verification succeeds
+/// when any `v1` matches and the timestamp is within `tolerance` of the current
+/// time. This example uses the committed cross-language test vector
+/// (`docs/examples/webhooks/test_vector.json`) with a wide tolerance, because
+/// its timestamp is fixed in the past and so would otherwise be rejected as
+/// stale — exactly the scenario the vector is designed to exercise across the
+/// Node, Python, Go and Rust verifiers:
+///
+/// ```rust
 /// use std::time::Duration;
-/// use lumenqraph_core::crypto::verify_webhook;
+/// use lumenqraph_core::crypto::{verify_webhook, VerifyError};
 ///
-/// let secret = "my-secret";
-/// let header = "t=1700000000,v1=abc123...";
-/// let body = b"webhook payload";
+/// let secret = "whsec-doc-vector-7c1e";
+/// let header = "t=1700000000,v1=0000000000000000000000000000000000000000000000000000000000000000,v1=8b8264463f41a643074ef665aa376f3079a0752f14938ca41d8b196087e1aaaf";
+/// let body: &[u8] = br#"{"id":"42","type":"contract.event","version":1,"created_at":"2023-11-14T22:13:20Z","data":{"event_id":"0000000000012345-0000000001","contract_id":"CDOCVECTORCONTRACTIDEXAMPLEXXXXXXXXXXXXXXXXXXXXXXXXXXXX","ledger":12345,"ledger_closed_at":"2023-11-14T22:13:18Z","event_name":"transfer","topics":["AAAADwAAAAd0cmFuc2Zlcg=="],"decoded_topics":["transfer"],"value":"AAAADwAAAAQ=","decoded_value":{"amount":"1000000","currency":"€"},"enriched":{"amount":1000000},"tx_hash":"abc123","in_successful_call":true}}"#;
 ///
-/// match verify_webhook(secret, header, body, Duration::from_secs(300)) {
-///     Ok(()) => { /* signature is valid */ }
-///     Err(_) => { /* signature is invalid */ }
-/// }
+/// // The vector's timestamp is fixed in the past, so widen the tolerance to
+/// // keep this example independent of the wall clock.
+/// assert_eq!(verify_webhook(secret, header, body, Duration::from_secs(u64::MAX)), Ok(()));
+///
+/// // A tampered body matches none of the signatures.
+/// let mut tampered = body.to_vec();
+/// tampered.push(b' ');
+/// assert_eq!(
+///     verify_webhook(secret, header, &tampered, Duration::from_secs(u64::MAX)),
+///     Err(VerifyError::Mismatch),
+/// );
 /// ```
 pub fn verify_webhook(
     secret: &str,

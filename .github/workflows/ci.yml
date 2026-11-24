@@ -366,6 +366,30 @@ jobs:
         run: |
           python3 scripts/check_openapi_drift.py openapi.yaml /tmp/generated-openapi.json
 
+  # Issue #796: rustdoc was never built in CI, so broken intra-doc links and
+  # ignored doctests (the only example showing how to verify a webhook
+  # signature) rotted unnoticed. Build the workspace docs with warnings denied
+  # so drift fails here, not in a release. `--document-private-items` keeps
+  # `private_intra_doc_links` from firing on the several public items that link
+  # to private helpers (e.g. `is_view_heuristic`, `ALIASES`).
+  rustdoc:
+    name: Rustdoc (deny warnings)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event_name != 'schedule'
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: rustdoc
+      - name: cargo doc (deny warnings)
+        run: cargo doc --workspace --no-deps --document-private-items
+
   # Issue #639: every environment variable read by runtime Rust code must be
   # documented in docs/CONFIGURATION.md, so operators can find security-relevant
   # settings and defaults.

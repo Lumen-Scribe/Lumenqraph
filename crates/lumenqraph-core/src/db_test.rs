@@ -7,6 +7,11 @@
 //!
 //! # Usage
 //!
+//! The snippet below is marked `ignore` because `TestDb` connects to a live
+//! Postgres reachable only via `TEST_DATABASE_URL`, which the doctest runner
+//! cannot supply; run the real database-backed tests with `make test-db`
+//! instead:
+//!
 //! ```ignore
 //! #[tokio::test]
 //! async fn my_test() {

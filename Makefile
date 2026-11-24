@@ -1,4 +1,4 @@
-.PHONY: help db db-down migrate seed build test test-db test-smoke fmt lint indexer api webhooks backfill up down mcp sdk-ts sdk-py openapi-check deny audit dashboards-check env-check ci
+.PHONY: help db db-down migrate seed build test test-db test-smoke fmt lint doc-check indexer api webhooks backfill up down mcp sdk-ts sdk-py openapi-check deny audit dashboards-check env-check ci
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -51,6 +51,9 @@ fmt: ## Format
 
 lint: ## Clippy (deny warnings)
 	cargo clippy --workspace --all-targets -- -D warnings
+
+doc-check: ## Build rustdoc with warnings denied (matches the CI rustdoc job, #796)
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
 
 indexer: ## Run the indexer (live)
 	cargo run -p lumenqraph-indexer
