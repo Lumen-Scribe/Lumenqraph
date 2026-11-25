@@ -37,7 +37,6 @@ use crate::auth::{
 };
 use crate::graphql::{self, AppSchema};
 use crate::metrics;
-use crate::request_id;
 use crate::state::AppState;
 
 /// Execute a GraphQL query against the shared schema.
@@ -223,8 +222,7 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn(move |req: Request, next: Next| {
             let collector = metrics_collector.clone();
             collector.middleware(req, next)
-        }))
-        .layer(middleware::from_fn(request_id::request_id_middleware));
+        }));
 
     // Sibling instances under a path prefix (see `proxy`). Each upstream
     // still enforces its own auth, but mounted routes get this instance's
