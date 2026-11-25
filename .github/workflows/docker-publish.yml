@@ -224,3 +224,39 @@ jobs:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+
+      # Issue #794: Scan the final multi-arch image for vulnerabilities and
+      # misconfigurations with Trivy. This catches CVEs in Debian base packages
+      # (ca-certificates, libc, etc.) and configuration issues (exposed secrets,
+      # insecure permissions) that cargo audit/cargo deny cannot see.
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@18f2510ee396bbf400402c92d8bde8f7e1d7c106 # v0.30.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@6db8d6351fd0be61f9ed8ebd12ccd35dcec51fea # v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      # Issue #794: Generate and attach an SBOM (Software Bill of Materials) to
+      # the release, documenting every package (Rust crates, Debian packages, Node
+      # modules) in the final image. The SBOM is generated in SPDX JSON format and
+      # pushed as an attestation alongside the provenance.
+      - name: Generate SBOM
+        uses: aquasecurity/trivy-action@18f2510ee396bbf400402c92d8bde8f7e1d7c106 # v0.30.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: spdx-json
+          output: sbom.spdx.json
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@7f4a357fba87328b3a5c99b79c7bab0870c8605a # v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: sbom.spdx.json
+          push-to-registry: true

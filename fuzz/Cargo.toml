@@ -1,0 +1,30 @@
+[package]
+name = "lumenqraph-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lumenqraph-core = { path = "../crates/lumenqraph-core" }
+
+[[bin]]
+name = "fuzz_xdr_decoder"
+path = "fuzz_targets/fuzz_xdr_decoder.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_contract_spec_parser"
+path = "fuzz_targets/fuzz_contract_spec_parser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_strkey_parser"
+path = "fuzz_targets/fuzz_strkey_parser.rs"
+test = false
+doc = false

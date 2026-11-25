@@ -24,13 +24,13 @@ Breaking changes will be documented in the changelog with migration guidance whe
 
 ### Added
 
-- Rustdoc built in CI with warnings denied (#796): a new `rustdoc` workflow job
-  runs `cargo doc --workspace --no-deps --document-private-items` with
-  `RUSTDOCFLAGS=-D warnings`, so broken intra-doc links and rotting examples fail
-  before merge. The previously `ignore`d `verify_webhook` doctest in
-  `lumenqraph-core` is now runnable — it exercises the committed cross-language
-  webhook signature vector — and the `db_test` usage example is kept `ignore`d
-  with an explanatory comment. `make doc-check` reproduces the check locally.
+- Pre-commit hooks (#795): the repo now ships a `.pre-commit-config.yaml` so
+  formatting, lint and drift failures are caught locally. Fast checks
+  (`cargo fmt --check`, shellcheck, actionlint, YAML/TOML sanity, a
+  `detect-secrets` scan against `.secrets.baseline`, and the `.env.example`
+  drift check) run on every commit; `cargo clippy` and the OpenAPI drift check
+  run on the pre-push hook. Install with
+  `pip install pre-commit && pre-commit install --install-hooks && pre-commit install --hook-type pre-push`.
 - Admin API for API-key management (#431): `GET /admin/keys`, `POST /admin/keys`,
   `POST /admin/keys/{prefix}/revoke` and `POST /admin/keys/{prefix}/rotate`.
   Guarded by the new `ADMIN_TOKEN` credential; the routes return 404 unless it is
