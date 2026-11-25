@@ -10,6 +10,8 @@ use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
+const MAX_REQUEST_ID_LENGTH: usize = 128;
+
 #[derive(Clone, Debug)]
 pub struct RequestId(pub Arc<String>);
 
@@ -52,7 +54,7 @@ pub async fn request_id_middleware(mut req: Request, next: Next) -> Response {
         .headers()
         .get("x-request-id")
         .and_then(|h| h.to_str().ok())
-        .filter(|id| !id.is_empty())
+        .filter(|id| is_valid_request_id(id))
         .map(|s| s.to_string())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
