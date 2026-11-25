@@ -12,6 +12,48 @@ INDEXER_URL="${INDEXER_URL:-http://localhost:9090}"
 # Deadline (in seconds) for the indexer to advance last_processed_ledger.
 LEDGER_ADVANCE_TIMEOUT="${LEDGER_ADVANCE_TIMEOUT:-120}"
 
+is_page_response() {
+  jq -e 'type == "object" and (.data | type == "array") and (.has_more | type == "boolean")' \
+    > /dev/null 2>&1
+}
+
+page_data_count() {
+  jq '.data | length'
+}
+
+first_contract_id() {
+  jq -r '.data[0].id // .data[0].contract_id // empty'
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+  if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 [--self-test]" >&2
+    exit 2
+  fi
+  contracts_fixture='{"data":[{"id":"Cfixture"}],"has_more":false,"next_cursor":null}'
+  events_fixture='{"data":[{"event_id":"event-fixture"}],"has_more":true,"next_cursor":"cursor"}'
+  fixture_contract_count=$(printf '%s\n' "$contracts_fixture" | page_data_count)
+  fixture_contract_id=$(printf '%s\n' "$contracts_fixture" | first_contract_id)
+  fixture_event_count=$(printf '%s\n' "$events_fixture" | page_data_count)
+  if ! printf '%s\n' "$contracts_fixture" | is_page_response \
+    || ! printf '%s\n' "$events_fixture" | is_page_response \
+    || [ "$fixture_contract_count" -ne 1 ] \
+    || [ "$fixture_contract_id" != "Cfixture" ] \
+    || [ "$fixture_event_count" -ne 1 ] \
+    || printf '%s\n' '[]' | is_page_response \
+    || printf '%s\n' '{"data":[],"has_more":"false"}' | is_page_response; then
+    echo "✗ E2E pagination envelope fixture assertions failed"
+    exit 1
+  fi
+  echo "✓ E2E pagination envelope fixture assertions passed"
+  exit 0
+fi
+
+if [ "$#" -ne 0 ]; then
+  echo "Usage: $0 [--self-test]" >&2
+  exit 2
+fi
+
 echo "Starting E2E smoke test..."
 echo "API URL: $API_URL"
 echo "Max attempts: $MAX_ATTEMPTS"
@@ -50,13 +92,13 @@ fi
 
 echo "✓ /contracts response is valid JSON"
 
-# Assert /contracts is a non-empty array of indexed contracts.
-if ! echo "$contracts" | jq -e 'type == "array"' > /dev/null 2>&1; then
-  echo "✗ /contracts response is not a JSON array"
+# Assert /contracts is a non-empty paginated response.
+if ! echo "$contracts" | is_page_response; then
+  echo "✗ /contracts response is not a valid paginated response"
   exit 1
 fi
 
-contract_count=$(echo "$contracts" | jq 'length')
+contract_count=$(echo "$contracts" | page_data_count)
 echo "Total contracts in database: $contract_count"
 
 if [ "$contract_count" -eq 0 ]; then
@@ -116,7 +158,7 @@ if [ "$advanced" != "true" ]; then
 fi
 
 # Assert the first indexed contract has at least one event.
-first_contract_id=$(echo "$contracts" | jq -r '.[0].id // .[0].contract_id // empty')
+first_contract_id=$(echo "$contracts" | first_contract_id)
 if [ -z "$first_contract_id" ]; then
   echo "✗ Could not determine contract id from /contracts response"
   exit 1
@@ -124,18 +166,20 @@ fi
 
 echo "Testing /contracts/$first_contract_id/events?limit=1 ..."
 events_url="$API_URL/contracts/$first_contract_id/events?limit=1"
-http_code=$(curl -s -o /tmp/e2e_events.json -w '%{http_code}' "$events_url")
+events_file=$(mktemp "${TMPDIR:-/tmp}/e2e_events.XXXXXX")
+trap 'rm -f "$events_file"' EXIT
+http_code=$(curl -s -o "$events_file" -w '%{http_code}' "$events_url")
 if [ "$http_code" != "200" ]; then
   echo "✗ $events_url returned HTTP $http_code (expected 200)"
   exit 1
 fi
 
-if ! jq -e 'type == "array"' /tmp/e2e_events.json > /dev/null 2>&1; then
-  echo "✗ events response is not a JSON array"
+if ! is_page_response < "$events_file"; then
+  echo "✗ events response is not a valid paginated response"
   exit 1
 fi
 
-event_count=$(jq 'length' /tmp/e2e_events.json)
+event_count=$(page_data_count < "$events_file")
 if [ "$event_count" -lt 1 ]; then
   echo "✗ events response contained no rows for contract $first_contract_id"
   exit 1

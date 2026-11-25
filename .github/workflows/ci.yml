@@ -87,9 +87,13 @@ jobs:
   migration-fresh-db:
     name: Migration Fresh Database
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["15", "16", "17", "18", "19"]
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:${{ matrix.postgres }}-alpine
         env:
           POSTGRES_USER: lumenqraph
           POSTGRES_PASSWORD: lumenqraph
@@ -194,12 +198,17 @@ jobs:
   # in rust-toolchain.toml. Do not duplicate it here.
 
   build-test:
+    name: Build and Test (Postgres ${{ matrix.postgres }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
     if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["15", "16", "17", "18", "19"]
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:${{ matrix.postgres }}-alpine
         env:
           POSTGRES_USER: lumenqraph
           POSTGRES_PASSWORD: lumenqraph
@@ -229,8 +238,19 @@ jobs:
         run: python3 scripts/check_sensitive_logging.py
       - name: Test sensitive logging lint fixtures
         run: python3 scripts/test_check_sensitive_logging.py
+      - name: Check tracked path hygiene
+        run: python3 scripts/check_repository_hygiene.py
+      - name: Test E2E smoke response fixtures
+        run: bash scripts/e2e_smoke_test.sh --self-test
       - name: Check .env.example covers every env var
         run: python3 scripts/check_env_example.py
+      - name: Verify database is available for ignored tests
+        run: |
+          if [ -z "${TEST_DATABASE_URL:-}" ]; then
+            echo "::error::TEST_DATABASE_URL is required for ignored database tests."
+            exit 1
+          fi
+          pg_isready --dbname="$TEST_DATABASE_URL" --timeout=5
       - name: Install sqlx-cli
         uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172
         with:
@@ -273,7 +293,7 @@ jobs:
       - name: Upload coverage artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: coverage-lcov
+          name: coverage-lcov-postgres-${{ matrix.postgres }}
           path: lcov.info
       - name: Build (release)
         run: cargo build --locked --workspace --release
@@ -443,6 +463,14 @@ jobs:
       - name: Build sdist and wheel
         working-directory: sdk/python
         run: python -m build
+      - name: Ensure sdist contains no editor backups
+        working-directory: sdk/python
+        run: |
+          tar -tzf dist/*.tar.gz > "$RUNNER_TEMP/sdist-files.txt"
+          if grep -Ei '\.(bak|orig|rej|swp)$' "$RUNNER_TEMP/sdist-files.txt"; then
+            echo "::error::The Python source distribution contains an editor backup file."
+            exit 1
+          fi
       - name: Check package metadata
         working-directory: sdk/python
         run: twine check dist/*

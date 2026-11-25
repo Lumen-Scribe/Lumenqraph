@@ -290,7 +290,7 @@ These are applied automatically by the indexer on first startup.
 
 | Variable | Example | Notes |
 | --- | --- | --- |
-| `DATABASE_URL` | `postgres://user:pass@host/db?sslmode=require` | Postgres 14+. Must include `?sslmode=require` for managed instances. |
+| `DATABASE_URL` | `postgres://user:pass@host/db?sslmode=require` | PostgreSQL 15–19. Must include `?sslmode=require` for managed instances. |
 | `RPC_URL` | `https://mainnet.sorobanrpc.com` | Soroban RPC endpoint for your target network. |
 
 All other variables have working defaults. See [Configuration](../README.md#configuration) for the full list.

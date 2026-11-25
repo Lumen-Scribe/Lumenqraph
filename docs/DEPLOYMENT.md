@@ -350,7 +350,9 @@ Use these together to distinguish pool starvation from a slow database:
 
 ## Postgres
 
-Any Postgres 14+ works. For managed hosting, point `DATABASE_URL` at Supabase or
+PostgreSQL 15 through 19 are supported and exercised by the database-backed CI
+matrix (the oldest currently supported major through the newest stable major).
+For managed hosting, point `DATABASE_URL` at Supabase or
 Neon (survives independently of the app host). Add read replicas for the API
 before scaling the write path.
 
