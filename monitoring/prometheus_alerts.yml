@@ -179,3 +179,48 @@ groups:
         annotations:
           summary: "Fewer than half of events are enriched while the indexer is ingesting events."
           runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphenrichmentratelow"
+
+      - alert: LumenqraphAPIDown
+        expr: 'up{job="lumenqraph-api"} == 0'
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Lumenqraph API scrape target is down."
+          runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphapidown"
+
+      - alert: LumenqraphIndexerDown
+        expr: 'up{job="lumenqraph-indexer"} == 0'
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Lumenqraph indexer scrape target is down."
+          runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphindexerdown"
+
+      - alert: LumenqraphWebhooksDown
+        expr: 'up{job="lumenqraph-webhooks"} == 0'
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Lumenqraph webhooks scrape target is down."
+          runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphwebhooksdown"
+
+      - alert: LumenqraphIndexerMetricsAbsent
+        expr: 'absent(lumenqraph_indexer_last_processed_ledger{job="lumenqraph-indexer"})'
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Lumenqraph indexer metrics series is absent."
+          runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphindexermetricsabsent"
+
+      - alert: LumenqraphIndexerHeartbeatStale
+        expr: "lumenqraph_indexer_heartbeat_timestamp_seconds > 0 and (time() - lumenqraph_indexer_heartbeat_timestamp_seconds) > 240"
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Indexer poll-loop heartbeat has not updated for more than 4 minutes."
+          runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphindexerheartbeatstale"

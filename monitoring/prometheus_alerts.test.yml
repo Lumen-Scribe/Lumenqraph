@@ -279,9 +279,96 @@ tests:
               summary: "Fewer than half of events are enriched while the indexer is ingesting events."
               runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphenrichmentratelow"
 
+  - interval: 1m
+    input_series:
+      - series: 'up{instance="lumenqraph-api",job="lumenqraph-api"}'
+        values: "0+0x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphAPIDown
+        exp_alerts:
+          - exp_labels:
+              instance: lumenqraph-api
+              job: lumenqraph-api
+              severity: critical
+            exp_annotations:
+              summary: "Lumenqraph API scrape target is down."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphapidown"
+
+  - interval: 1m
+    input_series:
+      - series: 'up{instance="lumenqraph-indexer",job="lumenqraph-indexer"}'
+        values: "0+0x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphIndexerDown
+        exp_alerts:
+          - exp_labels:
+              instance: lumenqraph-indexer
+              job: lumenqraph-indexer
+              severity: critical
+            exp_annotations:
+              summary: "Lumenqraph indexer scrape target is down."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphindexerdown"
+
+  - interval: 1m
+    input_series:
+      - series: 'up{instance="lumenqraph-webhooks",job="lumenqraph-webhooks"}'
+        values: "0+0x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphWebhooksDown
+        exp_alerts:
+          - exp_labels:
+              instance: lumenqraph-webhooks
+              job: lumenqraph-webhooks
+              severity: critical
+            exp_annotations:
+              summary: "Lumenqraph webhooks scrape target is down."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphwebhooksdown"
+
+  - interval: 1m
+    input_series:
+      - series: 'up{instance="lumenqraph-indexer",job="lumenqraph-indexer"}'
+        values: "1+0x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphIndexerMetricsAbsent
+        exp_alerts:
+          - exp_labels:
+              job: lumenqraph-indexer
+              severity: critical
+            exp_annotations:
+              summary: "Lumenqraph indexer metrics series is absent."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphindexermetricsabsent"
+
+  - interval: 1m
+    input_series:
+      - series: 'lumenqraph_indexer_heartbeat_timestamp_seconds{instance="test",job="lumenqraph-indexer"}'
+        values: "1+0x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LumenqraphIndexerHeartbeatStale
+        exp_alerts:
+          - exp_labels:
+              instance: test
+              job: lumenqraph-indexer
+              severity: critical
+            exp_annotations:
+              summary: "Indexer poll-loop heartbeat has not updated for more than 4 minutes."
+              runbook_url: "https://github.com/Lumen-Scribe/Lumenqraph/blob/main/monitoring/README.md#lumenqraphindexerheartbeatstale"
+
   # Quiet deployment: low lag, progressing cursor and no demand.
   - interval: 1m
     input_series:
+      - series: 'up{job="lumenqraph-api"}'
+        values: "1+0x30"
+      - series: 'up{job="lumenqraph-indexer"}'
+        values: "1+0x30"
+      - series: 'up{job="lumenqraph-webhooks"}'
+        values: "1+0x30"
+      - series: 'lumenqraph_indexer_heartbeat_timestamp_seconds{job="lumenqraph-indexer"}'
+        values: "1+60x30"
       - series: 'lumenqraph_indexer_lag_ledgers{job="lumenqraph-indexer"}'
         values: "1+0x30"
       - series: 'lumenqraph_indexer_last_processed_ledger{job="lumenqraph-indexer"}'
@@ -356,4 +443,19 @@ tests:
         exp_alerts: []
       - eval_time: 30m
         alertname: LumenqraphEnrichmentRateLow
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphAPIDown
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphIndexerDown
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphWebhooksDown
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphIndexerMetricsAbsent
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LumenqraphIndexerHeartbeatStale
         exp_alerts: []

@@ -407,6 +407,10 @@ async fn metrics(
         }
     }
 
+    // Exports lumenqraph_db_pool_connections, lumenqraph_db_pool_acquire_timeouts_total,
+    // and lumenqraph_db_pool_acquire_duration_seconds.
+    lumenqraph_core::db::render_pool_metrics(&mut body, &state.pool);
+
     (
         axum::http::StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -1345,6 +1349,14 @@ mod tests {
                 "# TYPE lumenqraph_indexer_webhook_deliveries_dropped_by_retention_total counter"
             ),
             "missing TYPE line for webhook_deliveries_dropped_by_retention_total:\n{body}"
+        );
+        assert!(
+            body.contains("lumenqraph_indexer_heartbeat_timestamp_seconds"),
+            "missing heartbeat_timestamp_seconds in metrics body:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE lumenqraph_indexer_heartbeat_timestamp_seconds gauge"),
+            "missing TYPE line for heartbeat_timestamp_seconds:\n{body}"
         );
     }
 }

@@ -34,7 +34,6 @@ use axum::http;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tower_http::compression::CompressionLayer;
 use tower_http::timeout::TimeoutLayer;
-use tower_http::trace::TraceLayer;
 use tracing::info;
 
 use call_cache::CallCache;
@@ -276,12 +275,13 @@ async fn main() -> anyhow::Result<()> {
     info!(max_body_bytes, "enforcing request body size limit");
     info!(request_timeout_secs, "enforcing request timeout");
 
-    let app = routes::router(state)
-        .layer(DefaultBodyLimit::max(max_body_bytes as usize))
-        .layer(TimeoutLayer::new(Duration::from_secs(request_timeout_secs)))
-        .layer(CompressionLayer::new())
-        .layer(TraceLayer::new_for_http())
-        .layer(build_cors_layer(&config.cors_allowed_origins));
+    let app = request_id::apply_request_tracing(
+        routes::router(state)
+            .layer(DefaultBodyLimit::max(max_body_bytes as usize))
+            .layer(TimeoutLayer::new(Duration::from_secs(request_timeout_secs)))
+            .layer(CompressionLayer::new()),
+    )
+    .layer(build_cors_layer(&config.cors_allowed_origins));
 
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await

@@ -11,8 +11,9 @@ use crate::metrics_middleware::escape_label_value;
 use crate::state::AppState;
 
 pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
+    let mut conn = lumenqraph_core::db::acquire_conn(&state.pool).await?;
     let total_events: (i64,) = sqlx::query_as("SELECT count(*) FROM events")
-        .fetch_one(&state.pool)
+        .fetch_one(&mut *conn)
         .await?;
 
     let requests = state.http_requests.load(Ordering::Relaxed);
@@ -112,6 +113,10 @@ pub async fn metrics(State(state): State<AppState>) -> ApiResult<impl IntoRespon
             }
         }
     }
+
+    // Exports lumenqraph_db_pool_connections, lumenqraph_db_pool_acquire_timeouts_total,
+    // and lumenqraph_db_pool_acquire_duration_seconds.
+    lumenqraph_core::db::render_pool_metrics(&mut body, &state.pool);
 
     Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body))
 }

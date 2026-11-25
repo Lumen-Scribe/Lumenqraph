@@ -1,0 +1,107 @@
+# Pre-commit hooks for Lumenqraph.
+#
+# Local mirrors of the CI checks so formatting, lint and drift failures are
+# caught before pushing instead of after a round-trip through CI. See issue
+# #795.
+#
+# Install once (requires a working Rust toolchain, Python 3 and Git):
+#
+#   pip install pre-commit
+#   pre-commit install --install-hooks
+#   pre-commit install --hook-type pre-push --install-hooks
+#
+# Then `pre-commit run --all-files` reproduces the fast checks locally:
+# cargo fmt --check, shellcheck, actionlint, YAML/TOML sanity, a secret scan
+# against `.secrets.baseline`, and the project's own `.env.example` drift check.
+# Slower checks (clippy, the OpenAPI drift check) run on the pre-push hook so a
+# quick commit is never blocked by a compile.
+#
+# The full set of CI checks (sensitive-logging lint, config-docs drift, dashboard
+# metrics, OpenAPI drift, cargo deny, …) still runs in CI via `make ci`; only the
+# fast, guaranteed-to-pass checks are wired in here so a clean checkout never
+# fails `pre-commit run --all-files`.
+
+# Generated/vendored/output paths that no hook should inspect or rewrite.
+# Migrations are append-only (CI rejects edits to released files), so they are
+# excluded from every fixer.
+exclude: |
+  (?x)^(
+      target/.*|
+      \.sqlx/.*|
+      \.secrets\.baseline|
+      sdk/typescript/node_modules/.*|
+      explorer/node_modules/.*|
+      sdk/typescript/package-lock\.json|
+      explorer/package-lock\.json|
+      docs/examples/webhooks/__pycache__/.*|
+      migrations/.*\.sql
+  )$
+
+default_language_version:
+  python: python3
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+
+  - repo: https://github.com/koalaman/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+        # Report only shell-level errors (syntax, unsafe quoting that breaks
+        # execution). Style warnings are too noisy on the existing scripts and
+        # would block a clean checkout; CI does not run shellcheck today.
+        args: [--severity=error]
+
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.7
+    hooks:
+      - id: actionlint
+
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: [--baseline, .secrets.baseline]
+
+  # Project checks that are fast and require no database or build.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: cargo fmt --all --check
+        language: system
+        files: \.rs$
+        pass_filenames: false
+
+      - id: env-example-drift
+        name: .env.example drift check
+        entry: python3 scripts/check_env_example.py
+        language: system
+        files: ^(\.env\.example|crates/.*\.rs)$
+        pass_filenames: false
+
+      # Slower checks that compile. They run on the pre-push hook only, so a
+      # quick commit is never blocked by a build, and `pre-commit run
+      # --all-files` (the commit stage) stays fast. Install the pre-push hook
+      # with `pre-commit install --hook-type pre-push`.
+      - id: clippy
+        name: cargo clippy (deny warnings)
+        entry: cargo clippy --workspace --all-targets -- -D warnings
+        language: system
+        files: \.rs$
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: openapi-drift
+        name: OpenAPI drift check
+        entry: bash -c 'cargo run -p lumenqraph-api -- --print-openapi > /tmp/lumenqraph-precommit-openapi.json && python3 scripts/check_openapi_drift.py openapi.yaml /tmp/lumenqraph-precommit-openapi.json' --
+        language: system
+        files: ^(crates/lumenqraph-api/.*\.rs|openapi\.yaml)$
+        pass_filenames: false
+        stages: [pre-push]

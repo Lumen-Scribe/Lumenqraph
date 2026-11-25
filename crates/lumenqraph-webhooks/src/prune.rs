@@ -120,7 +120,7 @@ async fn prune_once(
     retention_days: i64,
     pending_max_age_days: i64,
 ) -> anyhow::Result<(u64, u64)> {
-    let mut lock_conn = pool.acquire().await?;
+    let mut lock_conn = lumenqraph_core::db::acquire_conn(pool).await?;
     let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
         .bind(PRUNE_LOCK)
         .fetch_one(&mut *lock_conn)

@@ -159,8 +159,10 @@ pub async fn run(
         .collect();
 
     loop {
+        crate::metrics::record_heartbeat();
         let cycle_started = std::time::Instant::now();
         let cycle_result = poll_once(&pool, &rpc, &config, &specs, &shutdown).await;
+        crate::metrics::record_heartbeat();
         crate::timing::CYCLE_DURATION.observe(&[("phase", "total")], cycle_started.elapsed());
         let sleep_for = match cycle_result {
             Ok(processed_to) => {

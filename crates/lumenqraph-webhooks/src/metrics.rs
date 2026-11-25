@@ -247,6 +247,10 @@ async fn metrics(State(state): State<MetricsState>, headers: HeaderMap) -> impl 
         }
     }
 
+    // Exports lumenqraph_db_pool_connections, lumenqraph_db_pool_acquire_timeouts_total,
+    // and lumenqraph_db_pool_acquire_duration_seconds.
+    lumenqraph_core::db::render_pool_metrics(&mut body, &state.pool);
+
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],

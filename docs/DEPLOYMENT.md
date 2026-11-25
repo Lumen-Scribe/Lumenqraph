@@ -325,6 +325,29 @@ On paid plans (Neon Standard 100 conn, Supabase Pro 60 direct / PgBouncer
 unlimited): raise the API pool first; the indexer and webhooks are single-writer
 processes and rarely benefit from more than 5–10 connections each.
 
+**Tuning from exported pool metrics**
+
+Every service exports three Prometheus pool metrics on `/metrics`:
+
+- `lumenqraph_db_pool_connections{state="idle|in_use|max"}` — current idle,
+  in-use, and configured maximum connections (`DATABASE_MAX_CONNECTIONS`).
+- `lumenqraph_db_pool_acquire_duration_seconds` — histogram of time callers
+  spend waiting for a connection from the pool.
+- `lumenqraph_db_pool_acquire_timeouts_total` — counter incremented whenever a
+  caller hits `DATABASE_ACQUIRE_TIMEOUT_SECS`.
+
+Use these together to distinguish pool starvation from a slow database:
+
+1. **Pool exhausted (`in_use / max > 0.9`, rising acquire latency or timeouts,
+   while Postgres CPU/IO still has headroom):** raise `DATABASE_MAX_CONNECTIONS`
+   on that service (up to the database tier cap minus the other services' `max`).
+2. **Pool mostly idle (`in_use` stays well below `max`, `idle > 0`, but query
+   or acquire latency is high):** the database itself or a specific query is the
+   bottleneck; adding more connections will not help and can worsen contention.
+3. **Oversized pool (`in_use` peaks far below `max` while total `max` across
+   services nears the DB limit):** lower `DATABASE_MAX_CONNECTIONS` to free
+   slots for other services or replicas.
+
 ## Postgres
 
 Any Postgres 14+ works. For managed hosting, point `DATABASE_URL` at Supabase or

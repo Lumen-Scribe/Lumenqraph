@@ -1,9 +1,122 @@
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Executor;
 use tracing::{info, warn};
+
+const ACQUIRE_BUCKETS: [f64; 10] = [
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0,
+];
+
+static DB_POOL_ACQUIRE_TIMEOUTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DB_POOL_ACQUIRE_DURATION: Mutex<AcquireHistogram> = Mutex::new(AcquireHistogram::new());
+
+struct AcquireHistogram {
+    counts: [u64; ACQUIRE_BUCKETS.len()],
+    count: u64,
+    sum: f64,
+}
+
+impl AcquireHistogram {
+    const fn new() -> Self {
+        Self {
+            counts: [0; ACQUIRE_BUCKETS.len()],
+            count: 0,
+            sum: 0.0,
+        }
+    }
+
+    fn observe(&mut self, elapsed: Duration) {
+        let secs = elapsed.as_secs_f64();
+        for (i, le) in ACQUIRE_BUCKETS.iter().enumerate() {
+            if secs <= *le {
+                self.counts[i] += 1;
+            }
+        }
+        self.count += 1;
+        self.sum += secs;
+    }
+}
+
+/// Record a completed `pool.acquire()` duration.
+pub fn observe_acquire_duration(elapsed: Duration) {
+    let mut hist = DB_POOL_ACQUIRE_DURATION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    hist.observe(elapsed);
+}
+
+/// Increment the pool acquire-timeout counter.
+pub fn record_acquire_timeout() {
+    DB_POOL_ACQUIRE_TIMEOUTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Acquire a connection from `pool`, recording acquire latency and timeouts.
+pub async fn acquire_conn(
+    pool: &sqlx::PgPool,
+) -> Result<sqlx::pool::PoolConnection<sqlx::Postgres>, sqlx::Error> {
+    let start = Instant::now();
+    let res = pool.acquire().await;
+    observe_acquire_duration(start.elapsed());
+    if matches!(&res, Err(sqlx::Error::PoolTimedOut)) {
+        record_acquire_timeout();
+    }
+    res
+}
+
+/// Render `lumenqraph_db_pool_*` metrics in Prometheus text exposition format.
+pub fn render_pool_metrics(body: &mut String, pool: &sqlx::PgPool) {
+    let size = pool.size() as usize;
+    let idle = pool.num_idle();
+    let in_use = size.saturating_sub(idle);
+    let max = pool.options().get_max_connections() as usize;
+
+    body.push_str("# HELP lumenqraph_db_pool_connections Postgres connection pool connections by state\n");
+    body.push_str("# TYPE lumenqraph_db_pool_connections gauge\n");
+    body.push_str(&format!(
+        "lumenqraph_db_pool_connections{{state=\"idle\"}} {idle}\n"
+    ));
+    body.push_str(&format!(
+        "lumenqraph_db_pool_connections{{state=\"in_use\"}} {in_use}\n"
+    ));
+    body.push_str(&format!(
+        "lumenqraph_db_pool_connections{{state=\"max\"}} {max}\n"
+    ));
+
+    body.push_str("# HELP lumenqraph_db_pool_acquire_timeouts_total Total Postgres pool acquire timeouts\n");
+    body.push_str("# TYPE lumenqraph_db_pool_acquire_timeouts_total counter\n");
+    body.push_str(&format!(
+        "lumenqraph_db_pool_acquire_timeouts_total {}\n",
+        DB_POOL_ACQUIRE_TIMEOUTS_TOTAL.load(Ordering::Relaxed)
+    ));
+
+    let (counts, count, sum) = {
+        let hist = DB_POOL_ACQUIRE_DURATION
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (hist.counts, hist.count, hist.sum)
+    };
+    body.push_str("# HELP lumenqraph_db_pool_acquire_duration_seconds Postgres pool acquire latency\n");
+    body.push_str("# TYPE lumenqraph_db_pool_acquire_duration_seconds histogram\n");
+    for (i, le) in ACQUIRE_BUCKETS.iter().enumerate() {
+        body.push_str(&format!(
+            "lumenqraph_db_pool_acquire_duration_seconds_bucket{{le=\"{le}\"}} {}\n",
+            counts[i]
+        ));
+    }
+    body.push_str(&format!(
+        "lumenqraph_db_pool_acquire_duration_seconds_bucket{{le=\"+Inf\"}} {count}\n"
+    ));
+    body.push_str(&format!(
+        "lumenqraph_db_pool_acquire_duration_seconds_sum {sum}\n"
+    ));
+    body.push_str(&format!(
+        "lumenqraph_db_pool_acquire_duration_seconds_count {count}\n"
+    ));
+}
 
 /// Common Postgres pool settings shared by every Lumenqraph service.
 #[derive(Debug, Clone)]
@@ -146,5 +259,30 @@ mod tests {
             .unwrap();
             assert_eq!(count, 2, "time zone {tz} changed the rows selected");
         }
+    }
+
+    #[tokio::test]
+    async fn render_pool_metrics_exports_gauges_timeouts_and_histogram() {
+        let pool = PgPoolOptions::new()
+            .max_connections(7)
+            .connect_lazy("postgres://localhost:5432/lumenqraph")
+            .unwrap();
+        observe_acquire_duration(Duration::from_millis(12));
+        record_acquire_timeout();
+
+        let mut body = String::new();
+        render_pool_metrics(&mut body, &pool);
+
+        assert!(body.contains("# TYPE lumenqraph_db_pool_connections gauge"));
+        assert!(body.contains("lumenqraph_db_pool_connections{state=\"idle\"} 0\n"));
+        assert!(body.contains("lumenqraph_db_pool_connections{state=\"in_use\"} 0\n"));
+        assert!(body.contains("lumenqraph_db_pool_connections{state=\"max\"} 7\n"));
+        assert!(body.contains("# TYPE lumenqraph_db_pool_acquire_timeouts_total counter"));
+        assert!(body.contains("lumenqraph_db_pool_acquire_timeouts_total "));
+        assert!(body.contains("# TYPE lumenqraph_db_pool_acquire_duration_seconds histogram"));
+        assert!(body.contains("lumenqraph_db_pool_acquire_duration_seconds_bucket{le=\"0.025\"} "));
+        assert!(body.contains("lumenqraph_db_pool_acquire_duration_seconds_bucket{le=\"+Inf\"} "));
+        assert!(body.contains("lumenqraph_db_pool_acquire_duration_seconds_sum "));
+        assert!(body.contains("lumenqraph_db_pool_acquire_duration_seconds_count "));
     }
 }

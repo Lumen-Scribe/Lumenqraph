@@ -1,4 +1,4 @@
-.PHONY: help db db-down migrate seed build test test-db test-smoke fmt lint indexer api webhooks backfill up down mcp sdk-ts sdk-py openapi-check deny audit dashboards-check env-check ci
+.PHONY: help db db-down migrate seed build test test-db test-smoke fmt lint doc-check indexer api webhooks backfill up down mcp sdk-ts sdk-py openapi-check deny audit dashboards-check env-check ci
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -52,6 +52,9 @@ fmt: ## Format
 lint: ## Clippy (deny warnings)
 	cargo clippy --workspace --all-targets -- -D warnings
 
+doc-check: ## Build rustdoc with warnings denied (matches the CI rustdoc job, #796)
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
+
 indexer: ## Run the indexer (live)
 	cargo run -p lumenqraph-indexer
 
@@ -76,6 +79,23 @@ sdk-py: ## Install, test, and typecheck the Python SDK
 openapi-check: ## Verify openapi.yaml matches the API's generated schema
 	cargo run -p lumenqraph-api -- --print-openapi | python3 scripts/check_openapi_drift.py openapi.yaml -
 
+explorer-install: ## Install explorer dependencies
+	cd explorer && npm ci
+
+explorer-build: ## Build the explorer UI
+	cd explorer && npm run build
+
+explorer-lint: ## Lint the explorer code
+	cd explorer && npm run lint
+
+explorer-test: ## Run explorer Playwright tests
+	cd explorer && npx playwright install --with-deps && npm test
+
+explorer-serve: ## Serve the explorer locally (dev mode)
+	cd explorer && npm run dev
+
+explorer: explorer-install explorer-lint explorer-build explorer-test ## Run all explorer checks (install, lint, build, test)
+
 deny: ## Run cargo-deny supply-chain checks
 	cargo deny check
 
@@ -88,7 +108,7 @@ dashboards-check: ## Validate dashboard metric definitions
 env-check: ## Verify .env.example documents every env var the code reads
 	python3 scripts/check_env_example.py
 
-ci: fmt lint env-check dashboards-check test sdk-ts sdk-py openapi-check deny ## Run the same checks as CI (minus network-dependent E2E)
+ci: fmt lint env-check dashboards-check test sdk-ts sdk-py openapi-check explorer deny ## Run the same checks as CI (minus network-dependent E2E)
 
 up: ## Full stack in Docker
 	docker compose -f docker-compose.full.yml up --build -d

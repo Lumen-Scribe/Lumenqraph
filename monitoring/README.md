@@ -128,6 +128,9 @@ Exposed by the `lumenqraph-webhooks` service on its own `/metrics` endpoint
 | `lumenqraph_api_sse_broadcast_lagged_total` | counter | count | API |
 | `lumenqraph_api_sse_broadcast_receivers` | gauge | count | API |
 | `lumenqraph_api_sse_listener_up` | gauge | boolean (0 or 1) | API |
+| `lumenqraph_db_pool_acquire_duration_seconds` | histogram | seconds | All |
+| `lumenqraph_db_pool_acquire_timeouts_total` | counter | count | All |
+| `lumenqraph_db_pool_connections` | gauge | count | All |
 | `lumenqraph_indexer_chain_tip_ledger` | gauge | ledgers | Indexer |
 | `lumenqraph_indexer_consecutive_errors` | gauge | count | Indexer |
 | `lumenqraph_indexer_enrichment_rate` | gauge | fraction (0–1) | Indexer |
@@ -135,6 +138,7 @@ Exposed by the `lumenqraph-webhooks` service on its own `/metrics` endpoint
 | `lumenqraph_indexer_events_enriched_total` | counter | count | Indexer |
 | `lumenqraph_indexer_events_ingested_total` | counter | count | Indexer |
 | `lumenqraph_indexer_events_not_enriched_total` | counter | count | Indexer |
+| `lumenqraph_indexer_heartbeat_timestamp_seconds` | gauge | unix seconds | Indexer |
 | `lumenqraph_indexer_lag_ledgers` | gauge | ledgers | Indexer |
 | `lumenqraph_indexer_lag_seconds` | gauge | seconds (estimated) | Indexer |
 | `lumenqraph_indexer_last_processed_ledger` | gauge | ledgers | Indexer |
@@ -174,6 +178,9 @@ seconds since update for cursor freshness.
 
 ### Critical Alerts
 
+- **LumenqraphAPIDown / LumenqraphIndexerDown / LumenqraphWebhooksDown** - `up{job=...} == 0` for 2+ minutes (service crashed or unreachable)
+- **LumenqraphIndexerMetricsAbsent** - `lumenqraph_indexer_last_processed_ledger{job="lumenqraph-indexer"}` series absent for 2+ minutes
+- **LumenqraphIndexerHeartbeatStale** - Indexer poll-loop heartbeat (`lumenqraph_indexer_heartbeat_timestamp_seconds`) stale for 4+ minutes
 - **IndexerStalled** - No events ingested in 5+ minutes while lag exists, or the
   cursor has not advanced (`lumenqraph_indexer_seconds_since_progress`) in 5+ minutes
 - **IndexerLagCritical** - Lag > 500 ledgers for 2+ minutes

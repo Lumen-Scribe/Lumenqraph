@@ -10,13 +10,9 @@ import sys
 from pathlib import Path
 
 
-def extract_metrics_from_dashboard(dashboard_path: str) -> set[str]:
-    """Extract all metric names referenced in Grafana dashboard."""
-    with open(dashboard_path) as f:
-        dashboard = json.load(f)
-
-    metrics = set()
-    for panel in dashboard.get("panels", []):
+def _collect_panel_metrics(panels: list[dict], metrics: set[str]) -> None:
+    """Recursively extract metric names from panels and nested row panels."""
+    for panel in panels:
         for target in panel.get("targets", []):
             expr = target.get("expr", "")
             if expr:
@@ -24,7 +20,18 @@ def extract_metrics_from_dashboard(dashboard_path: str) -> set[str]:
                 # Patterns: metric_name, rate(metric_name), histogram_quantile(...metric_name...)
                 found = re.findall(r"\b(lumenqraph_\w+)\b", expr)
                 metrics.update(found)
+        nested = panel.get("panels")
+        if isinstance(nested, list):
+            _collect_panel_metrics(nested, metrics)
 
+
+def extract_metrics_from_dashboard(dashboard_path: str) -> set[str]:
+    """Extract all metric names referenced in Grafana dashboard."""
+    with open(dashboard_path) as f:
+        dashboard = json.load(f)
+
+    metrics: set[str] = set()
+    _collect_panel_metrics(dashboard.get("panels", []), metrics)
     return metrics
 
 
@@ -33,7 +40,7 @@ def extract_metrics_from_rust(rust_dir: str) -> set[str]:
     metrics = set()
 
     # Scan every Rust source file so counters defined outside `metrics.rs`
-    # (e.g. `store.rs`, `retention.rs`, `http.rs`) are also discovered.
+    # (e.g. `store.rs`, `retention.rs`, `http.rs`, `timing.rs`) are also discovered.
     for rust_file in Path(rust_dir).rglob("*.rs"):
         with open(rust_file) as f:
             content = f.read()
@@ -41,6 +48,9 @@ def extract_metrics_from_rust(rust_dir: str) -> set[str]:
                 metrics.add(metric)
                 if kind == "histogram":
                     metrics.update(metric + suffix for suffix in ("_bucket", "_sum", "_count"))
+            for metric in re.findall(r'Histogram::new\(\s*"(lumenqraph_\w+)"', content):
+                metrics.add(metric)
+                metrics.update(metric + suffix for suffix in ("_bucket", "_sum", "_count"))
 
     return metrics
 
