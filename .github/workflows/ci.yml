@@ -521,6 +521,14 @@ jobs:
           while IFS= read -r ref; do
             repo="${ref%@*}"
             sha="${ref##*@}"
+            # Issue #786: reject placeholder-looking SHAs (eight or more repeated
+            # characters, e.g. "...e0e0e0e0") before calling the API, so a
+            # filler pin fails with a clear message rather than a bare 422.
+            if printf '%s' "$sha" | grep -qE '(.)\1{7}'; then
+              echo "FAIL $ref (placeholder-looking SHA)"
+              status=1
+              continue
+            fi
             code=$(curl -s -o /dev/null -w '%{http_code}' \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
