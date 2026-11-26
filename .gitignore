@@ -3,6 +3,10 @@
 .env
 .env.local
 *.log
+*.bak
+*.orig
+*.rej
+*.swp
 
 # Postgres data volume for local docker dev
 /.pgdata
